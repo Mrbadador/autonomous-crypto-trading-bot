@@ -293,12 +293,24 @@ def run_ablation_simulation(
     pf = gross_win / gross_loss if gross_loss > 0 else 999.0
     sharpe = (np.mean(pnls) / (np.std(pnls) + 1e-9)) * np.sqrt(365 * 6) if len(pnls) > 1 else 0.0
 
+    # Bootstrap 90% Confidence Interval for Expected Value (EV) per trade
+    ev_mean = float(np.mean(pnls))
+    ev_ci_lo, ev_ci_hi = ev_mean, ev_mean
+    if len(pnls) >= 5:
+        rng = np.random.default_rng(42)
+        n_boot = 1500
+        boot_means = [float(np.mean(rng.choice(pnls, size=len(pnls), replace=True))) for _ in range(n_boot)]
+        ev_ci_lo = float(np.percentile(boot_means, 5.0))
+        ev_ci_hi = float(np.percentile(boot_means, 95.0))
+
     return {
         "n_trades": len(trades),
         "win_rate": round(wr, 1),
         "total_return": round(tot_ret, 2),
         "profit_factor": round(pf, 2),
         "sharpe": round(sharpe, 2),
+        "ev_mean": round(ev_mean * 100.0, 3),
+        "ev_ci_90": (round(ev_ci_lo * 100.0, 3), round(ev_ci_hi * 100.0, 3)),
         "trades": trades
     }
 
@@ -367,9 +379,10 @@ def main():
     df_4h_vec = precompute_4h_indicators_vectorized(df_4h)
     df_1d_vec = precompute_1d_trend_vectorized(df_1d)
 
-    print(f"\n{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'Profit Factor':<13} | {'Sharpe':<6}")
-    print("-" * 92)
+    print(f"\n{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'PF':<6} | {'Sharpe':<6} | {'EV / Trade (90% CI)':<22}")
+    print("-" * 105)
 
+    matrix_rows = []
     for name, config_dict in experiments:
         res = run_ablation_simulation(
             df_4h, df_1d, config_dict,
@@ -377,9 +390,12 @@ def main():
             df_4h_vec=df_4h_vec,
             df_1d_vec=df_1d_vec
         )
-        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>13.2f} | {res['sharpe']:>6.2f}")
+        ci_str = f"{res['ev_mean']:+.2f}% [{res['ev_ci_90'][0]:+.2f}%, {res['ev_ci_90'][1]:+.2f}%]"
+        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>6.2f} | {res['sharpe']:>6.2f} | {ci_str:<22}")
+        matrix_rows.append((name, res))
 
     print("\n[SUCCESS] Ablation comparison matrix successfully evaluated against real data.\n")
+    return matrix_rows
 
 
 if __name__ == "__main__":
