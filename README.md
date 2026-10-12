@@ -102,19 +102,28 @@ flowchart TD
 ## 📂 Repository Structure
 
 ```
-├── super_bot.py                 # Dual-regime orchestrator (Swing + Chop Grid)
-├── swing_trader.py              # 4H Ichimoku trend breakout engine
-├── bitget_uta_client.py         # Direct REST/WebSocket exchange connector
+├── backtests/                   # Historical simulation & multi-timeframe backtest engines
+├── tests/                       # Unit test suites, microstructure & WAL stress tests
+├── audits/                      # Forensic telemetry reviews, alpha roadmaps & reports
+├── scripts/                     # Offline training daemons, CLI tools & data utilities
+├── models/                      # PyTorch policy weights & neural flow classifiers (.pth)
+├── deploy/                      # Docker Compose & Prometheus service definitions
+├── data/state/                  # Static AI rule memory, replay buffers & cache state
+├── docs/assets/                 # Architecture diagrams & high-res HUD visual assets
+├── archive/legacy_agents/       # Deprecated/experimental fleet agents & scrapers
+├── super_bot.py                 # Dual-regime orchestrator (Swing + Chop Maker Grid)
+├── swing_trader.py              # 4H Ichimoku trend breakout execution engine
+├── bitget_uta_client.py         # Direct Bitget UTA REST/WebSocket exchange connector
 ├── conviction_filter.py         # Multi-agent AI boardroom & entry validator
-├── ai_engine.py                 # LLM provider router (Gemini + Groq pool)
-├── ofi_daemon.py                # Level-2 Order Flow Imbalance streamer
-├── regime_classifier.py         # ADX / Hurst market regime classifier
-├── risk_manager.py              # Empirical Kelly sizing & risk limits
-├── portfolio_risk_agent.py      # Real-time portfolio margin ceiling daemon
+├── ai_engine.py                 # Multi-LLM provider router (Gemini Flash + Groq pool)
+├── ofi_daemon.py                # Level-2 Order Flow Imbalance (OFI) streamer
+├── regime_classifier.py         # ADX / Hurst market regime classification daemon
+├── risk_manager.py              # Empirical Quarter-Kelly position sizing & risk gates
+├── portfolio_risk_agent.py      # Real-time portfolio margin ceiling daemon (70% hard cap)
 ├── macro_sentinel.py            # Funding rate skew & open interest monitor
 ├── sentinel_agent.py            # RSS & crypto disaster news auditor
-├── economic_calendar.py         # High-impact macro event calendar gate
-├── dashboard.py                 # Streamlit live telemetry dashboard
+├── economic_calendar.py         # Scheduled macro event calendar gate (CPI/FOMC)
+├── dashboard.py                 # Streamlit live telemetry dashboard (Port 8501)
 ├── start_system.py              # Master supervisor daemon & process manager
 └── config.py                    # Centralized parameters & trading constants
 ```
