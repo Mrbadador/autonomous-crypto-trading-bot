@@ -57,6 +57,7 @@ def connect_readonly(db_path: str, timeout: float = 10.0) -> sqlite3.Connection:
     conn = sqlite3.connect(db_uri, timeout=timeout, check_same_thread=False, uri=True)
     return conn
 
+@st.cache_data(ttl=4, show_spinner=False)
 def query_db(db_path: str, query: str, params: tuple = ()) -> pd.DataFrame:
     """Safely executes a query and returns a pandas DataFrame."""
     if not os.path.exists(db_path):
@@ -69,6 +70,7 @@ def query_db(db_path: str, query: str, params: tuple = ()) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+@st.cache_data(ttl=4, show_spinner=False)
 def query_system_state(key: str, default: str = "") -> str:
     """Fetches a single key value from the system_state table."""
     df = query_db(TRADING_DATA_DB, "SELECT value FROM system_state WHERE key = ?", (key,))
@@ -872,7 +874,10 @@ with st.sidebar:
         st.caption("🟢 **Liquidity Sweep Gate:** Active (Fakeout Shield)")
         st.caption("🟢 **Early Reversal Sentinel:** Active (Trailing Stops)")
         st.caption("🟢 **Dynamic Exit Geometry:** Active (Structure SL/TP)")
-        st.caption("🟢 **Rule Enforcement Gate:** Active (129 Rules)")
+        df_rule_cnt = query_db(TRADING_LEDGER_DB, "SELECT COUNT(*) as cnt FROM learned_rules")
+        live_rule_count = int(df_rule_cnt.iloc[0]["cnt"]) if not df_rule_cnt.empty else 0
+        rule_cnt_str = f"{live_rule_count} Rules" if live_rule_count > 0 else "Active"
+        st.caption(f"🟢 **Rule Enforcement Gate:** Active ({rule_cnt_str})")
         st.caption("🟢 **Funding Carry Shield:** Active (Pre-Settlement)")
         st.caption("🟢 **Session Macro Blueprint:** Active (Every 6h / 4x Daily)")
     st.markdown("---")
@@ -990,11 +995,11 @@ st.markdown(f"""
 
 # ── Dynamic Account Sizing & Performance Calculations ────────────────────────
 # Fetch All Closed Trades from all fleet trade tables (including swing & super bot maker grid)
-df_t1 = query_db(TRADING_DATA_DB, "SELECT * FROM trades WHERE status = 'closed' OR status = 'CLOSED'")
-df_t2 = query_db(TRADING_DATA_DB, "SELECT * FROM berserker_trades WHERE status = 'closed' OR status = 'CLOSED'")
-df_t3 = query_db(TRADING_DATA_DB, "SELECT * FROM marl_live_trades WHERE status = 'closed' OR status = 'CLOSED'")
-df_t4 = query_db(TRADING_DATA_DB, "SELECT * FROM mean_reversion_trades WHERE status = 'closed' OR status = 'CLOSED'")
-df_t5 = query_db(TRADING_DATA_DB, "SELECT id, timestamp, symbol, side, entry_price, exit_price, size as qty, pnl, notes, 'closed' as status FROM swing_trades")
+df_t1 = query_db(TRADING_DATA_DB, "SELECT *, exposure_time_mins as duration_mins FROM trades WHERE status = 'closed' OR status = 'CLOSED'")
+df_t2 = query_db(TRADING_DATA_DB, "SELECT *, exposure_time_mins as duration_mins FROM berserker_trades WHERE status = 'closed' OR status = 'CLOSED'")
+df_t3 = query_db(TRADING_DATA_DB, "SELECT *, NULL as duration_mins FROM marl_live_trades WHERE status = 'closed' OR status = 'CLOSED'")
+df_t4 = query_db(TRADING_DATA_DB, "SELECT *, NULL as duration_mins FROM mean_reversion_trades WHERE status = 'closed' OR status = 'CLOSED'")
+df_t5 = query_db(TRADING_DATA_DB, "SELECT id, timestamp, symbol, side, entry_price, exit_price, size as qty, pnl, notes, 'closed' as status, (holding_hours * 60.0) as duration_mins FROM swing_trades")
 trade_dfs = [d for d in [df_t1, df_t2, df_t3, df_t4, df_t5] if not d.empty]
 df_all_trades = pd.concat(trade_dfs, ignore_index=True) if trade_dfs else pd.DataFrame()
 
@@ -1014,7 +1019,7 @@ if not df_all_trades.empty:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (2.62 if win_count > 0 else 1.0)
     net_realized_pnl = gross_profit - gross_loss
 else:
-    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 43, 16, 72.9, 2.62, 12.18
+    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 0, 0, 0.0, 0.0, 0.0
 
 # Active Positions Query across all 5 fleet sub-engines
 df_open_1 = query_db(TRADING_DATA_DB, "SELECT * FROM open_positions")
@@ -1058,10 +1063,11 @@ if not df_open.empty:
 
 max_coin_slots = int(query_system_state("GLOBAL_MAX_POSITIONS", "5"))
 margin_limit_pct = float(query_system_state("GLOBAL_MARGIN_LIMIT", "70.0"))
-free_cash_buffer = max(0.0, live_bal_val - total_margin_locked)
+bal_for_calc = live_bal_val if live_bal_val is not None else 0.0
+free_cash_buffer = max(0.0, bal_for_calc - total_margin_locked)
 
 # Margin utilization calculation
-margin_util_pct = (total_margin_locked / live_bal_val * 100.0) if live_bal_val > 0 else 0.0
+margin_util_pct = (total_margin_locked / bal_for_calc * 100.0) if bal_for_calc > 0 else 0.0
 margin_bar_width = min(100.0, (margin_util_pct / margin_limit_pct) * 100.0)
 if margin_util_pct < 45.0:
     margin_color = "#00ff66"
@@ -1078,10 +1084,11 @@ kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 
 with kpi1:
     help_deposit = f"Deposited Capital: ${total_deposited:.2f} USDT (${deposit_t1:.0f} seed + ${deposit_t2:.0f} top-up 1" + (f" + ${deposit_t3:.0f} top-up 2" if deposit_t3 > 0 else "") + f"). True Net Profit: {total_profit:+.2f} USDT."
+    eq_val_str = f"${live_bal_val:.2f} USDT" if live_bal_val is not None else "Syncing..."
     st.metric(
         label="💰 Live Account Equity",
-        value=f"${live_bal_val:.2f} USDT",
-        delta=f"{'+$' if total_profit>=0 else '-$'}{abs(total_profit):.2f} ({total_roi_pct:+.2f}% ROI)",
+        value=eq_val_str,
+        delta=f"{'+$' if total_profit>=0 else '-$'}{abs(total_profit):.2f} ({total_roi_pct:+.2f}% ROI)" if live_bal_val is not None else None,
         help=help_deposit
     )
     principal_caption = f"Principal: **${total_deposited:.2f}** (`${deposit_t1:.0f}` + `${deposit_t2:.0f}`" + (f" + `${deposit_t3:.0f}`" if deposit_t3 > 0 else "") + ")"
@@ -1155,14 +1162,6 @@ with tab_briefing:
     now_ts = time.time()
     last_gen_ts = float(briefing_data.get("generated_at_timestamp") or 0.0)
     age_seconds = now_ts - last_gen_ts if last_gen_ts > 0 else 999999
-
-    # If missing or older than 300s (5 minutes), automatically generate fresh briefing
-    if (not briefing_data or age_seconds >= 300) and BRIEFING_ENGINE_AVAILABLE:
-        try:
-            briefing_data = run_single_briefing_cycle(briefing_data.get("cycle_num", 0) + 1)
-            age_seconds = 0
-        except Exception:
-            pass
 
     # Top Control Bar
     top_c1, top_c2 = st.columns([3, 1])
@@ -1939,6 +1938,22 @@ with tab_live:
         </div>
         """, unsafe_allow_html=True)
 
+    with st.expander("📜 Relative Strength & Leader Rotation History (Audit Log)", expanded=False):
+        df_rs_hist = query_db(TRADING_LEDGER_DB, "SELECT timestamp, priority_leaders, secondary_tier, avoid_chop_list, rationale FROM relative_strength_history ORDER BY id DESC LIMIT 10")
+        if not df_rs_hist.empty:
+            df_rs_hist['Time (SAST)'] = df_rs_hist['timestamp'].apply(utc_to_sast)
+            show_rs = df_rs_hist[['Time (SAST)', 'priority_leaders', 'secondary_tier', 'avoid_chop_list', 'rationale']].rename(
+                columns={
+                    'priority_leaders': 'Alpha Leaders',
+                    'secondary_tier': 'Secondary',
+                    'avoid_chop_list': 'Avoid List',
+                    'rationale': 'AI Rationale'
+                }
+            )
+            st.dataframe(show_rs, width="stretch", hide_index=True)
+        else:
+            st.caption("Relative strength audit history synchronizing...")
+
     st.subheader("📡 Top 10 Watchlist Radar (Live Technical Screening)")
     
     raw_allowed = query_system_state("ALLOWED_SYMBOLS")
@@ -2179,17 +2194,33 @@ with tab_ledger:
         st.markdown("---")
         st.subheader("⏱️ Trade Duration & Holding Time Analysis")
         
-        dur1, dur2, dur3, dur4 = st.columns(4)
-        with dur1:
-            st.metric("Avg Fleet Duration", "38.5 mins", delta="Intraday Scalp")
-        with dur2:
-            st.metric("Avg Winner Duration", "46.2 mins", delta="+18.4m longer than losers")
-        with dur3:
-            st.metric("Avg Loser Duration", "27.8 mins", delta="Cut quick on SL")
-        with dur4:
-            st.metric("Hold Ratio (Win/Loss)", "1.66x", delta="Healthy Asymmetry (>1.0x)")
+        valid_dur = df_all_trades[df_all_trades['duration_mins'].notnull() & (df_all_trades['duration_mins'] > 0)] if 'duration_mins' in df_all_trades.columns else pd.DataFrame()
+        if not valid_dur.empty:
+            avg_all_m = float(valid_dur['duration_mins'].mean())
+            win_dur = valid_dur[valid_dur['pnl'].astype(float) > 0]
+            loss_dur = valid_dur[valid_dur['pnl'].astype(float) <= 0]
+            avg_win_m = float(win_dur['duration_mins'].mean()) if not win_dur.empty else avg_all_m
+            avg_loss_m = float(loss_dur['duration_mins'].mean()) if not loss_dur.empty else avg_all_m
+            hold_ratio = (avg_win_m / avg_loss_m) if avg_loss_m > 0 else 1.0
             
-        st.info("💡 **Holding Asymmetry Insight:** Winning trades run 1.66x longer than losing trades. This confirms the system's dynamic trailing stops allow winners to expand while hard hardware stops cut losses quickly.")
+            def _fmt_mins(m):
+                if m >= 60.0:
+                    return f"{m/60.0:.1f} hrs"
+                return f"{m:.1f} mins"
+            
+            dur1, dur2, dur3, dur4 = st.columns(4)
+            with dur1:
+                st.metric("Avg Fleet Duration", _fmt_mins(avg_all_m), delta=f"{len(valid_dur)} Samples")
+            with dur2:
+                st.metric("Avg Winner Duration", _fmt_mins(avg_win_m), delta=f"+{max(0.0, avg_win_m - avg_loss_m):.1f}m vs losers" if avg_win_m >= avg_loss_m else "Shorter than losers")
+            with dur3:
+                st.metric("Avg Loser Duration", _fmt_mins(avg_loss_m), delta="Cut on SL / Invalidation")
+            with dur4:
+                st.metric("Hold Ratio (Win/Loss)", f"{hold_ratio:.2f}x", delta="Asymmetry (>1.0x)" if hold_ratio >= 1.0 else "Inverted (<1.0x)")
+                
+            st.info(f"💡 **Holding Asymmetry Insight:** Realized holding ratio is **{hold_ratio:.2f}x** across **{len(valid_dur)}** recorded trades. Winners average {_fmt_mins(avg_win_m)} while losers exit at {_fmt_mins(avg_loss_m)}.")
+        else:
+            st.caption("Duration metrics synchronizing with closed trades...")
     else:
         st.info("No closed trades recorded in the database yet.")
 
@@ -2995,18 +3026,24 @@ with tab_ai:
     
     with col_ai1:
         st.markdown("#### 📡 Recent AI Boardroom Decision Audits")
-        df_telem = query_db(TRADING_DATA_DB, "SELECT timestamp, symbol, action, price, vol_pct, quality, reasoning FROM telemetry ORDER BY timestamp DESC LIMIT 8")
-        if not df_telem.empty:
-            df_telem['Time (SAST)'] = df_telem['timestamp'].apply(utc_to_sast)
-            df_telem['Price'] = df_telem['price'].apply(lambda x: f"${float(x):,.2f}" if x else "---")
-            df_telem['Vol Ratio'] = df_telem['vol_pct'].apply(lambda x: f"{float(x or 0):.1f}%")
-            show_telem = df_telem[['Time (SAST)', 'symbol', 'action', 'Price', 'Vol Ratio', 'reasoning']].rename(columns={'symbol': 'Asset', 'action': 'Action', 'reasoning': 'AI Rationale'})
-            st.dataframe(show_telem, width="stretch", hide_index=True)
+        df_debates = query_db(TRADING_LEDGER_DB, "SELECT timestamp, symbol, side, execute, conviction_score, red_team_objection, final_rationale FROM boardroom_debates ORDER BY id DESC LIMIT 8")
+        if not df_debates.empty:
+            df_debates['Time (SAST)'] = df_debates['timestamp'].apply(utc_to_sast)
+            df_debates['Verdict'] = df_debates['execute'].apply(lambda x: "🟢 APPROVED" if x in (1, "1", True) else "🔴 VETOED")
+            df_debates['Conviction'] = df_debates['conviction_score'].apply(lambda x: f"{float(x or 0)*100:.0f}%")
+            df_debates['Objection / Thesis'] = df_debates.apply(
+                lambda r: str(r.get('red_team_objection') or r.get('final_rationale') or '')[:70] + "...",
+                axis=1
+            )
+            show_deb = df_debates[['Time (SAST)', 'symbol', 'side', 'Verdict', 'Conviction', 'Objection / Thesis']].rename(columns={'symbol': 'Asset', 'side': 'Side'})
+            st.dataframe(show_deb, width="stretch", hide_index=True)
         else:
-            st.info("Telemetry queue synchronizing...")
+            st.info("AI Boardroom decision ledger synchronizing...")
 
     with col_ai2:
-        st.markdown("#### 📚 Active Dynamic Rules Learned from Past Mistakes")
+        df_rule_total = query_db(TRADING_LEDGER_DB, "SELECT COUNT(*) as cnt FROM learned_rules")
+        total_rules_active = int(df_rule_total.iloc[0]["cnt"]) if not df_rule_total.empty else 0
+        st.markdown(f"#### 📚 Active Dynamic Rules ({total_rules_active} Rules in Memory)")
         df_rules = query_db(TRADING_LEDGER_DB, "SELECT category, rule_text, confidence, created_at FROM learned_rules ORDER BY rowid DESC LIMIT 6")
         if not df_rules.empty:
             for _, r in df_rules.iterrows():
@@ -3017,7 +3054,7 @@ with tab_ai:
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.info("33 dynamic neural rules active in long-term memory.")
+            st.info(f"{total_rules_active} dynamic neural rules active in long-term memory.")
 
     st.markdown("---")
     st.subheader("🎯 AI Model Calibration & Reliability Scorecard (Prediction vs Realized Outcome)")
@@ -3050,7 +3087,9 @@ with tab_ai:
         st.info(f"Model calibration tracker syncing: {c_err}")
 
     st.markdown("---")
-    st.subheader("📖 Post-Trade Forensic Lessons Extracted (220 Lessons in Database)")
+    df_lesson_total = query_db(TRADING_LEDGER_DB, "SELECT COUNT(*) as cnt FROM trade_lessons")
+    total_lessons_db = int(df_lesson_total.iloc[0]["cnt"]) if not df_lesson_total.empty else 0
+    st.subheader(f"📖 Post-Trade Forensic Lessons Extracted ({total_lessons_db} Lessons in Database)")
     df_lessons = query_db(TRADING_LEDGER_DB, "SELECT symbol, pnl, lesson, timestamp FROM trade_lessons ORDER BY id DESC LIMIT 5")
     if not df_lessons.empty:
         for _, l in df_lessons.iterrows():
@@ -3112,7 +3151,7 @@ with tab_risk:
     st.markdown("---")
     st.markdown("#### 🔬 Real-Time Order Flow Imbalance (OFI) & Regime Strength Deck")
 
-    df_micro = query_db(TRADING_LEDGER_DB, "SELECT symbol, liquidity_imbalance, bid_wall_price, ask_wall_price, updated_at FROM oracle_microstructure ORDER BY id DESC LIMIT 1")
+    df_micro = query_db(TRADING_LEDGER_DB, "SELECT symbol, liquidity_imbalance, bid_wall_price, ask_wall_price, timestamp FROM oracle_microstructure ORDER BY id DESC LIMIT 1")
     imb = 0.0
     bid_wall = 0.0
     ask_wall = 0.0
@@ -3503,7 +3542,7 @@ with tab_risk:
         mc_data = jv_report.get("monte_carlo", {})
 
         # 0. FinRL Mahalanobis Cross-Asset Turbulence & Rolling Sharpe Ensemble Header
-        turb_raw = state.get("finrl_turbulence_json", "")
+        turb_raw = query_system_state("finrl_turbulence_json", "")
         turb_data = {}
         if turb_raw:
             try:

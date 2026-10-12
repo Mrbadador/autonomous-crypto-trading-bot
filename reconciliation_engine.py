@@ -920,6 +920,17 @@ async def reconciliation_main_loop():
 
     while True:
         try:
+            # Check for immediate Operator Force Re-Sync signal from Dashboard
+            try:
+                with sqlite3.connect(DATA_DB, timeout=3.0) as conn_sig:
+                    sig_row = conn_sig.execute("SELECT value FROM system_state WHERE key = 'force_resync'").fetchone()
+                    if sig_row and str(sig_row[0]).strip() == "1":
+                        log.info("[FORCE-RESYNC] 🚨 Immediate Operator Force Re-Sync signal detected from Dashboard. Triggering audit now.")
+                        conn_sig.execute("UPDATE system_state SET value = '0', updated_at = ? WHERE key = 'force_resync'", (datetime.now(UTC).isoformat(),))
+                        conn_sig.commit()
+            except Exception as sig_err:
+                log.debug(f"[FORCE-RESYNC-NOTE] Signal check: {sig_err}")
+
             # 1. Run local cross-fleet paper audit
             paper_audit = audit_paper_positions()
             
@@ -939,7 +950,16 @@ async def reconciliation_main_loop():
         except Exception as e:
             log.error(f"Reconciliation cycle exception: {e}")
             
-        await asyncio.sleep(RECONCILIATION_INTERVAL_SECS)
+        # Fast responsive sleep loop (checks for force_resync every 1s instead of blocking for full interval)
+        for _ in range(int(RECONCILIATION_INTERVAL_SECS)):
+            try:
+                with sqlite3.connect(DATA_DB, timeout=2.0) as conn_chk:
+                    r = conn_chk.execute("SELECT value FROM system_state WHERE key = 'force_resync'").fetchone()
+                    if r and str(r[0]).strip() == "1":
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
 
 if __name__ == "__main__":
     try:
