@@ -443,7 +443,8 @@ class DatabaseManager:
                     veto_reason TEXT,
                     exit_price REAL,
                     pnl_pct REAL,
-                    status TEXT DEFAULT 'OPEN'
+                    status TEXT DEFAULT 'OPEN',
+                    candle_key TEXT
                 )
             """)
             cursor.execute("""
@@ -661,12 +662,35 @@ class DatabaseManager:
                         "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.2', ?)",
                         (datetime.now(UTC).isoformat(),)
                     )
-                    log.info("Database migration 1.2 SUCCESS: swing_trades successfully rebuilt with nullable exit constraints.")
                 except Exception as mig_err:
                     log.critical(f"Database migration 1.2 FAILED: {mig_err}", exc_info=True)
                     raise mig_err
                 finally:
                     cursor.execute("PRAGMA foreign_keys = ON;")
+
+            # Migration 1.3: Add candle_key to shadow_signals and unique index (FIX 3)
+            cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
+            row_v = cursor.fetchone()
+            curr_v = str(row_v[0]) if row_v else "0.0"
+            if curr_v < "1.3":
+                log.info("Migrating database to 1.3: Adding candle_key and unique index to shadow_signals...")
+                try:
+                    cursor.execute("PRAGMA table_info(shadow_signals)")
+                    shadow_cols = [c[1] for c in cursor.fetchall()]
+                    if "candle_key" not in shadow_cols:
+                        cursor.execute("ALTER TABLE shadow_signals ADD COLUMN candle_key TEXT;")
+                    cursor.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_signals_unique ON shadow_signals (symbol, direction, candle_key);
+                    """)
+                    from datetime import datetime, UTC
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.3', ?)",
+                        (datetime.now(UTC).isoformat(),)
+                    )
+                    log.info("Database migration 1.3 SUCCESS: shadow_signals deduplication index created.")
+                except Exception as mig_err:
+                    log.critical(f"Database migration 1.3 FAILED: {mig_err}", exc_info=True)
+                    raise mig_err
 
             conn.commit()
         log.info(f"Database initialized at {self.db_path} with WAL mode.")
