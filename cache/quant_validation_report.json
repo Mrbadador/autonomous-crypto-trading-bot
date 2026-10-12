@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-12T06:16:08.640528+00:00",
-  "compute_seconds": 5.35,
+  "generated_at": "2026-10-12T10:16:28.411925+00:00",
+  "compute_seconds": 0.61,
   "bootstrap_significance": {
     "GRID_MAKER": {
       "strategy_name": "GRID_MAKER",

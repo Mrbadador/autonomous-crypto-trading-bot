@@ -5,8 +5,6 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from ai_engine import red_team_deliberation
-from analyst_agent import BOARDROOM_DIRECTIVES
-
 
 log = logging.getLogger("conviction_boardroom")
 
