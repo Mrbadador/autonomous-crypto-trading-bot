@@ -183,9 +183,10 @@ async def _query_gemini_cloud(session: aiohttp.ClientSession, prompt: str, timeo
         if cooldowns.get(model_name, 0.0) > now:
             continue
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key.strip()}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        headers = {"x-goog-api-key": gemini_key.strip()}
         try:
-            async with session.post(url, json=payload, timeout=timeout) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")

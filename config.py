@@ -15,18 +15,18 @@ _log = logging.getLogger("config")
 # Engine Mode
 # ---------------------------------------------------------------------------
 MODE             = os.getenv("MODE", "live_pilot").lower()
-PAPER_TRADE      = os.getenv("PAPER_TRADE", "false").lower() == "true"
+PAPER_TRADE      = os.getenv("PAPER_TRADE", "false").lower() in ("true", "1")
 IS_REPLAY        = (MODE == "replay")
 DATA_DIR         = os.getenv("DATA_DIR", "data/historical")
 REPLAY_DELAY     = float(os.getenv("REPLAY_DELAY", "0.0"))
-BYPASS_AI_IN_REPLAY = os.getenv("BYPASS_AI_IN_REPLAY", "True").lower() == "true"
+BYPASS_AI_IN_REPLAY = os.getenv("BYPASS_AI_IN_REPLAY", "True").lower() in ("true", "1")
 REPLAY_START_DATE = os.getenv("REPLAY_START_DATE", "2023-04-01")
 REPLAY_END_DATE   = os.getenv("REPLAY_END_DATE", "2023-07-31")
 
 # ---------------------------------------------------------------------------
 # Exchange / Symbol
 # ---------------------------------------------------------------------------
-SANDBOX          = os.getenv("SANDBOX", "true").lower() == "true"
+SANDBOX          = os.getenv("SANDBOX", "true").lower() in ("true", "1")
 SYMBOLS_STR      = os.getenv("SYMBOLS") or "BTC/USDT"
 def normalize_symbol(s):
     if not s: return ""
@@ -293,7 +293,7 @@ FAST_SL_TIME_MINS             = int(os.getenv("FAST_SL_TIME_MINS", "5"))
 MAX_POSITIONS_PER_SYMBOL      = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "4"))
 GLOBAL_MAX_DISTINCT_COINS     = int(os.getenv("GLOBAL_MAX_DISTINCT_COINS", "8"))
 MAX_PORTFOLIO_MARGIN_PCT      = float(os.getenv("MAX_PORTFOLIO_MARGIN_PCT", "0.80"))
-ALLOW_SAME_COIN_SCALE_IN      = os.getenv("ALLOW_SAME_COIN_SCALE_IN", "true").lower() == "true"
+ALLOW_SAME_COIN_SCALE_IN      = os.getenv("ALLOW_SAME_COIN_SCALE_IN", "true").lower() in ("true", "1")
 RISK_VOLATILITY_CAP           = float(os.getenv("RISK_VOLATILITY_CAP", "0.5"))
 RISK_PHASE_MATRIX             = {"EARLY": 1.2, "MATURE": 1.0, "EXHAUSTED": 0.5, "CHOP": 0.3, "UNKNOWN": 0.5}
 
@@ -348,7 +348,7 @@ LATE_TREND_SIZE_REDUCTION     = 0.5
 # ---------------------------------------------------------------------------
 HTF_TIMEFRAME    = os.getenv("HTF_TIMEFRAME", "4h")
 HTF_EMA_PERIOD   = int(os.getenv("HTF_EMA_PERIOD", "200"))
-HTF_ENABLED      = os.getenv("HTF_ENABLED", "True").lower() == "true"
+HTF_ENABLED      = os.getenv("HTF_ENABLED", "True").lower() in ("true", "1")
 HTF_MIN_CANDLES  = 1000   # Matches OHLCV_LIMIT for a stable 4H EMA200
 
 # ---------------------------------------------------------------------------
