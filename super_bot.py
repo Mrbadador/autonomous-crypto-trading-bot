@@ -673,6 +673,20 @@ class SuperBotTrader:
 
             now_iso = datetime.now(UTC).isoformat()
             init_risk = (actual_entry - sl_price) * qty if is_long else (sl_price - actual_entry) * qty
+            intended_p = float(current_price)
+            actual_fill_p = float(actual_entry)
+            slippage_bps = ((actual_fill_p - intended_p) / intended_p * 10000.0) if intended_p > 0 else 0.0
+            fee_entry_usd = actual_fill_p * qty * 0.0002  # Maker fee 0.02%
+            grid_gates = {
+                "engine": engine_tag,
+                "5m_rsi": round(float(rsi), 2),
+                "conviction_score": round(float(conv_score), 2),
+                "rationale": str(rationale),
+                "intended_entry": intended_p,
+                "order_type": "post_only_limit"
+            }
+            grid_gates_json = json.dumps(grid_gates)
+
             notes_str = (
                 f"Chop Maker Grid [Post-Only Limit] (TP: +{self.grid_tp_pct*100:.1f}%)"
                 if is_long
@@ -681,12 +695,12 @@ class SuperBotTrader:
             pos_record = {
                 "symbol": symbol,
                 "side": pos_side,
-                "entry_price": actual_entry,
+                "entry_price": actual_fill_p,
                 "size": qty,
                 "stop_loss": sl_price,
                 "take_profit": tp_price,
                 "trailing_stop": sl_price,
-                "peak_price": actual_entry,
+                "peak_price": actual_fill_p,
                 "leverage": self.grid_leverage,
                 "opened_at": now_iso,
                 "updated_at": now_iso,
@@ -694,7 +708,13 @@ class SuperBotTrader:
                 "r_multiple": 0.0,
                 "initial_risk_usd": init_risk,
                 "notes": notes_str,
-                "engine_type": engine_tag
+                "engine_type": engine_tag,
+                "intended_entry_price": intended_p,
+                "actual_fill_price": actual_fill_p,
+                "slippage_bps": slippage_bps,
+                "fee_entry_usd": fee_entry_usd,
+                "execution_type": "maker",
+                "gates_snapshot": grid_gates_json
             }
             
             # Record in swing_open_positions for unified management
@@ -702,11 +722,14 @@ class SuperBotTrader:
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                     conn.execute("""
                         INSERT OR REPLACE INTO swing_open_positions 
-                        (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price, leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price,
+                         leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes,
+                         intended_entry_price, actual_fill_price, slippage_bps, fee_entry_usd, execution_type, gates_snapshot)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        symbol, pos_side, actual_entry, qty, sl_price, tp_price, sl_price, actual_entry,
-                        self.grid_leverage, now_iso, now_iso, "ACTIVE", 0.0, pos_record["initial_risk_usd"], pos_record["notes"]
+                        symbol, pos_side, actual_fill_p, qty, sl_price, tp_price, sl_price, actual_fill_p,
+                        self.grid_leverage, now_iso, now_iso, "ACTIVE", 0.0, pos_record["initial_risk_usd"], pos_record["notes"],
+                        intended_p, actual_fill_p, slippage_bps, fee_entry_usd, "maker", grid_gates_json
                     ))
                     # Acquire exclusive lock
                     lock_who = 'super_bot_grid' if is_long else 'super_bot_scalp_short'

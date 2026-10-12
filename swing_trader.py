@@ -132,7 +132,13 @@ class SwingArchitectTrader:
                         status TEXT DEFAULT 'ACTIVE',
                         r_multiple REAL DEFAULT 0.0,
                         initial_risk_usd REAL,
-                        notes TEXT
+                        notes TEXT,
+                        intended_entry_price REAL,
+                        actual_fill_price REAL,
+                        slippage_bps REAL,
+                        fee_entry_usd REAL,
+                        execution_type TEXT,
+                        gates_snapshot TEXT
                     )
                 """)
                 conn.execute("""
@@ -142,13 +148,23 @@ class SwingArchitectTrader:
                         symbol TEXT NOT NULL,
                         side TEXT NOT NULL,
                         entry_price REAL NOT NULL,
-                        exit_price REAL NOT NULL,
+                        exit_price REAL,
                         size REAL NOT NULL,
-                        pnl REAL NOT NULL,
-                        roe_pct REAL NOT NULL,
+                        pnl REAL,
+                        roe_pct REAL,
                         holding_hours REAL,
                         exit_reason TEXT,
-                        notes TEXT
+                        notes TEXT,
+                        intended_entry_price REAL,
+                        actual_fill_price REAL,
+                        slippage_bps REAL,
+                        fee_paid_usd REAL,
+                        fee_maker_usd REAL,
+                        fee_taker_usd REAL,
+                        funding_usd REAL,
+                        funding_source TEXT,
+                        gates_snapshot TEXT,
+                        status TEXT DEFAULT 'CLOSED'
                     )
                 """)
                 conn.execute("""
@@ -899,7 +915,7 @@ class SwingArchitectTrader:
     # ---------------------------------------------------------------------------
     # Order Execution & Lifecycle Management
     # ---------------------------------------------------------------------------
-    async def open_swing_position(self, symbol: str, ind_4h: dict, direction: str = "LONG", conviction_score: float = 0.70):
+    async def open_swing_position(self, symbol: str, ind_4h: dict, direction: str = "LONG", conviction_score: float = 0.70, gates_snapshot: dict = None):
         """Executes market entry, acquires asset lock, and records position."""
         # P0-4 DEFENSE: Check if Portfolio Risk Agent or Operator has activated RISK_HALT / OPERATOR_HALT (offloaded via to_thread, Fail-Closed)
         def _read_risk_halt():
@@ -1410,15 +1426,23 @@ class SwingArchitectTrader:
         now_iso = datetime.now(UTC).isoformat()
         order_tag = "POST_ONLY_MAKER" if execution_order_type == "POST_ONLY_LIMIT" else "MARKET_TAKER"
         final_size = actual_qty if (execution_order_type == "POST_ONLY_LIMIT" and 'actual_qty' in locals()) else qty
+        intended_price = float(entry_price)
+        actual_price = float(actual_entry_price)
+        slippage_bps = ((actual_price - intended_price) / intended_price * 10000.0) if intended_price > 0 else 0.0
+        exec_type = "maker" if execution_order_type == "POST_ONLY_LIMIT" else "taker"
+        entry_fee_rate = 0.0002 if exec_type == "maker" else 0.0006
+        fee_entry_usd = actual_price * final_size * entry_fee_rate
+        gates_json = json.dumps(gates_snapshot) if gates_snapshot else None
+
         pos_record = {
             "symbol": symbol,
             "side": side_str,
-            "entry_price": actual_entry_price,
+            "entry_price": actual_price,
             "size": final_size,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "trailing_stop": stop_loss,
-            "peak_price": actual_entry_price,
+            "peak_price": actual_price,
             "leverage": assigned_leverage,
             "opened_at": now_iso,
             "updated_at": now_iso,
@@ -1427,11 +1451,16 @@ class SwingArchitectTrader:
             "initial_risk_usd": risk_per_unit * final_size,
             "engine_type": "SWING_4H",
             "order_type": "post_only" if execution_order_type == "POST_ONLY_LIMIT" else "market",
-            "execution_type": "maker" if execution_order_type == "POST_ONLY_LIMIT" else "taker",
+            "execution_type": exec_type,
+            "intended_entry_price": intended_price,
+            "actual_fill_price": actual_price,
+            "slippage_bps": slippage_bps,
+            "fee_entry_usd": fee_entry_usd,
+            "gates_snapshot": gates_json,
             "notes": (
                 f"Ichimoku 4H {'Breakout' if is_long else 'Breakdown'} "
                 f"[{quality_tier} (Conviction: {conviction_score:.2f}, ADX: {adx:.1f})] "
-                f"[Order: {order_tag} | Engine: SWING_4H]"
+                f"[Order: {order_tag} | Slippage: {slippage_bps:+.1f}bps | Engine: SWING_4H]"
             ),
         }
         self.active_positions[symbol] = pos_record
@@ -1446,14 +1475,18 @@ class SwingArchitectTrader:
                         conn.execute("""
                             INSERT OR REPLACE INTO swing_open_positions
                             (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price,
-                             leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes,
+                             intended_entry_price, actual_fill_price, slippage_bps, fee_entry_usd, execution_type, gates_snapshot)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             pos_record["symbol"], pos_record["side"], pos_record["entry_price"], pos_record["size"],
                             pos_record["stop_loss"], pos_record["take_profit"], pos_record["trailing_stop"],
                             pos_record["peak_price"], pos_record["leverage"], pos_record["opened_at"],
                             pos_record["updated_at"], pos_record["status"], pos_record["r_multiple"],
-                            pos_record["initial_risk_usd"], pos_record["notes"]
+                            pos_record["initial_risk_usd"], pos_record["notes"],
+                            pos_record["intended_entry_price"], pos_record["actual_fill_price"],
+                            pos_record["slippage_bps"], pos_record["fee_entry_usd"],
+                            pos_record["execution_type"], pos_record["gates_snapshot"]
                         ))
                         conn.commit()
                         return
@@ -2030,18 +2063,44 @@ class SwingArchitectTrader:
             except Exception as fill_err:
                 log.debug(f"[CLOSE-FILLS-NOTE] Note aggregating fills for {symbol}: {fill_err}")
 
-        # Recalculate accounting with aggregated fill values
-        if is_long:
-            gross_pnl = (actual_exit_price - entry_p) * qty
-        else:
-            gross_pnl = (entry_p - actual_exit_price) * qty
-        total_fees = entry_fee + actual_exit_fee
-        pnl = actual_realized_pnl if actual_realized_pnl is not None else (gross_pnl - total_fees)
+        # Stage 1 Instrumentation: Query Bitget Funding Fee History across holding window
+        funding_usd = 0.0
+        funding_source = "unavailable"
+        try:
+            opened_ms = int(opened_dt.timestamp() * 1000) if 'opened_dt' in locals() and opened_dt else None
+            funding_records = await self.uta_client.get_funding_history(symbol=symbol, since_ms=opened_ms)
+            if funding_records:
+                # CCXT funding history records: positive is income, negative is fee paid
+                funding_usd = sum(float(fr.get("amount", 0.0) or 0.0) for fr in funding_records)
+                funding_source = "bitget_api"
+            else:
+                funding_usd = 0.0
+                funding_source = "bitget_api" if opened_ms else "unavailable"
+        except Exception as f_err:
+            log.warning(f"[FUNDING-NOTE] Could not fetch funding history for {symbol}: {f_err}")
+            funding_usd = 0.0
+            funding_source = "unavailable"
+
+        # Fee attribution split
+        fee_maker_usd = entry_fee if is_maker_entry else 0.0
+        fee_taker_usd = (0.0 if is_maker_entry else entry_fee) + actual_exit_fee
+        fee_paid_usd = fee_maker_usd + fee_taker_usd
+
+        # Net PnL incorporates trading gross pnl, fees, and funding payments
+        pnl = actual_realized_pnl if actual_realized_pnl is not None else (gross_pnl - fee_paid_usd + funding_usd)
         roe_pct = (pnl / ((entry_p * qty) / max(1.0, float(pos.get("leverage", 5.0))))) * 100.0 if (entry_p * qty) > 0 else 0.0
+
+        # Retrieve intended entry, fill price, slippage bps, and gates snapshot
+        intended_entry = float(pos.get("intended_entry_price", entry_p) or entry_p)
+        actual_fill_entry = float(pos.get("actual_fill_price", entry_p) or entry_p)
+        pos_slippage_bps = float(pos.get("slippage_bps", 0.0) or 0.0)
+        gates_snapshot_str = pos.get("gates_snapshot")
+        if not gates_snapshot_str and "gates_snapshot" in pos:
+            gates_snapshot_str = json.dumps(pos["gates_snapshot"])
 
         # Record in swing_trades history (with deduplication check)
         now_iso = datetime.now(UTC).isoformat()
-        notes_str = f"Gross: ${gross_pnl:+.4f} | Fees: ${total_fees:.4f} | {pos.get('notes', '')}".strip(" |")
+        notes_str = f"Gross: ${gross_pnl:+.4f} | Fees: ${fee_paid_usd:.4f} (M:${fee_maker_usd:.4f}/T:${fee_taker_usd:.4f}) | Funding: ${funding_usd:+.4f} ({funding_source}) | {pos.get('notes', '')}".strip(" |")
         def _finalize_db():
             with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                 existing = conn.execute("""
@@ -2053,14 +2112,33 @@ class SwingArchitectTrader:
                     log.info(f"[SWING-DEDUP] Trade {symbol} already recorded by reconciler (ID: {existing[0]}). Updating with accurate fills.")
                     conn.execute("""
                         UPDATE swing_trades
-                        SET exit_price = ?, pnl = ?, roe_pct = ?, exit_reason = ?, notes = ?
+                        SET exit_price = ?, pnl = ?, roe_pct = ?, exit_reason = ?, notes = ?,
+                            intended_entry_price = ?, actual_fill_price = ?, slippage_bps = ?,
+                            fee_paid_usd = ?, fee_maker_usd = ?, fee_taker_usd = ?,
+                            funding_usd = ?, funding_source = ?, gates_snapshot = ?, status = 'CLOSED'
                         WHERE id = ?
-                    """, (actual_exit_price, pnl, roe_pct, reason, notes_str, existing[0]))
+                    """, (
+                        actual_exit_price, pnl, roe_pct, reason, notes_str,
+                        intended_entry, actual_fill_entry, pos_slippage_bps,
+                        fee_paid_usd, fee_maker_usd, fee_taker_usd,
+                        funding_usd, funding_source, gates_snapshot_str,
+                        existing[0]
+                    ))
                 else:
                     conn.execute("""
-                        INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct, holding_hours, exit_reason, notes)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (now_iso, symbol, pos_side, entry_p, actual_exit_price, qty, pnl, roe_pct, holding_hours, reason, notes_str))
+                        INSERT INTO swing_trades (
+                            timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct,
+                            holding_hours, exit_reason, notes, intended_entry_price, actual_fill_price,
+                            slippage_bps, fee_paid_usd, fee_maker_usd, fee_taker_usd,
+                            funding_usd, funding_source, gates_snapshot, status
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        now_iso, symbol, pos_side, entry_p, actual_exit_price, qty, pnl, roe_pct,
+                        holding_hours, reason, notes_str, intended_entry, actual_fill_entry,
+                        pos_slippage_bps, fee_paid_usd, fee_maker_usd, fee_taker_usd,
+                        funding_usd, funding_source, gates_snapshot_str, 'CLOSED'
+                    ))
                 conn.execute("DELETE FROM swing_open_positions WHERE symbol = ?", (symbol,))
                 conn.commit()
 
@@ -2354,8 +2432,28 @@ class SwingArchitectTrader:
 
                 log.info(f"[BOARDROOM-APPROVED] {symbol} passed deliberation for {cand_direction} (Score: {score:.2f})!")
 
+                # Assemble Gate Snapshot for Truthful Quantitative Logging
+                gates_snapshot = {
+                    "1d_trend": ind_1d.get("daily_trend", "UNKNOWN"),
+                    "1d_bullish_alignment": bool(ind_1d.get("bullish_alignment", False)),
+                    "1d_bearish_alignment": bool(ind_1d.get("bearish_alignment", False)),
+                    "4h_adx": round(float(adx), 2),
+                    "4h_rsi": round(float(rsi), 2),
+                    "macro_safety": {"pass": bool(macro_ok), "reason": str(macro_rsn)},
+                    "sentinel_news": {"pass": bool(news_ok), "reason": str(news_rsn)},
+                    "htf_runway": {"pass": bool(runway_ok), "reason": str(runway_rsn)},
+                    "15m_alignment": {"pass": bool(align15_ok), "reason": str(align15_rsn)},
+                    "momentum_divergence": {"pass": bool(div_ok), "reason": str(div_rsn)},
+                    "volume_profile": {"pass": bool(vp_ok), "reason": str(vp_rsn)},
+                    "td_sequential": {"pass": bool(td_ok), "reason": str(td_rsn)},
+                    "breakout_trap": {"pass": True, "score": float(trap_score if 'trap_score' in locals() else 0.0), "reason": str(trap_rsn if 'trap_rsn' in locals() else "cached")},
+                    "boardroom_conviction": {"score": float(score), "rationale": str(rationale)}
+                }
+
                 # 6. Open swing position & acquire exclusive lock
-                await self.open_swing_position(symbol, ind_4h, direction=cand_direction, conviction_score=score)
+                await self.open_swing_position(
+                    symbol, ind_4h, direction=cand_direction, conviction_score=score, gates_snapshot=gates_snapshot
+                )
                 break  # Open at most one position per cycle to allow portfolio re-weighting
 
             except Exception as sym_err:

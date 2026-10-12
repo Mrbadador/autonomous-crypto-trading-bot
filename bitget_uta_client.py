@@ -775,6 +775,22 @@ class BitgetUTAClient:
             log.error(f"[BITGET-UTA] Error modifying strategy order for {clean_sym}: {e}")
             return False
 
+    async def get_funding_history(self, symbol: str, since_ms: int = None, limit: int = 50) -> list[dict]:
+        """
+        Fetches historical funding fee payments for symbol since since_ms.
+        Returns list of funding records or empty list if unavailable.
+        """
+        await self.ensure_time_sync()
+        clean_sym = self._normalize_symbol(symbol)
+        try:
+            ccxt_sym = f"{clean_sym[:-4]}/USDT:USDT" if clean_sym.endswith("USDT") else clean_sym
+            if hasattr(self.exchange, "fetch_funding_history"):
+                res = await self.exchange.fetch_funding_history(symbol=ccxt_sym, since=since_ms, limit=limit)
+                return res or []
+        except Exception as e:
+            log.warning(f"[BITGET-UTA] fetch_funding_history warning for {clean_sym}: {e}")
+        return []
+
     async def close(self):
         """Closes the underlying aiohttp connection."""
         try:

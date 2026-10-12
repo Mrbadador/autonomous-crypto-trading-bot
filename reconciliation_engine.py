@@ -436,12 +436,23 @@ async def audit_live_exchange_positions():
                                 except Exception as fill_fetch_err:
                                     log.debug(f"[RECONCILER-FILLS-NOTE] Error querying fills for {s_sym}: {fill_fetch_err}")
 
-                                # Fallback if fills endpoint is unavailable
+                                # Handle ground-truth fill availability honestly (Stage 1 Quantitative Invariant)
+                                is_unreconciled = False
                                 if exit_p is None or exit_p <= 0:
-                                    exit_p = fetch_live_price(s_sym) or (sl if sl > 0 else entry_p)
-                                gross_pnl = (exit_p - entry_p) * qty if is_long else (entry_p - exit_p) * qty
-                                est_fee = actual_fee if actual_fee is not None else ((entry_p * qty * 0.0006) + (exit_p * qty * 0.0006))
-                                net_pnl = actual_pnl if actual_pnl is not None else (gross_pnl - est_fee)
+                                    is_unreconciled = True
+                                    exit_p = None
+                                    gross_pnl = None
+                                    est_fee = None
+                                    net_pnl = None
+                                    roe_val = None
+                                    close_type = "UNRECONCILED_CLOSE"
+                                    notes_str = f"UNRECONCILED: Position closed on Bitget but fill history unavailable. No fabricated prices."
+                                    log.warning(f"[RECONCILER-UNRECONCILED] No ground-truth fills found for {s_sym}. Recording status='UNRECONCILED' with NULL exit_price/pnl.")
+                                else:
+                                    gross_pnl = (exit_p - entry_p) * qty if is_long else (entry_p - exit_p) * qty
+                                    est_fee = actual_fee if actual_fee is not None else ((entry_p * qty * 0.0006) + (exit_p * qty * 0.0006))
+                                    net_pnl = actual_pnl if actual_pnl is not None else (gross_pnl - est_fee)
+                                    roe_val = ((exit_p - entry_p)/entry_p * lev * 100.0) if is_long and entry_p > 0 else (((entry_p - exit_p)/entry_p * lev * 100.0) if entry_p > 0 else 0.0)
 
                                 # Calculate Real Holding Time
                                 holding_hours = 1.0
@@ -480,18 +491,33 @@ async def audit_live_exchange_positions():
                                 
                                 if not recent_close:
                                     try:
+                                        intended_entry_val = row_dict.get("intended_entry_price") or entry_p
+                                        actual_fill_entry_val = row_dict.get("actual_fill_price") or entry_p
+                                        slippage_bps_val = row_dict.get("slippage_bps") or 0.0
+                                        gates_snap_val = row_dict.get("gates_snapshot")
+                                        rec_status = "UNRECONCILED" if is_unreconciled else "CLOSED"
+
                                         if closed_tbl == "swing_trades":
-                                            roe_val = ((exit_p - entry_p)/entry_p * lev * 100.0) if is_long and entry_p > 0 else (((entry_p - exit_p)/entry_p * lev * 100.0) if entry_p > 0 else 0.0)
                                             conn.execute(
-                                                "INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct, holding_hours, exit_reason, notes) "
-                                                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                                (s_sym, norm_side, entry_p, exit_p, qty, net_pnl, roe_val, holding_hours, close_type, notes_str)
+                                                """INSERT INTO swing_trades (
+                                                    timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct,
+                                                    holding_hours, exit_reason, notes, intended_entry_price, actual_fill_price,
+                                                    slippage_bps, fee_paid_usd, fee_maker_usd, fee_taker_usd, funding_usd,
+                                                    funding_source, gates_snapshot, status
+                                                )
+                                                VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                                (
+                                                    s_sym, norm_side, entry_p, exit_p, qty, net_pnl, roe_val,
+                                                    holding_hours, close_type, notes_str, intended_entry_val, actual_fill_entry_val,
+                                                    slippage_bps_val, est_fee, 0.0, est_fee, 0.0,
+                                                    "reconciler", gates_snap_val, rec_status
+                                                )
                                             )
                                         else:
                                             conn.execute(
                                                 f"INSERT INTO {closed_tbl} (timestamp, symbol, side, type, entry_price, exit_price, qty, pnl, balance, notes, status, action) "
-                                                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?)",
-                                                (s_sym, norm_side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, norm_side)
+                                                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                                (s_sym, norm_side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, rec_status, norm_side)
                                             )
                                     except Exception as ins_e:
                                         log.debug(f"[RECONCILER] Note inserting into {closed_tbl}: {ins_e}")

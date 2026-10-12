@@ -414,6 +414,57 @@ class DatabaseManager:
                     source TEXT
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS swing_open_positions (
+                    symbol TEXT PRIMARY KEY,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    size REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    take_profit REAL NOT NULL,
+                    trailing_stop REAL NOT NULL,
+                    peak_price REAL NOT NULL,
+                    leverage INTEGER DEFAULT 3,
+                    opened_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    status TEXT DEFAULT 'ACTIVE',
+                    r_multiple REAL DEFAULT 0.0,
+                    initial_risk_usd REAL,
+                    notes TEXT,
+                    intended_entry_price REAL,
+                    actual_fill_price REAL,
+                    slippage_bps REAL,
+                    fee_entry_usd REAL,
+                    execution_type TEXT,
+                    gates_snapshot TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS swing_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    size REAL NOT NULL,
+                    pnl REAL,
+                    roe_pct REAL,
+                    holding_hours REAL,
+                    exit_reason TEXT,
+                    notes TEXT,
+                    intended_entry_price REAL,
+                    actual_fill_price REAL,
+                    slippage_bps REAL,
+                    fee_paid_usd REAL,
+                    fee_maker_usd REAL,
+                    fee_taker_usd REAL,
+                    funding_usd REAL,
+                    funding_source TEXT,
+                    gates_snapshot TEXT,
+                    status TEXT DEFAULT 'CLOSED'
+                )
+            """)
             
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp)')
@@ -424,7 +475,7 @@ class DatabaseManager:
             # Check if migrations are already applied to save I/O and time during startup
             cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
             row = cursor.fetchone()
-            if row and row[0] == "1.0":
+            if row and row[0] == "1.1":
                 # Migrations already applied, skip
                 pass
             else:
@@ -463,11 +514,54 @@ class DatabaseManager:
                             cursor.execute(f"ALTER TABLE cycles ADD COLUMN {col_name} TEXT")
                         else:
                             cursor.execute(f"ALTER TABLE cycles ADD COLUMN {col_name} REAL")
+
+                # Stage 1 Instrumentation: Truthful execution ledger columns for swing_trades & swing_open_positions
+                try:
+                    cursor.execute("PRAGMA table_info(swing_trades)")
+                    st_cols = [c[1] for c in cursor.fetchall()]
+                    if st_cols:
+                        st_new_cols = {
+                            "intended_entry_price": "REAL",
+                            "actual_fill_price": "REAL",
+                            "slippage_bps": "REAL",
+                            "fee_paid_usd": "REAL",
+                            "fee_maker_usd": "REAL",
+                            "fee_taker_usd": "REAL",
+                            "funding_usd": "REAL",
+                            "funding_source": "TEXT",
+                            "gates_snapshot": "TEXT",
+                            "status": "TEXT DEFAULT 'CLOSED'"
+                        }
+                        for col_name, col_type in st_new_cols.items():
+                            if col_name not in st_cols:
+                                log.info(f"Migrating database: Adding '{col_name}' column to 'swing_trades'.")
+                                cursor.execute(f"ALTER TABLE swing_trades ADD COLUMN {col_name} {col_type}")
+                except Exception as ex_st:
+                    log.warning(f"Failed to migrate swing_trades: {ex_st}")
+
+                try:
+                    cursor.execute("PRAGMA table_info(swing_open_positions)")
+                    sop_cols = [c[1] for c in cursor.fetchall()]
+                    if sop_cols:
+                        sop_new_cols = {
+                            "intended_entry_price": "REAL",
+                            "actual_fill_price": "REAL",
+                            "slippage_bps": "REAL",
+                            "fee_entry_usd": "REAL",
+                            "execution_type": "TEXT",
+                            "gates_snapshot": "TEXT"
+                        }
+                        for col_name, col_type in sop_new_cols.items():
+                            if col_name not in sop_cols:
+                                log.info(f"Migrating database: Adding '{col_name}' column to 'swing_open_positions'.")
+                                cursor.execute(f"ALTER TABLE swing_open_positions ADD COLUMN {col_name} {col_type}")
+                except Exception as ex_sop:
+                    log.warning(f"Failed to migrate swing_open_positions: {ex_sop}")
                 
                 # Mark as applied
                 from datetime import datetime, UTC
                 cursor.execute(
-                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.0', ?)",
+                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.1', ?)",
                     (datetime.now(UTC).isoformat(),)
                 )
             conn.commit()
