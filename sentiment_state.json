@@ -4,7 +4,7 @@
         "verdict": "CLEAR",
         "score": 8,
         "size_multiplier": 1.0,
-        "reason": "Global macro news structurally safe (106 headlines scanned)."
+        "reason": "Global macro news structurally safe (107 headlines scanned)."
     },
     "BTC": {
         "status": "WARNING",
@@ -46,7 +46,7 @@
         "verdict": "CLEAR",
         "score": 8,
         "size_multiplier": 1.0,
-        "reason": "No recent adverse news detected for ADA (106 global headlines scanned)."
+        "reason": "No recent adverse news detected for ADA (107 global headlines scanned)."
     },
     "AVAX": {
         "status": "SAFE",
@@ -67,39 +67,39 @@
         "verdict": "CLEAR",
         "score": 8,
         "size_multiplier": 1.0,
-        "reason": "No recent adverse news detected for NEAR (106 global headlines scanned)."
+        "reason": "No recent adverse news detected for NEAR (107 global headlines scanned)."
     },
     "SUI": {
         "status": "SAFE",
         "verdict": "CLEAR",
         "score": 8,
         "size_multiplier": 1.0,
-        "reason": "No recent adverse news detected for SUI (106 global headlines scanned)."
+        "reason": "No recent adverse news detected for SUI (107 global headlines scanned)."
     },
     "INJ": {
         "status": "SAFE",
         "verdict": "CLEAR",
         "score": 8,
         "size_multiplier": 1.0,
-        "reason": "No recent adverse news detected for INJ (106 global headlines scanned)."
+        "reason": "No recent adverse news detected for INJ (107 global headlines scanned)."
     },
     "APT": {
         "status": "SAFE",
         "verdict": "CLEAR",
         "score": 8,
         "size_multiplier": 1.0,
-        "reason": "No recent adverse news detected for APT (106 global headlines scanned)."
+        "reason": "No recent adverse news detected for APT (107 global headlines scanned)."
     },
     "DOGE": {
         "status": "SAFE",
         "verdict": "CLEAR",
         "score": 8,
         "size_multiplier": 1.0,
-        "reason": "No recent adverse news detected for DOGE (106 global headlines scanned)."
+        "reason": "No recent adverse news detected for DOGE (107 global headlines scanned)."
     },
     "fear_greed_index": 0.69,
     "fear_greed_raw": 69.0,
-    "headlines_scanned": 106,
+    "headlines_scanned": 107,
     "active_event_playbook": "IGNORE_NOISE",
-    "last_update": "2026-10-12T05:52:35.245198+00:00"
+    "last_update": "2026-10-12T06:55:55.587187+00:00"
 }
