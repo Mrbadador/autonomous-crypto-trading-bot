@@ -21,97 +21,95 @@ from typing import Dict, List, Any
 # Ensure project root in python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from indicators import compute_indicators, compute_td_sequential, compute_volume_profile
+from indicators import compute_indicators, compute_td_sequential, compute_volume_profile, detect_momentum_divergence
 
 
-def extract_4h_indicators(df: pd.DataFrame) -> dict:
-    """Computes exact 4H indicators identically to swing_trader.py:_compute_4h_indicators."""
-    c = df["close"]
-    h = df["high"]
-    l = df["low"]
-    o = df["open"]
+def precompute_4h_indicators_vectorized(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes 4H breakout indicators vectorized across all bars matching swing_trader.py logic.
+    Substantially accelerates backtest simulation loop from minutes to milliseconds.
+    """
+    res = df.copy()
+    c = res["close"]
+    h = res["high"]
+    l = res["low"]
+    o = res["open"]
 
     tenkan = (h.rolling(9).max() + l.rolling(9).min()) / 2.0
     kijun = (h.rolling(26).max() + l.rolling(26).min()) / 2.0
-    span_a = (tenkan + kijun) / 2.0
-    span_b = (h.rolling(52).max() + l.rolling(52).min()) / 2.0
+    span_a_raw = (tenkan + kijun) / 2.0
+    span_b_raw = (h.rolling(52).max() + l.rolling(52).min()) / 2.0
 
-    cloud_top = np.maximum(span_a.shift(26), span_b.shift(26))
-    cloud_bottom = np.minimum(span_a.shift(26), span_b.shift(26))
+    span_a = span_a_raw.shift(26).fillna(span_a_raw)
+    span_b = span_b_raw.shift(26).fillna(span_b_raw)
 
-    # Wilder's RSI (14)
-    delta = c.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
+    cloud_top = np.maximum(span_a, span_b)
+    cloud_bottom = np.minimum(span_a, span_b)
 
-    # ATR (14)
-    tr = np.maximum(h - l, np.maximum(abs(h - c.shift(1)), abs(l - c.shift(1))))
-    atr = tr.rolling(14).mean()
+    # True Range & ATR(14)
+    prev_close = c.shift(1).fillna(c)
+    tr = pd.concat([
+        h - l,
+        (h - prev_close).abs(),
+        (l - prev_close).abs()
+    ], axis=1).max(axis=1)
+    res["atr"] = tr.rolling(window=14).mean().fillna(0.0)
 
-    # ADX (14)
+    # Wilder ADX(14)
     up_move = h - h.shift(1)
     down_move = l.shift(1) - l
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_di = 100.0 * (pd.Series(plus_dm).rolling(14).mean() / (atr + 1e-9))
-    minus_di = 100.0 * (pd.Series(minus_dm).rolling(14).mean() / (atr + 1e-9))
-    dx = 100.0 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    adx = dx.rolling(14).mean()
+    tr_sum = tr.rolling(window=14).sum()
+    plus_di = 100.0 * (pd.Series(plus_dm, index=df.index).rolling(window=14).sum() / (tr_sum + 1e-9))
+    minus_di = 100.0 * (pd.Series(minus_dm, index=df.index).rolling(window=14).sum() / (tr_sum + 1e-9))
+    dx = 100.0 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
+    res["adx"] = dx.rolling(window=14).mean().fillna(0.0)
 
-    curr_c = float(c.iloc[-1])
-    c_top = float(cloud_top.iloc[-1])
-    c_bot = float(cloud_bottom.iloc[-1])
-    t_val = float(tenkan.iloc[-1])
-    k_val = float(kijun.iloc[-1])
+    # RSI(14)
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(window=14).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-9)
+    res["rsi"] = 100.0 - (100.0 / (1.0 + rs)).fillna(50.0)
 
-    bullish_kumo = (curr_c > c_top) and (t_val >= k_val * 0.995)
-    bearish_kumo = (curr_c < c_bot) and (t_val <= k_val * 1.005)
+    c_range = np.maximum(h - l, 1e-8)
+    res["upper_wick_ratio"] = (h - np.maximum(o, c)) / c_range
+    res["lower_wick_ratio"] = (np.minimum(o, c) - l) / c_range
 
-    c_open = float(o.iloc[-1])
-    prev_c = float(c.iloc[-2]) if len(c) > 1 else curr_c
-    bullish_candle = (curr_c > c_open) and (curr_c >= prev_c)
-    bearish_candle = (curr_c < c_open) and (curr_c <= prev_c)
+    res["bullish_candle"] = (c > o) & (c >= prev_close) & (res["upper_wick_ratio"] <= 0.60)
+    res["bearish_candle"] = (c < o) & (c <= prev_close) & (res["lower_wick_ratio"] <= 0.60)
 
-    c_high = float(h.iloc[-1])
-    c_low = float(l.iloc[-1])
-    c_range = max(c_high - c_low, 1e-6)
-    upper_wick_ratio = (c_high - max(c_open, curr_c)) / c_range
-    lower_wick_ratio = (min(c_open, curr_c) - c_low) / c_range
+    # Chikou Span Confirmation (Close vs Close 26 bars ago)
+    c_shift_26 = c.shift(26)
+    res["chikou_bull_clear"] = (c > c_shift_26).fillna(True)
+    res["chikou_bear_clear"] = (c < c_shift_26).fillna(True)
 
-    return {
-        "close": curr_c,
-        "atr": float(atr.iloc[-1]),
-        "rsi": float(rsi.iloc[-1]),
-        "adx": float(adx.iloc[-1]),
-        "bullish_kumo": bool(bullish_kumo),
-        "bearish_kumo": bool(bearish_kumo),
-        "bullish_candle": bool(bullish_candle),
-        "bearish_candle": bool(bearish_candle),
-        "upper_wick_ratio": upper_wick_ratio,
-        "lower_wick_ratio": lower_wick_ratio,
-        "cloud_top": c_top,
-        "cloud_bottom": c_bot
-    }
+    # Exact swing_trader.py Kumo Breakout formula:
+    res["bullish_kumo"] = (
+        (c > cloud_top) & (c > kijun) & res["chikou_bull_clear"] &
+        ((tenkan >= kijun * 0.995) | (c > cloud_top * 1.002))
+    )
+    res["bearish_kumo"] = (
+        (c < cloud_bottom) & (c < kijun) & res["chikou_bear_clear"] &
+        ((tenkan <= kijun * 1.005) | (c < cloud_bottom * 0.998))
+    )
+
+    res["is_base_long"] = res["bullish_kumo"] & res["bullish_candle"] & (res["adx"] >= 22.0) & (res["rsi"] <= 70.0)
+    res["is_base_short"] = res["bearish_kumo"] & res["bearish_candle"] & (res["adx"] >= 22.0) & (res["rsi"] >= 35.0)
+
+    return res
 
 
-def compute_1d_trend_pure(df_1d: pd.DataFrame) -> dict:
-    """Computes daily EMA 50 & 200 alignment identically to swing_trader.py:_compute_1d_trend."""
-    if len(df_1d) < 200:
-        return {"bullish_alignment": True, "bearish_alignment": True}
-    close = df_1d["close"]
-    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
-    ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
-    curr_price = close.iloc[-1]
-    bullish = (curr_price > ema200) and (ema50 >= (ema200 * 0.98))
-    bearish = (curr_price < ema200) and (ema50 <= (ema200 * 1.02))
-    return {
-        "bullish_alignment": bool(bullish),
-        "bearish_alignment": bool(bearish),
-        "ema50": float(ema50),
-        "ema200": float(ema200)
-    }
+def precompute_1d_trend_vectorized(df_1d: pd.DataFrame) -> pd.DataFrame:
+    """Computes daily EMA 50 & 200 alignment vectorized across full 1D history."""
+    res = df_1d.copy()
+    close = res["close"]
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    res["bullish_alignment"] = (close > ema200) & (ema50 >= (ema200 * 0.98))
+    res["bearish_alignment"] = (close < ema200) & (ema50 <= (ema200 * 1.02))
+    return res
 
 
 def simulate_trade_path(
@@ -160,7 +158,10 @@ def run_ablation_simulation(
     df_4h: pd.DataFrame,
     df_1d: pd.DataFrame,
     gates_config: Dict[str, bool],
-    fee_pct: float = 0.0008
+    fee_pct: float = 0.0008,
+    df_4h_precomputed: pd.DataFrame = None,
+    df_4h_vec: pd.DataFrame = None,
+    df_1d_vec: pd.DataFrame = None
 ) -> Dict[str, Any]:
     """
     Simulates 4H swing strategy across historical bars with the requested gate ablation config.
@@ -168,56 +169,67 @@ def run_ablation_simulation(
     trades = []
     cooldown_until = 0
 
+    if df_4h_vec is None:
+        df_4h_vec = precompute_4h_indicators_vectorized(df_4h)
+    if df_1d_vec is None:
+        df_1d_vec = precompute_1d_trend_vectorized(df_1d)
+    if df_4h_precomputed is None:
+        df_4h_precomputed = compute_indicators(df_4h, warmup_bars=min(len(df_4h), 200), strict=False)
+
     # Minimum window needed for 52-bar Ichimoku + 200-bar 1D
     start_bar = 90
     total_bars = len(df_4h)
 
-    for idx in range(start_bar, total_bars - 1):
+    # Pre-filter candidate bars with base setups
+    candidate_indices = np.where(df_4h_vec["is_base_long"] | df_4h_vec["is_base_short"])[0]
+    candidate_indices = [idx for idx in candidate_indices if idx >= start_bar and idx < total_bars - 1]
+
+    # Pre-index 1D timestamps for fast O(log N) lookup
+    has_ts = "timestamp" in df_1d_vec.columns and "timestamp" in df_4h_vec.columns
+    ts_1d = df_1d_vec["timestamp"].values if has_ts else None
+
+    for idx in candidate_indices:
         if idx < cooldown_until:
             continue
 
-        slice_4h = df_4h.iloc[:idx+1]
-        ind_4h = extract_4h_indicators(slice_4h)
-
-        curr_c = ind_4h["close"]
-        adx = ind_4h["adx"]
-        rsi = ind_4h["rsi"]
-        atr = ind_4h["atr"]
+        row_4h = df_4h_vec.iloc[idx]
+        curr_c = float(row_4h["close"])
+        atr = float(row_4h["atr"])
         if atr <= 0:
             continue
 
-        # Slice 1D data up to the current 4H timestamp
-        curr_ts = df_4h.iloc[idx].get("timestamp", idx)
-        slice_1d = df_1d[df_1d["timestamp"] <= curr_ts] if "timestamp" in df_1d.columns else df_1d
-        ind_1d = compute_1d_trend_pure(slice_1d)
-
-        # Baseline setup verification: Kumo breakout + candle expansion
-        is_long = ind_4h["bullish_kumo"] and ind_4h["bullish_candle"] and (adx >= 22.0) and (rsi <= 70.0)
-        is_short = ind_4h["bearish_kumo"] and ind_4h["bearish_candle"] and (adx >= 22.0) and (rsi >= 35.0)
-
-        if not (is_long or is_short):
-            continue
-
+        is_long = bool(row_4h["is_base_long"])
         side = "LONG" if is_long else "SHORT"
 
         # Gate A: 1D Trend Support Check
         if gates_config.get("gate_1d_trend", True):
-            if side == "LONG" and not ind_1d.get("bullish_alignment", False):
+            if has_ts:
+                c_ts = row_4h["timestamp"]
+                pos = np.searchsorted(ts_1d, c_ts, side="right") - 1
+                row_1d = df_1d_vec.iloc[max(0, pos)]
+            else:
+                pos = min(len(df_1d_vec) - 1, idx // 6)
+                row_1d = df_1d_vec.iloc[pos]
+
+            if side == "LONG" and not bool(row_1d.get("bullish_alignment", True)):
                 continue
-            if side == "SHORT" and not ind_1d.get("bearish_alignment", False):
+            if side == "SHORT" and not bool(row_1d.get("bearish_alignment", True)):
                 continue
 
         # Gate B: Wick Exhaustion Shield (wick <= 0.58)
         if gates_config.get("gate_wick_exhaustion", True):
-            if side == "LONG" and ind_4h["upper_wick_ratio"] >= 0.58:
+            if side == "LONG" and float(row_4h["upper_wick_ratio"]) >= 0.58:
                 continue
-            if side == "SHORT" and ind_4h["lower_wick_ratio"] >= 0.58:
+            if side == "SHORT" and float(row_4h["lower_wick_ratio"]) >= 0.58:
                 continue
+
+        # Sliced precomputed indicators for sub-millisecond gate execution
+        slice_precomp = df_4h_precomputed.iloc[max(0, idx - 60):idx+1]
 
         # Gate C: Momentum Divergence Gate
         if gates_config.get("gate_divergence", True):
             try:
-                div = detect_momentum_divergence(slice_4h)
+                div = detect_momentum_divergence(slice_precomp)
                 if side == "LONG" and div.get("bearish_divergence", False):
                     continue
                 if side == "SHORT" and div.get("bullish_divergence", False):
@@ -228,7 +240,7 @@ def run_ablation_simulation(
         # Gate D: TD Sequential Exhaustion Gate (TD-9)
         if gates_config.get("gate_td9", True):
             try:
-                td = compute_td_sequential(slice_4h)
+                td = compute_td_sequential(slice_precomp)
                 if side == "LONG" and td.get("is_td9_upward_exhaustion", False):
                     continue
                 if side == "SHORT" and td.get("is_td9_downward_exhaustion", False):
@@ -239,7 +251,7 @@ def run_ablation_simulation(
         # Gate E: Volume Profile & Value Area Clearance Gate
         if gates_config.get("gate_volume_profile", True):
             try:
-                vp = compute_volume_profile(slice_4h)
+                vp = compute_volume_profile(slice_precomp)
                 # Avoid long breakout into heavy overhead resistance POC
                 if side == "LONG" and vp.get("poc", 0.0) > curr_c and (vp["poc"] - curr_c) / curr_c < 0.004:
                     continue
@@ -295,29 +307,48 @@ def main():
     parser = argparse.ArgumentParser(description="Swing 4H Gate Ablation Testing Harness")
     parser.add_argument("--csv-4h", type=str, default="data/BTCUSDT_4h.csv", help="Path to 4H OHLCV CSV")
     parser.add_argument("--csv-1d", type=str, default="data/BTCUSDT_1d.csv", help="Path to 1D OHLCV CSV")
+    parser.add_argument("--csv-1h", type=str, default="data/historical/BTCUSDT_1h_full.csv", help="Path to 1H historical source CSV")
     args = parser.parse_args()
 
-    print("\n" + "=" * 76)
-    print("   SWING 4H ARCHITECT — ONE-COMMAND GATE ABLATION HARNESS")
-    print("=" * 76 + "\n")
+    print("\n" + "=" * 80)
+    print("   SWING 4H ARCHITECT -- RELATIVE GATE ABLATION SCREENER")
+    print("   [NOTE: Relative counterfactual screener over historical bars.")
+    print("    Used to rank gate contribution; not a full live-orderbook replay.]")
+    print("=" * 80 + "\n")
 
-    # Load or generate synthetic data if CSV does not exist
+    # Load authentic historical data
+    df_4h = None
+    df_1d = None
+
     if os.path.exists(args.csv_4h) and os.path.exists(args.csv_1d):
+        print(f"[*] Loading historical 4H and 1D data from {args.csv_4h} and {args.csv_1d}...")
         df_4h = pd.read_csv(args.csv_4h)
         df_1d = pd.read_csv(args.csv_1d)
+    elif os.path.exists(args.csv_1h):
+        print(f"[*] Resampling 4H and 1D datasets directly from authentic 1H ledger: {args.csv_1h}...")
+        df_1h = pd.read_csv(args.csv_1h)
+        # Ensure timestamp alignment
+        if "timestamp" in df_1h.columns:
+            ts_series = df_1h["timestamp"]
+            unit = "ms" if ts_series.iloc[0] > 1e11 else "s"
+            df_1h["dt"] = pd.to_datetime(ts_series, unit=unit)
+            df_1h = df_1h.set_index("dt").sort_index()
+            df_4h = df_1h.resample("4h").agg({
+                "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum", "timestamp": "last"
+            }).dropna().reset_index(drop=True)
+            df_1d = df_1h.resample("1D").agg({
+                "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum", "timestamp": "last"
+            }).dropna().reset_index(drop=True)
+        else:
+            df_4h = df_1h.iloc[::4].copy().reset_index(drop=True)
+            df_1d = df_1h.iloc[::24].copy().reset_index(drop=True)
+        print(f"[OK] Successfully prepared {len(df_4h):,} 4H bars and {len(df_1d):,} 1D bars.")
     else:
-        print("[!] Specific CSVs not found. Generating standardized deterministic OHLCV historical sample (1,000 bars)...")
-        np.random.seed(42)
-        n_bars = 1000
-        returns = np.random.normal(0.0003, 0.012, n_bars)
-        price = 60000.0 * np.exp(np.cumsum(returns))
-        high = price * (1.0 + np.abs(np.random.normal(0, 0.006, n_bars)))
-        low = price * (1.0 - np.abs(np.random.normal(0, 0.006, n_bars)))
-        open_p = price * (1.0 + np.random.normal(0, 0.003, n_bars))
-        vol = np.random.exponential(500.0, n_bars) + 50.0
-
-        df_4h = pd.DataFrame({"open": open_p, "high": high, "low": low, "close": price, "volume": vol})
-        df_1d = df_4h.iloc[::6].copy().reset_index(drop=True)
+        # Refuse to generate meaningless synthetic random walk
+        raise FileNotFoundError(
+            f"Authentic historical OHLCV data not found at {args.csv_4h}, {args.csv_1d}, or {args.csv_1h}. "
+            "Refusing to generate synthetic random walk data to avoid misleading ablation tables."
+        )
 
     # Define gate ablation matrix
     experiments = [
@@ -330,14 +361,25 @@ def main():
         ("Naked Baseline (All Gates OFF)", {"gate_1d_trend": False, "gate_wick_exhaustion": False, "gate_divergence": False, "gate_td9": False, "gate_volume_profile": False}),
     ]
 
-    print(f"{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'Profit Factor':<13} | {'Sharpe':<6}")
+    # Precompute indicators across full 4H dataset once
+    print("[*] Precomputing rolling indicators, Ichimoku breakout vectors, and 1D alignments...")
+    df_4h_precomputed = compute_indicators(df_4h, warmup_bars=min(len(df_4h), 200), strict=False)
+    df_4h_vec = precompute_4h_indicators_vectorized(df_4h)
+    df_1d_vec = precompute_1d_trend_vectorized(df_1d)
+
+    print(f"\n{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'Profit Factor':<13} | {'Sharpe':<6}")
     print("-" * 92)
 
     for name, config_dict in experiments:
-        res = run_ablation_simulation(df_4h, df_1d, config_dict)
+        res = run_ablation_simulation(
+            df_4h, df_1d, config_dict,
+            df_4h_precomputed=df_4h_precomputed,
+            df_4h_vec=df_4h_vec,
+            df_1d_vec=df_1d_vec
+        )
         print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>13.2f} | {res['sharpe']:>6.2f}")
 
-    print("\n[SUCCESS] Ablation comparison matrix successfully evaluated.\n")
+    print("\n[SUCCESS] Ablation comparison matrix successfully evaluated against real data.\n")
 
 
 if __name__ == "__main__":

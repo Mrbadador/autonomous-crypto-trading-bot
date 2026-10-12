@@ -675,14 +675,21 @@ def main():
             try:
                 def _run():
                     import subprocess
+                    ww_path = "whale_watcher.py"
+                    if not os.path.exists(ww_path):
+                        legacy_path = os.path.join("archive", "legacy_agents", "whale_watcher.py")
+                        if os.path.exists(legacy_path):
+                            ww_path = legacy_path
+                        else:
+                            return None
                     return subprocess.run(
-                        [sys.executable, "whale_watcher.py"],
+                        [sys.executable, ww_path],
                         capture_output=True,
                         text=True,
                         timeout=180.0
                     )
                 res = await asyncio.to_thread(_run)
-                if res.returncode == 0:
+                if res and res.returncode == 0:
                     log.info("[SYSTEM] Whale Watcher update complete.")
                     try:
                         if os.path.exists("whale_state.json"):
