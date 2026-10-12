@@ -415,6 +415,20 @@ class DatabaseManager:
                 )
             """)
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS boardroom_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    conviction_score REAL NOT NULL,
+                    verdict TEXT NOT NULL,
+                    agents_votes_json TEXT,
+                    rationale TEXT,
+                    subsequent_12h_pnl REAL,
+                    counterfactual_outcome TEXT
+                )
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS swing_open_positions (
                     symbol TEXT PRIMARY KEY,
                     side TEXT NOT NULL,

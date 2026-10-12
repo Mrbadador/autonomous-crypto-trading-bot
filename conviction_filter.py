@@ -115,6 +115,44 @@ class ConvictionBoardroom:
         if pre_filter_res.get("log_warning"):
             log.warning(pre_filter_res["log_warning"])
         if pre_filter_res.get("veto"):
+            # Persist pre-filter veto into boardroom_decisions table for auditability
+            def _log_prefilter_veto_sync():
+                try:
+                    with sqlite3.connect("trading_data.db", timeout=5.0) as conn_v:
+                        conn_v.execute("""
+                            CREATE TABLE IF NOT EXISTS boardroom_decisions (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                timestamp TEXT NOT NULL,
+                                symbol TEXT NOT NULL,
+                                direction TEXT NOT NULL,
+                                conviction_score REAL NOT NULL,
+                                verdict TEXT NOT NULL,
+                                agents_votes_json TEXT,
+                                rationale TEXT,
+                                subsequent_12h_pnl REAL,
+                                counterfactual_outcome TEXT
+                            )
+                        """)
+                        v_time = datetime.now(timezone.utc).isoformat()
+                        v_rat = pre_filter_res["veto"].get("final_rationale", "Pre-Filter Veto")
+                        conn_v.execute("""
+                            INSERT INTO boardroom_decisions
+                            (timestamp, symbol, direction, conviction_score, verdict, agents_votes_json, rationale, subsequent_12h_pnl, counterfactual_outcome)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            v_time,
+                            str(symbol).upper(),
+                            str(side).upper(),
+                            0.0,
+                            "VETOED",
+                            json.dumps({"stage": "pre_filter", "error": pre_filter_res.get("err")}),
+                            v_rat,
+                            None,
+                            "PENDING"
+                        ))
+                except Exception as ve:
+                    log.debug(f"[BOARDROOM] Pre-filter veto persist note: {ve}")
+            await asyncio.to_thread(_log_prefilter_veto_sync)
             return pre_filter_res["veto"]
 
         # Note: Learned-rules compliance and liquidity-sweep trap detection are consolidated
@@ -188,6 +226,41 @@ class ConvictionBoardroom:
                             "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('latest_ai_debate', ?, ?)",
                             (json.dumps(debate_record), now_str)
                         )
+                        conn.execute("""
+                            CREATE TABLE IF NOT EXISTS boardroom_decisions (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                timestamp TEXT NOT NULL,
+                                symbol TEXT NOT NULL,
+                                direction TEXT NOT NULL,
+                                conviction_score REAL NOT NULL,
+                                verdict TEXT NOT NULL,
+                                agents_votes_json TEXT,
+                                rationale TEXT,
+                                subsequent_12h_pnl REAL,
+                                counterfactual_outcome TEXT
+                            )
+                        """)
+                        votes_json = json.dumps({
+                            "red_team_objection": red_obj,
+                            "alpha_thesis": alpha_th,
+                            "raw_execute": raw_execute,
+                            "size_mult": debate.get("size_mult", 1.0)
+                        })
+                        conn.execute("""
+                            INSERT INTO boardroom_decisions 
+                            (timestamp, symbol, direction, conviction_score, verdict, agents_votes_json, rationale, subsequent_12h_pnl, counterfactual_outcome)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            now_str,
+                            symbol_upper,
+                            side.upper(),
+                            conv_score,
+                            "APPROVED" if execute else "VETOED",
+                            votes_json,
+                            rationale,
+                            None,
+                            "PENDING"
+                        ))
                 except Exception as dbe:
                     log.debug(f"[BOARDROOM] State persist note: {dbe}")
 
