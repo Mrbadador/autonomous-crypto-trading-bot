@@ -188,6 +188,14 @@ def run_ablation_simulation(
     has_ts = "timestamp" in df_1d_vec.columns and "timestamp" in df_4h_vec.columns
     ts_1d = df_1d_vec["timestamp"].values if has_ts else None
 
+    gate_fires = {
+        "gate_1d_trend": 0,
+        "gate_wick_exhaustion": 0,
+        "gate_divergence": 0,
+        "gate_td9": 0,
+        "gate_volume_profile": 0
+    }
+
     for idx in candidate_indices:
         if idx < cooldown_until:
             continue
@@ -212,15 +220,19 @@ def run_ablation_simulation(
                 row_1d = df_1d_vec.iloc[pos]
 
             if side == "LONG" and not bool(row_1d.get("bullish_alignment", True)):
+                gate_fires["gate_1d_trend"] += 1
                 continue
             if side == "SHORT" and not bool(row_1d.get("bearish_alignment", True)):
+                gate_fires["gate_1d_trend"] += 1
                 continue
 
         # Gate B: Wick Exhaustion Shield (wick <= 0.58)
         if gates_config.get("gate_wick_exhaustion", True):
             if side == "LONG" and float(row_4h["upper_wick_ratio"]) >= 0.58:
+                gate_fires["gate_wick_exhaustion"] += 1
                 continue
             if side == "SHORT" and float(row_4h["lower_wick_ratio"]) >= 0.58:
+                gate_fires["gate_wick_exhaustion"] += 1
                 continue
 
         # Sliced precomputed indicators for sub-millisecond gate execution
@@ -231,8 +243,10 @@ def run_ablation_simulation(
             try:
                 div = detect_momentum_divergence(slice_precomp)
                 if side == "LONG" and div.get("bearish_divergence", False):
+                    gate_fires["gate_divergence"] += 1
                     continue
                 if side == "SHORT" and div.get("bullish_divergence", False):
+                    gate_fires["gate_divergence"] += 1
                     continue
             except Exception:
                 pass
@@ -242,8 +256,10 @@ def run_ablation_simulation(
             try:
                 td = compute_td_sequential(slice_precomp)
                 if side == "LONG" and td.get("is_td9_upward_exhaustion", False):
+                    gate_fires["gate_td9"] += 1
                     continue
                 if side == "SHORT" and td.get("is_td9_downward_exhaustion", False):
+                    gate_fires["gate_td9"] += 1
                     continue
             except Exception:
                 pass
@@ -254,6 +270,7 @@ def run_ablation_simulation(
                 vp = compute_volume_profile(slice_precomp)
                 # Avoid long breakout into heavy overhead resistance POC
                 if side == "LONG" and vp.get("poc", 0.0) > curr_c and (vp["poc"] - curr_c) / curr_c < 0.004:
+                    gate_fires["gate_volume_profile"] += 1
                     continue
             except Exception:
                 pass
@@ -281,7 +298,7 @@ def run_ablation_simulation(
         cooldown_until = idx + max(1, trade_res["bars_held"])
 
     if not trades:
-        return {"n_trades": 0, "win_rate": 0.0, "total_return": 0.0, "profit_factor": 0.0, "sharpe": 0.0}
+        return {"n_trades": 0, "win_rate": 0.0, "total_return": 0.0, "profit_factor": 0.0, "sharpe": 0.0, "gate_fires": gate_fires, "trades": []}
 
     pnls = [t["net_pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
@@ -311,6 +328,7 @@ def run_ablation_simulation(
         "sharpe": round(sharpe, 2),
         "ev_mean": round(ev_mean * 100.0, 3),
         "ev_ci_90": (round(ev_ci_lo * 100.0, 3), round(ev_ci_hi * 100.0, 3)),
+        "gate_fires": gate_fires,
         "trades": trades
     }
 
@@ -379,8 +397,8 @@ def main():
     df_4h_vec = precompute_4h_indicators_vectorized(df_4h)
     df_1d_vec = precompute_1d_trend_vectorized(df_1d)
 
-    print(f"\n{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'PF':<6} | {'Sharpe':<6} | {'EV / Trade (90% CI)':<22}")
-    print("-" * 105)
+    print(f"\n{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'PF':<6} | {'Sharpe':<6} | {'EV / Trade (90% CI)':<22} | {'Active Gate Fires'}")
+    print("-" * 135)
 
     matrix_rows = []
     for name, config_dict in experiments:
@@ -391,7 +409,9 @@ def main():
             df_1d_vec=df_1d_vec
         )
         ci_str = f"{res['ev_mean']:+.2f}% [{res['ev_ci_90'][0]:+.2f}%, {res['ev_ci_90'][1]:+.2f}%]"
-        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>6.2f} | {res['sharpe']:>6.2f} | {ci_str:<22}")
+        gf = res.get("gate_fires", {})
+        gf_str = ", ".join(f"{k.replace('gate_', '')}:{v}" for k, v in gf.items() if v > 0) or "none"
+        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>6.2f} | {res['sharpe']:>6.2f} | {ci_str:<22} | {gf_str}")
         matrix_rows.append((name, res))
 
     print("\n[SUCCESS] Ablation comparison matrix successfully evaluated against real data.\n")
