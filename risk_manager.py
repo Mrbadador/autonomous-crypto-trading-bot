@@ -202,16 +202,22 @@ class RiskManager:
 
     def calculate_empirical_kelly_fraction(self) -> float:
         """
+        Stage 5: Sample-Size Engine & Measured Bayesian-Shrinkage Kelly.
         Calculates distribution-free Kelly fraction using empirical log-wealth optimization
-        with an explicit Bayesian shrinkage prior:
-            w = n / (n + 100)
-            f_blended = w * f_empirical + (1 - w) * f_prior
-        Prevents sample noise in small trade histories (e.g. n < 200) from distorting position sizing.
+        with an explicit sample-size threshold (N >= 60) and Bayesian shrinkage prior:
+            If n < 60: strictly return conservative prior_f (baseline Kelly / 0.25 cap).
+            If n >= 60: w = (n - 60) / (n + 40)
+                        f_blended = w * f_empirical + (1 - w) * f_prior
+        Prevents sample noise in small trade histories from distorting position sizing.
         """
         returns = self._get_historical_returns()
         prior_f = self.calculate_kelly_fraction()
         n = len(returns)
-        if n < 5:
+
+        # Stage 5 Sample-Size Enforcement: require N >= 60 real trades before shifting away from conservative prior
+        MIN_SAMPLE_SIZE = 60
+        if n < MIN_SAMPLE_SIZE:
+            log.info(f"[RISK-MANAGER-SAMPLE-SIZE] Trade sample size n={n} < {MIN_SAMPLE_SIZE}. Using conservative baseline Kelly prior: {prior_f:.2%}")
             return prior_f
 
         empirical_f = calculate_bayesian_smoothed_kelly(
@@ -221,10 +227,10 @@ class RiskManager:
             min_cap=min(0.005, self.max_cap)
         )
 
-        # Shrinkage weight: blends smoothly from prior (when n is small) towards empirical (as n -> large)
-        w = float(n) / (float(n) + 100.0)
+        # Shrinkage weight: starts at 0 at n=60, smoothly asymptotes to 1 as n grows large
+        w = float(n - MIN_SAMPLE_SIZE) / float(n + 40.0)
         blended_f = (w * empirical_f) + ((1.0 - w) * prior_f)
-        log.info(f"[RISK-MANAGER] Kelly Sizing: Empirical={empirical_f:.2%}, Prior={prior_f:.2%}, Shrinkage Weight w={w:.2f} (n={n}) -> Blended={blended_f:.2%}")
+        log.info(f"[RISK-MANAGER] Kelly Sizing (N={n}>={MIN_SAMPLE_SIZE}): Empirical={empirical_f:.2%}, Prior={prior_f:.2%}, Shrinkage w={w:.2f} -> Blended={blended_f:.2%}")
         return blended_f
 
     async def _calculate_diversification_penalty(self, symbol: str, current_positions: list) -> float:

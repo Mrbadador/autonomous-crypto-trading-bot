@@ -429,6 +429,22 @@ class DatabaseManager:
                 )
             """)
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS shadow_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    veto_reason TEXT,
+                    exit_price REAL,
+                    pnl_pct REAL,
+                    status TEXT DEFAULT 'OPEN'
+                )
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS swing_open_positions (
                     symbol TEXT PRIMARY KEY,
                     side TEXT NOT NULL,
