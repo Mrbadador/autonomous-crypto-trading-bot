@@ -469,8 +469,9 @@ class SwingArchitectTrader:
         bullish_candle_4h = (c > o) and (c >= prev_c) and (upper_wick_ratio <= 0.60)
         bearish_candle_4h = (c < o) and (c <= prev_c) and (lower_wick_ratio <= 0.60)
 
-        chikou_bull_clear = bool(c > float(close.iloc[-26])) if len(df) >= 26 else True
-        chikou_bear_clear = bool(c < float(close.iloc[-26])) if len(df) >= 26 else True
+        chikou_ref = float(close.iloc[-27]) if len(df) >= 27 else float(close.iloc[0])
+        chikou_bull_clear = bool(c > chikou_ref) if len(df) >= 27 else True
+        chikou_bear_clear = bool(c < chikou_ref) if len(df) >= 27 else True
 
         # Bullish Breakout: Close > Cloud Top AND Close > Kijun AND Chikou Clear AND (Tenkan >= Kijun * 0.995 or Close > Cloud Top * 1.002)
         bullish_kumo = (c > cloud_top) and (c > k) and chikou_bull_clear and ((t >= k * 0.995) or (c > cloud_top * 1.002))
