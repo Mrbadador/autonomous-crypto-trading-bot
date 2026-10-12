@@ -28,6 +28,38 @@ A production-grade, multi-asset crypto futures trading system featuring a **Dual
 
 ---
 
+## 📸 Visual HUD & Live Telemetry Deck
+
+The bot features a real-time Streamlit HUD (`http://localhost:8501`) delivering end-to-end operational visibility:
+
+| Live Fleet & Executive Briefing | Microstructure & OFI Meter |
+|:---:|:---:|
+| ![Live Fleet HUD](docs/assets/dashboard_hud.png) | ![OFI & Microstructure](docs/assets/ofi_microstructure.png) |
+| *Active position cards, margin utilization bar, and live PnL tracking* | *Real-time L2 Order Flow Imbalance depth meter & regime deck* |
+
+<p align="center">
+  <img src="docs/assets/execution_charts.png" alt="Execution Candlestick Charts" width="95%" />
+  <br>
+  <em>Interactive Plotly Execution Charts with live entry, stop-loss, and take-profit geometry</em>
+</p>
+
+---
+
+## 📊 Quantitative Performance & Execution Matrix
+
+The swarm operates across multiple asset classes with strict statistical risk gating:
+
+| Metric | Target Specification | Production Implementation |
+|---|---|---|
+| **Execution Regime** | Dual Adaptive | 4H Trend Breakout (Ichimoku) + 5m Chop Grid (Post-Only Maker) |
+| **Microstructure Gate** | High-Frequency L2 | Real-time Order Flow Imbalance (OFI) + VPIN Toxicity |
+| **Position Sizing** | Dynamic Asymmetric | Quarter-Kelly Criterion conditioned on Hurst exponent |
+| **Max Portfolio Margin** | Hard Ceiling | 70% maximum margin utilization circuit breaker |
+| **On-Exchange Protection** | Native Contingent | Exchange-side SL / TP placed immediately on order confirmation |
+| **AI Consensus Filter** | Multi-Agent | Gemini 1.5 Flash (Primary) + Groq Llama-3 pool failover |
+
+---
+
 ## 🏗️ System Architecture
 
 ```mermaid
