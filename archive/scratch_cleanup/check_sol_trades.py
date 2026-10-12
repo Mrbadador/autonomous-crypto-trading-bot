@@ -1,0 +1,10 @@
+import sqlite3
+conn = sqlite3.connect("trading_data.db")
+cursor = conn.cursor()
+cursor.execute("SELECT * FROM trades WHERE symbol LIKE '%SOL%'")
+rows = cursor.fetchall()
+print(f"SOL trades in 'trades' table: {rows}")
+cursor.execute("SELECT * FROM berserker_trades WHERE symbol LIKE '%SOL%'")
+rows = cursor.fetchall()
+print(f"SOL trades in 'berserker_trades' table: {rows}")
+conn.close()

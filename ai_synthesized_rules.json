@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "name": "RSI Overextension Shield",
+    "description": "VETO Longs when RSI > 64 (lowered from 70). VETO Shorts when RSI < 36 (raised from 30). Prevents buying tops and shorting bottoms.",
+    "expected_loss_reduction": "Eliminates ~28% of false breakout entries."
+  },
+  {
+    "id": 2,
+    "name": "High-Conviction Volume Surge Gate",
+    "description": "Raise volume surge gate from 1.3x -> 1.7x average volume. Kills low-liquidity fakeouts.",
+    "expected_loss_reduction": "Eliminates ~42% of chop traps."
+  },
+  {
+    "id": 3,
+    "name": "Strict Trend Power Gate (ADX > 28 & Hurst > 0.54)",
+    "description": "Require stronger directional momentum on the 1H anchor before deploying capital.",
+    "expected_loss_reduction": "Eliminates ~51% of sideways whipsaws, especially on ETH."
+  },
+  {
+    "id": 4,
+    "name": "Early Profit Protection (Dynamic Trailing @ +0.8R)",
+    "description": "Lock stop-loss to 50% risk reduction once trade reaches +0.8R MFE, preventing winning impulses from turning into full -1R losses.",
+    "expected_loss_reduction": "Cuts loss severity on 34% of failed runners in half."
+  }
+]

@@ -1,0 +1,17 @@
+ccxt
+pandas
+ta
+python-dotenv
+rich
+aiohttp
+numpy
+requests
+feedparser
+pandas-ta
+torch
+yfinance
+psutil
+streamlit
+groq
+scipy
+numba

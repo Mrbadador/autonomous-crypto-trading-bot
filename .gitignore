@@ -1,0 +1,41 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Python runtime & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.ruff_cache/
+
+# Databases & local state
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs & temp files
+logs/
+*.log
+.tmp.*
+tmp/
+
+# Executables & binaries
+*.exe
+cloudflared*
+
+# Large historical data dumps & backtest CSVs
+*.csv
+*.parquet
+
+# IDE / Antigravity metadata
+.agent/
+.antigravity/
+.vscode/
+.idea/

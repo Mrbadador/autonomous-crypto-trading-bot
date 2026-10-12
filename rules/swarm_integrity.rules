@@ -1,0 +1,9 @@
+# antigravity-automation ruleset: Swarm Integrity Rule Definition
+# File: rules/swarm_integrity.rules
+
+RULE [WAL-WATCHDOG-OR-CRITICAL]
+  TRIGGER: IF "[WAL-BREACH]" OR "[PRIORITY-CRITICAL]" OR "database is locked" OR "[CRITICAL]" in logs/main.log
+  COOLDOWN: 60s
+  ACTION:
+    # Categorize error type and execute targeted remediation
+    COMMAND: python antigravity_rules_handler.py --log logs/main.log --analyze

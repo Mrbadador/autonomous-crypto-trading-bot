@@ -1,0 +1,105 @@
+{
+    "GLOBAL": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "Global macro news structurally safe (106 headlines scanned)."
+    },
+    "BTC": {
+        "status": "WARNING",
+        "verdict": "WARNING",
+        "score": 4,
+        "size_multiplier": 0.5,
+        "reason": "CAUTION HEADLINE DETECTED (liquidations): 'Bitcoin speculators move 55K BTC to exchanges amid $1.1B liquidations'"
+    },
+    "ETH": {
+        "status": "WARNING",
+        "verdict": "WARNING",
+        "score": 4,
+        "size_multiplier": 0.5,
+        "reason": "CAUTION HEADLINE DETECTED (outflows): 'Bitcoin, Ether ETFs\u2019 October outflows swell toward $1B'"
+    },
+    "SOL": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "News for SOL structurally safe (16 ticker headlines scanned)."
+    },
+    "XRP": {
+        "status": "WARNING",
+        "verdict": "WARNING",
+        "score": 4,
+        "size_multiplier": 0.5,
+        "reason": "CAUTION HEADLINE DETECTED (emergency patch): 'XRP Ledger defends emergency patch for unlimited XRP bug'"
+    },
+    "BNB": {
+        "status": "WARNING",
+        "verdict": "WARNING",
+        "score": 4,
+        "size_multiplier": 0.5,
+        "reason": "CAUTION HEADLINE DETECTED (outflows): 'Binance BTC outflows hit highest since mid-2023 as whales deposit stablecoins'"
+    },
+    "ADA": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "No recent adverse news detected for ADA (106 global headlines scanned)."
+    },
+    "AVAX": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "News for AVAX structurally safe (1 ticker headlines scanned)."
+    },
+    "LINK": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "News for LINK structurally safe (1 ticker headlines scanned)."
+    },
+    "NEAR": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "No recent adverse news detected for NEAR (106 global headlines scanned)."
+    },
+    "SUI": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "No recent adverse news detected for SUI (106 global headlines scanned)."
+    },
+    "INJ": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "No recent adverse news detected for INJ (106 global headlines scanned)."
+    },
+    "APT": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "No recent adverse news detected for APT (106 global headlines scanned)."
+    },
+    "DOGE": {
+        "status": "SAFE",
+        "verdict": "CLEAR",
+        "score": 8,
+        "size_multiplier": 1.0,
+        "reason": "No recent adverse news detected for DOGE (106 global headlines scanned)."
+    },
+    "fear_greed_index": 0.69,
+    "fear_greed_raw": 69.0,
+    "headlines_scanned": 106,
+    "active_event_playbook": "IGNORE_NOISE",
+    "last_update": "2026-10-12T05:52:35.245198+00:00"
+}
