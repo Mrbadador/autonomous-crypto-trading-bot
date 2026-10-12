@@ -178,11 +178,24 @@ class DBWriteQueue:
                     pass
                 break
             except Exception as e:
-                log.error(f"[DBWriteQueue] Non-retryable error in batch commit ({len(batch)} ops): {e}")
+                log.error(f"[DBWriteQueue] Non-retryable error in batch commit ({len(batch)} ops): {e}. Attempting isolated 1-by-1 commit fallback.")
                 try:
                     conn.rollback()
                 except Exception:
                     pass
+                # Isolate failure: commit valid operations individually so one bad op doesn't drop the rest
+                salvaged = 0
+                for op in batch:
+                    try:
+                        with conn:
+                            conn.execute(op.query, op.params)
+                        salvaged += 1
+                        self.total_flushed += 1
+                    except Exception as single_err:
+                        log.error(f"[DBWriteQueue] Dropping malformed op on {op.table}: {single_err} | Query: {op.query[:120]}")
+                if salvaged > 0:
+                    self.total_batches += 1
+                    self.last_flush_time = time.monotonic()
                 break
 
     def enqueue_write(self, table: str, query: str, params: tuple = ()):

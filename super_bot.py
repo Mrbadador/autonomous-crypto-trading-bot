@@ -536,24 +536,22 @@ class SuperBotTrader:
                 tp_price = current_price * (1.0 - self.scalp_short_tp_pct)
                 sl_price = current_price * (1.0 + self.scalp_short_sl_pct)
             
-            log.info(f"[{engine_tag}] [LIMIT-{order_verb.upper()}] Placing Post-Only Limit {order_verb} for {symbol}: {qty:.4f} units @ ${current_price:,.4f} | TP: ${tp_price:,.4f} | SL: ${sl_price:,.4f}")
+            log.info(f"[{engine_tag}] [POST-ONLY-{order_verb.upper()}] Placing True Post-Only Maker Limit {order_verb} for {symbol}: {qty:.4f} units @ ${current_price:,.4f}")
             
-            # Place Maker order via UTA client
-            order = await self.uta_client.create_limit_order(
+            # Place TRUE Maker Post-Only order via UTA client (guarantees maker rebate and zero taker fee crossing)
+            order = await self.uta_client.create_post_only_order(
                 symbol=symbol,
                 side=pos_side,
                 qty=qty,
                 price=current_price,
-                sl=sl_price,
-                tp=tp_price,
                 leverage_val=self.grid_leverage
             )
             order_id = order.get("id") or order.get("orderId") if order else None
             if not order_id:
-                log.warning(f"[{engine_tag}] Order placement failed on {symbol}.")
+                log.warning(f"[{engine_tag}] Maker post-only order placement rejected or crossed spread on {symbol}.")
                 return
 
-            log.info(f"[{engine_tag}] Order {order_id} placed for {symbol}. Monitoring fill queue (30s TTL)...")
+            log.info(f"[{engine_tag}] Maker order {order_id} placed for {symbol}. Monitoring fill queue (30s TTL)...")
             start_t = time.time()
             is_filled = False
             actual_entry = current_price
@@ -571,10 +569,10 @@ class SuperBotTrader:
                         deal_p = float(info.get("deal_avg_price") or info.get("avgPrice") or 0.0)
                         if deal_p > 0:
                             actual_entry = deal_p
-                        log.info(f"[{engine_tag}-FILLED] Order {order_id} FILLED on {symbol}! Qty: {qty} @ ${actual_entry:,.4f}")
+                        log.info(f"[{engine_tag}-FILLED] Maker order {order_id} FILLED on {symbol}! Qty: {qty} @ ${actual_entry:,.4f}")
                         break
                     elif st in ("canceled", "cancelled"):
-                        log.warning(f"[{engine_tag}-CANCELED] Order {order_id} cancelled by exchange.")
+                        log.warning(f"[{engine_tag}-CANCELED] Order {order_id} cancelled by exchange (post-only protect).")
                         break
                 except Exception as pe:
                     log.debug(f"[{engine_tag}-POLL-NOTE] {pe}")
@@ -601,10 +599,18 @@ class SuperBotTrader:
                 if not is_filled:
                     return
 
+            # Formulate TP & SL accurately based on ACTUAL execution fill price (not pre-fill quote)
+            if is_long:
+                tp_price = actual_entry * (1.0 + self.grid_tp_pct)
+                sl_price = actual_entry * (1.0 - self.grid_sl_pct)
+            else:
+                tp_price = actual_entry * (1.0 - self.scalp_short_tp_pct)
+                sl_price = actual_entry * (1.0 + self.scalp_short_sl_pct)
+
             # Register native strategy stop loss on Bitget with aggressive retry
             sl_attached = False
             last_se = None
-            sl_qty_str = str(self.uta_client.format_qty_precision(symbol, qty))
+            sl_qty_str = self.uta_client.format_quantity_precision(symbol, qty) if hasattr(self.uta_client, "format_quantity_precision") else str(self.uta_client.format_qty_precision(symbol, qty))
             for sl_att in range(3):
                 try:
                     sl_str = self.uta_client.format_price_precision(symbol, sl_price)

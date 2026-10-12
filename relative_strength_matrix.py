@@ -207,32 +207,33 @@ class RelativeStrengthMatrix:
         asset_details = res.get("asset_details", {})
         rationale = res.get("fleet_focus_rationale", "")
 
-        # 1. Update system_state in trading_data.db
-        try:
-            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-                    ("ai_asset_rankings", json.dumps(res), now_iso)
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-                    ("ai_asset_leaders", leaders_str, now_iso)
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-                    ("ai_asset_avoid", avoid_str, now_iso)
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-                    ("ai_decoupled_runners", runners_str, now_iso)
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-                    ("ai_decoupled_regime_matrix", json.dumps(asset_details), now_iso)
-                )
-                conn.commit()
-        except Exception as e:
-            log.warning(f"Failed to persist asset rankings to system_state: {e}")
+        # 1. Update system_state in trading_data.db and trading_ledger.db (synchronized)
+        for target_db in ["trading_data.db", "trading_ledger.db"]:
+            try:
+                with sqlite3.connect(target_db, timeout=5.0) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+                        ("ai_asset_rankings", json.dumps(res), now_iso)
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+                        ("ai_asset_leaders", leaders_str, now_iso)
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+                        ("ai_asset_avoid", avoid_str, now_iso)
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+                        ("ai_decoupled_runners", runners_str, now_iso)
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+                        ("ai_decoupled_regime_matrix", json.dumps(asset_details), now_iso)
+                    )
+                    conn.commit()
+            except Exception as e:
+                log.warning(f"Failed to persist asset rankings to system_state in {target_db}: {e}")
 
         # 2. Append to relative_strength_history in trading_ledger.db
         try:

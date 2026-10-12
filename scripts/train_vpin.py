@@ -158,14 +158,14 @@ def train():
     print(f"Final Model Validation Accuracy: {final_acc:.2%}")
     print("-"*50)
     
-    # Export Weights
-    export_path = "flow_classifier.pth"
-    print(f"Saving model state_dict to {os.path.abspath(export_path)}...")
+    # Export Weights (Safety: export to models/flow_classifier_synthetic.pth to never overwrite production weights)
+    os.makedirs("models", exist_ok=True)
+    export_path = os.path.join("models", "flow_classifier_synthetic.pth")
+    print(f"Saving synthetic model state_dict to {os.path.abspath(export_path)}...")
     tmp_path = export_path + ".tmp"
     torch.save(model.state_dict(), tmp_path)
-    import os
     os.replace(tmp_path, export_path)
-    print("SUCCESS: VPIN flow classifier weights successfully exported.")
+    print(f"SUCCESS: Synthetic VPIN flow classifier weights exported to {export_path} (production weights protected).")
     print("=" * 60)
 
 if __name__ == "__main__":
