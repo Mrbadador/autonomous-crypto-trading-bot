@@ -10,7 +10,6 @@ import ccxt.async_support as ccxt
 from dotenv import load_dotenv
 from datetime import datetime, UTC, timezone
 from core.entropy_engine import compute_signal_readiness
-from core.dark_forest import MempoolGraphBuilder, DarkForestGNN, SyntheticMempool
 from core.liquidity_hunter import LiquidityHunter
 from indicators import compute_indicators
 import sys
@@ -398,61 +397,66 @@ class LiveOracle:
                 else:
                     await self.exchange.load_markets(reload=False)
 
-                # 1b. Centralized BTC Macro Fetch (V30.4 Compliance Upgrade)
+                # 1b. Centralized BTC Macro Fetch (V30.4 Compliance Upgrade - 600-Bar Warmup)
                 btc_trend = "UNKNOWN"
                 try:
-                    btc_raw = await self.exchange.fetch_ohlcv("BTC/USDT", timeframe='1h', limit=220)
+                    btc_raw = await self.exchange.fetch_ohlcv("BTC/USDT", timeframe='1h', limit=600)
                     def process_btc(raw):
                         df_1h = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
                         df_1h["timestamp"] = pd.to_datetime(df_1h["timestamp"], unit="ms", utc=True)
                         df_1h.set_index("timestamp", inplace=True)
-                        df_1h = compute_indicators(df_1h)
+                        df_1h = compute_indicators(df_1h, warmup_bars=600)
                         last_row = df_1h.iloc[-1]
-                        e20 = float(last_row.get("ema20", 0))
-                        e50 = float(last_row.get("ema50", 0))
-                        e200 = float(last_row.get("ema200", 0))
+                        is_warm = bool(last_row.get("warm", False))
+                        e20 = float(last_row.get("ema20", np.nan))
+                        e50 = float(last_row.get("ema50", np.nan))
+                        e200 = float(last_row.get("ema200", np.nan))
                         close = float(last_row["close"])
                         prev_close = float(df_1h["close"].iloc[-2]) if len(df_1h) >= 2 else close
                         roc_1h = ((close - prev_close) / prev_close) * 100
-                        return e20, e50, e200, close, roc_1h
+                        return is_warm, e20, e50, e200, close, roc_1h
 
-                    ema20_1h, ema50_1h, ema200_1h, btc_price, roc_1h = await asyncio.to_thread(process_btc, btc_raw)
+                    is_warm, ema20_1h, ema50_1h, ema200_1h, btc_price, roc_1h = await asyncio.to_thread(process_btc, btc_raw)
                     
-                    # Multi-Horizon Trend Determination:
-                    if roc_1h <= -0.65 or (btc_price < ema20_1h and btc_price < ema50_1h):
+                    # Multi-Horizon Trend Determination with Unbiased NEUTRAL Fallback:
+                    if not is_warm or np.isnan(ema200_1h):
+                        btc_trend = "UNKNOWN"
+                    elif roc_1h <= -0.65 or (btc_price < ema20_1h and btc_price < ema50_1h and btc_price < ema200_1h):
                         btc_trend = "BEARISH"
                     elif roc_1h >= +0.65 or (btc_price > ema20_1h and btc_price > ema50_1h and btc_price > ema200_1h):
                         btc_trend = "BULLISH"
-                    elif btc_price < ema20_1h:
-                        btc_trend = "BEARISH"
-                    elif btc_price > ema200_1h and btc_price > ema50_1h:
-                        btc_trend = "BULLISH"
+                    elif btc_price > ema200_1h:
+                        btc_trend = "BULLISH" if btc_price > ema50_1h else "NEUTRAL"
+                    elif btc_price < ema200_1h:
+                        btc_trend = "BEARISH" if btc_price < ema50_1h else "NEUTRAL"
                     else:
-                        btc_trend = "BEARISH"
-                    log.info(f"[MACRO-CENTRAL] Multi-Horizon BTC 1H trend: {btc_trend} (Price: {btc_price:.2f} | 1h ROC: {roc_1h:+.2f}% | EMA20: {ema20_1h:.2f} | EMA50: {ema50_1h:.2f} | EMA200: {ema200_1h:.2f})")
+                        btc_trend = "NEUTRAL"
+                    log.info(f"[MACRO-CENTRAL] Multi-Horizon BTC 1H trend: {btc_trend} (Price: {btc_price:.2f} | 1h ROC: {roc_1h:+.2f}% | EMA20: {ema20_1h:.2f} | EMA50: {ema50_1h:.2f} | EMA200: {ema200_1h:.2f} | Warm: {is_warm})")
                 except Exception as macro_err:
                     log.error(f"[MACRO-CENTRAL] Centralized BTC Macro fetch/calculation failed: {macro_err}")
                     btc_trend = "UNKNOWN"
 
-                # 1. Fetching historical candles and volumes using the persistent client
-                bars = await self.exchange.fetch_ohlcv(self.symbol, timeframe='1h', limit=100)
+                # 1. Fetching historical candles and volumes using the persistent client (600 bars for causal indicator warmup)
+                bars = await self.exchange.fetch_ohlcv(self.symbol, timeframe='1h', limit=600)
                 
                 # Extract raw arrays for the Numba engine
                 prices = np.array([float(b[4]) for b in bars], dtype=np.float64)
                 
-                # Volume splits: Taker buy base asset volume is typically at index 9
-                # If unavailable, fall back to estimated 48/48/4 split
+                # Volume splits: Taker buy base asset volume is at index 9 if exchange supports it.
+                # If unavailable (e.g. Bitget 6-element OHLCV), derive directional volume from candle body delta.
                 try:
                     buy_vol = np.array([float(b[9]) for b in bars], dtype=np.float64) 
                     sell_vol = np.array([float(b[5]) - float(b[9]) for b in bars], dtype=np.float64) 
                     neutral_vol = np.zeros_like(buy_vol) 
-                except (IndexError, ValueError, TypeError) as e:
-                    # P3 FIX: Exchange did not return taker buy volume at index 9.
-                    # Falling back to symmetric 48/48/4 volume approximation.
-                    log.warning(f"[ORACLE] Taker buy volume unavailable ({e}). Using 48/48/4 volume split approximation.")
+                except (IndexError, ValueError, TypeError):
+                    # Directional volume derivation from candle close vs open
                     total_v = np.array([float(b[5]) for b in bars], dtype=np.float64)
-                    buy_vol, sell_vol = total_v * 0.48, total_v * 0.48
-                    neutral_vol = total_v * 0.04
+                    opens = np.array([float(b[1]) for b in bars], dtype=np.float64)
+                    closes = prices
+                    bullish_mask = closes >= opens
+                    buy_vol = np.where(bullish_mask, total_v * 0.70, total_v * 0.30)
+                    sell_vol = total_v - buy_vol
+                    neutral_vol = np.zeros_like(total_v)
 
                 # 2. Information-Theoretic Compute Block with JIT Fallback
                 try:
@@ -464,41 +468,33 @@ class LiveOracle:
                     log.warning(f"[ORACLE] Numba Engine JIT Fault: {e}. Defaulting to Signal Readiness 0.50")
                     readiness_value, apen_value, hurst_value = 0.50, 0.0, 0.5
 
-                # 3. Standard Quantitative Metrics (Volatility, Trend, VWAP, RSI)
-                returns = np.diff(prices) / prices[:-1]
-                vol_baseline = getattr(config, "VOLATILITY_BASELINE", 0.005)
-                volatility = (np.std(returns[-20:]) / vol_baseline) if len(returns) >= 20 else 1.0
-                volatility = np.clip(volatility, 0.5, 2.0)
-                
-                sma20 = np.mean(prices[-20:])
-                trend_strength = np.clip(((prices[-1] - sma20) / sma20) * 50.0, -1.0, 1.0)
-                
-                # Simple VWAP
-                vols = np.array([float(b[5]) for b in bars])
-                typical_p = (np.array([float(b[2]) for b in bars]) + np.array([float(b[3]) for b in bars]) + prices) / 3.0
-                sum_vols = np.sum(vols)
-                vwap = np.sum(typical_p * vols) / sum_vols if sum_vols > 0 else float(prices[-1])
-                
-                # RSI 14 — Wilder's Smoothed Moving Average (SMMA)
-                # simple mean() over deltas[-14:] gives WRONG values vs every exchange chart;
-                # Wilder's SMMA seeds from a simple 14-period mean then applies alpha=1/14.
-                deltas = np.diff(prices)
-                gains = np.where(deltas > 0, deltas, 0.0)
-                losses = np.where(deltas < 0, -deltas, 0.0)
-                if len(gains) >= 14:
-                    # Seed the smoothed average with the simple mean of the first 14 periods
-                    avg_gain = float(np.mean(gains[:14]))
-                    avg_loss = float(np.mean(losses[:14]))
-                    # Wilder's SMMA forward pass
-                    alpha = 1.0 / 14.0
-                    for i in range(14, len(gains)):
-                        avg_gain = avg_gain * (1.0 - alpha) + gains[i] * alpha
-                        avg_loss = avg_loss * (1.0 - alpha) + losses[i] * alpha
-                else:
-                    avg_gain = float(np.mean(gains)) if len(gains) > 0 else 0.0
-                    avg_loss = float(np.mean(losses)) if len(losses) > 0 else 0.0
-                rs = avg_gain / (avg_loss + 1e-9)
-                rsi = 100.0 - (100.0 / (1.0 + rs))
+                # 3. Standard Quantitative Metrics unified via indicators.py compute_indicators
+                def process_sym_indicators(raw_bars):
+                    df_sym = pd.DataFrame(raw_bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df_sym["timestamp"] = pd.to_datetime(df_sym["timestamp"], unit="ms", utc=True)
+                    df_sym.set_index("timestamp", inplace=True)
+                    df_sym = compute_indicators(df_sym, warmup_bars=min(len(df_sym), 600))
+                    last = df_sym.iloc[-1]
+                    
+                    vol = float(last.get("atr_pct", 1.0)) if not np.isnan(last.get("atr_pct", np.nan)) else 1.0
+                    vol = float(np.clip(vol, 0.5, 2.0))
+                    
+                    t_str = float(last.get("trend_str", 0.0))
+                    # Map trend_str [0, 100] with directional slope sign into [-1.0, 1.0]
+                    slope_val = float(last.get("ema_slope", 0.0))
+                    direction = 1.0 if slope_val >= 0 else -1.0
+                    t_strength = float(np.clip((t_str / 100.0) * direction, -1.0, 1.0))
+                    
+                    v_val = float(last.get("vwap", last["close"]))
+                    if np.isnan(v_val):
+                        v_val = float(last["close"])
+                        
+                    r_val = float(last.get("rsi14", 50.0))
+                    if np.isnan(r_val):
+                        r_val = 50.0
+                    return vol, t_strength, v_val, r_val
+
+                volatility, trend_strength, vwap, rsi = await asyncio.to_thread(process_sym_indicators, bars)
 
                 # 4. Telemetry Output Upgrade
                 log.info("==================================================")
@@ -520,13 +516,13 @@ class LiveOracle:
                     ts = datetime.now(timezone.utc).isoformat()
 
                     # [V36.2-DEDUP] Compute the current 5-minute candle bucket.
-                    # Two writes are considered duplicates if they share the same bucket key.
+                    # Deduplicate writes so each 5-minute cycle only writes once.
                     now_utc = datetime.now(timezone.utc)
                     candle_bucket = now_utc.strftime("%Y-%m-%dT%H:") + str((now_utc.minute // 5) * 5).zfill(2)
 
                     if candle_bucket == self._last_oracle_write_ts:
                         log.debug(
-                            f"[DEDUP] oracle_state write suppressed — bucket '{candle_bucket}' "
+                            f"[DEDUP] Telemetry write suppressed — bucket '{candle_bucket}' "
                             "already committed this candle cycle."
                         )
                     else:
@@ -539,32 +535,32 @@ class LiveOracle:
                         p1 = (ts, self.symbol, volatility, trend_strength, vwap, rsi, apen_value, hurst_value, readiness_value)
                         self.db_queue.put((q1, p1))
                         self._last_oracle_write_ts = candle_bucket
-                        log.debug(f"[DEDUP] oracle_state committed for bucket '{candle_bucket}'.")
 
-                    # V30.0 Legacy Support Task (idempotent UPSERT at id=1)
-                    q2 = """
-                        INSERT OR REPLACE INTO market_context 
-                        (id, timestamp, fear_greed_index, volatility_state, trend_strength, vwap, rsi_14, signal_readiness, whale_threat)
-                        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """
-                    p2 = (ts, fng, volatility, trend_strength, vwap, rsi, readiness_value, 0.0)
-                    self.db_queue.put((q2, p2))
+                        # V30.0 Legacy Support Task (idempotent UPSERT at id=1)
+                        q2 = """
+                            INSERT OR REPLACE INTO market_context 
+                            (id, timestamp, fear_greed_index, volatility_state, trend_strength, vwap, rsi_14, signal_readiness, whale_threat)
+                            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                        p2 = (ts, fng, volatility, trend_strength, vwap, rsi, readiness_value, 0.0)
+                        self.db_queue.put((q2, p2))
 
-                    # Dense Chronological Series Task (auto-incrementing id for temporal sequence extraction)
-                    q2_seq = """
-                        INSERT INTO market_context 
-                        (timestamp, fear_greed_index, volatility_state, trend_strength, vwap, rsi_14, signal_readiness, whale_threat)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """
-                    self.db_queue.put((q2_seq, p2))
+                        # Dense Chronological Series Task (auto-incrementing id for temporal sequence extraction)
+                        q2_seq = """
+                            INSERT INTO market_context 
+                            (timestamp, fear_greed_index, volatility_state, trend_strength, vwap, rsi_14, signal_readiness, whale_threat)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                        self.db_queue.put((q2_seq, p2))
 
-                    # Retain last 500 chronological rows
-                    q2_prune = """
-                        DELETE FROM market_context WHERE id > 1 AND id NOT IN (
-                            SELECT id FROM market_context WHERE id > 1 ORDER BY id DESC LIMIT 500
-                        )
-                    """
-                    self.db_queue.put((q2_prune, ()))
+                        # Retain last 500 chronological rows
+                        q2_prune = """
+                            DELETE FROM market_context WHERE id > 1 AND id NOT IN (
+                                SELECT id FROM market_context WHERE id > 1 ORDER BY id DESC LIMIT 500
+                            )
+                        """
+                        self.db_queue.put((q2_prune, ()))
+                        log.debug(f"[DEDUP] oracle_state & market_context committed for bucket '{candle_bucket}'.")
                     
                     # V30.4 Centralized Macro Trend Distribution Task (idempotent UPSERT)
                     q3 = """
@@ -589,11 +585,10 @@ class LiveOracle:
             except Exception as loop_err:
                 log.error(f"[ORACLE] Critical fault in update cycle: {loop_err}")
             
-            # V30.5: Truncate WAL files for both databases to keep read latency near-zero
+            # Non-blocking WAL checkpoint: PASSIVE on ledger only (avoids locking trading_data.db)
             try:
-                self.db_queue.put(("PRAGMA wal_checkpoint(TRUNCATE);", ()))
-                self.db_queue.put(("PRAGMA wal_checkpoint(TRUNCATE);", (), "trading_data.db"))
-                log.info("[WAL-CHECKPOINT] Queued WAL checkpoint TRUNCATE for ledger and trading data.")
+                self.db_queue.put(("PRAGMA wal_checkpoint(PASSIVE);", ()))
+                log.info("[WAL-CHECKPOINT] Queued passive WAL checkpoint for trading_ledger.db.")
             except Exception as checkpoint_err:
                 log.error(f"[ORACLE] Failed to queue WAL checkpoint: {checkpoint_err}")
 
