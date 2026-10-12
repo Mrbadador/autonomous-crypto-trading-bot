@@ -1,35 +1,64 @@
 import os
 import sqlite3
-import pandas as pd
+import math
 import logging
-import asyncio
 from datetime import datetime, timedelta, UTC
-from openbb import obb
+import yfinance as yf
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MACRO_WARDEN: %(message)s")
 log = logging.getLogger("macro_warden")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 class MacroWarden:
     """
-    V19.0 Macro Financial Warden:
-    Ingests institutional traditional finance vectors into the RL Tensor
-    utilizing the OpenBB Platform directly.
+    Macro Financial Warden:
+    Ingests institutional traditional finance vectors (SPY, DXY) into the SQLite ledger
+    utilizing direct yfinance feeds with finite math guards and append-only logging.
     """
-    def __init__(self, db_path="trading_ledger.db"):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        if db_path is None:
+            self.db_path = os.path.join(BASE_DIR, "trading_ledger.db")
+        elif not os.path.isabs(db_path):
+            self.db_path = os.path.join(BASE_DIR, db_path)
+        else:
+            self.db_path = db_path
         self._init_db()
 
     def _init_db(self):
         """Initializes persistence layer for macro intelligence."""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
             with conn:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS macro_logs (
-                        timestamp TEXT,
-                        spy_health REAL,
-                        dxy_momentum REAL
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        symbol TEXT DEFAULT 'BTC/USDT',
+                        spy_health REAL NOT NULL DEFAULT 0.0,
+                        dxy_momentum REAL NOT NULL DEFAULT 0.0,
+                        source TEXT DEFAULT 'macro_warden'
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS macro_telemetry_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        spy_price REAL,
+                        uup_price REAL,
+                        dxy_price REAL,
+                        spy_1h_change REAL,
+                        uup_1h_change REAL,
+                        avg_funding_rate_8h REAL,
+                        global_killswitch INTEGER NOT NULL DEFAULT 0,
+                        derivatives_skew_halt INTEGER NOT NULL DEFAULT 0,
+                        alt_long_pause INTEGER NOT NULL DEFAULT 0,
+                        macro_regime TEXT NOT NULL DEFAULT 'UNKNOWN',
+                        market_posture TEXT NOT NULL DEFAULT 'TACTICAL_DEFENSE',
+                        source TEXT DEFAULT 'macro_warden'
                     )
                 """)
             conn.close()
@@ -38,41 +67,64 @@ class MacroWarden:
             log.critical(f"Failed to bootstrap storage: {e}")
 
     def fetch_macro_vectors(self):
-        """Fetches SPY and DXY from OpenBB and computes relative scalar indicators."""
-        # Go back 300 days to ensure a healthy 200-period moving average buffer
-        start_dt = (datetime.now(UTC) - timedelta(days=350)).strftime("%Y-%m-%d")
-        
+        """Fetches SPY and DXY via yfinance with timeout and computes finite scalar indicators."""
         try:
             log.info("Executing institutional ingest for SPY (S&P 500)...")
-            spy_data = obb.equity.price.historical("SPY", provider="yfinance", start_date=start_dt).to_dataframe()
+            spy_ticker = yf.Ticker("SPY")
+            spy_data = spy_ticker.history(period="350d", timeout=10.0)
             
             log.info("Executing institutional ingest for DX-Y.NYB (DXY)...")
-            dxy_data = obb.equity.price.historical("DX-Y.NYB", provider="yfinance", start_date=start_dt).to_dataframe()
+            dxy_ticker = yf.Ticker("DX-Y.NYB")
+            dxy_data = dxy_ticker.history(period="10d", timeout=10.0)
+            if dxy_data.empty:
+                dxy_ticker = yf.Ticker("UUP")
+                dxy_data = dxy_ticker.history(period="10d", timeout=10.0)
             
             if spy_data.empty or dxy_data.empty:
-                raise ValueError("Received empty datasets from institutional feed.")
+                log.warning("Received empty datasets from Yahoo Finance feed.")
+                return None
             
             # 1. SPY Health Computation (Distance from 200 SMA)
-            spy_closes = spy_data['close']
+            spy_closes = spy_data['Close']
+            if len(spy_closes) < 200:
+                log.warning(f"Insufficient SPY history ({len(spy_closes)} bars) for 200-SMA.")
+                return None
+                
             current_spy = float(spy_closes.iloc[-1])
             sma_200 = float(spy_closes.rolling(window=200).mean().iloc[-1])
             
-            # (Price / 200MA) - 1.0 -> scalar % distance
-            spy_health = (current_spy / sma_200) - 1.0 if sma_200 > 0 else 0.0
+            if not math.isfinite(current_spy) or not math.isfinite(sma_200) or sma_200 <= 0:
+                log.warning("Invalid/non-finite SPY closes or 200-SMA.")
+                return None
+                
+            spy_health = (current_spy / sma_200) - 1.0
+            if not math.isfinite(spy_health):
+                spy_health = 0.0
             
             # 2. DXY Momentum Computation (24h / 1-day Rate of Change)
-            dxy_closes = dxy_data['close']
+            dxy_closes = dxy_data['Close']
+            if len(dxy_closes) < 2:
+                log.warning("Insufficient DXY history bars for momentum calculation.")
+                return None
+                
             current_dxy = float(dxy_closes.iloc[-1])
             prev_dxy = float(dxy_closes.iloc[-2])
             
-            # Daily Pct Change
-            dxy_momentum = (current_dxy / prev_dxy) - 1.0 if prev_dxy > 0 else 0.0
+            if not math.isfinite(current_dxy) or not math.isfinite(prev_dxy) or prev_dxy <= 0:
+                log.warning("Invalid/non-finite DXY closes.")
+                return None
+                
+            dxy_momentum = (current_dxy / prev_dxy) - 1.0
+            if not math.isfinite(dxy_momentum):
+                dxy_momentum = 0.0
             
             log.info(f"[MACRO SNAPSHOT] SPY Distance from 200MA: {spy_health:+.4f} | DXY 1D Delta: {dxy_momentum:+.4f}")
             
             return {
                 "spy_health": float(spy_health),
-                "dxy_momentum": float(dxy_momentum)
+                "dxy_momentum": float(dxy_momentum),
+                "spy_price": current_spy,
+                "dxy_price": current_dxy
             }
             
         except Exception as e:
@@ -80,19 +132,41 @@ class MacroWarden:
             return None
 
     def save_vectors(self, metrics):
-        """Persists scalar vectors into the centralized data stack."""
+        """Append-only persistence into the centralized data stack."""
+        if not metrics:
+            return False
+        spy_health = metrics.get('spy_health', 0.0)
+        dxy_momentum = metrics.get('dxy_momentum', 0.0)
+        if not math.isfinite(spy_health) or not math.isfinite(dxy_momentum):
+            log.error(f"Refusing to save non-finite vectors: spy_health={spy_health}, dxy_momentum={dxy_momentum}")
+            return False
+            
+        now_iso = datetime.now(UTC).isoformat()
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
             with conn:
-                # Keep density light, we only care about current state for the active RL tensor
-                conn.execute("DELETE FROM macro_logs")
                 conn.execute("""
-                    INSERT INTO macro_logs (timestamp, spy_health, dxy_momentum)
-                    VALUES (?, ?, ?)
-                """, (datetime.now(UTC).isoformat(), metrics['spy_health'], metrics['dxy_momentum']))
-                conn.commit()
+                    INSERT INTO macro_logs (timestamp, symbol, spy_health, dxy_momentum, source)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (now_iso, 'BTC/USDT', float(spy_health), float(dxy_momentum), 'macro_warden'))
+                
+                # Also log to append-only macro_telemetry_history
+                conn.execute("""
+                    INSERT INTO macro_telemetry_history (
+                        timestamp, spy_price, dxy_price, macro_regime, market_posture, source
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    now_iso,
+                    metrics.get('spy_price'),
+                    metrics.get('dxy_price'),
+                    'RISK_ON_BULL' if spy_health > 0.02 and dxy_momentum < 0 else ('DEFENSIVE_BEAR' if spy_health < -0.02 or dxy_momentum > 0.005 else 'NEUTRAL'),
+                    'TACTICAL_DEFENSE' if spy_health < 0 else 'BALANCED_CHOP',
+                    'macro_warden'
+                ))
             conn.close()
-            log.info("Successfully committed Macro vectors to ledger.")
+            log.info("Successfully committed Macro vectors to ledger (append-only).")
             return True
         except Exception as e:
             log.error(f"Persistence cycle failure: {e}")

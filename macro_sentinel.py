@@ -6,6 +6,7 @@ import logging
 import json
 import asyncio
 import os
+import math
 from datetime import datetime, UTC
 import yfinance as yf
 import ai_engine
@@ -14,10 +15,12 @@ import config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MACRO_SENTINEL: %(message)s")
 log = logging.getLogger("macro_sentinel")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _get_db_path(name: str) -> str:
+    return os.path.join(BASE_DIR, name)
+
 # P2-PATCH: Graceful shutdown event.
-# Without this, SIGTERM from main.py killed the process mid-sleep, leaving the
-# killswitch row in whatever state it was last written. Now the loop checks this
-# flag and exits cleanly after the current DB write completes.
 _stop_event = threading.Event()
 
 def _handle_shutdown(signum, frame):
@@ -27,10 +30,28 @@ def _handle_shutdown(signum, frame):
 signal.signal(signal.SIGTERM, _handle_shutdown)
 signal.signal(signal.SIGINT, _handle_shutdown)
 
+def _parse_bool(val, default: bool = False) -> bool:
+    """Defensively parses string or boolean values to avoid 'false' -> True bug."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "t"):
+        return True
+    if s in ("false", "0", "no", "f", ""):
+        return False
+    return default
 
-def init_db(db_path="trading_ledger.db"):
+
+def init_db(db_path=None):
+    if db_path is None:
+        db_path = _get_db_path("trading_ledger.db")
+    elif not os.path.isabs(db_path):
+        db_path = _get_db_path(db_path)
+
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         with conn:
@@ -48,7 +69,7 @@ def init_db(db_path="trading_ledger.db"):
             try:
                 conn.execute("ALTER TABLE macro_market_context ADD COLUMN dxy_price REAL")
             except sqlite3.OperationalError:
-                pass # Already exists
+                pass
             try:
                 conn.execute("ALTER TABLE macro_market_context ADD COLUMN macro_regime TEXT")
             except sqlite3.OperationalError:
@@ -60,56 +81,94 @@ def init_db(db_path="trading_ledger.db"):
                     updated_at TEXT
                 )
             """)
+            # Append-only audit table for all macro dislocations and telemetry
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS macro_telemetry_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    spy_price REAL,
+                    uup_price REAL,
+                    dxy_price REAL,
+                    spy_1h_change REAL,
+                    uup_1h_change REAL,
+                    avg_funding_rate_8h REAL,
+                    global_killswitch INTEGER NOT NULL DEFAULT 0,
+                    derivatives_skew_halt INTEGER NOT NULL DEFAULT 0,
+                    alt_long_pause INTEGER NOT NULL DEFAULT 0,
+                    macro_regime TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    market_posture TEXT NOT NULL DEFAULT 'TACTICAL_DEFENSE',
+                    source TEXT DEFAULT 'macro_sentinel'
+                )
+            """)
         conn.close()
     except Exception as e:
-        log.critical(f"Failed to init macro_market_context table in {db_path}: {e}")
+        log.critical(f"Failed to init macro tables in {db_path}: {e}")
         raise
 
 def _raw_fetch_macro():
-    """Inner polling routine for yfinance SPY, UUP, and DXY."""
+    """Inner polling routine for yfinance SPY, UUP, and DXY with strict data validity gates."""
     try:
-        spy = yf.Ticker("SPY").history(period="5d", interval="1h")
-        uup = yf.Ticker("UUP").history(period="5d", interval="1h")
+        spy = yf.Ticker("SPY").history(period="5d", interval="1h", timeout=8.0)
+        uup = yf.Ticker("UUP").history(period="5d", interval="1h", timeout=8.0)
         
-        dxy_latest = 0.0
+        dxy_latest = None
         try:
-            dxy = yf.Ticker("DX-Y.NYB").history(period="2d")
+            dxy = yf.Ticker("DX-Y.NYB").history(period="2d", timeout=8.0)
             if not dxy.empty:
-                dxy_latest = float(dxy['Close'].iloc[-1])
-            else:
-                dxy = yf.Ticker("DXY").history(period="2d")
+                val = float(dxy['Close'].iloc[-1])
+                if math.isfinite(val) and val > 0:
+                    dxy_latest = val
+            if dxy_latest is None:
+                dxy = yf.Ticker("DXY").history(period="2d", timeout=8.0)
                 if not dxy.empty:
-                    dxy_latest = float(dxy['Close'].iloc[-1])
+                    val = float(dxy['Close'].iloc[-1])
+                    if math.isfinite(val) and val > 0:
+                        dxy_latest = val
         except Exception as e:
-            log.warning(f"Failed to fetch DXY from Yahoo Finance: {e}. Fallback to UUP estimate.")
-            
-        if dxy_latest == 0.0 and len(uup) > 0:
-            uup_latest = float(uup['Close'].iloc[-1])
-            dxy_latest = uup_latest * 3.48
-            
+            log.warning(f"Failed to fetch DXY directly from Yahoo Finance: {e}.")
+        # Note: Do not synthesize DXY via UUP * 3.48 multiplier because roll costs,
+        # fees, and leverage drift cause false thresholds. DXY must be directly fetched.
+                
         if len(spy) < 2 or len(uup) < 2:
-            log.warning("Not enough hourly bars to compute 1h change.")
+            log.warning("Not enough hourly bars for SPY or UUP to compute 1h change.")
             return None
             
         spy_latest = float(spy['Close'].iloc[-1])
         spy_prev = float(spy['Close'].iloc[-2])
+        if not math.isfinite(spy_latest) or not math.isfinite(spy_prev) or spy_prev <= 0:
+            log.warning("Non-finite or invalid SPY price bars received.")
+            return None
         spy_change = ((spy_latest - spy_prev) / spy_prev) * 100.0
         
         uup_latest = float(uup['Close'].iloc[-1])
         uup_prev = float(uup['Close'].iloc[-2])
+        if not math.isfinite(uup_latest) or not math.isfinite(uup_prev) or uup_prev <= 0:
+            log.warning("Non-finite or invalid UUP price bars received.")
+            return None
         uup_change = ((uup_latest - uup_prev) / uup_prev) * 100.0
         
+        # Guard: If DXY could not be resolved, do NOT fabricate 0.0.
+        # DXY missing/zero makes dxy < 103.5 evaluate to True, which was falsely triggering RISK_ON_BULL.
+        data_ok = True
+        if dxy_latest is None or not math.isfinite(dxy_latest) or dxy_latest <= 50.0:
+            log.warning(f"Invalid or missing DXY ({dxy_latest}). Marking data_ok=False and forcing regime UNKNOWN.")
+            dxy_latest = None
+            data_ok = False
+
         global_killswitch = 0
         if spy_change < -1.0:
             global_killswitch = 1
             log.critical(f"GLOBAL KILLSWITCH ACTIVATED: SPY dumped > 1.0%! (Change: {spy_change:.2f}%)")
-        elif dxy_latest > 106.0:
+        elif dxy_latest is not None and dxy_latest > 106.0:
             global_killswitch = 1
             log.critical(f"GLOBAL KILLSWITCH ACTIVATED: DXY dollar index has exceeded 106.0! (DXY: {dxy_latest:.2f})")
 
-        # Macro Regime Classification
+        # Macro Regime Classification:
+        # If DXY or SPY is missing/invalid, regime must be UNKNOWN to avoid dangerous false bullish expansion.
         if global_killswitch:
             macro_regime = "RISK_OFF_KILLSWITCH"
+        elif not data_ok or dxy_latest is None:
+            macro_regime = "UNKNOWN"
         elif spy_change > 0.3 and dxy_latest < 103.5:
             macro_regime = "RISK_ON_BULL"
         elif spy_change < -0.4 or dxy_latest > 105.5:
@@ -120,28 +179,37 @@ def _raw_fetch_macro():
         return {
             'spy_price': spy_latest,
             'uup_price': uup_latest,
-            'dxy_price': dxy_latest,
+            'dxy_price': dxy_latest if dxy_latest is not None else 0.0,
+            'dxy_valid': (dxy_latest is not None),
             'spy_1h_change': spy_change,
             'uup_1h_change': uup_change,
             'global_killswitch': global_killswitch,
-            'macro_regime': macro_regime
+            'macro_regime': macro_regime,
+            'data_ok': data_ok
         }
     except Exception as e:
         log.error(f"Error fetching macro data: {e}")
         return None
 
 def fetch_macro_data():
-    """Polls yfinance with a hard 10-second timeout to prevent thread hangs during Yahoo API degradation."""
+    """
+    Polls yfinance with non-blocking executor cleanup.
+    Avoids ThreadPoolExecutor context manager wait-on-exit deadlock on TimeoutError.
+    """
     import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_raw_fetch_macro)
-        try:
-            return future.result(timeout=10.0)
-        except concurrent.futures.TimeoutError:
-            log.warning("[MACRO-SENTINEL] Yahoo Finance API fetch timed out after 10.0s. Preserving last known state.")
-        except Exception as e:
-            log.error(f"[MACRO-SENTINEL] Unexpected error in macro worker: {e}")
-            return None
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_raw_fetch_macro)
+    try:
+        return future.result(timeout=10.0)
+    except concurrent.futures.TimeoutError:
+        log.warning("[MACRO-SENTINEL] Yahoo Finance API fetch timed out after 10.0s. Non-blocking cancellation triggered.")
+        return None
+    except Exception as e:
+        log.error(f"[MACRO-SENTINEL] Unexpected error in macro worker: {e}")
+        return None
+    finally:
+        # Crucial fix: wait=False, cancel_futures=True prevents hung threads from blocking python process
+        executor.shutdown(wait=False, cancel_futures=True)
 
 def fetch_derivatives_skew() -> dict:
     """
@@ -152,12 +220,13 @@ def fetch_derivatives_skew() -> dict:
     skew_data = {
         "symbols": {},
         "avg_funding_rate_8h": 0.0,
-        "max_funding_rate_8h": 0.0
+        "max_funding_rate_8h": 0.0,
+        "valid_symbols_count": 0
     }
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     rates = []
     for s in symbols:
-        fr_val = 0.0001
+        fr_val = None
         oi_val = 0.0
         try:
             url_f = f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={s}&productType=USDT-FUTURES"
@@ -165,7 +234,11 @@ def fetch_derivatives_skew() -> dict:
             with urllib.request.urlopen(req, timeout=4.0) as res:
                 d = json.loads(res.read().decode())
                 if d.get("code") == "00000" and d.get("data"):
-                    fr_val = float(d["data"][0].get("fundingRate", 0.0) or 0.0)
+                    raw_fr = d["data"][0].get("fundingRate")
+                    if raw_fr is not None:
+                        val = float(raw_fr)
+                        if math.isfinite(val):
+                            fr_val = val
         except Exception as e:
             log.debug(f"Funding rate fetch note for {s}: {e}")
 
@@ -175,38 +248,68 @@ def fetch_derivatives_skew() -> dict:
             with urllib.request.urlopen(req_oi, timeout=4.0) as res:
                 d_oi = json.loads(res.read().decode())
                 if d_oi.get("code") == "00000" and d_oi.get("data", {}).get("openInterestList"):
-                    oi_val = float(d_oi["data"]["openInterestList"][0].get("size", 0.0) or 0.0)
+                    raw_oi = d_oi["data"]["openInterestList"][0].get("size")
+                    if raw_oi is not None:
+                        val_oi = float(raw_oi)
+                        if math.isfinite(val_oi):
+                            oi_val = val_oi
         except Exception as e:
             log.debug(f"Open interest fetch note for {s}: {e}")
 
-        rates.append(fr_val)
-        skew_data["symbols"][s] = {
-            "funding_rate_8h": fr_val,
-            "funding_rate_8h_pct": f"{fr_val * 100.0:+.4f}%",
-            "open_interest_contracts": oi_val
-        }
+        if fr_val is not None:
+            rates.append(fr_val)
+            skew_data["symbols"][s] = {
+                "funding_rate_8h": fr_val,
+                "funding_rate_8h_pct": f"{fr_val * 100.0:+.4f}%",
+                "open_interest_contracts": oi_val
+            }
+        else:
+            # Explicitly mark unverified rather than fabricating 0.0001
+            skew_data["symbols"][s] = {
+                "funding_rate_8h": 0.0,
+                "funding_rate_8h_pct": "UNVERIFIED",
+                "open_interest_contracts": oi_val
+            }
 
     if rates:
         skew_data["avg_funding_rate_8h"] = sum(rates) / len(rates)
         skew_data["max_funding_rate_8h"] = max(rates)
+        skew_data["valid_symbols_count"] = len(rates)
 
     return skew_data
 
 def update_macro_context():
-    # Initialize in both SQLite database files for full fleet visibility
-    init_db("trading_ledger.db")
-    init_db("trading_data.db")
+    # Initialize in both SQLite database files for full fleet visibility using absolute paths
+    init_db(_get_db_path("trading_ledger.db"))
+    init_db(_get_db_path("trading_data.db"))
 
     macro_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(macro_loop)
     iteration_count = 0
 
     while not _stop_event.is_set():
+        # Clean per-cycle state initialization to prevent cross-cycle variable leakage
+        data = None
+        data_ok = False
+        deriv_skew = None
+        ai_synth = None
+        btc_price = 0.0
+        warden_regime = "UNKNOWN"
+        btc_macro_trend = "UNKNOWN"
+        active_event_playbook = "NORMAL_OPERATIONS"
+        active_event_headline = ""
+        active_event_horizon = "NEUTRAL"
+        anchor_res = None
+        hedge_rec = None
+        ranking = None
+        daily_bp = None
+        now_iso = datetime.now(UTC).isoformat()
+
         log.info("Polling Yahoo Finance for Macro Context (SPY/UUP/DXY)...")
         data = fetch_macro_data()
-        if data:
-            timestamp = datetime.now(UTC).isoformat()
-            for db_target in ["trading_ledger.db", "trading_data.db"]:
+        if data and data.get('data_ok', False):
+            data_ok = True
+            for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                 try:
                     conn = sqlite3.connect(db_target, timeout=30.0)
                     conn.execute("PRAGMA journal_mode=WAL;")
@@ -218,19 +321,23 @@ def update_macro_context():
                                 spy_1h_change, uup_1h_change, global_killswitch, macro_regime
                             ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            timestamp, data['spy_price'], data['uup_price'], data.get('dxy_price', 0.0),
+                            now_iso, data['spy_price'], data['uup_price'], data.get('dxy_price', 0.0),
                             data['spy_1h_change'], data['uup_1h_change'], data['global_killswitch'],
                             data['macro_regime']
                         ))
                         # Telemetry writes for state manager / HUD
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_global_killswitch', ?, ?)",
-                                     (str(data['global_killswitch']), timestamp))
+                                     (str(data['global_killswitch']), now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_regime', ?, ?)",
-                                     (data['macro_regime'], timestamp))
+                                     (data['macro_regime'], now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_spy_1h_change', ?, ?)",
-                                     (f"{data['spy_1h_change']:.2f}%", timestamp))
+                                     (f"{data['spy_1h_change']:.2f}%", now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_dxy_price', ?, ?)",
-                                     (f"{data['dxy_price']:.2f}", timestamp))
+                                     (f"{data['dxy_price']:.2f}", now_iso))
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_data_ok', ?, ?)",
+                                     ("1", now_iso))
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_heartbeat', ?, ?)",
+                                     (now_iso, now_iso))
                     conn.close()
                 except Exception as e:
                     log.error(f"Failed to commit macro context to {db_target}: {e}")
@@ -240,50 +347,57 @@ def update_macro_context():
                 log.critical(f"GLOBAL KILLSWITCH STATUS: ACTIVE! {log_msg}")
             else:
                 log.info(f"Macro Context Updated: {log_msg}")
+        else:
+            log.warning("Macro data invalid or unavailable this cycle. Marking macro_data_ok=0 in system_state.")
+            for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
+                try:
+                    conn = sqlite3.connect(db_target, timeout=10.0)
+                    with conn:
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_data_ok', ?, ?)",
+                                     ("0", now_iso))
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_regime', ?, ?)",
+                                     ("UNKNOWN", now_iso))
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_heartbeat', ?, ?)",
+                                     (now_iso, now_iso))
+                    conn.close()
+                except Exception as de:
+                    log.error(f"Failed to commit macro fallback status to {db_target}: {de}")
 
-        # 7.4 Economic Calendar Event Check
+        # Economic Calendar Event Check
         try:
             from economic_calendar import EconomicCalendarGate
-            econ_gate = EconomicCalendarGate(db_path="trading_data.db")
+            econ_gate = EconomicCalendarGate(db_path=_get_db_path("trading_data.db"))
             econ_gate.update_system_state()
         except Exception as ee:
             log.warning(f"Economic calendar sync note in sentinel: {ee}")
 
-        # V37.0 Autonomous AI Sovereign Macro & Derivatives Synthesis (Google Gemini Flash)
+        # Sovereign Macro & Derivatives Synthesis
         try:
-            # Gather crypto market context from system_state
-            warden_regime = "UNKNOWN"
-            btc_macro_trend = "UNKNOWN"
-            btc_price = 0.0
             try:
-                with sqlite3.connect("trading_data.db", timeout=5.0) as c_data:
-                    # Prioritize live regime classifier & super bot regime over obsolete warden keys
+                with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as c_data:
                     for rk in ['market_regime_label', 'super_bot_regime', 'warden_60m_regime']:
                         r_row = c_data.execute("SELECT value FROM system_state WHERE key = ?", (rk,)).fetchone()
                         if r_row and r_row[0]:
                             warden_regime = r_row[0]
                             break
                     r2 = c_data.execute("SELECT value FROM system_state WHERE key = 'btc_macro_trend'").fetchone()
-                    if r2: btc_macro_trend = r2[0]
+                    if r2 and r2[0]: btc_macro_trend = r2[0]
                     r3 = c_data.execute("SELECT value FROM system_state WHERE key = 'btc_price'").fetchone()
-                    if r3 and r3[0]: btc_price = float(r3[0])
+                    if r3 and r3[0]: btc_price = float(r3[0] or 0.0)
             except Exception:
                 pass
 
-            if btc_price == 0.0 and os.path.exists("microstructure_state.json"):
+            micro_path = os.path.join(BASE_DIR, "microstructure_state.json")
+            if btc_price == 0.0 and os.path.exists(micro_path):
                 try:
-                    with open("microstructure_state.json", "r") as mf:
+                    with open(micro_path, "r") as mf:
                         m_json = json.load(mf)
                         btc_price = float(m_json.get("best_bid", 0.0) or 0.0)
                 except Exception:
                     pass
 
-            # V40.0 Ingest active event catalyst & headline
-            active_event_playbook = "NORMAL_OPERATIONS"
-            active_event_headline = ""
-            active_event_horizon = "NEUTRAL"
             try:
-                with sqlite3.connect("trading_data.db", timeout=5.0) as c_data:
+                with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as c_data:
                     ep_row = c_data.execute("SELECT value FROM system_state WHERE key = 'ai_event_playbook'").fetchone()
                     if ep_row and ep_row[0]: active_event_playbook = ep_row[0]
                     eh_row = c_data.execute("SELECT value FROM system_state WHERE key = 'ai_event_headline'").fetchone()
@@ -295,12 +409,13 @@ def update_macro_context():
 
             deriv_skew = fetch_derivatives_skew()
             macro_packet = {
-                "spy_price": data['spy_price'] if data else 0.0,
-                "spy_1h_change": data['spy_1h_change'] if data else 0.0,
-                "uup_price": data['uup_price'] if data else 0.0,
-                "dxy_price": data.get('dxy_price', 0.0) if data else 0.0,
-                "macro_regime": data['macro_regime'] if data else "NEUTRAL",
+                "spy_price": data['spy_price'] if (data and data_ok) else 0.0,
+                "spy_1h_change": data['spy_1h_change'] if (data and data_ok) else 0.0,
+                "uup_price": data['uup_price'] if (data and data_ok) else 0.0,
+                "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0,
+                "macro_regime": data['macro_regime'] if (data and data_ok) else "UNKNOWN",
                 "global_killswitch": bool(data['global_killswitch']) if data else False,
+                "data_ok": data_ok,
                 "btc_price": btc_price,
                 "warden_regime": warden_regime,
                 "btc_macro_trend": btc_macro_trend,
@@ -320,22 +435,36 @@ def update_macro_context():
                     "derivatives_notes": "AI synthesis fallback - defensive posture default"
                 }
 
-            now_iso = datetime.now(UTC).isoformat()
-
-            # Fast-path override if secular event catalyst is actively declared
+            # Fast-path event playbook handling with strict asymmetric risk override
+            # An event playbook or AI synthesis can ONLY tighten risk, NEVER loosen it over deterministic triggers.
             if active_event_playbook == "SECULAR_SHORT_BREAKDOWN":
                 ai_synth["macro_bias"] = "BEARISH"
                 ai_synth["market_posture"] = "TACTICAL_DEFENSE"
             elif active_event_playbook == "BULL_MOMENTUM_EXPANSION":
-                ai_synth["macro_bias"] = "BULLISH"
-                ai_synth["market_posture"] = "AGGRESSIVE_EXPANSION"
+                # Only allow expansion if global killswitch is NOT active and macro data is valid
+                if (data and data.get("global_killswitch", 0) == 1) or not data_ok:
+                    log.warning("[AI-MACRO] Refusing BULL_MOMENTUM_EXPANSION posture: Global Killswitch engaged or data invalid.")
+                    ai_synth["macro_bias"] = "NEUTRAL"
+                    ai_synth["market_posture"] = "TACTICAL_DEFENSE"
+                else:
+                    ai_synth["macro_bias"] = "BULLISH"
+                    ai_synth["market_posture"] = "AGGRESSIVE_EXPANSION"
             
-            # Derivatives Skew Circuit Breaker Guard
-            is_skew_halt = bool(ai_synth.get("derivatives_skew_halt", False))
+            # Derivatives Skew Circuit Breaker Guard (defensive bool parsing)
+            is_skew_halt = _parse_bool(ai_synth.get("derivatives_skew_halt", False))
             skew_regime = ai_synth.get("derivatives_skew_regime", "BALANCED_CHOP")
             skew_notes = ai_synth.get("derivatives_notes", "")
 
-            for db_target in ["trading_ledger.db", "trading_data.db"]:
+            # Deterministic Asymmetric Gate:
+            # If global killswitch is engaged OR derivatives skew halt is triggered, force TACTICAL_DEFENSE / RISK_OFF
+            if (data and data.get("global_killswitch", 0) == 1):
+                ai_synth["market_posture"] = "RISK_OFF_KILLSWITCH"
+                ai_synth["macro_bias"] = "DEFENSIVE_BEAR"
+            elif is_skew_halt:
+                ai_synth["market_posture"] = "TACTICAL_DEFENSE"
+                ai_synth["macro_bias"] = "DEFENSIVE_CHOP"
+
+            for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                 try:
                     with sqlite3.connect(db_target, timeout=10.0) as conn:
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_macro_briefing', ?, ?)",
@@ -353,7 +482,7 @@ def update_macro_context():
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('derivatives_skew_notes', ?, ?)",
                                      (skew_notes, now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('derivatives_funding_rates', ?, ?)",
-                                     (json.dumps(deriv_skew.get("symbols", {})), now_iso))
+                                     (json.dumps(deriv_skew.get("symbols", {}) if deriv_skew else {}), now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_macro_summary', ?, ?)",
                                      (ai_synth.get("executive_summary", ""), now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_macro_bias', ?, ?)",
@@ -366,51 +495,52 @@ def update_macro_context():
             else:
                 log.info(f"[DERIVATIVES-SKEW-RADAR] 📡 Skew Regime: {skew_regime} | Posture: {ai_synth.get('market_posture')} | Halt={is_skew_halt} | {skew_notes}")
 
-            log.info(f"[AI-MACRO] Synthesis Complete: Posture={ai_synth.get('market_posture')} | Bias={ai_synth.get('macro_bias')} | {ai_synth.get('executive_summary')}")
+            log.info(f"[AI-MACRO] Synthesis Complete: Posture={ai_synth.get('market_posture')} | Bias={ai_synth.get('macro_bias')} | {ai_synth.get('executive_summary', '')[:80]}")
         except Exception as syn_e:
             log.warning(f"[AI-MACRO] Periodic synthesis error: {syn_e}")
 
-        # Feature 4: The Bitcoin Anchor (Cross-Market Contagion Filter)
-        # Evaluates Bitcoin microstructure, funding skew, and order book absorption to protect altcoins.
-        # Safety: ensure now_iso is always defined even if macro synthesis block above threw an exception.
-        if 'now_iso' not in locals():
-            now_iso = datetime.now(UTC).isoformat()
+        # Bitcoin Anchor (Cross-Market Contagion Filter)
         try:
             btc_sym = "BTCUSDT"
-            btc_fr = deriv_skew.get("symbols", {}).get(btc_sym, {}).get("funding_rate_8h", 0.0001) if 'deriv_skew' in locals() else 0.0001
-            btc_oi = deriv_skew.get("symbols", {}).get(btc_sym, {}).get("open_interest_contracts", 0.0) if 'deriv_skew' in locals() else 0.0
+            btc_fr = 0.0
+            btc_oi = 0.0
+            if deriv_skew and deriv_skew.get("symbols", {}).get(btc_sym):
+                btc_fr = float(deriv_skew["symbols"][btc_sym].get("funding_rate_8h", 0.0) or 0.0)
+                btc_oi = float(deriv_skew["symbols"][btc_sym].get("open_interest_contracts", 0.0) or 0.0)
+                
             btc_ofi = 0.0
-            if os.path.exists("microstructure_state.json"):
+            micro_path = os.path.join(BASE_DIR, "microstructure_state.json")
+            if os.path.exists(micro_path):
                 try:
-                    with open("microstructure_state.json", "r") as mf:
+                    with open(micro_path, "r") as mf:
                         m_json = json.load(mf)
-                        btc_ofi = float(m_json.get("symbols", {}).get("BTCUSDT", {}).get("normalized_ofi", 0.0))
+                        btc_ofi = float(m_json.get("symbols", {}).get("BTCUSDT", {}).get("normalized_ofi", 0.0) or 0.0)
                 except Exception:
                     pass
 
             btc_anchor_packet = {
                 "timestamp": now_iso,
-                "btc_price": btc_price if 'btc_price' in locals() else 0.0,
-                "btc_macro_trend": btc_macro_trend if 'btc_macro_trend' in locals() else "UNKNOWN",
-                "warden_regime": warden_regime if 'warden_regime' in locals() else "UNKNOWN",
+                "btc_price": btc_price,
+                "btc_macro_trend": btc_macro_trend,
+                "warden_regime": warden_regime,
                 "btc_funding_rate_8h": btc_fr,
                 "btc_open_interest": btc_oi,
                 "btc_normalized_ofi": btc_ofi,
-                "spy_1h_change": data['spy_1h_change'] if data else 0.0,
-                "dxy_price": data.get('dxy_price', 0.0) if data else 0.0
+                "spy_1h_change": data['spy_1h_change'] if (data and data_ok) else 0.0,
+                "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0
             }
 
             anchor_res = macro_loop.run_until_complete(ai_engine.evaluate_btc_anchor(btc_anchor_packet, timeout_sec=12.0))
             if anchor_res:
                 btc_state = anchor_res.get("btc_anchor_state", "HEALTHY_EXPANSION")
-                alt_pause = bool(anchor_res.get("alt_long_pause", False))
-                risk_score = float(anchor_res.get("contagion_risk_score", 20))
+                alt_pause = _parse_bool(anchor_res.get("alt_long_pause", False))
+                risk_score = float(anchor_res.get("contagion_risk_score", 20) or 20)
                 directive = anchor_res.get("anchor_directive", "Normal operations.")
-                key_pivot = float(anchor_res.get("key_btc_pivot", 0.0))
+                key_pivot = float(anchor_res.get("key_btc_pivot", 0.0) or 0.0)
 
                 log.info(f"[BTC-ANCHOR] ⚓ BTC State: {btc_state} | AltLongPause: {alt_pause} | ContagionRisk: {risk_score}/100 | {directive}")
 
-                for db_target in ["trading_ledger.db", "trading_data.db"]:
+                for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                     try:
                         with sqlite3.connect(db_target, timeout=10.0) as conn:
                             conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('btc_anchor_state', ?, ?)",
@@ -432,14 +562,13 @@ def update_macro_context():
         except Exception as anchor_err:
             log.warning(f"[BTC-ANCHOR] Periodic Bitcoin anchor error: {anchor_err}")
 
-        # Engine 4: AI Delta-Neutral Hedging Oracle (Macro Volatility Shield)
+        # AI Delta-Neutral Hedging Oracle
         try:
-            # Query active positions across open_positions and berserker_open_positions
             open_pos_list = []
             net_long_usd = 0.0
             net_short_usd = 0.0
             try:
-                with sqlite3.connect("trading_data.db", timeout=5.0) as p_conn:
+                with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as p_conn:
                     for tbl in ["open_positions", "berserker_open_positions"]:
                         try:
                             rows = p_conn.execute(f"SELECT symbol, side, qty, entry_price FROM {tbl}").fetchall()
@@ -461,12 +590,11 @@ def update_macro_context():
                 pass
 
             net_delta_dollars = round(net_long_usd - net_short_usd, 2)
-            posture = ai_synth.get("market_posture", "TACTICAL_DEFENSE") if 'ai_synth' in locals() else "NEUTRAL"
+            posture = ai_synth.get("market_posture", "TACTICAL_DEFENSE") if ai_synth else "NEUTRAL"
             
-            # Fetch avoid list / weakest assets
             weakest_list = ["ETH/USDT", "XRP/USDT"]
             try:
-                with sqlite3.connect("trading_data.db", timeout=5.0) as a_conn:
+                with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as a_conn:
                     r_av = a_conn.execute("SELECT value FROM system_state WHERE key = 'ai_asset_avoid'").fetchone()
                     if r_av and r_av[0]:
                         weakest_list = [x.strip() for x in r_av[0].split(",") if x.strip()]
@@ -479,17 +607,17 @@ def update_macro_context():
                 "gross_long_dollars": round(net_long_usd, 2),
                 "gross_short_dollars": round(net_short_usd, 2),
                 "open_positions": open_pos_list,
-                "macro_regime": data.get('macro_regime', 'NEUTRAL') if data else "NEUTRAL",
+                "macro_regime": data.get('macro_regime', 'UNKNOWN') if (data and data_ok) else "UNKNOWN",
                 "macro_posture": posture,
-                "spy_1h_change": data.get('spy_1h_change', 0.0) if data else 0.0,
-                "dxy_price": data.get('dxy_price', 0.0) if data else 0.0,
+                "spy_1h_change": data.get('spy_1h_change', 0.0) if (data and data_ok) else 0.0,
+                "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0,
                 "weakest_fleet_assets": weakest_list
             }
 
             hedge_rec = macro_loop.run_until_complete(ai_engine.calculate_delta_neutral_hedge(hedging_context, timeout_sec=15.0))
             if hedge_rec:
                 log.info(f"[HEDGING-ORACLE] 🛡️ Shield={hedge_rec.get('risk_shield_level')} | HedgeReq={hedge_rec.get('hedge_required')} | Asset={hedge_rec.get('hedge_asset')} ({hedge_rec.get('hedge_side')}) | Target=${hedge_rec.get('target_short_notional')} | Rationale={hedge_rec.get('rationale')}")
-                for db_target in ["trading_ledger.db", "trading_data.db"]:
+                for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                     try:
                         with sqlite3.connect(db_target, timeout=10.0) as conn:
                             conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_hedging_oracle', ?, ?)",
@@ -501,7 +629,47 @@ def update_macro_context():
         except Exception as hedge_e:
             log.warning(f"[HEDGING-ORACLE] Periodic hedging oracle error: {hedge_e}")
 
-        # Feature 3: Chief Strategist Asset Hierarchy Leaderboard (Every 2 hours = 8 iterations)
+        # Append-Only Telemetry Table Write: commit comprehensive row for auditability
+        try:
+            active_kill = 1 if (data and data.get('global_killswitch', 0) == 1) else 0
+            skew_halt_flag = 1 if (ai_synth and _parse_bool(ai_synth.get("derivatives_skew_halt", False))) else 0
+            alt_pause_flag = 1 if (anchor_res and _parse_bool(anchor_res.get("alt_long_pause", False))) else 0
+            curr_regime = data['macro_regime'] if (data and data_ok) else "UNKNOWN"
+            curr_posture = ai_synth.get('market_posture', 'TACTICAL_DEFENSE') if ai_synth else "TACTICAL_DEFENSE"
+            avg_fr = deriv_skew.get("avg_funding_rate_8h", 0.0) if deriv_skew else 0.0
+
+            for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
+                try:
+                    conn = sqlite3.connect(db_target, timeout=10.0)
+                    with conn:
+                        conn.execute("""
+                            INSERT INTO macro_telemetry_history (
+                                timestamp, spy_price, uup_price, dxy_price, spy_1h_change, uup_1h_change,
+                                avg_funding_rate_8h, global_killswitch, derivatives_skew_halt,
+                                alt_long_pause, macro_regime, market_posture, source
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            now_iso,
+                            data['spy_price'] if (data and data_ok) else None,
+                            data['uup_price'] if (data and data_ok) else None,
+                            data.get('dxy_price') if (data and data_ok) else None,
+                            data['spy_1h_change'] if (data and data_ok) else None,
+                            data['uup_1h_change'] if (data and data_ok) else None,
+                            avg_fr,
+                            active_kill,
+                            skew_halt_flag,
+                            alt_pause_flag,
+                            curr_regime,
+                            curr_posture,
+                            'macro_sentinel'
+                        ))
+                    conn.close()
+                except Exception as he:
+                    log.warning(f"Failed to append macro_telemetry_history to {db_target}: {he}")
+        except Exception as tel_err:
+            log.warning(f"Telemetry history commit error: {tel_err}")
+
+        # Chief Strategist Asset Hierarchy Leaderboard (Every 2 hours = 8 iterations)
         if iteration_count % 8 == 0:
             try:
                 log.info("[CHIEF-STRATEGIST] Polling Fleet Metrics for 2-Hour Institutional Asset Ranking...")
@@ -513,13 +681,13 @@ def update_macro_context():
                     asset_adx = 25.0
                     asset_hurst = 0.52
                     try:
-                        with sqlite3.connect("trading_data.db", timeout=5.0) as c_m:
+                        with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as c_m:
                             r_lbl = c_m.execute("SELECT value FROM system_state WHERE key = ?", (f"regime_{clean_s}",)).fetchone()
                             if r_lbl: asset_regime = r_lbl[0]
                             r_adx = c_m.execute("SELECT value FROM system_state WHERE key = ?", (f"adx_{clean_s}",)).fetchone()
-                            if r_adx: asset_adx = float(r_adx[0])
+                            if r_adx: asset_adx = float(r_adx[0] or 25.0)
                             r_h = c_m.execute("SELECT hurst FROM active_fleet_config WHERE symbol LIKE ?", (f"%{clean_s[:3]}%",)).fetchone()
-                            if r_h and r_h[0]: asset_hurst = float(r_h[0])
+                            if r_h and r_h[0]: asset_hurst = float(r_h[0] or 0.52)
                     except Exception:
                         pass
                         
@@ -529,11 +697,10 @@ def update_macro_context():
                         "hurst": asset_hurst
                     }
 
-                now_iso = datetime.now(UTC).isoformat()
                 fleet_context = {
                     "timestamp": now_iso,
-                    "btc_price": btc_price if 'btc_price' in locals() else 0.0,
-                    "macro_posture": ai_synth.get("market_posture", "TACTICAL_DEFENSE") if 'ai_synth' in locals() else "NEUTRAL",
+                    "btc_price": btc_price,
+                    "macro_posture": ai_synth.get("market_posture", "TACTICAL_DEFENSE") if ai_synth else "NEUTRAL",
                     "assets": assets_metrics
                 }
 
@@ -544,7 +711,7 @@ def update_macro_context():
                     avoid = ", ".join(ranking.get("avoid_chop_list", []))
                     log.info(f"[CHIEF-STRATEGIST] 👑 Asset Hierarchy Updated: Leaders=[{leaders}] | Avoid=[{avoid}] | Rationale={ranking.get('fleet_focus_rationale')}")
 
-                    for db_target in ["trading_ledger.db", "trading_data.db"]:
+                    for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                         try:
                             with sqlite3.connect(db_target, timeout=10.0) as conn:
                                 conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_asset_rankings', ?, ?)",
@@ -558,8 +725,7 @@ def update_macro_context():
             except Exception as rank_err:
                 log.warning(f"[CHIEF-STRATEGIST] Periodic ranking error: {rank_err}")
 
-        # Feature 6: AI 6-Hour Strategic Macro Blueprint & Key Level Roadmap
-        # Generates or updates strategic macro gameplan every 6 hours (00:00, 06:00, 12:00, 18:00 UTC) or if stale (>6h)
+        # AI 6-Hour Strategic Macro Blueprint & Key Level Roadmap
         try:
             now_utc = datetime.now(UTC)
             today_utc = now_utc.strftime("%Y-%m-%d")
@@ -576,7 +742,7 @@ def update_macro_context():
 
             needs_blueprint = False
             try:
-                with sqlite3.connect("trading_data.db", timeout=5.0) as b_conn:
+                with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as b_conn:
                     row_bp = b_conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'ai_daily_blueprint'").fetchone()
                     if not row_bp or not row_bp[0]:
                         needs_blueprint = True
@@ -603,11 +769,11 @@ def update_macro_context():
                 log.info(f"[MACRO-BLUEPRINT] Generating fresh 6-Hour AI Strategic Blueprint for session [{session_tag}: {session_name}]...")
                 fleet_symbols = getattr(config, "SYMBOLS", ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'BNB/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'NEAR/USDT'])
                 
-                # Fetch live prices across fleet for accurate S/R anchoring
                 live_prices = {}
-                if os.path.exists("microstructure_state.json"):
+                micro_path = os.path.join(BASE_DIR, "microstructure_state.json")
+                if os.path.exists(micro_path):
                     try:
-                        with open("microstructure_state.json", "r") as msf:
+                        with open(micro_path, "r") as msf:
                             ms_data = json.load(msf)
                             sym_dict = ms_data.get("symbols", {})
                             for s in fleet_symbols[:10]:
@@ -621,11 +787,11 @@ def update_macro_context():
                     "date": today_utc,
                     "session_tag": session_tag,
                     "session_name": session_name,
-                    "btc_price": live_prices.get("BTC/USDT", btc_price if 'btc_price' in locals() else 0.0),
+                    "btc_price": live_prices.get("BTC/USDT", btc_price),
                     "asset_current_prices": live_prices,
-                    "macro_regime": data.get('macro_regime', 'NEUTRAL') if data else "NEUTRAL",
-                    "spy_price": data.get('spy_price', 0.0) if data else 0.0,
-                    "dxy_price": data.get('dxy_price', 0.0) if data else 0.0,
+                    "macro_regime": data.get('macro_regime', 'UNKNOWN') if (data and data_ok) else "UNKNOWN",
+                    "spy_price": data.get('spy_price', 0.0) if (data and data_ok) else 0.0,
+                    "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0,
                     "fleet_symbols": fleet_symbols[:10]
                 }
                 daily_bp = macro_loop.run_until_complete(ai_engine.generate_daily_market_blueprint(fleet_symbols[:10], bp_snapshot, timeout_sec=25.0))
@@ -633,9 +799,8 @@ def update_macro_context():
                     daily_bp["session_tag"] = session_tag
                     daily_bp["session_name"] = session_name
                     bp_json = json.dumps(daily_bp)
-                    now_iso = datetime.now(UTC).isoformat()
-                    log.info(f"[MACRO-BLUEPRINT] 🗺️ 6-Hour Blueprint Generated [{session_tag}] ({daily_bp.get('macro_bias')}): {daily_bp.get('daily_narrative')[:80]}...")
-                    for db_target in ["trading_ledger.db", "trading_data.db"]:
+                    log.info(f"[MACRO-BLUEPRINT] 🗺️ 6-Hour Blueprint Generated [{session_tag}] ({daily_bp.get('macro_bias')}): {daily_bp.get('daily_narrative', '')[:80]}...")
+                    for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                         try:
                             with sqlite3.connect(db_target, timeout=10.0) as conn:
                                 conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_daily_blueprint', ?, ?)",
@@ -660,4 +825,3 @@ def update_macro_context():
 
 if __name__ == "__main__":
     update_macro_context()
-
