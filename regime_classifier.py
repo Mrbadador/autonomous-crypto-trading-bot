@@ -99,7 +99,7 @@ class RegimeClassifier:
             N = len(returns)
             
             lags = [10, 20, 30, 40, 50]
-            RS_values = []
+            valid_pairs = []
             
             for lag in lags:
                 num_subsets = N // lag
@@ -115,10 +115,10 @@ class RegimeClassifier:
                     if s > 0:
                         rs_sub.append(r / s)
                 if rs_sub:
-                    RS_values.append(np.mean(rs_sub))
+                    avg_rs = float(np.mean(rs_sub))
+                    if avg_rs > 0:
+                        valid_pairs.append((lag, avg_rs))
                     
-            # Filter to positive values to prevent log of non-positive numbers
-            valid_pairs = [(lag, rs) for lag, rs in zip(lags[:len(RS_values)], RS_values) if rs > 0]
             if len(valid_pairs) < 2:
                 return 0.50
                 

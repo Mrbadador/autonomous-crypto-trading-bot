@@ -294,10 +294,19 @@ class RiskManager:
                 except Exception:
                     pass
             try:
-                cursor = conn.execute("SELECT size AS qty, entry_price, stop_loss FROM swing_open_positions WHERE status = 'ACTIVE' OR status IS NULL")
+                # swing_open_positions can use 'size' or 'qty' depending on table migration
+                cursor = conn.execute("""
+                    SELECT COALESCE(size, qty, 0.0) AS qty, entry_price, stop_loss 
+                    FROM swing_open_positions 
+                    WHERE status = 'ACTIVE' OR status IS NULL
+                """)
                 rows.extend(cursor.fetchall())
             except Exception:
-                pass
+                try:
+                    cursor = conn.execute("SELECT size AS qty, entry_price, stop_loss FROM swing_open_positions WHERE status = 'ACTIVE' OR status IS NULL")
+                    rows.extend(cursor.fetchall())
+                except Exception:
+                    pass
             conn.close()
             
             import math

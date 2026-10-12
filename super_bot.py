@@ -209,14 +209,14 @@ class SuperBotTrader:
             log.error(f"[SYNC-ERR] Error adopting positions: {e}")
 
     def _get_market_regime_sync(self):
-        """Reads current market regime & FinRL Mahalanobis Turbulence determined by regime_classifier.py."""
-        regime = "CHOP"
-        adx = 20.0
+        """Reads current market regime & FinRL Mahalanobis Turbulence determined by regime_classifier.py (Fail-Closed)."""
+        regime = "UNKNOWN"
+        adx = 0.0
         hurst = 0.50
         di_spread = 0.0
         turb_idx = 0.0
         turb_thresh = 22.0
-        turb_state = "CALM_NORMAL"
+        turb_state = "UNKNOWN"
         try:
             with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                 row = conn.execute(
@@ -224,7 +224,7 @@ class SuperBotTrader:
                     "FROM market_regime ORDER BY id DESC LIMIT 1"
                 ).fetchone()
                 if row:
-                    regime = str(row[0] or "CHOP").upper()
+                    regime = str(row[0] or "UNKNOWN").upper()
                     if row[1] is not None: adx = float(row[1])
                     if row[2] is not None: hurst = float(row[2])
                     p_di = float(row[3]) if row[3] is not None else 0.0
@@ -233,8 +233,13 @@ class SuperBotTrader:
                     if len(row) > 5 and row[5] is not None: turb_idx = float(row[5])
                     if len(row) > 6 and row[6] is not None: turb_thresh = float(row[6])
                     if len(row) > 7 and row[7] is not None: turb_state = str(row[7] or "CALM_NORMAL")
+                else:
+                    regime = "UNKNOWN"
+                    adx = 0.0
         except Exception as e:
-            log.debug(f"[REGIME-READ-NOTE] {e}")
+            log.warning(f"[REGIME-READ-FAIL-CLOSED] Error reading market_regime: {e}. Forcing regime=UNKNOWN.")
+            regime = "UNKNOWN"
+            adx = 0.0
             
         self.current_regime = regime
         self.regime_adx = adx
@@ -436,6 +441,29 @@ class SuperBotTrader:
                     return
             except Exception as rhe:
                 log.warning(f"[GRID-RISK-HALT-VETO] Failed to read RISK_HALT state (fail-closed) for {symbol}: {rhe}")
+                return
+
+            # Check if another fleet engine (e.g. swing_architect) currently holds an active fresh lock
+            def _check_asset_lock():
+                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    row = conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (symbol,)).fetchone()
+                    if row and row[0]:
+                        holder = str(row[0])
+                        if holder not in ('super_bot_grid', 'super_bot_scalp_short'):
+                            hb_str = str(row[1] or "")
+                            try:
+                                clean_hb = hb_str.replace("Z", "+00:00")
+                                if "+" not in clean_hb: clean_hb += "+00:00"
+                                hb_dt = datetime.fromisoformat(clean_hb)
+                                if (datetime.now(timezone.utc) - hb_dt).total_seconds() <= 900.0:
+                                    return holder, hb_str
+                            except Exception:
+                                return holder, hb_str
+                    return None, None
+
+            locked_by, locked_hb = await asyncio.to_thread(_check_asset_lock)
+            if locked_by:
+                log.warning(f"[{engine_tag}-LOCK-VETO] Cannot enter {symbol}: Already locked by '{locked_by}' (heartbeat: {locked_hb}). Aborting entry.")
                 return
 
             # Unified Sentinel News & Sentiment Gate (2h max-age, fail-closed, WARNING=0.5x size-down)

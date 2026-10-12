@@ -1072,17 +1072,17 @@ async def red_team_deliberation(
     has_momentum = (adx_val >= 22.0)
 
     if has_momentum and optimal_rsi:
-        log.info(f"[BOARDROOM-FAIL-SMART] Cloud AI rate-limited/busy. Quantitative momentum confirmed for {sym_upper} (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}). Approving setup.")
+        log.info(f"[BOARDROOM-FAIL-SMART] Cloud AI rate-limited/busy. Quantitative momentum confirmed for {sym_upper} (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}). Calibrated fallback.")
         return {
             "execute": True,
-            "conviction_score": 0.75,
-            "conviction_percent": 75.0,
-            "size_mult": 1.0,
+            "conviction_score": 0.70,
+            "conviction_percent": 70.0,
+            "size_mult": 0.8,
             "sl_mult": 2.0,
             "tp_mult": 3.0,
-            "red_team_objection": "Cloud AI temporarily busy; verified via quantitative momentum.",
+            "red_team_objection": "Cloud AI temporarily busy; evaluated via quantitative momentum safeguards.",
             "alpha_thesis": f"Confirmed technical momentum (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}).",
-            "final_rationale": "AI cloud busy; quantitative technical fail-smart approved setup.",
+            "final_rationale": "AI cloud busy; quantitative technical fail-smart rendered candidate score (0.70).",
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
     else:

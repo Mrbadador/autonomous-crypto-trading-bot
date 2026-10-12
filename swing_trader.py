@@ -1260,26 +1260,52 @@ class SwingArchitectTrader:
                         
                         if is_filled:
                             order_success = True
-                            # Register native strategy stop loss and take profit on Bitget
-                            try:
-                                opp_side = "sell" if is_long else "buy"
-                                sl_str = self.uta_client.format_price_precision(symbol, stop_loss) if hasattr(self.uta_client, "format_price_precision") else str(round(stop_loss, 4) if stop_loss < 10 else round(stop_loss, 2))
-                                sl_p = {
-                                    "category": "USDT-FUTURES",
-                                    "symbol": self.uta_client._normalize_symbol(symbol),
-                                    "marginMode": getattr(config, "MARGIN_MODE", "isolated").lower(),
-                                    "marginCoin": "USDT",
-                                    "planType": "pos_loss",
-                                    "posSide": "long" if is_long else "short",
-                                    "side": opp_side,
-                                    "triggerPrice": sl_str,
-                                    "stopLoss": sl_str,
-                                    "triggerType": "mark_price",
-                                    "size": str(qty)
-                                }
-                                await self.uta_client.exchange.private_uta_post_v3_trade_place_strategy_order(sl_p)
-                                log.info(f"[ENTRY-SNIPER-SHIELD] Native Stop Loss REGISTERED on Bitget! (SL=${stop_loss:,.4f})")
-                                if take_profit and take_profit > 0.0:
+                            # Clean quantity and prices for Bitget exchange precision
+                            actual_qty = filled_amount if (filled_amount > 0 and filled_amount <= qty) else qty
+                            qty_str = self.uta_client.format_quantity_precision(symbol, actual_qty) if hasattr(self.uta_client, "format_quantity_precision") else str(actual_qty)
+                            opp_side = "sell" if is_long else "buy"
+                            sl_str = self.uta_client.format_price_precision(symbol, stop_loss) if hasattr(self.uta_client, "format_price_precision") else str(round(stop_loss, 4) if stop_loss < 10 else round(stop_loss, 2))
+                            
+                            # Register native strategy stop loss on Bitget with 3-attempt backoff retry
+                            sl_attached = False
+                            last_sl_err = None
+                            for sl_attempt in range(3):
+                                try:
+                                    sl_p = {
+                                        "category": "USDT-FUTURES",
+                                        "symbol": self.uta_client._normalize_symbol(symbol),
+                                        "marginMode": getattr(config, "MARGIN_MODE", "isolated").lower(),
+                                        "marginCoin": "USDT",
+                                        "planType": "pos_loss",
+                                        "posSide": "long" if is_long else "short",
+                                        "side": opp_side,
+                                        "triggerPrice": sl_str,
+                                        "stopLoss": sl_str,
+                                        "triggerType": "mark_price",
+                                        "size": qty_str
+                                    }
+                                    await self.uta_client.exchange.private_uta_post_v3_trade_place_strategy_order(sl_p)
+                                    log.info(f"[ENTRY-SNIPER-SHIELD] Native Stop Loss REGISTERED on Bitget! (SL=${stop_loss:,.4f})")
+                                    sl_attached = True
+                                    break
+                                except Exception as sl_reg_err:
+                                    last_sl_err = sl_reg_err
+                                    log.warning(f"[ENTRY-SNIPER] Native SL registration attempt {sl_attempt+1}/3 failed for {symbol}: {sl_reg_err}")
+                                    await asyncio.sleep(0.5 * (sl_attempt + 1))
+
+                            if not sl_attached:
+                                log.critical(f"[ENTRY-SNIPER] 🚨 CRITICAL NAKED STOP FAILURE: Failed to attach native SL on {symbol} after 3 attempts ({last_sl_err})! Aborting position to eliminate naked risk.")
+                                try:
+                                    await self.uta_client.close_position_order(symbol=symbol, side="long" if is_long else "short", qty=actual_qty)
+                                    log.warning(f"[ENTRY-SNIPER] Emergency position abort SUCCESS for {symbol}.")
+                                except Exception as abort_err:
+                                    log.error(f"[ENTRY-SNIPER] Emergency position abort FAILED for {symbol}: {abort_err}")
+                                await asyncio.to_thread(self._release_lock_sync, symbol)
+                                raise RuntimeError(f"Native Stop Loss placement failed on sniper order for {symbol} after 3 retries ({last_sl_err}). Position aborted.")
+
+                            # Register native Take Profit
+                            if take_profit and take_profit > 0.0:
+                                try:
                                     tp_str = self.uta_client.format_price_precision(symbol, take_profit) if hasattr(self.uta_client, "format_price_precision") else str(round(take_profit, 4) if take_profit < 10 else round(take_profit, 2))
                                     tp_p = {
                                         "category": "USDT-FUTURES",
@@ -1292,12 +1318,12 @@ class SwingArchitectTrader:
                                         "triggerPrice": tp_str,
                                         "takeProfit": tp_str,
                                         "triggerType": "mark_price",
-                                        "size": str(qty)
+                                        "size": qty_str
                                     }
                                     await self.uta_client.exchange.private_uta_post_v3_trade_place_strategy_order(tp_p)
                                     log.info(f"[ENTRY-SNIPER-TARGET] Native Take Profit REGISTERED on Bitget! (TP=${take_profit:,.4f})")
-                            except Exception as sl_reg_err:
-                                log.warning(f"[ENTRY-SNIPER] Strategy order registration note: {sl_reg_err}")
+                                except Exception as tp_reg_err:
+                                    log.warning(f"[ENTRY-SNIPER] Native TP registration note: {tp_reg_err}")
                         else:
                             # Do NOT market-chase the top when AI Sniper explicitly mandated RETEST_PULLBACK due to exhaustion!
                             curr_mkt_p = entry_price
@@ -1383,11 +1409,12 @@ class SwingArchitectTrader:
         # 2. Record active position in database
         now_iso = datetime.now(UTC).isoformat()
         order_tag = "POST_ONLY_MAKER" if execution_order_type == "POST_ONLY_LIMIT" else "MARKET_TAKER"
+        final_size = actual_qty if (execution_order_type == "POST_ONLY_LIMIT" and 'actual_qty' in locals()) else qty
         pos_record = {
             "symbol": symbol,
             "side": side_str,
             "entry_price": actual_entry_price,
-            "size": qty,
+            "size": final_size,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "trailing_stop": stop_loss,
@@ -1397,7 +1424,7 @@ class SwingArchitectTrader:
             "updated_at": now_iso,
             "status": "ACTIVE",
             "r_multiple": 0.0,
-            "initial_risk_usd": risk_per_unit * qty,
+            "initial_risk_usd": risk_per_unit * final_size,
             "engine_type": "SWING_4H",
             "order_type": "post_only" if execution_order_type == "POST_ONLY_LIMIT" else "market",
             "execution_type": "maker" if execution_order_type == "POST_ONLY_LIMIT" else "taker",
@@ -1841,14 +1868,15 @@ class SwingArchitectTrader:
                                 log.info(f"[SCALP-SHORT-45M-TIGHTEN] 🛡️ {symbol} at {holding_mins:.1f}m (PnL {short_pnl_pct:+.2f}% < {min_harvest_pct:.2f}% harvest). Tightened SL ${old_sl:.4f} -> ${target_sl:.4f} until {hard_expiry_mins:.0f}m hard expiry.")
                                 self._track_task(self.uta_client.modify_strategy_order(symbol, sl=target_sl, tp=pos.get("take_profit")), f"scalp_45m_tighten_{symbol}")
 
-                # Exit Condition 0: Global AI Macro Killswitch
+                # Exit Condition 0: Global AI Macro Killswitch (Fail-Closed)
                 def _check_emergency_killswitch():
                     try:
                         with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                             row = conn.execute("SELECT value FROM system_state WHERE key = 'macro_global_killswitch'").fetchone()
                             return bool(row and str(row[0]) == "1")
-                    except Exception:
-                        return False
+                    except Exception as k_err:
+                        log.warning(f"[KILLSWITCH-READ-FAIL-CLOSED] Error reading macro_global_killswitch: {k_err}. Fail-closed engaged.")
+                        return True
 
                 is_emergency = await asyncio.to_thread(_check_emergency_killswitch)
                 if is_emergency:
@@ -2133,10 +2161,16 @@ class SwingArchitectTrader:
             # 0b. Check Anti-Whipsaw Cooldown (Rule #166)
             cooldown_until = await asyncio.to_thread(self._get_cooldown_sync, symbol, allowed_direction or "LONG")
             if cooldown_until:
-                now_iso = datetime.now(UTC).isoformat()
-                if cooldown_until > now_iso:
-                    log.debug(f"[COOLDOWN-GATE] Skipping {symbol}: active cool-off until {cooldown_until} (Anti-Whipsaw Rule #166)")
-                    continue
+                try:
+                    clean_cd = str(cooldown_until).replace("Z", "+00:00")
+                    if "T" not in clean_cd and " " in clean_cd: clean_cd = clean_cd.replace(" ", "T")
+                    if "+" not in clean_cd: clean_cd += "+00:00"
+                    cd_epoch = datetime.fromisoformat(clean_cd).timestamp()
+                    if cd_epoch > datetime.now(UTC).timestamp():
+                        log.debug(f"[COOLDOWN-GATE] Skipping {symbol}: active cool-off until {cooldown_until} (Anti-Whipsaw Rule #166)")
+                        continue
+                except Exception as cd_parse_err:
+                    log.debug(f"[COOLDOWN-PARSE] {symbol}: {cd_parse_err}")
 
             try:
                 # 1. Fetch 4H (limit=95 for 52+26 shifted Ichimoku Kumo) and 1D data

@@ -279,6 +279,7 @@ class BitgetUTAClient:
                 for sl_attempt in range(3):
                     try:
                         sl_str = self.format_price_precision(symbol, sl)
+                        qty_str = self.format_quantity_precision(symbol, qty)
                         sl_params = {
                             "category": "USDT-FUTURES",
                             "symbol": clean_sym,
@@ -290,7 +291,7 @@ class BitgetUTAClient:
                             "triggerPrice": sl_str,
                             "stopLoss": sl_str,
                             "triggerType": "mark_price",
-                            "size": str(qty)
+                            "size": qty_str
                         }
                         strat_res = await self.exchange.private_uta_post_v3_trade_place_strategy_order(sl_params)
                         sl_id = strat_res.get("data", {}).get("orderId")
@@ -315,6 +316,7 @@ class BitgetUTAClient:
             if tp and tp > 0.0:
                 try:
                     tp_str = self.format_price_precision(symbol, tp)
+                    qty_str = self.format_quantity_precision(symbol, qty)
                     tp_params = {
                         "category": "USDT-FUTURES",
                         "symbol": clean_sym,
@@ -326,7 +328,7 @@ class BitgetUTAClient:
                         "triggerPrice": tp_str,
                         "takeProfit": tp_str,
                         "triggerType": "mark_price",
-                        "size": str(qty)
+                        "size": qty_str
                     }
                     strat_res_tp = await self.exchange.private_uta_post_v3_trade_place_strategy_order(tp_params)
                     tp_id = strat_res_tp.get("data", {}).get("orderId")
