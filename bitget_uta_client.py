@@ -5,6 +5,7 @@ on Bitget Unified Trading Accounts (UTA / V3) without legacy Classic API errors.
 """
 import os
 import time
+import math
 import logging
 import asyncio
 import ccxt.async_support as ccxt_async
@@ -44,18 +45,34 @@ class BitgetUTAClient:
         if price is None or price <= 0:
             return ""
         clean_sym = self._normalize_symbol(symbol)
-        
-        # Explicit per-asset tick precision rules for Bitget USDT-Futures
+
+        # 1. Inspect loaded CCXT market precision if available
+        if self._markets_loaded and self.exchange.markets:
+            ccxt_sym = f"{clean_sym[:-4]}/USDT:USDT" if clean_sym.endswith("USDT") else clean_sym
+            market = self.exchange.markets.get(ccxt_sym) or self.exchange.markets.get(symbol)
+            if market and "precision" in market and market["precision"].get("price") is not None:
+                p_prec = market["precision"]["price"]
+                try:
+                    # If precision is float tick size (e.g. 0.001)
+                    if isinstance(p_prec, float) and p_prec < 1.0:
+                        dec = max(0, int(round(-math.log10(p_prec))))
+                        return f"{price:.{dec}f}"
+                    elif isinstance(p_prec, int):
+                        return f"{price:.{p_prec}f}"
+                except Exception:
+                    pass
+
+        # 2. Explicit per-asset tick precision rules for Bitget USDT-Futures
         if clean_sym in ("BTCUSDT", "BTC"):
             return f"{price:.1f}"
-        elif clean_sym in ("ETHUSDT", "ETH", "BNBUSDT", "BNB", "SOLUSDT", "SOL", "AVAXUSDT", "AVAX"):
+        elif clean_sym in ("ETHUSDT", "ETH", "BNBUSDT", "BNB", "AVAXUSDT", "AVAX"):
             return f"{price:.2f}"
-        elif clean_sym in ("NEARUSDT", "NEAR", "LINKUSDT", "LINK"):
+        elif clean_sym in ("SOLUSDT", "SOL"):
             return f"{price:.3f}"
-        elif clean_sym in ("ADAUSDT", "ADA", "XRPUSDT", "XRP", "DOGEUSDT", "DOGE"):
+        elif clean_sym in ("NEARUSDT", "NEAR", "LINKUSDT", "LINK", "ADAUSDT", "ADA", "XRPUSDT", "XRP", "DOGEUSDT", "DOGE"):
             return f"{price:.4f}"
-        
-        # Dynamic fallback based on price magnitude
+
+        # 3. Dynamic fallback based on price magnitude
         if price >= 10000:
             return f"{price:.1f}"
         elif price >= 10:
@@ -70,6 +87,28 @@ class BitgetUTAClient:
         if qty is None or qty <= 0:
             return 0.0
         clean_sym = self._normalize_symbol(symbol)
+
+        # 1. Inspect loaded CCXT market amount precision & limits
+        if self._markets_loaded and self.exchange.markets:
+            ccxt_sym = f"{clean_sym[:-4]}/USDT:USDT" if clean_sym.endswith("USDT") else clean_sym
+            market = self.exchange.markets.get(ccxt_sym) or self.exchange.markets.get(symbol)
+            if market:
+                a_prec = market.get("precision", {}).get("amount")
+                min_amt = market.get("limits", {}).get("amount", {}).get("min") or 0.0
+                if a_prec is not None:
+                    try:
+                        if isinstance(a_prec, float) and a_prec < 1.0:
+                            dec = max(0, int(round(-math.log10(a_prec))))
+                            rounded_qty = round(qty, dec)
+                        elif isinstance(a_prec, int):
+                            rounded_qty = round(qty, a_prec)
+                        else:
+                            rounded_qty = round(qty, 2)
+                        return max(rounded_qty, float(min_amt) if min_amt > 0 else rounded_qty)
+                    except Exception:
+                        pass
+
+        # 2. Explicit per-asset step size and minimums
         if "BTC" in clean_sym:
             return max(round(qty, 4), 0.0001)
         elif "ETH" in clean_sym or "BNB" in clean_sym:

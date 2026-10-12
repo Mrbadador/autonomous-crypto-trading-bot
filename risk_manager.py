@@ -38,12 +38,17 @@ class RiskManager:
         self,
         historical_win_rate: float = 0.65,
         avg_risk_reward: float = 1.5,
-        max_risk_cap: float = 0.015,  # V_AUDIT_FIX: 1.5% hard cap (was 5% — corrected)
+        max_risk_cap: float = None,
         max_positions: int = 5,       # 5-position Top 5 fleet limit
     ):
-        self.win_rate = historical_win_rate
-        self.b = avg_risk_reward   # Odds ratio (Reward / Risk)
-        self.max_cap = max_risk_cap
+        self.win_rate = max(0.01, min(0.99, historical_win_rate))
+        self.b = max(0.1, avg_risk_reward)   # Odds ratio (Reward / Risk)
+        # Inherit institutional hard cap from config (default 0.5% = 0.005)
+        if max_risk_cap is None:
+            cfg_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 0.5))
+            self.max_cap = cfg_risk_pct / 100.0 if cfg_risk_pct > 0.05 else cfg_risk_pct
+        else:
+            self.max_cap = max(0.001, min(0.10, max_risk_cap))
         self.max_positions = max_positions
         # Lazy-initialized — created inside the async event loop on first use.
         self._corr_exchange = None
@@ -350,15 +355,23 @@ class RiskManager:
             Tuple of (allocated_capital_usd, final_risk_pct).
             Returns (0.0, 0.0) if the mathematical edge is negative.
         """
+        if account_balance <= 0.0 or not math.isfinite(account_balance):
+            log.warning("[RISK-MANAGER] Invalid or non-positive account balance. Returning zero allocation.")
+            return 0.0, 0.0
+
         import asyncio
         base_risk_pct = await asyncio.to_thread(self.calculate_empirical_kelly_fraction)
 
-        if base_risk_pct == 0.0:
-            log.warning("[RISK-MANAGER] Edge is negative. Returning zero allocation — VETO trade.")
+        if base_risk_pct <= 0.0:
+            log.warning("[RISK-MANAGER] Edge is negative or zero. Returning zero allocation — VETO trade.")
             return 0.0, 0.0
 
-        # Scale risk linearly by conviction (0 conviction → 0 size, 100 → full Kelly)
-        conviction_multiplier = max(0.0, min(conviction_score, 100.0)) / 100.0
+        # Scale risk linearly by conviction: normalize whether passed as [0.0, 1.0] or [0.0, 100.0]
+        c_score = float(conviction_score) if conviction_score is not None else 0.75
+        if c_score <= 1.0 and c_score > 0.0:
+            conviction_multiplier = max(0.0, min(1.0, c_score))
+        else:
+            conviction_multiplier = max(0.0, min(100.0, c_score)) / 100.0
         adjusted_risk_pct = base_risk_pct * conviction_multiplier
 
         # Apply Block 3 Diversification Penalty

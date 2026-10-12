@@ -6,36 +6,59 @@ live execution (super_bot.py / swing_trader.py) and statistical validation (quan
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from enum import Enum
+from typing import Optional, Dict, Any, Literal
+import math
 import numpy as np
 import pandas as pd
 import config
 
 
-@dataclass
+class OrderSide(str, Enum):
+    LONG = "long"
+    SHORT = "short"
+
+
+class OrderType(str, Enum):
+    MARKET = "market"
+    LIMIT_POST_ONLY = "limit_post_only"
+
+
+class PositionAction(str, Enum):
+    HOLD = "HOLD"
+    RATCHET_SL = "RATCHET_SL"
+    CLOSE_TP = "CLOSE_TP"
+    CLOSE_SL = "CLOSE_SL"
+    CLOSE_TIME_DECAY = "CLOSE_TIME_DECAY"
+
+
+@dataclass(frozen=True)
 class StrategyContext:
-    """Immutable snapshot of candle & indicator state passed to declarative strategy methods."""
+    """
+    Immutable snapshot of candle & indicator state passed to declarative strategy methods.
+    Uninitialized / missing indicators default to float('nan') to prevent fail-open bugs.
+    """
     symbol: str
     timeframe: str
     current_price: float
-    open_price: float = 0.0
-    high_price: float = 0.0
-    low_price: float = 0.0
+    open_price: float = float("nan")
+    high_price: float = float("nan")
+    low_price: float = float("nan")
     volume: float = 0.0
-    atr: float = 0.0
-    adx: float = 20.0
-    rsi: float = 50.0
-    rsi_prev: float = 50.0
-    vwap: float = 0.0
-    lower_vwap_band: float = 0.0
-    upper_vwap_band: float = 0.0
-    ema20: float = 0.0
-    tenkan: float = 0.0
-    kijun: float = 0.0
-    cloud_top: float = 0.0
-    cloud_bottom: float = 0.0
-    vah: float = 0.0
-    val: float = 0.0
+    atr: float = float("nan")
+    adx: float = float("nan")
+    rsi: float = float("nan")
+    rsi_prev: float = float("nan")
+    vwap: float = float("nan")
+    lower_vwap_band: float = float("nan")
+    upper_vwap_band: float = float("nan")
+    ema20: float = float("nan")
+    tenkan: float = float("nan")
+    kijun: float = float("nan")
+    cloud_top: float = float("nan")
+    cloud_bottom: float = float("nan")
+    vah: float = float("nan")
+    val: float = float("nan")
     td_up: int = 0
     td_down: int = 0
     daily_trend: str = "NEUTRAL"  # BULLISH, BEARISH, NEUTRAL
@@ -45,6 +68,45 @@ class StrategyContext:
     bar_index: int = 0
     timestamp_ms: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def is_valid(self, strategy_name: str = "") -> bool:
+        """
+        Validates that required indicator and price inputs exist and are non-NaN.
+        Prevents trading on broken feeds or incomplete warm-up windows.
+        """
+        if not math.isfinite(self.current_price) or self.current_price <= 0.0:
+            return False
+        if not math.isfinite(self.open_price) or self.open_price <= 0.0:
+            return False
+        if not math.isfinite(self.high_price) or self.high_price <= 0.0:
+            return False
+        if not math.isfinite(self.low_price) or self.low_price <= 0.0:
+            return False
+        if self.high_price < self.low_price:
+            return False
+
+        # Common indicators across strategies
+        if not math.isfinite(self.adx) or not math.isfinite(self.rsi):
+            return False
+
+        if strategy_name == "SWING_4H":
+            # Requires ATR and Ichimoku fields
+            if not math.isfinite(self.atr) or self.atr <= 0.0:
+                return False
+            for val in (self.cloud_top, self.cloud_bottom, self.kijun, self.tenkan):
+                if not math.isfinite(val) or val <= 0.0:
+                    return False
+        elif strategy_name in ("GRID_MAKER", "SCALP_SHORT"):
+            if not math.isfinite(self.rsi_prev):
+                return False
+            if strategy_name == "GRID_MAKER":
+                if not math.isfinite(self.lower_vwap_band) or self.lower_vwap_band <= 0.0:
+                    return False
+            elif strategy_name == "SCALP_SHORT":
+                if not math.isfinite(self.upper_vwap_band) or self.upper_vwap_band <= 0.0:
+                    return False
+
+        return True
 
 
 @dataclass
@@ -63,9 +125,14 @@ class OrderPlan:
 
 @dataclass
 class ExitOrRatchetAction:
-    """Action returned by update_position() during in-flight candle evaluation."""
+    """
+    Action returned by update_position() during in-flight candle evaluation.
+    Pure evaluation: the caller amends the exchange stop and commits to local state
+    only after the exchange confirms.
+    """
     action: str             # "HOLD", "RATCHET_SL", "CLOSE_TP", "CLOSE_SL", "CLOSE_TIME_DECAY"
     new_sl: Optional[float] = None
+    new_peak_price: Optional[float] = None
     exit_price: Optional[float] = None
     reason: str = ""
 
@@ -121,8 +188,11 @@ class SwingKumoStrategy(BaseStrategy):
         self.vah_tol = float(getattr(config, "SWING_VOLUME_PROFILE_VAH_TOLERANCE", 0.985))
 
     def should_long(self, ctx: StrategyContext) -> bool:
+        if not ctx.is_valid(self.name):
+            return False
+
         c = ctx.current_price
-        bullish_candle = (ctx.open_price <= 0.0) or (c > ctx.open_price)
+        bullish_candle = c > ctx.open_price
         bullish_kumo = (
             bullish_candle and
             c > ctx.cloud_top and
@@ -130,12 +200,30 @@ class SwingKumoStrategy(BaseStrategy):
             ((ctx.tenkan >= ctx.kijun * 0.995) or (c > ctx.cloud_top * 1.002))
         )
         not_1d_bear = ctx.daily_trend != "BEARISH"
-        td_ok = ctx.td_up not in (9, 13)
-        return bool(bullish_kumo and ctx.adx >= self.min_adx and not_1d_bear and (40.0 <= ctx.rsi <= 72.0) and td_ok)
+        # Exhaustion check: block if count is 9 or above (9-13)
+        td_ok = not (9 <= ctx.td_up <= 13)
+
+        # Go-Stock VPVR Value Area Clearance check:
+        # Price should clear or be within tolerance of Value Area High (VAH)
+        vpvr_clear = True
+        if math.isfinite(ctx.vah) and ctx.vah > 0.0:
+            vpvr_clear = c >= (ctx.vah * self.vah_tol)
+
+        return bool(
+            bullish_kumo and
+            ctx.adx >= self.min_adx and
+            not_1d_bear and
+            (40.0 <= ctx.rsi <= 72.0) and
+            td_ok and
+            vpvr_clear
+        )
 
     def should_short(self, ctx: StrategyContext) -> bool:
+        if not ctx.is_valid(self.name):
+            return False
+
         c = ctx.current_price
-        bearish_candle = (ctx.open_price <= 0.0) or (c < ctx.open_price)
+        bearish_candle = c < ctx.open_price
         bearish_kumo = (
             bearish_candle and
             c < ctx.cloud_bottom and
@@ -143,8 +231,21 @@ class SwingKumoStrategy(BaseStrategy):
             ((ctx.tenkan <= ctx.kijun * 1.005) or (c < ctx.cloud_bottom * 0.998))
         )
         is_1d_bear = ctx.daily_trend == "BEARISH"
-        td_ok = ctx.td_down not in (9, 13)
-        return bool(bearish_kumo and ctx.adx >= self.min_adx and is_1d_bear and (28.0 <= ctx.rsi <= 60.0) and td_ok)
+        td_ok = not (9 <= ctx.td_down <= 13)
+
+        # Go-Stock VPVR Value Area Clearance for short (clear below VAL)
+        vpvr_clear = True
+        if math.isfinite(ctx.val) and ctx.val > 0.0:
+            vpvr_clear = c <= (ctx.val * (2.0 - self.vah_tol))
+
+        return bool(
+            bearish_kumo and
+            ctx.adx >= self.min_adx and
+            is_1d_bear and
+            (28.0 <= ctx.rsi <= 60.0) and
+            td_ok and
+            vpvr_clear
+        )
 
     def go_long(self, ctx: StrategyContext) -> OrderPlan:
         entry = ctx.current_price
@@ -195,12 +296,18 @@ class SwingKumoStrategy(BaseStrategy):
         )
 
     def update_position(self, ctx: StrategyContext, pos: Dict[str, Any]) -> Optional[ExitOrRatchetAction]:
+        """
+        Pure function: does NOT mutate pos in place.
+        Returns the action and proposed new_sl / new_peak_price for caller state commit.
+        """
         side = str(pos.get("side", "long")).lower()
         entry = float(pos["entry_price"])
         sl = float(pos["stop_loss"])
         tp = float(pos["take_profit"])
-        high_p = ctx.high_price or ctx.current_price
-        low_p = ctx.low_price or ctx.current_price
+
+        # Strictly inspect candle wicks; if missing/invalid, fallback to current_price
+        high_p = ctx.high_price if (math.isfinite(ctx.high_price) and ctx.high_price > 0) else ctx.current_price
+        low_p = ctx.low_price if (math.isfinite(ctx.low_price) and ctx.low_price > 0) else ctx.current_price
 
         if side == "long":
             if low_p <= sl:
@@ -209,7 +316,6 @@ class SwingKumoStrategy(BaseStrategy):
                 return ExitOrRatchetAction(action="CLOSE_TP", exit_price=tp, reason="TAKE_PROFIT")
 
             peak = max(float(pos.get("peak_price", entry)), high_p)
-            pos["peak_price"] = peak
             gain_pct = (peak - entry) / entry if entry > 0 else 0.0
 
             new_sl = sl
@@ -218,13 +324,19 @@ class SwingKumoStrategy(BaseStrategy):
             elif gain_pct >= 0.008:
                 new_sl = max(new_sl, entry * 1.0015)
 
-            if ctx.atr > 0 and (peak - entry) >= (2.0 * ctx.atr):
+            if math.isfinite(ctx.atr) and ctx.atr > 0 and (peak - entry) >= (2.0 * ctx.atr):
                 chandelier_sl = peak - (2.2 * ctx.atr)
                 new_sl = max(new_sl, chandelier_sl)
 
             if new_sl > sl and new_sl < ctx.current_price:
-                pos["stop_loss"] = new_sl
-                return ExitOrRatchetAction(action="RATCHET_SL", new_sl=new_sl, reason="SWING_RATCHET")
+                return ExitOrRatchetAction(
+                    action="RATCHET_SL",
+                    new_sl=new_sl,
+                    new_peak_price=peak,
+                    reason="SWING_RATCHET"
+                )
+            elif peak > float(pos.get("peak_price", entry)):
+                return ExitOrRatchetAction(action="HOLD", new_peak_price=peak)
         else:
             if high_p >= sl:
                 return ExitOrRatchetAction(action="CLOSE_SL", exit_price=sl, reason="STOP_LOSS")
@@ -232,7 +344,6 @@ class SwingKumoStrategy(BaseStrategy):
                 return ExitOrRatchetAction(action="CLOSE_TP", exit_price=tp, reason="TAKE_PROFIT")
 
             trough = min(float(pos.get("peak_price", entry)), low_p)
-            pos["peak_price"] = trough
             gain_pct = (entry - trough) / entry if entry > 0 else 0.0
 
             new_sl = sl
@@ -241,13 +352,19 @@ class SwingKumoStrategy(BaseStrategy):
             elif gain_pct >= 0.008:
                 new_sl = min(new_sl, entry * 0.9985)
 
-            if ctx.atr > 0 and (entry - trough) >= (2.0 * ctx.atr):
+            if math.isfinite(ctx.atr) and ctx.atr > 0 and (entry - trough) >= (2.0 * ctx.atr):
                 chandelier_sl = trough + (2.2 * ctx.atr)
                 new_sl = min(new_sl, chandelier_sl)
 
             if new_sl < sl and new_sl > ctx.current_price:
-                pos["stop_loss"] = new_sl
-                return ExitOrRatchetAction(action="RATCHET_SL", new_sl=new_sl, reason="SWING_RATCHET")
+                return ExitOrRatchetAction(
+                    action="RATCHET_SL",
+                    new_sl=new_sl,
+                    new_peak_price=trough,
+                    reason="SWING_RATCHET"
+                )
+            elif trough < float(pos.get("peak_price", entry)):
+                return ExitOrRatchetAction(action="HOLD", new_peak_price=trough)
 
         return ExitOrRatchetAction(action="HOLD")
 
@@ -268,13 +385,22 @@ class ChopGridMakerStrategy(BaseStrategy):
         self.leverage = int(getattr(config, "GRID_LEVERAGE", 3))
 
     def should_long(self, ctx: StrategyContext) -> bool:
+        if not ctx.is_valid(self.name):
+            return False
+
         if ctx.adx >= self.max_adx:
             return False
         if ctx.adx >= 22.0 and ctx.di_spread < -4.0:
             return False
+
         c_range = max(ctx.high_price - ctx.low_price, 1e-6)
         lower_wick_ratio = (min(ctx.open_price, ctx.current_price) - ctx.low_price) / c_range
-        rebound_hook = (ctx.current_price >= ctx.open_price) or (lower_wick_ratio >= 0.25) or (ctx.rsi > ctx.rsi_prev)
+        # Rebound hook requires either a bullish close with non-trivial lower wick, or a meaningful hammer
+        rebound_hook = (
+            (ctx.current_price > ctx.open_price and lower_wick_ratio >= 0.20) or
+            (lower_wick_ratio >= 0.35) or
+            (ctx.rsi >= (ctx.rsi_prev + 1.0))
+        )
         return bool(ctx.rsi <= self.rsi_thresh and ctx.current_price <= ctx.lower_vwap_band and rebound_hook)
 
     def go_long(self, ctx: StrategyContext) -> OrderPlan:
@@ -294,11 +420,15 @@ class ChopGridMakerStrategy(BaseStrategy):
         )
 
     def update_position(self, ctx: StrategyContext, pos: Dict[str, Any]) -> Optional[ExitOrRatchetAction]:
+        side = str(pos.get("side", "long")).lower()
+        if side != "long":
+            return ExitOrRatchetAction(action="HOLD")
+
         entry = float(pos["entry_price"])
         sl = float(pos["stop_loss"])
         tp = float(pos["take_profit"])
-        high_p = ctx.high_price or ctx.current_price
-        low_p = ctx.low_price or ctx.current_price
+        high_p = ctx.high_price if (math.isfinite(ctx.high_price) and ctx.high_price > 0) else ctx.current_price
+        low_p = ctx.low_price if (math.isfinite(ctx.low_price) and ctx.low_price > 0) else ctx.current_price
 
         if low_p <= sl:
             return ExitOrRatchetAction(action="CLOSE_SL", exit_price=sl, reason="STOP_LOSS")
@@ -306,7 +436,6 @@ class ChopGridMakerStrategy(BaseStrategy):
             return ExitOrRatchetAction(action="CLOSE_TP", exit_price=tp, reason="TAKE_PROFIT")
 
         peak = max(float(pos.get("peak_price", entry)), high_p)
-        pos["peak_price"] = peak
         gain_pct = (peak - entry) / entry if entry > 0 else 0.0
 
         new_sl = sl
@@ -314,8 +443,14 @@ class ChopGridMakerStrategy(BaseStrategy):
             new_sl = max(new_sl, entry * 1.0015)
 
         if new_sl > sl and new_sl < ctx.current_price:
-            pos["stop_loss"] = new_sl
-            return ExitOrRatchetAction(action="RATCHET_SL", new_sl=new_sl, reason="GRID_BE_RATCHET")
+            return ExitOrRatchetAction(
+                action="RATCHET_SL",
+                new_sl=new_sl,
+                new_peak_price=peak,
+                reason="GRID_BE_RATCHET"
+            )
+        elif peak > float(pos.get("peak_price", entry)):
+            return ExitOrRatchetAction(action="HOLD", new_peak_price=peak)
 
         return ExitOrRatchetAction(action="HOLD")
 
@@ -335,10 +470,14 @@ class BearScalpShortStrategy(BaseStrategy):
         self.rsi_overbought = float(getattr(config, "SCALP_SHORT_RSI_OVERBOUGHT", 68.0))
         self.min_rsi = float(getattr(config, "SCALP_SHORT_MIN_RSI", 38.0))
         self.max_adx = float(getattr(config, "SCALP_SHORT_MAX_5M_ADX", 22.0))
-        self.leverage = int(getattr(config, "GRID_LEVERAGE", 3))
+        # Dedicated leverage setting for ScalpShort with fallback to GRID_LEVERAGE
+        self.leverage = int(getattr(config, "SCALP_SHORT_LEVERAGE", getattr(config, "GRID_LEVERAGE", 3)))
         self.max_hold_bars_5m = 9  # 45 minutes (9 x 5m bars)
 
     def should_short(self, ctx: StrategyContext) -> bool:
+        if not ctx.is_valid(self.name):
+            return False
+
         if ctx.rsi < self.min_rsi:
             return False
 
@@ -351,7 +490,11 @@ class BearScalpShortStrategy(BaseStrategy):
         has_bearish_reversal = (is_red and upper_wick_ratio >= 0.25) or (is_shooting_star and is_rsi_falling)
 
         if ctx.market_regime == "BEAR":
-            bounced = (ctx.current_price >= ctx.vwap * 0.997) or (ctx.current_price >= ctx.ema20 * 0.998)
+            bounced = False
+            if math.isfinite(ctx.vwap) and ctx.vwap > 0:
+                bounced = bounced or (ctx.current_price >= ctx.vwap * 0.997)
+            if math.isfinite(ctx.ema20) and ctx.ema20 > 0:
+                bounced = bounced or (ctx.current_price >= ctx.ema20 * 0.998)
             return bool(bounced and (45.0 <= ctx.rsi <= 68.0) and has_bearish_reversal)
         else:
             # CHOP Range Top Fade
@@ -380,29 +523,41 @@ class BearScalpShortStrategy(BaseStrategy):
         )
 
     def update_position(self, ctx: StrategyContext, pos: Dict[str, Any]) -> Optional[ExitOrRatchetAction]:
+        side = str(pos.get("side", "short")).lower()
+        if side != "short":
+            return ExitOrRatchetAction(action="HOLD")
+
         entry = float(pos["entry_price"])
         sl = float(pos["stop_loss"])
         tp = float(pos["take_profit"])
-        high_p = ctx.high_price or ctx.current_price
-        low_p = ctx.low_price or ctx.current_price
+        high_p = ctx.high_price if (math.isfinite(ctx.high_price) and ctx.high_price > 0) else ctx.current_price
+        low_p = ctx.low_price if (math.isfinite(ctx.low_price) and ctx.low_price > 0) else ctx.current_price
 
         if high_p >= sl:
             return ExitOrRatchetAction(action="CLOSE_SL", exit_price=sl, reason="STOP_LOSS")
         if low_p <= tp:
             return ExitOrRatchetAction(action="CLOSE_TP", exit_price=tp, reason="TAKE_PROFIT")
 
-        bars_held = ctx.bar_index - int(pos.get("entry_bar", ctx.bar_index))
-        if bars_held >= self.max_hold_bars_5m:
+        # Explicitly check entry_bar; if not set, fallback to 0 so time decay can fire
+        entry_bar = int(pos.get("entry_bar", 0))
+        bars_held = ctx.bar_index - entry_bar if entry_bar > 0 else 0
+        if entry_bar > 0 and bars_held >= self.max_hold_bars_5m:
             return ExitOrRatchetAction(action="CLOSE_TIME_DECAY", exit_price=ctx.current_price, reason="TIME_DECAY_45M")
 
         trough = min(float(pos.get("peak_price", entry)), low_p)
-        pos["peak_price"] = trough
         gain_pct = (entry - trough) / entry if entry > 0 else 0.0
 
         if gain_pct >= self.be_trigger:
             new_sl = min(sl, entry * 0.9995)
             if new_sl < sl and new_sl > ctx.current_price:
-                pos["stop_loss"] = new_sl
-                return ExitOrRatchetAction(action="RATCHET_SL", new_sl=new_sl, reason="SCALP_SHORT_BE_RATCHET")
+                return ExitOrRatchetAction(
+                    action="RATCHET_SL",
+                    new_sl=new_sl,
+                    new_peak_price=trough,
+                    reason="SCALP_SHORT_BE_RATCHET"
+                )
+
+        if trough < float(pos.get("peak_price", entry)):
+            return ExitOrRatchetAction(action="HOLD", new_peak_price=trough)
 
         return ExitOrRatchetAction(action="HOLD")
