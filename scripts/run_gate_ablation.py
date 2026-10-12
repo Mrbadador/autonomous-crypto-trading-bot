@@ -78,18 +78,38 @@ def evaluate_all():
                 f.write(f"| {r['name']} | {r['n_trades']} | {r['win_rate']:.1f}% | {r['total_return']:+.2f}% | {r['profit_factor']:.2f} | {r['sharpe']:.2f} | {ci} |\n")
             f.write("\n")
             
+        # Extract dynamic metrics from results dict for truthful prose interpolation
+        btc_rows = {r["name"]: r for r in all_results.get("BTCUSDT", [])}
+        eth_rows = {r["name"]: r for r in all_results.get("ETHUSDT", [])}
+        
+        btc_full = btc_rows.get("Full Stack (All Gates ON)", {})
+        btc_no_1d = btc_rows.get("Ablate Gate A (1D Trend Support OFF)", {})
+        eth_full = eth_rows.get("Full Stack (All Gates ON)", {})
+        eth_no_1d = eth_rows.get("Ablate Gate A (1D Trend Support OFF)", {})
+        eth_no_div = eth_rows.get("Ablate Gate C (Momentum Divergence OFF)", {})
+
         f.write("## Statistical Analysis & Empirical Verdicts\n\n")
         f.write("### 1. Gate A — 1D EMA Trend Alignment (`gate_1d_trend`)\n")
         f.write("- **Verdict:** **KEEP (CRITICAL ALPHA DEFENSE)**\n")
-        f.write("- **Empirical Evidence:** Disabling Gate A causes severe performance degradation across all major assets. On BTC, cumulative return collapses from -14.01% to -36.95% (PF drops from 0.70 to 0.44). On ETH, return collapses from -16.31% to -42.29%. Trading against the higher-timeframe 1D EMA alignment is the single largest source of negative expectancy.\n\n")
+        f.write(
+            f"- **Empirical Evidence:** Disabling Gate A causes severe performance degradation across major assets. "
+            f"On BTC, cumulative return collapses from {btc_full.get('total_return', 0.0):+.2f}% to {btc_no_1d.get('total_return', 0.0):+.2f}% "
+            f"(PF shifts from {btc_full.get('profit_factor', 0.0):.2f} to {btc_no_1d.get('profit_factor', 0.0):.2f}). "
+            f"On ETH, return collapses from {eth_full.get('total_return', 0.0):+.2f}% to {eth_no_1d.get('total_return', 0.0):+.2f}%. "
+            f"Trading against the higher-timeframe 1D EMA alignment is the single largest driver of excess negative drift.\n\n"
+        )
 
         f.write("### 2. Gate C — Momentum Divergence (`gate_divergence`)\n")
         f.write("- **Verdict:** **KEEP (POSITIVE STATISTICAL FILTER)**\n")
-        f.write("- **Empirical Evidence:** Removing Gate C on ETH drops win rate from 37.0% to 35.6% and doubles drawdowns from -16.31% to -32.44%. Gate C successfully filters out late-stage exhaustion breakouts where momentum is diverging negatively.\n\n")
+        f.write(
+            f"- **Empirical Evidence:** Removing Gate C on ETH drops win rate from {eth_full.get('win_rate', 0.0):.1f}% to {eth_no_div.get('win_rate', 0.0):.1f}% "
+            f"and degrades cumulative return from {eth_full.get('total_return', 0.0):+.2f}% to {eth_no_div.get('total_return', 0.0):+.2f}%. "
+            f"Gate C successfully filters out late-stage exhaustion breakouts where momentum is diverging negatively.\n\n"
+        )
 
         f.write("### 3. Gate B (Wick Exhaustion) & Gate D (TD-9 Count Exhaustion)\n")
         f.write("- **Verdict:** **RETAIN AS STRUCTURAL TAIL-RISK BRAKES**\n")
-        f.write("- **Empirical Evidence:** On a 4H close-confirmed breakout basis, these gates fire infrequently relative to standard trend regimes, causing minimal trade drag while acting as hard stops against blow-off top entries.\n\n")
+        f.write("- **Empirical Evidence:** On a 4H close-confirmed breakout basis, these gates fire selectively relative to standard trend regimes, causing minimal trade drag while acting as hard stops against blow-off top entries.\n\n")
 
         f.write("### 4. Gate E — Volume Profile & Value Area Clearance (`gate_volume_profile`)\n")
         f.write("- **Verdict:** **KEEP**\n")

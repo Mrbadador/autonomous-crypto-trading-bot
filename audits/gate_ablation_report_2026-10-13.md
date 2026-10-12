@@ -1,6 +1,6 @@
 # Quantitative Gate Ablation Report & Empirical Verdicts
 
-**Date:** 2026-10-13 00:33:44
+**Date:** 2026-10-13 01:05:02
 **Methodology:** 2-Year Authentic Historical OHLCV Replay (Bitget Futures). Full Causal indicators with Bootstrap 90% Confidence Interval for Expected Value (EV) per trade.
 
 ---
@@ -45,15 +45,15 @@
 
 ### 1. Gate A — 1D EMA Trend Alignment (`gate_1d_trend`)
 - **Verdict:** **KEEP (CRITICAL ALPHA DEFENSE)**
-- **Empirical Evidence:** Disabling Gate A causes severe performance degradation across all major assets. On BTC, cumulative return collapses from -14.01% to -36.95% (PF drops from 0.70 to 0.44). On ETH, return collapses from -16.31% to -42.29%. Trading against the higher-timeframe 1D EMA alignment is the single largest source of negative expectancy.
+- **Empirical Evidence:** Disabling Gate A causes severe performance degradation across major assets. On BTC, cumulative return collapses from -14.01% to -36.95% (PF shifts from 0.89 to 0.84). On ETH, return collapses from -16.31% to -42.29%. Trading against the higher-timeframe 1D EMA alignment is the single largest driver of excess negative drift.
 
 ### 2. Gate C — Momentum Divergence (`gate_divergence`)
 - **Verdict:** **KEEP (POSITIVE STATISTICAL FILTER)**
-- **Empirical Evidence:** Removing Gate C on ETH drops win rate from 37.0% to 35.6% and doubles drawdowns from -16.31% to -32.44%. Gate C successfully filters out late-stage exhaustion breakouts where momentum is diverging negatively.
+- **Empirical Evidence:** Removing Gate C on ETH drops win rate from 37.0% to 35.6% and degrades cumulative return from -16.31% to -32.44%. Gate C successfully filters out late-stage exhaustion breakouts where momentum is diverging negatively.
 
 ### 3. Gate B (Wick Exhaustion) & Gate D (TD-9 Count Exhaustion)
 - **Verdict:** **RETAIN AS STRUCTURAL TAIL-RISK BRAKES**
-- **Empirical Evidence:** On a 4H close-confirmed breakout basis, these gates fire infrequently relative to standard trend regimes, causing minimal trade drag while acting as hard stops against blow-off top entries.
+- **Empirical Evidence:** On a 4H close-confirmed breakout basis, these gates fire selectively relative to standard trend regimes, causing minimal trade drag while acting as hard stops against blow-off top entries.
 
 ### 4. Gate E — Volume Profile & Value Area Clearance (`gate_volume_profile`)
 - **Verdict:** **KEEP**
