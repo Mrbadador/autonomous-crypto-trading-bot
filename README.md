@@ -16,6 +16,11 @@ A production-grade, multi-asset crypto futures trading system featuring a **Dual
   - **5m Chop Maker Grid**: Low-latency, post-only limit order grid designed to capture mean-reverting chop while earning maker fee rebates.
 - **Microstructure & Order Flow Filtering (OFI)**:
   - Real-time Level-2 order book depth tracking, flow toxicity estimation (VPIN), and empirical position sizing via Quarter-Kelly criterion.
+- **Causal Quantitative Indicator Pipeline**:
+  - Zero lookahead bias (`row t` strictly depends on closes $\le t$), strict OHLCV integrity validation, and cold-start warm-up verification ($N \ge 600$ bars required for EMA200).
+  - Causal Tom DeMark Setup engine (`td_setup_counts`) requiring price-flip initiation and completing cleanly at TD-9 without indefinite rollover.
+  - Confirmed $k$-bar fractal momentum divergence (RSI & MACD histogram) with strict bar separation and ATR-normalized displacement to prevent pivot repainting.
+  - Prior-bar Volume Profile (VPVR: POC, VAH, VAL) calculation avoiding in-flight candle lookahead leaks.
 - **Multi-Agent AI Boardroom**:
   - Consensus filtering using primary LLM reasoning (Gemini Flash) with automatic zero-downtime failover to high-throughput secondary pools (Groq / Llama-3).
   - In-flight position monitoring, early structural invalidation, and automated post-mortem trade analysis.
@@ -117,8 +122,16 @@ flowchart TD
 - **Independent Daemons**: Daemons (`ofi_daemon.py`, `regime_classifier.py`, `macro_sentinel.py`) run as standalone background processes. If an external RSS feed or sentiment API times out, the core order execution engine continues operating uninterrupted.
 - **SQLite WAL Concurrency**: All daemons communicate through SQLite Write-Ahead Logging (`WAL` mode) with a unified `DBWriteQueue` and busy-timeout retry handlers, eliminating database lock contention.
 - **Fail-Safe Fallbacks**: If the AI boardroom (Gemini/Groq) encounters rate limits (HTTP 429) or network disconnects, it defaults to a strict **fail-closed** mode for speculative entries while allowing risk-reducing exits.
-- **Standalone Execution**: Any engine can be run independently for testing or isolated debugging:
+- **Quantitative Pipeline Invariants**:
+  - **Zero Lookahead & Truncation Invariance**: `row t` computed on slice `df[:t+1]` strictly equals `row t` from full history.
+  - **Strict Warm-up Enforcement**: Requires $N \ge 600$ candles before trusting long-memory indicators (EMA200, Wilder ADX/ATR/RSI). Unwarmed or corrupted candles return `NaN` and force an `UNKNOWN` regime, preventing cold-start trading on random seed weights.
+  - **Causal TD-9 Setups**: Rebuilt from first principles with mandatory price-flip initiation and strict completion at count 9 without rollover.
+  - **Pure State Updates**: Strategy evaluations (`update_position`) are pure mathematical transformations that never mutate active positions until exchange ACK is received.
+- **Standalone Execution & Verification**:
   ```bash
+  # Run the causal indicators unit test suite:
+  python tests/test_indicators.py
+
   # Run only the 4H Swing engine in dry-run mode:
   python swing_trader.py --dry-run
 
