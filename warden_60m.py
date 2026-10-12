@@ -105,8 +105,8 @@ class Warden60Minute:
         df_15m = await self.fetch_15m_data()
 
         if df_1h is None or len(df_1h) < 21:
-            log.warning("[60M-WARDEN] Insufficient 1H data. Defaulting to CHOP_GRID_ACTIVE.")
-            return "CHOP_GRID_ACTIVE"
+            log.warning("[60M-WARDEN] Insufficient 1H data (fail-closed). Defaulting to CAPITAL_PRESERVATION.")
+            return "CAPITAL_PRESERVATION"
 
         # 1H Vectorized dual-EMA stack
         df_1h["EMA_9"]  = df_1h["close_price"].ewm(span=9,  adjust=False).mean()

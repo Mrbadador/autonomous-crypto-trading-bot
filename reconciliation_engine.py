@@ -385,6 +385,21 @@ async def audit_live_exchange_positions():
                                     pass
 
                             if (s_sym, norm_side) not in live_exchange_keys and (s_sym.replace("/", ""), norm_side) not in live_exchange_keys:
+                                # P0 SAFEGUARD: Double-check with a targeted single-symbol fetch to prevent false closure on partial batch drops
+                                try:
+                                    targeted_chk = await uta.fetch_positions(symbol=s_sym)
+                                    matching_live = [
+                                        p for p in (targeted_chk or [])
+                                        if float(p.get("total", 0.0) or p.get("contracts", 0.0) or 0.0) > 0
+                                        and str(p.get("posSide", "long")).lower() == norm_side
+                                    ]
+                                    if matching_live:
+                                        log.warning(f"[RECONCILER-SHIELD] 🛡️ Partial API drop prevented! Global list missed {s_sym} {norm_side.upper()}, but targeted query confirmed active position. Preserving local record.")
+                                        continue
+                                except Exception as target_err:
+                                    log.warning(f"[RECONCILER-SHIELD] Targeted verification for {s_sym} returned error ({target_err}). Skipping pruning this cycle to prevent accidental deletion.")
+                                    continue
+
                                 log.info(f"[RECONCILER] Detected on-exchange closure for {tbl} -> {s_sym} {norm_side.upper()}. Reconciling & notifying...")
                                 
                                 entry_p = float(row_dict.get("entry_price", 0.0) or 0.0)

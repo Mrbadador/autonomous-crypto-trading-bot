@@ -808,8 +808,7 @@ with st.sidebar:
             st.caption("⚠️ *Auto Risk Cap Halt is currently active (margin/slot ceiling).*")
         if pause_entries != curr_op_halt:
             new_val = "1" if pause_entries else "0"
-            execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('OPERATOR_HALT', ?, datetime('now'))", (new_val,))
-            if execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('RISK_HALT', ?, datetime('now'))", (new_val,)):
+            if execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('OPERATOR_HALT', ?, datetime('now'))", (new_val,)):
                 st.toast(f"Fleet State Updated: {'Entries Paused (Close-Only)' if pause_entries else 'Manual Pause Cleared'}")
                 st.rerun()
 
@@ -835,16 +834,22 @@ with st.sidebar:
                 st.error(f"Failed to dispatch email: {em_ui_err}")
 
     st.markdown("---")
-    live_bal_val = float(query_system_state("balance", "155.50"))
+    bal_str = query_system_state("balance", None)
+    live_bal_val = float(bal_str) if bal_str and bal_str != "None" else None
     total_deposited = float(query_system_state("user_total_deposit", os.getenv("INITIAL_BALANCE", "250.00")))
     deposit_t1 = float(query_system_state("initial_deposit_tranche_1", "55.00"))
     deposit_t2 = float(query_system_state("topup_deposit_tranche_2", "82.00"))
     deposit_t3 = float(query_system_state("topup_deposit_tranche_3", "113.00"))
-    total_profit = live_bal_val - total_deposited
-    total_roi_pct = (total_profit / total_deposited) * 100.0 if total_deposited > 0 else 0.0
 
     st.write(f"**Connected Exchange:** Bitget UTA (Live)")
-    st.write(f"**Current Equity:** `${live_bal_val:.2f} USDT`")
+    if live_bal_val is not None:
+        total_profit = live_bal_val - total_deposited
+        total_roi_pct = (total_profit / total_deposited) * 100.0 if total_deposited > 0 else 0.0
+        st.write(f"**Current Equity:** `${live_bal_val:.2f} USDT`")
+    else:
+        st.write(f"**Current Equity:** `⚠️ Telemetry Offline (Syncing...)`")
+        total_profit = 0.0
+        total_roi_pct = 0.0
     st.write(f"**Deposited Capital:** `${total_deposited:.2f} USDT`")
     tranche_str = f"↳ Seed: `${deposit_t1:.2f}` | Top-up 1: `${deposit_t2:.2f}`"
     if deposit_t3 > 0:

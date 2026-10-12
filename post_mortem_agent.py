@@ -195,12 +195,20 @@ Output exactly ONE JSON object (no markdown, no extra text) with this schema:
                         r_txt = str(resp_json["learned_rule"]).strip()
                         r_conf = max(0.50, min(0.95, float(resp_json.get("rule_confidence") or 0.75)))
                         try:
-                            conn_ledger.execute(
-                                "INSERT INTO learned_rules (category, rule_text, confidence, created_at) VALUES (?, ?, ?, datetime('now'))",
-                                (r_cat, r_txt, r_conf)
-                            )
-                            conn_ledger.commit()
-                            log.info(f"[POST-MORTEM-RULE] 🧠 Added Dynamic Learned Rule: [{r_cat}] {r_txt} (Conf: {r_conf:.0%})")
+                            # Verify if an identical or highly similar rule already exists in memory
+                            exists = conn_ledger.execute(
+                                "SELECT id FROM learned_rules WHERE category = ? AND rule_text = ?",
+                                (r_cat, r_txt)
+                            ).fetchone()
+                            if not exists:
+                                conn_ledger.execute(
+                                    "INSERT INTO learned_rules (category, rule_text, confidence, created_at) VALUES (?, ?, ?, datetime('now'))",
+                                    (r_cat, r_txt, r_conf)
+                                )
+                                conn_ledger.commit()
+                                log.info(f"[POST-MORTEM-RULE] 🧠 Added Dynamic Learned Rule: [{r_cat}] {r_txt} (Conf: {r_conf:.0%})")
+                            else:
+                                log.debug(f"[POST-MORTEM-RULE] Duplicate rule already present in ledger: [{r_cat}] {r_txt}")
                         except Exception as re_err:
                             log.warning(f"Error inserting learned rule: {re_err}")
 

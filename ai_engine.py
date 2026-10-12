@@ -599,7 +599,9 @@ class LLMClient:
                 if os.path.exists(ledger_db):
                     with _sq.connect(ledger_db, timeout=5) as _conn:
                         rows = _conn.execute(
-                            "SELECT category, rule_text, confidence FROM learned_rules ORDER BY confidence DESC LIMIT 50"
+                            "SELECT category, rule_text, confidence FROM learned_rules "
+                            "WHERE confidence >= 0.70 AND created_at >= datetime('now', '-30 days') "
+                            "ORDER BY confidence DESC LIMIT 25"
                         ).fetchall()
                         for row in rows:
                             rules.append(f"[{row[0]}] (conf={row[2]:.0%}) {row[1]}")

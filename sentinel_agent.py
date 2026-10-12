@@ -491,10 +491,6 @@ class SentimentSentinel:
         If memory cache and `sentiment_state.json` are both missing or >2h stale, performs an
         immediate live RSS refresh; if that also fails, fails CLOSED (`VETO`).
         """
-        override = self._check_playbook_override(direction)
-        if override is not None:
-            return override
-
         ticker_up = ticker.upper()
         if not (self._is_cache_entry_fresh("GLOBAL") and self._is_cache_entry_fresh(ticker_up)):
             loaded = await asyncio.to_thread(self._load_shared_sentiment_state)
@@ -506,6 +502,10 @@ class SentimentSentinel:
             reason = f"[SENTINEL FAIL-CLOSED] Sentiment & RSS state missing or stale (>2h) for {ticker_up}."
             log.error(reason)
             return "VETO", reason, 0.0
+
+        override = self._check_playbook_override(direction)
+        if override is not None:
+            return override
 
         g_status, g_msg, _ = self._cache["GLOBAL"]
         if g_status == "VETO":

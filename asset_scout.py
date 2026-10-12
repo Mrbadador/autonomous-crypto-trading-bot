@@ -446,6 +446,7 @@ def run_scout():
                         conn.execute("PRAGMA journal_mode=WAL;")
                         conn.execute("PRAGMA busy_timeout=60000;")
                         with conn:
+                            formatted_symbols = [p['symbol'][:-4] + '/USDT' for p in top_10]
                             for idx, p in enumerate(top_10):
                                 formatted_symbol = p['symbol'][:-4] + '/USDT'
                                 conn.execute("""
@@ -455,6 +456,13 @@ def run_scout():
                             
                             conn.execute("DELETE FROM active_fleet_config WHERE id > ?", (len(top_10),))
                             
+                            # Connect directly to ALLOWED_SYMBOLS gate in conviction_filter.py
+                            import json as _json
+                            conn.execute("""
+                                INSERT OR REPLACE INTO system_state (key, value, updated_at)
+                                VALUES ('ALLOWED_SYMBOLS', ?, ?)
+                            """, (_json.dumps(formatted_symbols), timestamp))
+
                             conn.execute("""
                                 INSERT OR REPLACE INTO system_state (key, value, updated_at)
                                 VALUES ('asset_scout_last_sweep_timestamp', ?, ?)

@@ -99,27 +99,31 @@ async def run_recovery_loop():
                             regime = await warden.determine_regime()
                             
                             if (side == "long" and regime == "LONG_ONLY") or (side == "short" and regime == "SHORT_ONLY"):
-                                # P1-PATCH: 4-hour DCA re-entry guard.
-                                # Prevents loop from stacking 10+ DCAs on a sustained drawdown.
+                                # P1-PATCH: Persist DCA count & cooldown in SQLite system_state to survive daemon restarts
                                 DCA_COOLDOWN_SECONDS = 4 * 3600  # 4 hours
-                                last_dca = last_dca_time.get(symbol, 0)
-                                time_since_last_dca = time.time() - last_dca
-                                
+                                dca_state_key = f"dca_state_{symbol}_{side}"
+                                dca_meta = {"count": 0, "last_ts": 0.0}
+                                try:
+                                    conn_st = sqlite3.connect(db_path, timeout=5.0)
+                                    row_st = conn_st.execute("SELECT value FROM system_state WHERE key = ?", (dca_state_key,)).fetchone()
+                                    if row_st and row_st[0]:
+                                        import json as _json
+                                        dca_meta = _json.loads(row_st[0])
+                                    conn_st.close()
+                                except Exception:
+                                    pass
+
+                                time_since_last_dca = time.time() - float(dca_meta.get("last_ts", 0.0))
+                                current_dca_count = int(dca_meta.get("count", 0))
+
                                 if time_since_last_dca < DCA_COOLDOWN_SECONDS:
                                     remaining_mins = (DCA_COOLDOWN_SECONDS - time_since_last_dca) / 60
-                                    log.info(f"[RECOVERY] DCA cooldown active for {symbol}. "
+                                    log.info(f"[RECOVERY] DCA cooldown active for {symbol} ({side}). "
                                              f"Next DCA eligible in {remaining_mins:.0f}m. Skipping.")
+                                elif current_dca_count >= 3:
+                                    log.warning(f"[RECOVERY] MAX DCA LIMIT (3) reached for {symbol} ({side}). Aborting further DCAs to prevent liquidation.")
                                 else:
                                     dca_qty = qty * 0.5
-                                    
-                                    # dca_count is tracked on the warden object.
-                                    # The warden is guaranteed initialized above.
-                                    if not hasattr(warden, 'dca_count'):
-                                        warden.dca_count = 0
-                                        
-                                    if warden.dca_count >= 3:
-                                        log.warning(f"[RECOVERY] MAX DCA LIMIT (3) reached for {symbol}. Aborting further DCAs to prevent liquidation.")
-                                        continue
                                     
                                     # Execute DCA Recovery Order on the Exchange!
                                     try:
@@ -138,22 +142,43 @@ async def run_recovery_loop():
                                     new_qty = qty + dca_qty
                                     new_entry_price = ((entry_price * qty) + (current_price * dca_qty)) / new_qty
                                     
-                                    # Execute DCA Recovery DB Update
+                                    # Proportional Stop Loss Recalculation to prevent liquidation
+                                    # Maintain original stop percentage distance relative to new entry
+                                    old_sl_dist_pct = abs(entry_price - stop_loss) / entry_price if (stop_loss and entry_price > 0) else 0.03
+                                    new_sl = new_entry_price * (1.0 - old_sl_dist_pct) if side == "long" else new_entry_price * (1.0 + old_sl_dist_pct)
+                                    
+                                    # Update native strategy stop loss order on Bitget
+                                    if ex_id == "bitget":
+                                        try:
+                                            uta = get_bitget_uta_client()
+                                            await uta.modify_strategy_order(symbol, sl=new_sl)
+                                            await uta.close()
+                                            log.info(f"[RECOVERY] Exchange Stop Loss updated to ${new_sl:,.4f} for {symbol} {side.upper()}")
+                                        except Exception as sl_mod_err:
+                                            log.warning(f"[RECOVERY] Could not modify exchange SL after DCA: {sl_mod_err}")
+
+                                    # Execute DCA Recovery DB Update (strictly scoped by symbol AND side)
                                     conn_dca = sqlite3.connect(db_path, timeout=10.0)
                                     conn_dca.execute("PRAGMA journal_mode=WAL;")
                                     conn_dca.execute("PRAGMA busy_timeout=30000;")
-                                    conn_dca.execute(f"UPDATE {table_name} SET qty = ?, entry_price = ? WHERE symbol = ?",
-                                                 (new_qty, new_entry_price, symbol))
+                                    conn_dca.execute(
+                                        f"UPDATE {table_name} SET qty = ?, entry_price = ?, stop_loss = ? WHERE symbol = ? AND LOWER(side) = ?",
+                                        (new_qty, new_entry_price, new_sl, symbol, side.lower())
+                                    )
+                                    # Persist DCA state to survive restarts
+                                    dca_meta["count"] = current_dca_count + 1
+                                    dca_meta["last_ts"] = time.time()
+                                    import json as _json
+                                    conn_dca.execute(
+                                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                                        (dca_state_key, _json.dumps(dca_meta))
+                                    )
                                     conn_dca.commit()
                                     conn_dca.close()
                                     
-                                    # Record DCA timestamp to enforce cooldown on next iteration
-                                    last_dca_time[symbol] = time.time()
-                                    warden.dca_count += 1
-                                    
                                     # Log AFTER the DB update to confirm end-to-end success
-                                    log.info(f"[RECOVERY] Position {symbol} underwater. Macro valid. Safety DCA completed.")
-                                    log.info(f"           -> Old Entry: {entry_price:.2f} | New Entry: {new_entry_price:.2f} | Qty: {new_qty:.4f} | DCA #{warden.dca_count}")
+                                    log.info(f"[RECOVERY] Position {symbol} ({side}) underwater. Macro valid. Safety DCA #{dca_meta['count']} completed.")
+                                    log.info(f"           -> Old Entry: {entry_price:.4f} | New Entry: {new_entry_price:.4f} | New SL: {new_sl:.4f} | Qty: {new_qty:.4f}")
                     except Exception as e:
                         log.error(f"[RECOVERY] Error processing {symbol}: {e}")
                         

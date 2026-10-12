@@ -142,7 +142,7 @@ def _section_financials() -> tuple[str, list[str]]:
     if total_pnl < -10:
         alerts.append(f"ALERT: 6h Net PnL is {total_pnl:+.2f} USDT — drawdown exceeds $10.")
 
-    # Open positions across all fleet engines (Sniper, Berserker, MARL)
+    # Open positions across all fleet engines (Sniper, Berserker, MARL, Swing Architect)
     open_pos = _safe_query(
         TRADING_DATA_DB,
         "SELECT symbol, side, entry_price, take_profit, stop_loss, qty, leverage, entry_time FROM open_positions "
@@ -150,14 +150,16 @@ def _section_financials() -> tuple[str, list[str]]:
         "SELECT symbol, side, entry_price, take_profit, stop_loss, qty, leverage, entry_time FROM berserker_open_positions "
         "UNION ALL "
         "SELECT symbol, side, entry_price, take_profit, stop_loss, qty, leverage, entry_time FROM marl_live_open_positions "
+        "UNION ALL "
+        "SELECT symbol, side, entry_price, take_profit, stop_loss, size AS qty, leverage, opened_at AS entry_time FROM swing_open_positions "
         "ORDER BY entry_time ASC"
     )
 
     # Fetch live account balance from system_state
     bal_rows = _safe_query(TRADING_DATA_DB, "SELECT value FROM system_state WHERE key = 'balance'")
-    live_bal = float(bal_rows[0]['value']) if bal_rows and bal_rows[0].get('value') else 155.50
+    live_bal = float(bal_rows[0]['value']) if bal_rows and bal_rows[0].get('value') and bal_rows[0]['value'] != 'None' else float(os.getenv("INITIAL_BALANCE", "250.00"))
     dep_rows = _safe_query(TRADING_DATA_DB, "SELECT value FROM system_state WHERE key = 'user_total_deposit'")
-    init_bal = float(dep_rows[0]['value']) if dep_rows and dep_rows[0].get('value') else float(os.getenv("INITIAL_BALANCE", "137.00"))
+    init_bal = float(dep_rows[0]['value']) if dep_rows and dep_rows[0].get('value') else float(os.getenv("INITIAL_BALANCE", "250.00"))
     tot_roi = ((live_bal - init_bal) / init_bal) * 100.0 if init_bal > 0 else 0.0
     tot_profit = live_bal - init_bal
     

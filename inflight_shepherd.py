@@ -497,9 +497,15 @@ class InflightPositionShepherd:
 
                                 if rev_action == "EXIT_IMMEDIATE" and not breathing_room_active:
                                     log.warning(f"[EARLY-REVERSAL] 🚨 Closing {std_sym} immediately to preserve capital and abort failing trade...")
-                                    close_res = await client.close_position_order(clean_sym, pos_side, size)
-                                    verdict = "EARLY_REVERSAL_EXIT"
-                                    diagnosis = f"Early Reversal Capital Defense Exit: {rev_reason}"
+                                    try:
+                                        close_res = await client.close_position_order(clean_sym, pos_side, size)
+                                        if close_res:
+                                            verdict = "EARLY_REVERSAL_EXIT"
+                                            diagnosis = f"Early Reversal Capital Defense Exit: {rev_reason}"
+                                        else:
+                                            log.error(f"[EARLY-REVERSAL] Close position returned false for {std_sym}. Position retained.")
+                                    except Exception as c_err:
+                                        log.error(f"[EARLY-REVERSAL] Close position failed on exchange for {std_sym}: {c_err}")
                                 elif rev_action == "TIGHTEN_SL" and rev_tight_sl:
                                     suggested_sl = float(rev_tight_sl)
                                     tighten_sl = True
@@ -597,14 +603,32 @@ class InflightPositionShepherd:
                             if breathing_room_active and r_multiple < 0.8:
                                 log.info(f"[BREATHING-ROOM] Rule #173/175 Active: Muting micro-tightening for {std_sym} (Hold: {holding_mins:.1f}m < 60m & advance < 1.0 ATR). Allowing room to expand.")
                             else:
-                                log.info(f"[SHEPHERD-RATCHET] {std_sym} SL Ratchet Approved! Moving SL from ${current_sl:,.4f} -> ${suggested_sl:,.4f} ({verdict})")
-                                try:
-                                    res = await client.modify_strategy_order(std_sym, sl=suggested_sl, tp=current_tp)
-                                    sl_ratcheted = True
-                                    # Update local swing state
-                                    self._update_local_sl(std_sym, suggested_sl)
-                                except Exception as me:
-                                    log.error(f"[SHEPHERD-ERROR] Failed to ratchet strategy SL on Bitget for {std_sym}: {me}")
+                                # Coordinate with swing_architect to prevent racing modification on the same position
+                                def _is_swing_locked():
+                                    try:
+                                        with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
+                                            l_row = l_conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
+                                            return bool(l_row and str(l_row[0]) == "swing_architect")
+                                    except Exception:
+                                        return False
+
+                                swing_is_owner = await asyncio.to_thread(_is_swing_locked)
+                                if swing_is_owner:
+                                    log.info(f"[SHEPHERD-COORDINATION] {std_sym} is actively managed by swing_architect. Inflight Shepherd acting in advisory mode.")
+                                    diagnosis = f"Advisory Shepherding: {verdict}"
+                                else:
+                                    log.info(f"[SHEPHERD-RATCHET] {std_sym} SL Ratchet Approved! Moving SL from ${current_sl:,.4f} -> ${suggested_sl:,.4f} ({verdict})")
+                                    try:
+                                        res = await client.modify_strategy_order(std_sym, sl=suggested_sl, tp=current_tp)
+                                        if res:
+                                            sl_ratcheted = True
+                                            # Only update local swing state if exchange confirms modification
+                                            self._update_local_sl(std_sym, suggested_sl)
+                                            log.info(f"[SHEPHERD-CONFIRMED] Native exchange SL successfully moved to ${suggested_sl:,.4f} on Bitget for {std_sym}")
+                                        else:
+                                            log.warning(f"[SHEPHERD-ABORT] modify_strategy_order returned false/empty for {std_sym}. Local SL not updated to prevent phantom stop.")
+                                    except Exception as me:
+                                        log.error(f"[SHEPHERD-ERROR] Failed to ratchet strategy SL on Bitget for {std_sym}: {me}")
                         else:
                             log.debug(f"[SHEPHERD] Suggested SL (${suggested_sl}) violates tightening bounds. Ignored.")
 
