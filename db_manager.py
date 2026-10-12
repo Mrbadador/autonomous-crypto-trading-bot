@@ -124,6 +124,8 @@ class DBWriteQueue:
                     last_flush = time.monotonic()
                     self._flush_requested = False
             except Exception as e:
+                if not self._running:
+                    break
                 log.critical(f"[DB-WORKER-CRASH] Worker loop fault: {e}", exc_info=True)
                 try:
                     conn.close()
@@ -594,6 +596,78 @@ class DatabaseManager:
                     "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.1', ?)",
                     (datetime.now(UTC).isoformat(),)
                 )
+
+            # Migration 1.2: Rebuild swing_trades table with nullable exit_price, pnl, and roe_pct (FIX 1)
+            cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
+            row_v = cursor.fetchone()
+            curr_v = str(row_v[0]) if row_v else "0.0"
+            if curr_v < "1.2":
+                log.info("Migrating database to 1.2: Rebuilding swing_trades with nullable exit_price/pnl/roe_pct...")
+                try:
+                    cursor.execute("PRAGMA foreign_keys = OFF;")
+                    # 1. Create temporary migration table with identical modern schema but NULLABLE exit columns
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS swing_trades_mig (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TEXT NOT NULL,
+                            symbol TEXT NOT NULL,
+                            side TEXT NOT NULL,
+                            entry_price REAL NOT NULL,
+                            exit_price REAL,
+                            size REAL NOT NULL,
+                            pnl REAL,
+                            roe_pct REAL,
+                            holding_hours REAL,
+                            exit_reason TEXT,
+                            notes TEXT,
+                            intended_entry_price REAL,
+                            actual_fill_price REAL,
+                            slippage_bps REAL,
+                            fee_paid_usd REAL,
+                            fee_maker_usd REAL,
+                            fee_taker_usd REAL,
+                            funding_usd REAL,
+                            funding_source TEXT,
+                            gates_snapshot TEXT,
+                            status TEXT DEFAULT 'CLOSED'
+                        );
+                    """)
+                    
+                    # 2. Copy all existing records across matching columns
+                    cursor.execute("PRAGMA table_info(swing_trades)")
+                    existing_cols = [c[1] for c in cursor.fetchall()]
+                    target_cols = [
+                        "id", "timestamp", "symbol", "side", "entry_price", "exit_price", "size",
+                        "pnl", "roe_pct", "holding_hours", "exit_reason", "notes",
+                        "intended_entry_price", "actual_fill_price", "slippage_bps",
+                        "fee_paid_usd", "fee_maker_usd", "fee_taker_usd", "funding_usd",
+                        "funding_source", "gates_snapshot", "status"
+                    ]
+                    common_cols = [c for c in target_cols if c in existing_cols]
+                    cols_csv = ", ".join(common_cols)
+                    
+                    cursor.execute(f"INSERT INTO swing_trades_mig ({cols_csv}) SELECT {cols_csv} FROM swing_trades;")
+                    
+                    # 3. Atomic swap
+                    cursor.execute("DROP TABLE swing_trades;")
+                    cursor.execute("ALTER TABLE swing_trades_mig RENAME TO swing_trades;")
+                    
+                    # 4. Recreate indexes
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swing_trades_symbol ON swing_trades (symbol);")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swing_trades_timestamp ON swing_trades (timestamp);")
+                    
+                    from datetime import datetime, UTC
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.2', ?)",
+                        (datetime.now(UTC).isoformat(),)
+                    )
+                    log.info("Database migration 1.2 SUCCESS: swing_trades successfully rebuilt with nullable exit constraints.")
+                except Exception as mig_err:
+                    log.critical(f"Database migration 1.2 FAILED: {mig_err}", exc_info=True)
+                    raise mig_err
+                finally:
+                    cursor.execute("PRAGMA foreign_keys = ON;")
+
             conn.commit()
         log.info(f"Database initialized at {self.db_path} with WAL mode.")
 
