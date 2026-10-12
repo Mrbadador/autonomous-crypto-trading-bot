@@ -60,6 +60,161 @@ if not log.handlers:
         pass
 
 
+def compute_grid_5m_indicators(df: pd.DataFrame) -> dict:
+    """
+    Pure indicator pipeline for 5m Chop Grid & Scalp Short engines.
+    Zero-lookahead: computes RSI (14), 24-period rolling VWAP & deviation bands,
+    EMA20, candle wick ratios, and 14-period ADX strictly up to the current bar.
+    """
+    if df is None or len(df) < 25:
+        return {}
+
+    c = df["close"]
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / (loss + 1e-9)
+    rsi_series = 100.0 - (100.0 / (1.0 + rs))
+    rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
+    rsi_prev = float(rsi_series.iloc[-2]) if len(rsi_series) >= 2 and not pd.isna(rsi_series.iloc[-2]) else rsi
+
+    cum_pv = (c * df["volume"]).rolling(24).sum()
+    cum_v = df["volume"].rolling(24).sum()
+    vwap_series = cum_pv / (cum_v + 1e-9)
+    vwap = float(vwap_series.iloc[-1]) if not pd.isna(vwap_series.iloc[-1]) else float(c.iloc[-1])
+
+    # True VWAP deviation band: σ of (price - rolling VWAP), fallback to std-of-closes
+    vwap_diff = c - vwap_series
+    std_series = vwap_diff.rolling(24).std()
+    rolling_std = float(std_series.iloc[-1]) if not pd.isna(std_series.iloc[-1]) else 0.0
+    if rolling_std <= 0:
+        c_std = c.rolling(24).std()
+        rolling_std = float(c_std.iloc[-1]) if not pd.isna(c_std.iloc[-1]) else 0.0
+
+    lower_band = vwap - (2.0 * rolling_std)
+    upper_band = vwap + (2.0 * rolling_std)
+
+    ema20_series = c.ewm(span=20, adjust=False).mean()
+    ema20 = float(ema20_series.iloc[-1]) if not pd.isna(ema20_series.iloc[-1]) else float(c.iloc[-1])
+
+    c_open = float(df["open"].iloc[-1])
+    c_high = float(df["high"].iloc[-1])
+    c_low = float(df["low"].iloc[-1])
+    c_close = float(df["close"].iloc[-1])
+    c_range = max(c_high - c_low, 1e-6)
+    upper_wick = c_high - max(c_open, c_close)
+    upper_wick_ratio = upper_wick / c_range
+
+    adx_5m = 0.0
+    try:
+        adx_series = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
+        if not pd.isna(adx_series.iloc[-1]):
+            adx_5m = float(adx_series.iloc[-1])
+    except Exception:
+        adx_5m = 0.0
+
+    is_red_candle = c_close < c_open
+    is_shooting_star = upper_wick_ratio >= 0.35
+    is_rsi_falling = rsi < (rsi_prev - 0.5)
+    has_bearish_reversal = (is_red_candle and upper_wick_ratio >= 0.25) or (is_shooting_star and is_rsi_falling)
+
+    return {
+        "rsi": rsi,
+        "rsi_prev": rsi_prev,
+        "vwap": vwap,
+        "rolling_std": rolling_std,
+        "lower_band": lower_band,
+        "upper_band": upper_band,
+        "ema20": ema20,
+        "adx_5m": adx_5m,
+        "curr_price": c_close,
+        "open": c_open,
+        "high": c_high,
+        "low": c_low,
+        "close": c_close,
+        "upper_wick_ratio": upper_wick_ratio,
+        "is_red_candle": is_red_candle,
+        "is_shooting_star": is_shooting_star,
+        "is_rsi_falling": is_rsi_falling,
+        "has_bearish_reversal": has_bearish_reversal,
+    }
+
+
+def evaluate_chop_grid_signal(
+    ind: dict,
+    curr_price: float,
+    rsi_thresh: float = 30.0,
+    max_adx: float = 24.0,
+    regime_adx: float = 20.0,
+    di_spread: float = 0.0
+) -> tuple[bool, str]:
+    """
+    Pure evaluation of Chop Grid Maker Long Dip-Buy entry.
+    """
+    if not ind or "rsi" not in ind:
+        return False, "NO_INDICATORS"
+
+    # Regime gates
+    if regime_adx >= 25.0 and di_spread < -4.0:
+        return False, f"REGIME_SELLER_DOMINANCE (ADX={regime_adx:.1f}, DI_SPREAD={di_spread:+.1f})"
+    if regime_adx >= 28.0:
+        return False, f"REGIME_EXPANSION (ADX={regime_adx:.1f})"
+
+    # Asset 5m ADX exhaustion guard
+    if ind.get("adx_5m", 0.0) >= max_adx:
+        return False, f"ASSET_5M_ADX_WATERFALL (ADX={ind.get('adx_5m', 0.0):.1f} >= {max_adx:.1f})"
+
+    rsi = ind["rsi"]
+    lower_band = ind["lower_band"]
+
+    if rsi < rsi_thresh and curr_price <= lower_band:
+        return True, f"CHOP_DIP_CONFIRMED (RSI={rsi:.1f} < {rsi_thresh:.1f}, Price={curr_price} <= Lower={lower_band:.4f})"
+
+    return False, "CONDITIONS_NOT_MET"
+
+
+def evaluate_scalp_short_signal(
+    ind: dict,
+    curr_price: float,
+    mode: str = "CHOP",
+    min_rsi: float = 38.0,
+    rsi_overbought: float = 68.0,
+    max_adx: float = 22.0
+) -> tuple[bool, str]:
+    """
+    Pure evaluation of Quick Scalp Short entry.
+    """
+    if not ind or "rsi" not in ind:
+        return False, "NO_INDICATORS"
+
+    rsi = ind["rsi"]
+    if rsi < min_rsi:
+        return False, f"ANTI_BOTTOM_RSI (RSI={rsi:.1f} < {min_rsi:.1f})"
+
+    adx_5m = ind.get("adx_5m", 0.0)
+    if mode == "CHOP" and adx_5m >= max_adx:
+        return False, f"ACTIVE_BREAKOUT_ADX (5m ADX={adx_5m:.1f} >= {max_adx:.1f})"
+
+    upper_band = ind["upper_band"]
+    has_bearish_reversal = ind.get("has_bearish_reversal", False)
+    vwap = ind["vwap"]
+    ema20 = ind["ema20"]
+    is_red_candle = ind.get("is_red_candle", False)
+
+    if mode == "CHOP":
+        if curr_price >= (upper_band * 0.998) and rsi >= rsi_overbought:
+            if not has_bearish_reversal:
+                return False, f"LACKS_REVERSAL_CONFIRMATION (Wick={ind.get('upper_wick_ratio', 0.0):.1%})"
+            return True, f"CHOP_RANGE_TOP_FADE (Price={curr_price} >= Upper={upper_band:.4f}, RSI={rsi:.1f}, ADX={adx_5m:.1f})"
+    elif mode == "BEAR":
+        bounced_to_resistance = (curr_price >= vwap * 0.997) or (curr_price >= ema20 * 0.998)
+        in_relief_rsi_window = (45.0 <= rsi <= 68.0)
+        if bounced_to_resistance and in_relief_rsi_window and is_red_candle:
+            return True, f"BEAR_RELIEF_BOUNCE_FADE (Price={curr_price}, RSI={rsi:.1f})"
+
+    return False, "CONDITIONS_NOT_MET"
+
+
 class SuperBotTrader:
     def __init__(self):
         # 1. Configuration & Fleet
@@ -268,164 +423,9 @@ class SuperBotTrader:
             pass
         return 1.0
 
-def compute_grid_5m_indicators(df: pd.DataFrame) -> dict:
-    """
-    Pure indicator pipeline for 5m Chop Grid & Scalp Short engines.
-    Zero-lookahead: computes RSI (14), 24-period rolling VWAP & deviation bands,
-    EMA20, candle wick ratios, and 14-period ADX strictly up to the current bar.
-    """
-    if df is None or len(df) < 25:
-        return {}
-
-    c = df["close"]
-    delta = c.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
-    rsi_series = 100.0 - (100.0 / (1.0 + rs))
-    rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
-    rsi_prev = float(rsi_series.iloc[-2]) if len(rsi_series) >= 2 and not pd.isna(rsi_series.iloc[-2]) else rsi
-
-    cum_pv = (c * df["volume"]).rolling(24).sum()
-    cum_v = df["volume"].rolling(24).sum()
-    vwap_series = cum_pv / (cum_v + 1e-9)
-    vwap = float(vwap_series.iloc[-1]) if not pd.isna(vwap_series.iloc[-1]) else float(c.iloc[-1])
-
-    # True VWAP deviation band: σ of (price - rolling VWAP), fallback to std-of-closes
-    vwap_diff = c - vwap_series
-    std_series = vwap_diff.rolling(24).std()
-    rolling_std = float(std_series.iloc[-1]) if not pd.isna(std_series.iloc[-1]) else 0.0
-    if rolling_std <= 0:
-        c_std = c.rolling(24).std()
-        rolling_std = float(c_std.iloc[-1]) if not pd.isna(c_std.iloc[-1]) else 0.0
-
-    lower_band = vwap - (2.0 * rolling_std)
-    upper_band = vwap + (2.0 * rolling_std)
-
-    ema20_series = c.ewm(span=20, adjust=False).mean()
-    ema20 = float(ema20_series.iloc[-1]) if not pd.isna(ema20_series.iloc[-1]) else float(c.iloc[-1])
-
-    c_open = float(df["open"].iloc[-1])
-    c_high = float(df["high"].iloc[-1])
-    c_low = float(df["low"].iloc[-1])
-    c_close = float(df["close"].iloc[-1])
-    c_range = max(c_high - c_low, 1e-6)
-    upper_wick = c_high - max(c_open, c_close)
-    upper_wick_ratio = upper_wick / c_range
-
-    adx_5m = 0.0
-    try:
-        adx_series = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
-        if not pd.isna(adx_series.iloc[-1]):
-            adx_5m = float(adx_series.iloc[-1])
-    except Exception:
-        adx_5m = 0.0
-
-    is_red_candle = c_close < c_open
-    is_shooting_star = upper_wick_ratio >= 0.35
-    is_rsi_falling = rsi < (rsi_prev - 0.5)
-    has_bearish_reversal = (is_red_candle and upper_wick_ratio >= 0.25) or (is_shooting_star and is_rsi_falling)
-
-    return {
-        "rsi": rsi,
-        "rsi_prev": rsi_prev,
-        "vwap": vwap,
-        "rolling_std": rolling_std,
-        "lower_band": lower_band,
-        "upper_band": upper_band,
-        "ema20": ema20,
-        "adx_5m": adx_5m,
-        "curr_price": c_close,
-        "open": c_open,
-        "high": c_high,
-        "low": c_low,
-        "close": c_close,
-        "upper_wick_ratio": upper_wick_ratio,
-        "is_red_candle": is_red_candle,
-        "is_shooting_star": is_shooting_star,
-        "is_rsi_falling": is_rsi_falling,
-        "has_bearish_reversal": has_bearish_reversal,
-    }
-
-
-def evaluate_chop_grid_signal(
-    ind: dict,
-    curr_price: float,
-    rsi_thresh: float = 30.0,
-    max_adx: float = 24.0,
-    regime_adx: float = 20.0,
-    di_spread: float = 0.0
-) -> tuple[bool, str]:
-    """
-    Pure evaluation of Chop Grid Maker Long Dip-Buy entry.
-    """
-    if not ind or "rsi" not in ind:
-        return False, "NO_INDICATORS"
-
-    # Regime gates
-    if regime_adx >= 25.0 and di_spread < -4.0:
-        return False, f"REGIME_SELLER_DOMINANCE (ADX={regime_adx:.1f}, DI_SPREAD={di_spread:+.1f})"
-    if regime_adx >= 28.0:
-        return False, f"REGIME_EXPANSION (ADX={regime_adx:.1f})"
-
-    # Asset 5m ADX exhaustion guard
-    if ind.get("adx_5m", 0.0) >= max_adx:
-        return False, f"ASSET_5M_ADX_WATERFALL (ADX={ind.get('adx_5m', 0.0):.1f} >= {max_adx:.1f})"
-
-    rsi = ind["rsi"]
-    lower_band = ind["lower_band"]
-
-    if rsi < rsi_thresh and curr_price <= lower_band:
-        return True, f"CHOP_DIP_CONFIRMED (RSI={rsi:.1f} < {rsi_thresh:.1f}, Price={curr_price} <= Lower={lower_band:.4f})"
-
-    return False, "CONDITIONS_NOT_MET"
-
-
-def evaluate_scalp_short_signal(
-    ind: dict,
-    curr_price: float,
-    mode: str = "CHOP",
-    min_rsi: float = 38.0,
-    rsi_overbought: float = 68.0,
-    max_adx: float = 22.0
-) -> tuple[bool, str]:
-    """
-    Pure evaluation of Quick Scalp Short entry.
-    """
-    if not ind or "rsi" not in ind:
-        return False, "NO_INDICATORS"
-
-    rsi = ind["rsi"]
-    if rsi < min_rsi:
-        return False, f"ANTI_BOTTOM_RSI (RSI={rsi:.1f} < {min_rsi:.1f})"
-
-    adx_5m = ind.get("adx_5m", 0.0)
-    if mode == "CHOP" and adx_5m >= max_adx:
-        return False, f"ACTIVE_BREAKOUT_ADX (5m ADX={adx_5m:.1f} >= {max_adx:.1f})"
-
-    upper_band = ind["upper_band"]
-    has_bearish_reversal = ind.get("has_bearish_reversal", False)
-    vwap = ind["vwap"]
-    ema20 = ind["ema20"]
-    is_red_candle = ind.get("is_red_candle", False)
-
-    if mode == "CHOP":
-        if curr_price >= (upper_band * 0.998) and rsi >= rsi_overbought:
-            if not has_bearish_reversal:
-                return False, f"LACKS_REVERSAL_CONFIRMATION (Wick={ind.get('upper_wick_ratio', 0.0):.1%})"
-            return True, f"CHOP_RANGE_TOP_FADE (Price={curr_price} >= Upper={upper_band:.4f}, RSI={rsi:.1f}, ADX={adx_5m:.1f})"
-    elif mode == "BEAR":
-        bounced_to_resistance = (curr_price >= vwap * 0.997) or (curr_price >= ema20 * 0.998)
-        in_relief_rsi_window = (45.0 <= rsi <= 68.0)
-        if bounced_to_resistance and in_relief_rsi_window and is_red_candle:
-            return True, f"BEAR_RELIEF_BOUNCE_FADE (Price={curr_price}, RSI={rsi:.1f})"
-
-    return False, "CONDITIONS_NOT_MET"
-
-
-# ---------------------------------------------------------------------------
-# Mean Reversion Maker Engine (CHOP Mode)
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Mean Reversion Maker Engine (CHOP Mode)
+    # ---------------------------------------------------------------------------
     async def scan_chop_grid_opportunities(self):
         """Scans unallocated assets during CHOP regime for Maker dip-buys."""
         # Check available capacity
