@@ -32,33 +32,37 @@ A production-grade, multi-asset crypto futures trading system featuring a **Dual
 
 ```mermaid
 flowchart TD
-    subgraph Market Ingest & Daemons
-        MD[Bitget UTA WebSocket / REST] --> OFI[OFI & Microstructure Daemon]
-        MD --> REG[Regime Classifier - ADX / Hurst]
-        MD --> SENT[Sentiment & RSS Macro Sentinel]
+    subgraph Market_Ingest["Market Ingest & Daemons"]
+        MD["Bitget UTA WebSocket / REST"] --> OFI["OFI & Microstructure Daemon"]
+        MD --> REG["Regime Classifier (ADX / Hurst)"]
+        MD --> SENT["Sentiment & RSS Macro Sentinel"]
     end
 
-    subgraph Strategy Orchestrator
-        OFI & REG & SENT --> SB[Super Bot Dual-Regime Engine]
-        SB -->|Bull Trend Detected| SWING[4H Swing Architect]
-        SB -->|Sideways Chop Detected| CHOP[5m Chop Maker Grid]
+    subgraph Strategy_Orchestrator["Strategy Orchestrator"]
+        OFI --> SB["Super Bot Dual-Regime Engine"]
+        REG --> SB
+        SENT --> SB
+        SB -->|Bull Trend Detected| SWING["4H Swing Architect"]
+        SB -->|Sideways Chop Detected| CHOP["5m Chop Maker Grid"]
     end
 
-    subgraph AI Boardroom Filter
-        SWING & CHOP --> AI[AI Conviction Filter & Macro Blueprint]
-        AI -->|Gemini Primary / Groq Failover| VETO{Boardroom Consensus?}
+    subgraph AI_Boardroom["AI Boardroom Filter"]
+        SWING --> AI["AI Conviction Filter & Macro Blueprint"]
+        CHOP --> AI
+        AI -->|Gemini Primary / Groq Failover| VETO{"Boardroom Consensus?"}
     end
 
-    subgraph Risk & Execution
-        VETO -->|Approved| RM[Risk Manager - 1/4 Kelly & 70% Margin Ceiling]
-        RM --> EX[Bitget UTA Execution Client]
-        EX --> STOP[On-Exchange Native SL / TP Orders]
+    subgraph Risk_Execution["Risk & Execution"]
+        VETO -->|Approved| RM["Risk Manager (1/4 Kelly & 70% Margin Ceiling)"]
+        RM --> EX["Bitget UTA Execution Client"]
+        EX --> STOP["On-Exchange Native SL / TP Orders"]
     end
 
-    subgraph Telemetry & Supervision
-        EX --> DB[(SQLite WAL Database)]
-        DB --> HUD[Streamlit Executive Dashboard - Port 8501]
-        DB --> WATCH[Swarm Integrity Watchdog]
+    subgraph Telemetry_Supervision["Telemetry & Supervision"]
+        EX --> DB[("SQLite WAL Database")]
+        DB --> HUD["Streamlit Executive Dashboard (Port 8501)"]
+        DB --> WATCH["Swarm Integrity Watchdog"]
+    end
 ```
 
 ---
