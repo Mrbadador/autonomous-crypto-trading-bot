@@ -83,11 +83,14 @@ class SymbolOFIState:
         self.latest_micro_price = 0.0
         self.latest_micro_bps = 0.0
         self.vpin_calc = VPINCalculator(bucket_volume=2000.0, num_buckets=30)
+        self.vpin_calc_real = VPINCalculator(bucket_volume=2000.0, num_buckets=30)
         self.hawkes_guard = HawkesSpoofGuard()
         self.latest_hawkes_spoof = 0.0
         self.latest_hawkes_rho = 0.0
         self.latest_hawkes_veto = False
         self.last_depth_ts = 0.0
+        self.real_trade_count = 0
+        self.last_real_trade_ts = 0.0
 
     def reset(self):
         """Resets state machine on WebSocket reconnection to avoid spurious spikes."""
@@ -112,6 +115,15 @@ class SymbolOFIState:
         self.latest_hawkes_rho = 0.0
         self.latest_hawkes_veto = False
         self.last_depth_ts = 0.0
+        self.real_trade_count = 0
+
+    def process_trade(self, price: float, size: float, side: str = "buy"):
+        """Ingests live trade tape from Bitget trade channel for genuine VPIN and flow toxicity."""
+        if price <= 0.0 or size <= 0.0:
+            return
+        self.real_trade_count += 1
+        self.last_real_trade_ts = time.time()
+        self.vpin_calc_real.update_trade(price=price, size=size)
 
     def process_depth(self, bids: list, asks: list):
         """
@@ -302,6 +314,11 @@ class SymbolOFIState:
         n_c = sum(cnt for _, cnt in self.rolling_cancellations)
         mean_tau = float(np.mean(self.residence_times)) if self.residence_times else 250.0
 
+        vpin_synth = round(self.vpin_calc.get_vpin(), 3)
+        vpin_real = round(self.vpin_calc_real.get_vpin(), 3)
+        # Use real VPIN when available (e.g. > 10 real trades received); fallback smoothly to synthetic
+        effective_vpin = vpin_real if self.real_trade_count >= 10 else vpin_synth
+
         return {
             "net_ofi_score": round(net_ofi, 4),
             "normalized_ofi": round(norm_ofi, 4),
@@ -312,7 +329,10 @@ class SymbolOFIState:
             "mlofi": round(self.latest_mlofi, 4),
             "micro_price": round(self.latest_micro_price, 4),
             "micro_price_bps": round(self.latest_micro_bps, 2),
-            "vpin": round(self.vpin_calc.get_vpin(), 3),
+            "vpin": effective_vpin,
+            "vpin_synthetic": vpin_synth,
+            "vpin_real": vpin_real,
+            "real_trade_count": self.real_trade_count,
             "hawkes_spoof_index": round(self.latest_hawkes_spoof, 4),
             "hawkes_rho": round(self.latest_hawkes_rho, 4),
             "hawkes_veto": self.latest_hawkes_veto,
@@ -339,6 +359,10 @@ class MultiSymbolOFIDaemon:
     def reset_all(self):
         for state in self.symbol_states.values():
             state.reset()
+
+    def process_trade_tick(self, symbol: str, price: float, size: float, side: str = "buy"):
+        if symbol in self.symbol_states:
+            self.symbol_states[symbol].process_trade(price, size, side)
 
     def process_tick(self, symbol: str, bids: list, asks: list):
         if symbol in self.symbol_states:
@@ -540,23 +564,29 @@ async def stream_level2_data():
     _BASE_DELAY = 3.0
     _MAX_DELAY = 60.0
 
+    sub_args = []
+    for s in SYMBOLS:
+        sub_args.append({
+            "instType": "USDT-FUTURES",
+            "channel": "books15",
+            "instId": s
+        })
+        sub_args.append({
+            "instType": "USDT-FUTURES",
+            "channel": "trade",
+            "instId": s
+        })
+
     sub_payload = {
         "op": "subscribe",
-        "args": [
-            {
-                "instType": "USDT-FUTURES",
-                "channel": "books15",
-                "instId": s
-            }
-            for s in SYMBOLS
-        ]
+        "args": sub_args
     }
 
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=None) as ws:
                 await ws.send(json.dumps(sub_payload))
-                print("[OK] Connection Established. Subscribed to Bitget books15 multi-stream...")
+                print(f"[OK] Connection Established. Subscribed to Bitget books15 & trade channels ({len(SYMBOLS)} symbols)...")
                 _reconnect_attempt = 0
                 daemon.reset_all()
                 print("[OFI] All symbol state machines reset on WebSocket reconnection.")
@@ -581,25 +611,41 @@ async def stream_level2_data():
 
                         arg = data.get("arg", {})
                         symbol = arg.get("instId", "").upper()
+                        channel = arg.get("channel", "")
                         raw_data = data.get("data", [])
                         if not raw_data or not symbol or symbol not in daemon.symbol_states:
                             continue
 
-                        entry = raw_data[0]
-                        bids = entry.get("bids", [])
-                        asks = entry.get("asks", [])
+                        # Handle real public trade feed
+                        if channel == "trade":
+                            for tr in raw_data:
+                                try:
+                                    t_price = float(tr.get("price") or tr.get("p") or 0.0)
+                                    t_size = float(tr.get("size") or tr.get("s") or 0.0)
+                                    t_side = str(tr.get("side") or "buy").lower()
+                                    if t_price > 0 and t_size > 0:
+                                        daemon.process_trade_tick(symbol, t_price, t_size, t_side)
+                                except Exception:
+                                    pass
+                            continue
 
-                        chk = entry.get("checksum") or entry.get("checkSum")
-                        if chk is not None and bids and asks:
-                            try:
-                                if not verify_bitget_crc32_checksum(bids, asks, int(chk)):
-                                    print(f"[WARN] CRC32 Checksum mismatch for {symbol}! Re-syncing book.")
-                                    daemon.symbol_states[symbol].reset()
-                            except Exception:
-                                pass
+                        # Handle 15-level L2 depth feed
+                        if channel == "books15":
+                            entry = raw_data[0]
+                            bids = entry.get("bids", [])
+                            asks = entry.get("asks", [])
 
-                        if bids and asks:
-                            daemon.process_tick(symbol, bids, asks)
+                            chk = entry.get("checksum") or entry.get("checkSum")
+                            if chk is not None and bids and asks:
+                                try:
+                                    if not verify_bitget_crc32_checksum(bids, asks, int(chk)):
+                                        print(f"[WARN] CRC32 Checksum mismatch for {symbol}! Re-syncing book.")
+                                        daemon.symbol_states[symbol].reset()
+                                except Exception:
+                                    pass
+
+                            if bids and asks:
+                                daemon.process_tick(symbol, bids, asks)
                 finally:
                     ping_task.cancel()
 
