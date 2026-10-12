@@ -607,8 +607,16 @@ class InflightPositionShepherd:
                                 def _is_swing_locked():
                                     try:
                                         with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
-                                            l_row = l_conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
-                                            return bool(l_row and str(l_row[0]) == "swing_architect")
+                                            l_row = l_conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
+                                            if not l_row or str(l_row[0]) != "swing_architect":
+                                                return False
+                                            hb_str = str(l_row[1] or "")
+                                            clean_hb = hb_str.replace("Z", "+00:00")
+                                            if "+" not in clean_hb:
+                                                clean_hb += "+00:00"
+                                            hb_dt = datetime.fromisoformat(clean_hb)
+                                            # Fresh lock only if heartbeat within last 900 seconds (15 mins)
+                                            return (datetime.now(timezone.utc) - hb_dt).total_seconds() <= 900.0
                                     except Exception:
                                         return False
 

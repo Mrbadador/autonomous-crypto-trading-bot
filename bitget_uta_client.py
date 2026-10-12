@@ -120,6 +120,11 @@ class BitgetUTAClient:
         else:
             return max(round(qty, 2), 0.1)
 
+    def format_quantity_precision(self, symbol: str, qty: float) -> str:
+        """Alias for format_qty_precision returning clean string representation."""
+        val = self.format_qty_precision(symbol, qty)
+        return str(int(val)) if val == int(val) else str(val)
+
     async def ensure_time_sync(self, force: bool = False):
         """Synchronizes exchange clock offset with Bitget server time to prevent 40008 expired timestamp errors."""
         if not self._time_synced or force:

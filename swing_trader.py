@@ -1868,15 +1868,20 @@ class SwingArchitectTrader:
                                 log.info(f"[SCALP-SHORT-45M-TIGHTEN] 🛡️ {symbol} at {holding_mins:.1f}m (PnL {short_pnl_pct:+.2f}% < {min_harvest_pct:.2f}% harvest). Tightened SL ${old_sl:.4f} -> ${target_sl:.4f} until {hard_expiry_mins:.0f}m hard expiry.")
                                 self._track_task(self.uta_client.modify_strategy_order(symbol, sl=target_sl, tp=pos.get("take_profit")), f"scalp_45m_tighten_{symbol}")
 
-                # Exit Condition 0: Global AI Macro Killswitch (Fail-Closed)
+                # Exit Condition 0: Global AI Macro Killswitch
                 def _check_emergency_killswitch():
-                    try:
-                        with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                            row = conn.execute("SELECT value FROM system_state WHERE key = 'macro_global_killswitch'").fetchone()
-                            return bool(row and str(row[0]) == "1")
-                    except Exception as k_err:
-                        log.warning(f"[KILLSWITCH-READ-FAIL-CLOSED] Error reading macro_global_killswitch: {k_err}. Fail-closed engaged.")
-                        return True
+                    for attempt in range(2):
+                        try:
+                            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                                row = conn.execute("SELECT value FROM system_state WHERE key = 'macro_global_killswitch'").fetchone()
+                                return bool(row and str(row[0]) == "1")
+                        except Exception as k_err:
+                            if attempt == 0:
+                                time.sleep(0.1)
+                                continue
+                            log.warning(f"[KILLSWITCH-READ-TRANSIENT-ERR] Error reading macro_global_killswitch: {k_err}. Preserving active position, will retry next cycle.")
+                            return False
+                    return False
 
                 is_emergency = await asyncio.to_thread(_check_emergency_killswitch)
                 if is_emergency:

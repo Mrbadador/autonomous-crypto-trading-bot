@@ -30,7 +30,7 @@ class ConvictionBoardroom:
                             res["veto"] = {
                                 "execute": False,
                                 "conviction_score": 0.0,
-                                "final_rationale": f"Asset {symbol} filtered out — Top 5 coins constraint active."
+                                "final_rationale": f"Asset {symbol} filtered out — ALLOWED_SYMBOLS fleet constraint active."
                             }
                             res["log"] = f"[BOARDROOM] VETO: {symbol} is not in ALLOWED_SYMBOLS whitelist ({allowed}). Bypassing entry."
                             return res
