@@ -25,6 +25,13 @@ logs/
 *.log
 .tmp.*
 tmp/
+*.lock
+*.pid
+microstructure_state.json
+sentiment_state.json
+volatility_state.json
+debug.html
+marl_cockpit_verification.png
 
 # Executables & binaries
 *.exe
