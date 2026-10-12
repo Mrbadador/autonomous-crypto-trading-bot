@@ -185,21 +185,47 @@ def run_risk_agent():
                 row_op = cursor.fetchone()
                 operator_halt = bool(row_op and str(row_op[0]).strip().upper() in ("1", "TRUE"))
 
+                # Hysteresis State Machine for Margin & Exposure Cap:
+                # Engage halt at 70% margin limit; clear only below 62% margin limit to eliminate flapping.
+                margin_clear_pct = max(0.20, max_margin_pct - 0.08)
+                max_margin_clear = live_bal * margin_clear_pct
+
+                exposure_clear_mult = max(1.0, MAX_EXPOSURE_MULT - 0.5)
+                max_exposure_clear = live_bal * exposure_clear_mult
+
+                # Determine if auto halt was previously active
+                cursor.execute("SELECT value FROM system_state WHERE key = 'AUTO_RISK_HALTED'")
+                row_auto_prev = cursor.fetchone()
+                auto_halt_prev = bool(row_auto_prev and str(row_auto_prev[0]).strip() == "1")
+
                 halt_reasons: list[str] = []
                 if operator_halt:
                     halt_reasons.append("OPERATOR_PAUSE")
-                if total_count >= max_open:
-                    halt_reasons.append(f"SLOT_CAP({total_count}/{max_open})")
-                if total_margin >= max_margin_allowed:
-                    halt_reasons.append(f"MARGIN_CAP(${total_margin:.2f}>=${max_margin_allowed:.2f})")
-                if total_exposure >= max_exposure_allowed:
-                    halt_reasons.append(f"EXPOSURE_CAP(${total_exposure:.2f}>=${max_exposure_allowed:.2f})")
 
-                auto_halted = (
-                    total_count >= max_open
-                    or total_margin >= max_margin_allowed
-                    or total_exposure >= max_exposure_allowed
-                )
+                auto_halted = auto_halt_prev
+                if not auto_halt_prev:
+                    # Condition to engage halt
+                    if total_count >= max_open:
+                        auto_halted = True
+                        halt_reasons.append(f"SLOT_CAP({total_count}/{max_open})")
+                    if total_margin >= max_margin_allowed:
+                        auto_halted = True
+                        halt_reasons.append(f"MARGIN_CAP(${total_margin:.2f}>=${max_margin_allowed:.2f})")
+                    if total_exposure >= max_exposure_allowed:
+                        auto_halted = True
+                        halt_reasons.append(f"EXPOSURE_CAP(${total_exposure:.2f}>=${max_exposure_allowed:.2f})")
+                else:
+                    # Currently halted: check if cleared below hysteresis buffer
+                    if total_count < max_open and total_margin < max_margin_clear and total_exposure < max_exposure_clear:
+                        auto_halted = False
+                    else:
+                        if total_count >= max_open:
+                            halt_reasons.append(f"SLOT_CAP({total_count}/{max_open})")
+                        if total_margin >= max_margin_clear:
+                            halt_reasons.append(f"MARGIN_HYSTERESIS(${total_margin:.2f}>=${max_margin_clear:.2f})")
+                        if total_exposure >= max_exposure_clear:
+                            halt_reasons.append(f"EXPOSURE_HYSTERESIS(${total_exposure:.2f}>=${max_exposure_clear:.2f})")
+
                 is_halted = operator_halt or auto_halted
 
                 # Log state transitions clearly
@@ -223,6 +249,7 @@ def run_risk_agent():
 
                 now_iso = datetime.now(UTC).isoformat()
                 halt_val = "1" if is_halted else "0"
+                auto_halt_val = "1" if auto_halted else "0"
                 cursor.execute(
                     """
                     INSERT INTO system_state (key, value, updated_at)
@@ -230,6 +257,14 @@ def run_risk_agent():
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                     """,
                     (halt_val, now_iso),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO system_state (key, value, updated_at)
+                    VALUES ('AUTO_RISK_HALTED', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                    """,
+                    (auto_halt_val, now_iso),
                 )
 
                 metrics = {

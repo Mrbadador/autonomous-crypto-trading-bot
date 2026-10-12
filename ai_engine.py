@@ -1065,42 +1065,23 @@ async def red_team_deliberation(
         except Exception as ae:
             log.warning(f"[RED-TEAM] Arbiter parse error: {ae}")
 
-    # FAIL-SMART TECHNICAL FALLBACK:
-    # If cloud LLMs are busy or rate-limited, calculate conviction directly from quantitative momentum
+    # FAIL-CLOSED FALLBACK:
+    # If cloud LLMs are busy or rate-limited, safely veto execution rather than simulating arbitrary scores
     adx_val = safe_float(context_data.get("adx"), 20.0)
     rsi_val = safe_float(context_data.get("rsi"), 50.0)
-    is_long = (side_upper == "LONG")
-    optimal_rsi = (38.0 <= rsi_val <= 68.0) if is_long else (32.0 <= rsi_val <= 62.0)
-    has_momentum = (adx_val >= 22.0)
-
-    if has_momentum and optimal_rsi:
-        log.info(f"[BOARDROOM-FAIL-SMART] Cloud AI rate-limited/busy. Quantitative momentum confirmed for {sym_upper} (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}). Calibrated fallback.")
-        return {
-            "execute": True,
-            "conviction_score": 0.70,
-            "conviction_percent": 70.0,
-            "size_mult": 0.8,
-            "sl_mult": 2.0,
-            "tp_mult": 3.0,
-            "red_team_objection": "Cloud AI temporarily busy; evaluated via quantitative momentum safeguards.",
-            "alpha_thesis": f"Confirmed technical momentum (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}).",
-            "final_rationale": "AI cloud busy; quantitative technical fail-smart rendered candidate score (0.70).",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-    else:
-        log.warning(f"[BOARDROOM-FAIL-SMART] Cloud AI busy and sub-optimal technicals for {sym_upper} (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}). Safely vetoing.")
-        return {
-            "execute": False,
-            "conviction_score": 0.0,
-            "conviction_percent": 0.0,
-            "size_mult": 0.0,
-            "sl_mult": 2.0,
-            "tp_mult": 3.0,
-            "red_team_objection": f"Sub-optimal technical momentum (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}) while AI offline.",
-            "alpha_thesis": "Insufficient edge.",
-            "final_rationale": f"Deliberation failed closed due to weak technicals (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}) during AI rate-limit.",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+    log.warning(f"[BOARDROOM-FAIL-CLOSED] Cloud AI offline/exhausted for {sym_upper} (ADX: {adx_val:.1f}, RSI: {rsi_val:.1f}). Safety veto engaged (fail-closed).")
+    return {
+        "execute": False,
+        "conviction_score": 0.0,
+        "conviction_percent": 0.0,
+        "size_mult": 0.0,
+        "sl_mult": 2.0,
+        "tp_mult": 3.0,
+        "red_team_objection": "Cloud AI deliberation unavailable — fail-closed safety veto active.",
+        "alpha_thesis": "Deliberation offline.",
+        "final_rationale": "Boardroom LLM offline or timed out; fail-closed capital preservation active.",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 
 async def generate_macro_synthesis(

@@ -383,7 +383,11 @@ class SuperBotTrader:
                 cum_pv = (c * df["volume"]).rolling(24).sum()
                 cum_v = df["volume"].rolling(24).sum()
                 vwap = cum_pv / (cum_v + 1e-9)
-                rolling_std = c.rolling(24).std()
+                # True VWAP deviation band: σ of (price - rolling VWAP), not raw std-of-closes
+                vwap_diff = c - vwap
+                rolling_std = vwap_diff.rolling(24).std()
+                if rolling_std.isna().iloc[-1] or float(rolling_std.iloc[-1]) <= 0:
+                    rolling_std = c.rolling(24).std()
                 lower_band = float((vwap - (2.0 * rolling_std)).iloc[-1])
                 
                 curr_price = float(c.iloc[-1])
@@ -902,8 +906,13 @@ class SuperBotTrader:
 
                 cum_pv = (c * df["volume"]).rolling(24).sum()
                 cum_v = df["volume"].rolling(24).sum()
-                vwap = float((cum_pv / (cum_v + 1e-9)).iloc[-1])
-                rolling_std = float(c.rolling(24).std().iloc[-1])
+                vwap_series = cum_pv / (cum_v + 1e-9)
+                vwap = float(vwap_series.iloc[-1])
+                # True VWAP deviation band: σ of (price - rolling VWAP), not raw std-of-closes
+                vwap_diff = c - vwap_series
+                rolling_std = float(vwap_diff.rolling(24).std().iloc[-1])
+                if pd.isna(rolling_std) or rolling_std <= 0:
+                    rolling_std = float(c.rolling(24).std().iloc[-1])
                 upper_band = vwap + (2.0 * rolling_std)
                 ema20 = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
 

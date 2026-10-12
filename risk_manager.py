@@ -202,22 +202,30 @@ class RiskManager:
 
     def calculate_empirical_kelly_fraction(self) -> float:
         """
-        Calculates distribution-free Quarter-Kelly fraction using empirical log-wealth optimization.
-        Avoids Gaussian over-leveraging and accounts for actual skewness/kurtosis of trade returns.
+        Calculates distribution-free Kelly fraction using empirical log-wealth optimization
+        with an explicit Bayesian shrinkage prior:
+            w = n / (n + 100)
+            f_blended = w * f_empirical + (1 - w) * f_prior
+        Prevents sample noise in small trade histories (e.g. n < 200) from distorting position sizing.
         """
         returns = self._get_historical_returns()
-        if len(returns) < 5:
-            # Fallback to discrete half-kelly if trade history is fresh
-            return self.calculate_kelly_fraction()
+        prior_f = self.calculate_kelly_fraction()
+        n = len(returns)
+        if n < 5:
+            return prior_f
 
-        optimal_f = calculate_bayesian_smoothed_kelly(
+        empirical_f = calculate_bayesian_smoothed_kelly(
             returns=returns,
             fraction=0.25,  # Quarter-Kelly for maximum drawdown dampening
             max_cap=self.max_cap if self.max_cap > 0 else 0.25,
             min_cap=min(0.005, self.max_cap)
         )
-        log.info(f"[RISK-MANAGER] Empirical Bayesian Quarter-Kelly Fraction: {optimal_f:.2%} (Sample: {len(returns)} trades)")
-        return optimal_f
+
+        # Shrinkage weight: blends smoothly from prior (when n is small) towards empirical (as n -> large)
+        w = float(n) / (float(n) + 100.0)
+        blended_f = (w * empirical_f) + ((1.0 - w) * prior_f)
+        log.info(f"[RISK-MANAGER] Kelly Sizing: Empirical={empirical_f:.2%}, Prior={prior_f:.2%}, Shrinkage Weight w={w:.2f} (n={n}) -> Blended={blended_f:.2%}")
+        return blended_f
 
     async def _calculate_diversification_penalty(self, symbol: str, current_positions: list) -> float:
         """

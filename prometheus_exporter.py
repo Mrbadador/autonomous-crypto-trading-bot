@@ -87,15 +87,15 @@ def read_latest_regime(cursor):
 
 def read_latest_sentiment(cursor):
     if not table_exists(cursor, "sentiment_logs"):
-        return 0.0
+        return 50.0  # Neutral fallback when no sentiment logged
     try:
         cursor.execute("SELECT score FROM sentiment_logs ORDER BY timestamp DESC LIMIT 1")
         row = cursor.fetchone()
-        if row:
-            return float(row[0] or 0)
+        if row and row[0] is not None:
+            return float(row[0])
     except Exception as e:
         log.warning(f"Failed to read sentiment_logs: {e}")
-    return 0.0
+    return 50.0
 
 def read_latest_oracle(cursor):
     if not table_exists(cursor, "oracle_state"):
@@ -200,25 +200,14 @@ def collect_metrics(data_db_path, ledger_db_path):
             metric_swarm_capital.labels(agent='marl').set(balance_marl)
             metric_swarm_capital.labels(agent='mean_reversion').set(balance_mean_reversion)
             
-            # Drawdown Calculation (Persistent Peak Balance)
+            # Drawdown Calculation (Read-Only Peak Balance Tracking)
             global max_balances
             for agent in ['sniper', 'berserker', 'marl', 'mean_reversion']:
                 peak_key = f"peak_balance_{agent}"
                 current_bal = locals()[f"balance_{agent}"]
                 stored_peak = read_system_state(c_data, peak_key, 0.0)
-                
-                # Update peak if current is higher or if stored peak is 0.0
-                peak = max(stored_peak, current_bal)
-                if peak > stored_peak:
-                    try:
-                        c_data.execute("""
-                            INSERT INTO system_state (key, value, updated_at)
-                            VALUES (?, ?, datetime('now'))
-                            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                        """, (peak_key, str(peak)))
-                    except Exception as e:
-                        log.warning(f"Failed to update persistent peak balance for {agent}: {e}")
-                
+                # Keep in-memory peak without performing write operations in the exporter
+                peak = max(stored_peak, max_balances.get(agent, 0.0), current_bal)
                 max_balances[agent] = peak
             
             dd_sniper = ((max_balances['sniper'] - balance_sniper) / max_balances['sniper'] * 100) if max_balances['sniper'] > 0 else 0

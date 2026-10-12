@@ -90,15 +90,24 @@ async def run_recovery_loop():
                             
                         if pnl_pct < -0.03:
                             # Position is > 3% underwater
-                            if symbol not in warden_cache:
-                                # P1-PATCH: Always evaluate global BTC macro trend, not the asset's own
-                                # trend, to avoid circular logic (e.g. using ETH regime to validate ETH DCA).
-                                warden_cache[symbol] = Warden60Minute(symbol='BTC/USDT')
-                            
-                            warden = warden_cache[symbol]
-                            regime = await warden.determine_regime()
-                            
-                            if (side == "long" and regime == "LONG_ONLY") or (side == "short" and regime == "SHORT_ONLY"):
+                            # Dual Regime Verification: Check both global BTC macro AND the specific asset's own trend
+                            btc_warden = Warden60Minute(symbol='BTC/USDT')
+                            btc_regime = await btc_warden.determine_regime()
+
+                            asset_warden = Warden60Minute(symbol=symbol)
+                            asset_regime = await asset_warden.determine_regime()
+
+                            # Require both global BTC and the specific asset to be aligned in trend
+                            regime_aligned = (
+                                (side == "long" and btc_regime == "LONG_ONLY" and asset_regime == "LONG_ONLY") or
+                                (side == "short" and btc_regime == "SHORT_ONLY" and asset_regime == "SHORT_ONLY")
+                            )
+
+                            if not regime_aligned:
+                                log.warning(f"[RECOVERY] DCA Veto for {symbol} ({side}): Regime misaligned (BTC={btc_regime}, Asset={asset_regime}). Blocking DCA to avoid averaging into structural trend collapse.")
+                                continue
+
+                            if regime_aligned:
                                 # P1-PATCH: Persist DCA count & cooldown in SQLite system_state to survive daemon restarts
                                 DCA_COOLDOWN_SECONDS = 4 * 3600  # 4 hours
                                 dca_state_key = f"dca_state_{symbol}_{side}"
