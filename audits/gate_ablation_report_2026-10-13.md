@@ -1,6 +1,6 @@
 # Quantitative Gate Ablation Report & Empirical Verdicts
 
-**Date:** 2026-10-13 00:19:33
+**Date:** 2026-10-13 00:33:44
 **Methodology:** 2-Year Authentic Historical OHLCV Replay (Bitget Futures). Full Causal indicators with Bootstrap 90% Confidence Interval for Expected Value (EV) per trade.
 
 ---
