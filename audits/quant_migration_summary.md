@@ -91,23 +91,41 @@ Every invariant and rule was strictly preserved:
 
 > [!IMPORTANT]
 > **Live System Integrity Notice:**
-> The current background process running `start_system.py` (PID 18840 / task-26904) was **NOT** terminated automatically during this migration. Live trades and orders have continued operating seamlessly.
+> The live system daemon running `start_system.py` was **NOT** terminated automatically during these modifications, preventing any interruption to active orders. The follow-up fixes have been committed with individual test verifications.
 
-To activate the newly compiled Stage 6 real trade WebSocket feeds and updated runtime schemas in live execution, the operator should perform a graceful restart when convenient:
+---
 
-1. **Verify No Open Positions in High Volatility:**
-   Check the live Streamlit dashboard (`http://localhost:8501`) or run:
-   ```powershell
-   .venv\Scripts\python.exe -c "import sqlite3; conn = sqlite3.connect('trading_data.db'); print(conn.execute('SELECT symbol, side, entry_price FROM swing_open_positions WHERE status=\"ACTIVE\"').fetchall())"
-   ```
-2. **Graceful Restart:**
-   In your terminal or supervisor:
-   ```powershell
-   # Stop the existing start_system supervisor cleanly
-   Stop-Process -Id 18840 -Force   # or press Ctrl+C in the supervisor console
+## Follow-up fix round (P1 data-loss + wiring verification)
 
-   # Start the updated system
-   .venv\Scripts\python.exe start_system.py
-   ```
-3. **Verify Startup:**
-   Check that `microstructure_state.json` updates with `real_trade_count` and that both `books15` and `trade` subscriptions log successfully.
+### Summary of Completed Fixes
+
+| Fix | Severity | Description | Commit | Test Evidence |
+| :--- | :---: | :--- | :---: | :--- |
+| **FIX 1** | **P1** | Rebuild `swing_trades` table schema with nullable exit columns (`exit_price`, `pnl`, `roe_pct`) via 12-step SQLite migration to support `UNRECONCILED_CLOSE` without data loss | `656a8af` | `tests/test_stage1_notnull_rebuild.py` verifies PRAGMA nullable flags and round-trip insert of NULL exits |
+| **FIX 2** | **P1** | Guard against `None` comparisons (`net_pnl is not None and net_pnl < 0`, guarded string formatting) in `reconciliation_engine.py` to prevent crash on unreconciled trade closures | `6af9210` | Verified with `tests/test_stage1_notnull_rebuild.py` step 7 asserting Anti-Knife logic evaluates cleanly on None |
+| **FIX 3** | **P2** | Deduplicate `shadow_signals` table via `candle_key` (`symbol\|direction\|candle_4h_ts`), unique index `idx_shadow_signals_unique`, and `INSERT OR IGNORE` | `08d1b3e` | Migration 1.3 applied; duplicate insert test verified single row retention in `trading_data.db` |
+| **FIX 4** | **P2** | Instrument per-gate trigger counters in `backtests/backtest_ablation_harness.py` and build `tests/test_gate_toggle_wiring.py` proving each gate changes trade sets | `a0f27ac` | Ran `tests/test_gate_toggle_wiring.py` (5/5 passed); confirmed gate trigger counts and trade set alterations |
+| **FIX 5** | **P3** | Format-string interpolate all narrative metrics in `scripts/run_gate_ablation.py` directly from the simulation results dictionary, eliminating hand-typed discrepancy | `e3ea645` | Re-ran evaluation; generated `audits/gate_ablation_report_2026-10-13.md` with exact matches to simulation table |
+| **FIX 6** | **P3** | Integrate Bitget genuine aggressor trade side (`buy`/`sell`) into `VPINCalculator.update_trade()` in `microstructure_metrics.py` and `ofi_daemon.py`, falling back to tick rule when side is `None`. Reset `last_real_trade_ts` in `SymbolOFIState.reset()` | `864a538` | Unit test verified 100% directional aggressor VPIN computation ($1.0$) and fallback tick-rule computation ($0.502$) |
+
+---
+
+### Exact Process Restart Manifest
+
+When the operator decides to restart processes to deploy the in-memory code updates:
+
+1. **`swing_trader.py` (Swing Architect)**
+   - **Why restart:** Picks up `candle_key` deduplication in `_record_shadow_signal_sync()` (FIX 3) and nullable ledger schema compatibility (FIX 1).
+   - **Command:** Restart the `swing_trader` daemon or run `.venv\Scripts\python.exe swing_trader.py`.
+
+2. **`reconciliation_engine.py` (Reconciler)**
+   - **Why restart:** Loads the `net_pnl is not None` guard and safe string formatters preventing `TypeError` during exchange reconciliation of open/closed positions (FIX 2).
+   - **Command:** Managed under `start_system.py` or run directly.
+
+3. **`ofi_daemon.py` (Microstructure Daemon)**
+   - **Why restart:** Ingests genuine aggressor trade sides from the Bitget `trade` WebSocket channel into `vpin_calc_real` and resets `last_real_trade_ts` on connection drop (FIX 6).
+   - **Command:** Restart the OFI daemon process or run `.venv\Scripts\python.exe ofi_daemon.py`.
+
+4. **All Other Daemons (`super_bot.py`, `dashboard.py`, `state_manager.py`)**
+   - **Status:** Unaffected by these fixes; can remain running uninterrupted.
+
