@@ -63,9 +63,14 @@ class ConvictionBoardroom:
                             buyers_dominate = bool(reg_row and float(reg_row[0] or 0.0) > float(reg_row[1] or 0.0))
                             sym_clean = symbol.upper().replace("/", "").replace("-", "")
                             
-                            if sym_clean in decoupled_runners or buyers_dominate:
+                            # Contagion protection: if Bitcoin is in severe systemic dump or contagion crisis,
+                            # a minor 15m +DI micro-bounce must NOT bypass the altcoin pause.
+                            is_severe_contagion = btc_st in ("DISTRIBUTION_DUMP_RISK", "CONTAGION_CRITICAL", "SYSTEMIC_DUMP", "EXTREME_CONTRACTION")
+                            can_exempt = (sym_clean in decoupled_runners) or (buyers_dominate and not is_severe_contagion)
+                            
+                            if can_exempt:
                                 res["decoupled_info"] = f"[BOARDROOM] 🚀 DECOUPLED ALPHA EXEMPTION: {symbol} authorized (Runner or Market +DI > -DI)."
-                            elif is_dip_buy:
+                            elif is_dip_buy and not is_severe_contagion:
                                 res["decoupled_info"] = f"[BOARDROOM] ⚡ MEAN-REVERSION DIP EXEMPTION: {symbol} is at severe oversold levels (RSI: {context_data.get('rsi')}). Dip-buy authorized despite Bitcoin Anchor pause."
                             else:
                                 res["veto"] = {
@@ -94,6 +99,12 @@ class ConvictionBoardroom:
                                 return res
             except Exception as e:
                 res["err"] = str(e)
+                res["veto"] = {
+                    "execute": False,
+                    "conviction_score": 0.0,
+                    "final_rationale": f"Boardroom Pre-Filter Veto (Fail-Closed on DB Error): {e}"
+                }
+                res["log_warning"] = f"[BOARDROOM] 🛡️ FAIL-CLOSED SAFETY VETO: Error reading system_state pre-filters: {e}"
             return res
 
         pre_filter_res = await asyncio.to_thread(_check_pre_filters_sync)

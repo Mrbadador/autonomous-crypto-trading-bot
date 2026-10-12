@@ -70,7 +70,7 @@ def run_wal_checkpoints():
         try:
             with sqlite3.connect(db_path, timeout=30.0) as conn:
                 conn.execute("PRAGMA busy_timeout=30000;")
-                res = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+                res = conn.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
                 conn.execute("PRAGMA optimize;")
                 results[db_name] = f"WAL Checkpoint OK (busy={res[0]}, log={res[1]}, checkpointed={res[2]})"
                 log.info(f"[{db_name}] {results[db_name]}")
@@ -82,7 +82,9 @@ def run_wal_checkpoints():
 def prune_ephemeral_records():
     """Prunes high-frequency market tick logs and telemetry older than RETENTION_DAYS."""
     pruned_summary = {}
-    cutoff_date = (datetime.now(UTC) - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_dt = datetime.now(UTC) - timedelta(days=RETENTION_DAYS)
+    cutoff_space = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S")
     
     for item in EPHEMERAL_TABLES:
         db_path = os.path.join(BASE_DIR, item["db"])
@@ -101,9 +103,10 @@ def prune_ephemeral_records():
                 if not cursor.fetchone():
                     continue
                     
-                # Delete rows older than cutoff
+                # Delete rows older than cutoff (handling both standard space and ISO-T string formats)
                 res = conn.execute(
-                    f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_date,)
+                    f"DELETE FROM {table} WHERE {time_col} < ? OR ({time_col} LIKE '%T%' AND {time_col} < ?)",
+                    (cutoff_space, cutoff_iso)
                 )
                 deleted = res.rowcount
                 if deleted > 0:

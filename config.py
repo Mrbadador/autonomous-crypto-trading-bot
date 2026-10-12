@@ -364,7 +364,7 @@ CHOP_TP_MULTIPLE       = 1.0
 MIN_AI_CONVICTION_SCORE   = 50.0
 MIN_NN_CONFIDENCE         = float(os.getenv("MIN_NN_CONFIDENCE", "0.34"))
 MAX_TRADES_PER_24H        = 3
-MAX_CONCURRENT_TRADES     = int(os.getenv("MAX_CONCURRENT_TRADES", "5"))
+MAX_CONCURRENT_TRADES     = int(os.getenv("MAX_CONCURRENT_TRADES", "8"))
 RISK_PER_TRADE_PCT        = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))  # Single source of truth (0.5% equity risk per trade)
 # P3-PATCH: Raised from 5.0 → 55.0. At 5.0 the gate was functionally dead (any
 # conviction > 5/100 passed). 55.0 creates a meaningful second-tier filter:

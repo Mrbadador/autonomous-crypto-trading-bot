@@ -17,14 +17,15 @@ from microstructure_metrics import (
     verify_bitget_crc32_checksum
 )
 
-# Import symbols from config if available, fallback to 10 top coins
-DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT"]
+# Import symbols from config if available, fallback to top active coins
+DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT"]
 try:
     import config
     raw_symbols = getattr(config, "SYMBOLS", [])
-    SYMBOLS = [s.replace("/", "").upper() for s in raw_symbols if s]
+    blacklist = [s.replace("/", "").upper() for s in getattr(config, "SWING_BLACKLIST", [])]
+    SYMBOLS = [s.replace("/", "").upper() for s in raw_symbols if s and s.replace("/", "").upper() not in blacklist]
     if not SYMBOLS:
-        SYMBOLS = DEFAULT_SYMBOLS
+        SYMBOLS = [s for s in DEFAULT_SYMBOLS if s not in blacklist]
     if "BTCUSDT" not in SYMBOLS:
         SYMBOLS.insert(0, "BTCUSDT")
 except Exception:
@@ -345,10 +346,12 @@ class MultiSymbolOFIDaemon:
 
         now = time.time()
         if now - self.last_write_time >= 1.0:
-            self.last_write_time = now
-            t = asyncio.create_task(self.write_state_async())
-            self._background_tasks.add(t)
-            t.add_done_callback(self._background_tasks.discard)
+            # Drop trigger if prior write is still pending to avoid disk queue build-up
+            if not any(t.get_name() == "ofi_write_state" and not t.done() for t in self._background_tasks):
+                self.last_write_time = now
+                t = asyncio.create_task(self.write_state_async(), name="ofi_write_state")
+                self._background_tasks.add(t)
+                t.add_done_callback(self._background_tasks.discard)
 
 
     async def write_state_async(self):
