@@ -8,6 +8,7 @@
 import logging
 import socket
 import aiohttp
+import math
 import dns_fix  # noqa: F401
 import ccxt.async_support as ccxt
 import config  # noqa: F401 — required for _ensure_corr_exchange()
@@ -166,28 +167,35 @@ class RiskManager:
         try:
             with sqlite3.connect(db_path, timeout=5.0) as conn:
                 st_rows = conn.execute("""
-                    SELECT pnl, initial_risk_usd, size, entry_price 
+                    SELECT pnl, size, entry_price 
                     FROM swing_trades 
-                    WHERE status IN ('closed', 'CLOSED') AND pnl IS NOT NULL
+                    WHERE pnl IS NOT NULL
                     ORDER BY id DESC LIMIT 50
                 """).fetchall()
                 for r in st_rows:
                     pnl = float(r[0] or 0.0)
-                    risk = float(r[1] or 0.0)
-                    if risk > 0.1:
-                        returns.append(pnl / risk)
-                    elif r[2] and r[3] and float(r[2]) * float(r[3]) > 1.0:
-                        notional = float(r[2]) * float(r[3])
-                        returns.append((pnl / notional) * 5.0)
+                    sz = float(r[1] or 0.0)
+                    ep = float(r[2] or 0.0)
+                    if sz > 0 and ep > 0:
+                        margin_est = (sz * ep) / 5.0  # Normalized to 5x margin base
+                        returns.append(pnl / margin_est if margin_est > 0 else 0.0)
+                    elif pnl != 0.0:
+                        returns.append(pnl / 2.0)  # Normalized fallback risk unit
 
                 t_rows = conn.execute("""
-                    SELECT pnl FROM trades 
+                    SELECT pnl, qty, entry_price FROM trades 
                     WHERE status IN ('closed', 'CLOSED') AND pnl IS NOT NULL
                     ORDER BY id DESC LIMIT 50
                 """).fetchall()
                 for r in t_rows:
                     pnl = float(r[0] or 0.0)
-                    returns.append(pnl / 1.50)
+                    q = float(r[1] or 0.0)
+                    ep = float(r[2] or 0.0)
+                    if q > 0 and ep > 0:
+                        margin_est = (q * ep) / 5.0
+                        returns.append(pnl / margin_est if margin_est > 0 else 0.0)
+                    else:
+                        returns.append(pnl / 1.50)
         except Exception as e:
             log.debug(f"[RISK-MANAGER] Return history read note: {e}")
         return returns
@@ -206,7 +214,7 @@ class RiskManager:
             returns=returns,
             fraction=0.25,  # Quarter-Kelly for maximum drawdown dampening
             max_cap=self.max_cap if self.max_cap > 0 else 0.25,
-            min_cap=0.03
+            min_cap=min(0.005, self.max_cap)
         )
         log.info(f"[RISK-MANAGER] Empirical Bayesian Quarter-Kelly Fraction: {optimal_f:.2%} (Sample: {len(returns)} trades)")
         return optimal_f
@@ -277,7 +285,7 @@ class RiskManager:
             db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_data.db")
             conn = sqlite3.connect(db_path, timeout=30.0)
             
-            # Query all active fleet position tables
+            # Query all active fleet position tables including swing_open_positions
             rows = []
             for tbl in ["open_positions", "berserker_open_positions", "marl_live_open_positions", "mean_reversion_open_positions"]:
                 try:
@@ -285,6 +293,11 @@ class RiskManager:
                     rows.extend(cursor.fetchall())
                 except Exception:
                     pass
+            try:
+                cursor = conn.execute("SELECT size AS qty, entry_price, stop_loss FROM swing_open_positions WHERE status = 'ACTIVE' OR status IS NULL")
+                rows.extend(cursor.fetchall())
+            except Exception:
+                pass
             conn.close()
             
             import math

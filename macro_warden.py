@@ -152,6 +152,9 @@ class MacroWarden:
                     VALUES (?, ?, ?, ?, ?)
                 """, (now_iso, 'BTC/USDT', float(spy_health), float(dxy_momentum), 'macro_warden'))
                 
+                macro_regime_label = 'RISK_ON_BULL' if spy_health > 0.02 and dxy_momentum < 0 else ('DEFENSIVE_BEAR' if spy_health < -0.02 or dxy_momentum > 0.005 else 'NEUTRAL')
+                market_posture_label = 'TACTICAL_DEFENSE' if spy_health < 0 else 'BALANCED_CHOP'
+
                 # Also log to append-only macro_telemetry_history
                 conn.execute("""
                     INSERT INTO macro_telemetry_history (
@@ -161,11 +164,28 @@ class MacroWarden:
                     now_iso,
                     metrics.get('spy_price'),
                     metrics.get('dxy_price'),
-                    'RISK_ON_BULL' if spy_health > 0.02 and dxy_momentum < 0 else ('DEFENSIVE_BEAR' if spy_health < -0.02 or dxy_momentum > 0.005 else 'NEUTRAL'),
-                    'TACTICAL_DEFENSE' if spy_health < 0 else 'BALANCED_CHOP',
+                    macro_regime_label,
+                    market_posture_label,
                     'macro_warden'
                 ))
             conn.close()
+
+            # Wire to trading_data.db system_state so Swing and fleet daemons consume live TradFi macro posture
+            trading_data_path = os.path.join(BASE_DIR, "trading_data.db")
+            if os.path.exists(trading_data_path):
+                try:
+                    with sqlite3.connect(trading_data_path, timeout=10.0) as data_conn:
+                        data_conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('tradfi_macro_regime', ?, ?)",
+                                          (macro_regime_label, now_iso))
+                        data_conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('spy_health', ?, ?)",
+                                          (str(round(spy_health, 4)), now_iso))
+                        data_conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('dxy_momentum', ?, ?)",
+                                          (str(round(dxy_momentum, 4)), now_iso))
+                        data_conn.commit()
+                        log.info(f"[MACRO-WARDEN] Dispatched tradfi_macro_regime '{macro_regime_label}' to trading_data.db system_state.")
+                except Exception as de:
+                    log.warning(f"[MACRO-WARDEN] system_state broadcast note: {de}")
+
             log.info("Successfully committed Macro vectors to ledger (append-only).")
             return True
         except Exception as e:

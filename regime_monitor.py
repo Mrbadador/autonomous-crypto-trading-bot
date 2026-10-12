@@ -175,6 +175,8 @@ async def run_regime_monitor():
     last_alerted_regime: str = str(initial.get("regime") or "UNKNOWN") if initial else "UNKNOWN"
     log.info(f"[REGIME-MONITOR] Bootstrapped with initial regime: {last_alerted_regime}")
 
+    KNOWN_REGIMES = ("BULL_TREND", "BULLISH", "TRENDING", "BEAR_TREND", "BEARISH", "CHOP", "DEFENSIVE_CHOP", "NEUTRAL")
+
     while True:
         await asyncio.sleep(POLL_INTERVAL_SEC)
 
@@ -191,7 +193,7 @@ async def run_regime_monitor():
         macro_trend = str(data.get("macro_trend") or "NEUTRAL")
 
         # Check for meaningful state transition
-        if regime != last_alerted_regime and regime in ("BULL_TREND", "BEAR_TREND", "CHOP"):
+        if regime != last_alerted_regime and regime in KNOWN_REGIMES:
             log.info(
                 f"[REGIME-MONITOR] 🚨 REGIME SHIFT DETECTED: {last_alerted_regime} ➔ {regime} | "
                 f"ADX={adx:.2f} +DI={plus_di:.1f} -DI={minus_di:.1f} Macro={macro_trend}. Dispatching alert..."

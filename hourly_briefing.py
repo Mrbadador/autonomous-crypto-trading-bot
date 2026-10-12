@@ -23,8 +23,10 @@ import json
 import sqlite3
 import re
 import logging
+import html
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
+import config
 
 # Ensure UTF-8 console output
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -81,14 +83,14 @@ def generate_hourly_briefing_data() -> Dict[str, Any]:
     one_hour_ago = now_utc - timedelta(minutes=65)
     one_hour_iso = one_hour_ago.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1. Fetch 5-Minute Briefing Cycles from the last hour
+    # 1. Fetch 5-Minute Briefing Cycles from the last hour (timestamp-aware)
     cycles_rows = safe_query(
         TRADING_LEDGER_DB,
         "SELECT * FROM executive_briefing_history WHERE generated_at >= ? ORDER BY id ASC",
         (one_hour_iso,)
     )
     if not cycles_rows or len(cycles_rows) < 3:
-        # Fallback to last 12 cycles regardless of strict timestamp filter
+        # Fallback to last 12 cycles only if recent (within 4 hours)
         cycles_rows = safe_query(
             TRADING_LEDGER_DB,
             "SELECT * FROM executive_briefing_history ORDER BY id DESC LIMIT 12"
@@ -102,13 +104,13 @@ def generate_hourly_briefing_data() -> Dict[str, Any]:
     start_equity = float(oldest_cycle.get("equity") or 0.0)
     end_equity = float(newest_cycle.get("equity") or 0.0)
 
-    # Fallback equity if history records were 0
+    # Truthful live balance query without fabricated constants
     if end_equity <= 0.0:
-        live_bal_str = query_system_state("live_balance", "156.30")
+        live_bal_str = query_system_state("live_balance", "") or query_system_state("balance", "0.0")
         try:
             end_equity = float(live_bal_str)
         except Exception:
-            end_equity = 156.30
+            end_equity = 0.0
         if start_equity <= 0.0:
             start_equity = end_equity
 
@@ -119,10 +121,19 @@ def generate_hourly_briefing_data() -> Dict[str, Any]:
     peak_equity = max(equities) if equities else end_equity
     low_equity = min(equities) if equities else end_equity
 
+    # Truthful live margin utilization without fabricated 54% / 74.9% defaults
     margin_utils = [float(r.get("margin_util_pct") or 0.0) for r in cycles_rows if r.get("margin_util_pct") is not None]
-    min_margin = min(margin_utils) if margin_utils else 54.0
-    max_margin = max(margin_utils) if margin_utils else 74.9
-    end_margin = margin_utils[-1] if margin_utils else 74.9
+    if margin_utils:
+        min_margin = min(margin_utils)
+        max_margin = max(margin_utils)
+        end_margin = margin_utils[-1]
+    else:
+        live_util = query_system_state("margin_util_pct", "0.0")
+        try:
+            end_margin = float(live_util)
+        except Exception:
+            end_margin = 0.0
+        min_margin, max_margin = end_margin, end_margin
 
     start_cycle_num = oldest_cycle.get("cycle_num", 1)
     end_cycle_num = newest_cycle.get("cycle_num", 1)
@@ -171,25 +182,53 @@ def generate_hourly_briefing_data() -> Dict[str, Any]:
     nar_m = re.search(r"\*\s*\*\*Strategic Macro Narrative:\*\*\s*([^\n]+)", latest_md)
     if nar_m: latest_macro_narrative = nar_m.group(1).strip()
 
-    # 3. Fetch Trades Executed Over the Past 60 Minutes
-    past_hour_trades = safe_query(
-        TRADING_DATA_DB,
-        "SELECT symbol, side, pnl, action AS exit_reason, status, timestamp, notes FROM trades WHERE timestamp >= ? ORDER BY timestamp DESC",
-        (one_hour_iso,)
-    )
-    past_hour_swing = safe_query(
-        TRADING_DATA_DB,
-        "SELECT symbol, side, pnl, exit_reason, notes, timestamp FROM swing_trades WHERE timestamp >= ? ORDER BY timestamp DESC",
-        (one_hour_iso,)
-    )
-    closed_trades = past_hour_trades + past_hour_swing
+    # 3. Fetch Trades Executed Over the Past 60 Minutes (All fleet engines, ISO + space normalized)
+    closed_trades = []
+    trade_queries = [
+        ("trades", "SELECT symbol, side, pnl, action AS exit_reason, status, timestamp, notes FROM trades"),
+        ("swing_trades", "SELECT symbol, side, pnl, exit_reason, notes, timestamp FROM swing_trades"),
+        ("berserker_trades", "SELECT symbol, side, pnl, action AS exit_reason, notes, timestamp FROM berserker_trades"),
+        ("marl_live_trades", "SELECT symbol, side, pnl, action AS exit_reason, notes, timestamp FROM marl_live_trades"),
+    ]
+    for tbl_name, q_base in trade_queries:
+        try:
+            raw_rows = safe_query(TRADING_DATA_DB, f"{q_base} ORDER BY id DESC LIMIT 50")
+            for tr in raw_rows:
+                ts_str = tr.get("timestamp") or ""
+                # Parse timestamp robustly regardless of space vs T or timezone format
+                try:
+                    c_clean = str(ts_str).replace("Z", "+00:00")
+                    if "T" not in c_clean and " " in c_clean:
+                        c_clean = c_clean.replace(" ", "T")
+                    if "+" not in c_clean and not c_clean.endswith("Z"):
+                        c_clean += "+00:00"
+                    t_dt = datetime.fromisoformat(c_clean)
+                    if t_dt.tzinfo is None:
+                        t_dt = t_dt.replace(tzinfo=timezone.utc)
+                    if t_dt >= one_hour_ago:
+                        closed_trades.append(tr)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     hourly_realized_pnl = sum([float(t.get("pnl") or 0.0) for t in closed_trades])
 
-    # 4. Fetch Active Positions Snapshot & Live Funding Telemetry
-    open_p1 = safe_query(TRADING_DATA_DB, "SELECT * FROM open_positions")
-    open_p2 = safe_query(TRADING_DATA_DB, "SELECT symbol, side, entry_price, size AS qty, stop_loss, take_profit, trailing_stop, peak_price, opened_at AS entry_time, leverage, notes AS comments FROM swing_open_positions")
+    # 4. Fetch Active Positions Snapshot & Live Funding Telemetry (All fleet tables)
+    combined_open = []
+    open_queries = [
+        ("swing_open_positions", "SELECT symbol, side, entry_price, size AS qty, stop_loss, take_profit, trailing_stop, peak_price, opened_at AS entry_time, leverage, notes AS comments FROM swing_open_positions WHERE status = 'ACTIVE' OR status IS NULL"),
+        ("open_positions", "SELECT * FROM open_positions"),
+        ("berserker_open_positions", "SELECT * FROM berserker_open_positions"),
+        ("marl_live_open_positions", "SELECT * FROM marl_live_open_positions"),
+    ]
+    for tbl_name, q_open in open_queries:
+        try:
+            p_rows = safe_query(TRADING_DATA_DB, q_open)
+            combined_open.extend(p_rows)
+        except Exception:
+            pass
     
-    combined_open = open_p1 + open_p2
     seen_syms = set()
     deduped_open = []
     for op in combined_open:
@@ -316,13 +355,14 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
     directives_html = ""
     if data["directives"]:
         for d in data["directives"]:
+            escaped_dir = html.escape(str(d.get("directive", "")))
             directives_html += f"""
             <div style="padding: 6px 10px; margin-bottom: 6px; background: rgba(255,255,255,0.02); border-left: 3px solid #38bdf8; border-radius: 4px; font-size: 13px;">
-                <b style="color: #38bdf8;">Cycle #{d['cycle']} ({d['time']}):</b> <span style="color: #f1f5f9;">{d['directive']}</span>
+                <b style="color: #38bdf8;">Cycle #{d['cycle']} ({d['time']}):</b> <span style="color: #f1f5f9;">{escaped_dir}</span>
             </div>
             """
     else:
-        directives_html = f"<div style='color: #94a3b8; font-size: 13px;'>{data['latest_stance'] or 'Enforce capital preservation in chop regime.'}</div>"
+        directives_html = f"<div style='color: #94a3b8; font-size: 13px;'>{html.escape(str(data['latest_stance'] or 'Enforce capital preservation in chop regime.'))}</div>"
 
     # 2. Closed Trades Rows
     closed_trades_html = ""
@@ -333,10 +373,10 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
             t_sign = "+$" if pnl_val >= 0 else "-$"
             closed_trades_html += f"""
             <tr>
-                <td style="padding: 8px; border-bottom: 1px solid #1e293b; color: #38bdf8; font-weight: bold;">{t.get('symbol')}</td>
-                <td style="padding: 8px; border-bottom: 1px solid #1e293b; text-align: center;">{t.get('side', '').upper()}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #1e293b; color: #38bdf8; font-weight: bold;">{html.escape(str(t.get('symbol', '')))}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #1e293b; text-align: center;">{html.escape(str(t.get('side', '')).upper())}</td>
                 <td style="padding: 8px; border-bottom: 1px solid #1e293b; text-align: right; color: {t_col}; font-weight: bold;">{t_sign}{abs(pnl_val):.4f}</td>
-                <td style="padding: 8px; border-bottom: 1px solid #1e293b; text-align: right; color: #94a3b8;">{t.get('exit_reason') or t.get('action') or 'Settled'}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #1e293b; text-align: right; color: #94a3b8;">{html.escape(str(t.get('exit_reason') or t.get('action') or 'Settled'))}</td>
             </tr>
             """
     else:
@@ -358,10 +398,13 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
             p_fund_col = "#22c55e" if p["funding"] >= 0 else "#f59e0b"
             ratchet_str = " <span style='color: #22c55e; font-weight: bold;'>[RATCHET]</span>" if p["shep_ratchet"] else ""
             
+            raw_diag = str(p.get("shep_diag", ""))
+            disp_diag = html.escape(raw_diag[:55] + "..." if len(raw_diag) > 55 else raw_diag)
+            
             positions_html += f"""
             <tr style="border-bottom: 1px solid #1e293b;">
                 <td style="padding: 10px 8px; color: #ffffff; font-weight: bold;">
-                    {p['symbol']}<br>
+                    {html.escape(str(p['symbol']))}<br>
                     <span style="font-size: 11px; color: #38bdf8;">{p['side']} {p['lev']:.0f}x (${p['margin']:.2f})</span>
                 </td>
                 <td style="padding: 10px 8px; font-family: monospace; font-size: 12px;">
@@ -380,8 +423,8 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
                     TP: <b style="color: #22c55e;">${p['tp']:,.4f}</b> (Target: {p['shep_target_r']:.1f}R)
                 </td>
                 <td style="padding: 10px 8px; font-size: 11px; color: #cbd5e1;">
-                    <b style="color: #38bdf8;">{p['shep_verdict']}</b><br>
-                    <span style="color: #94a3b8;">{p['shep_diag'][:55]}...</span>
+                    <b style="color: #38bdf8;">{html.escape(str(p['shep_verdict']))}</b><br>
+                    <span style="color: #94a3b8;">{disp_diag}</span>
                 </td>
             </tr>
             """
@@ -393,6 +436,8 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
             </td>
         </tr>
         """
+
+    max_fleet_slots = getattr(config, "GLOBAL_MAX_POSITIONS", 8)
 
     html = f"""
     <!DOCTYPE html>
@@ -456,7 +501,7 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
                 </div>
                 <div class="kpi-cell">
                     <div class="kpi-label">FLEET SLOTS</div>
-                    <div class="kpi-val" style="color: #38bdf8;">{data['slots_occupied']} / 5</div>
+                    <div class="kpi-val" style="color: #38bdf8;">{data['slots_occupied']} / {max_fleet_slots}</div>
                     <div style="font-size: 11px; color: #94a3b8; margin-top: 2px;">Active Positions</div>
                 </div>
             </div>
@@ -533,6 +578,24 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
 def send_hourly_briefing_email(force: bool = False) -> bool:
     """Generates the hourly rollup and dispatches it via email_dispatcher.send_html_alert."""
     try:
+        # Enforce 50-minute dispatch cooldown unless force=True
+        if not force:
+            try:
+                conn_check = get_db_connection(TRADING_LEDGER_DB)
+                last_row = conn_check.execute("SELECT generated_at FROM hourly_briefing_history ORDER BY id DESC LIMIT 1").fetchone()
+                conn_check.close()
+                if last_row and last_row[0]:
+                    last_str = str(last_row[0]).replace(" UTC", "").strip()
+                    last_dt = datetime.fromisoformat(last_str) if "T" in last_str else datetime.strptime(last_str, "%Y-%m-%d %H:%M:%S")
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    elapsed_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60.0
+                    if elapsed_min < 50.0:
+                        log.info(f"Hourly briefing skipped (last sent {elapsed_min:.1f} mins ago; cooldown=50m; force=False).")
+                        return True
+            except Exception as cd_err:
+                log.debug(f"Hourly briefing cooldown check note: {cd_err}")
+
         data = generate_hourly_briefing_data()
         html_content = build_hourly_briefing_html(data)
         

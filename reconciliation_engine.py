@@ -268,6 +268,7 @@ async def audit_live_exchange_positions():
             pruned_count = 0
 
             # 0. ORPHAN ORDER REAPER: Scan Bitget for abandoned resting limit orders
+            # Only reap orders that are not plan/trigger orders and older than 300s (protecting maker grids and TP/SL)
             try:
                 unfilled_res = await uta.exchange.private_uta_get_v3_trade_unfilled_orders({"category": "USDT-FUTURES"})
                 unfilled_data = unfilled_res.get("data", {})
@@ -277,12 +278,17 @@ async def audit_live_exchange_positions():
                     u_id = u_ord.get("orderId")
                     u_sym = u_ord.get("symbol", "")
                     u_type = str(u_ord.get("orderType", "")).lower()
+                    reduce_only = str(u_ord.get("reduceOnly", "")).lower() in ("true", "1")
+                    # Do not cancel plan, conditional, or reduce-only (TP/SL) orders!
+                    if "plan" in u_type or "trigger" in u_type or reduce_only:
+                        continue
+
                     c_time = float(u_ord.get("createdTime", 0) or 0)
                     age_sec = (now_ms - c_time) / 1000.0 if c_time > 0 else 999.0
                     
-                    # Any unfilled limit order resting for > 180s without active fill monitor is an orphan
-                    if age_sec > 180.0:
-                        log.warning(f"[RECONCILER-ORPHAN-REAPER] Found orphaned resting order {u_id} on {u_sym} (type={u_type}, age={age_sec:.1f}s). Cancelling from exchange!")
+                    # Only cancel non-reduce-only limit orders resting beyond 300 seconds
+                    if age_sec > 300.0 and u_type == "limit":
+                        log.warning(f"[RECONCILER-ORPHAN-REAPER] Found orphaned resting entry limit {u_id} on {u_sym} (age={age_sec:.1f}s). Cancelling from exchange!")
                         try:
                             await uta.cancel_order(u_sym, u_id)
                             log.info(f"[RECONCILER-ORPHAN-REAPER] Successfully cancelled orphaned order {u_id} on {u_sym}")
@@ -701,6 +707,7 @@ async def audit_live_exchange_positions():
                                 entry_p = float(row_dict.get("entry_price", 0.0) or 0.0)
                                 qty = float(row_dict.get("qty", 0.0) or row_dict.get("size", 0.0) or 0.0)
                                 side = str(row_dict.get("side", "long")).lower()
+                                is_long = "long" in side
                                 sl = float(row_dict.get("stop_loss", 0.0) or 0.0)
                                 tp = float(row_dict.get("take_profit", 0.0) or 0.0)
                                 lev = float(row_dict.get("leverage", 5.0) or 5.0)

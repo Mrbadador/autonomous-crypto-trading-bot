@@ -260,9 +260,12 @@ class LiveOracle:
                 # Schema matches macro_warden.py exactly for cross-daemon compatibility.
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS macro_logs (
-                        timestamp TEXT,
-                        spy_health REAL,
-                        dxy_momentum REAL
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        symbol TEXT DEFAULT 'BTC/USDT',
+                        spy_health REAL NOT NULL DEFAULT 0.0,
+                        dxy_momentum REAL NOT NULL DEFAULT 0.0,
+                        source TEXT DEFAULT 'macro_warden'
                     )
                 """)
             conn.close()

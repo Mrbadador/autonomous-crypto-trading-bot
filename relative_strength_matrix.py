@@ -44,10 +44,11 @@ if not log.handlers:
 
 UTC = timezone.utc
 
-FLEET_ASSETS = [
+# Derive fleet assets dynamically from config if available
+FLEET_ASSETS = getattr(config, "SYMBOLS", [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT",
     "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "NEAR/USDT"
-]
+])
 
 def _ensure_rs_tables():
     """Initializes SQLite schema for relative strength history in trading_ledger.db."""
@@ -110,24 +111,37 @@ class RelativeStrengthMatrix:
             "normalized_ofi": micro_data.get(symbol, {}).get("normalized_ofi", 0.0)
         }
         try:
-            ohlcv = await exchange.fetch_ohlcv(clean_s, timeframe="15m", limit=30)
-            if ohlcv and len(ohlcv) >= 16:
+            # Fetch 60 15m candles (15 hours of data)
+            ohlcv = await exchange.fetch_ohlcv(clean_s, timeframe="15m", limit=60)
+            if ohlcv and len(ohlcv) >= 20:
                 df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
                 curr_c = float(df["close"].iloc[-1])
+                # Exact 1 hour = 4 bars ago
                 c_1h_ago = float(df["close"].iloc[-5]) if len(df) >= 5 else curr_c
-                c_4h_ago = float(df["close"].iloc[0])
+                # Exact 4 hours = 16 bars ago
+                c_4h_ago = float(df["close"].iloc[-17]) if len(df) >= 17 else float(df["close"].iloc[0])
 
                 res["price"] = curr_c
                 res["change_1h_pct"] = round(((curr_c - c_1h_ago) / c_1h_ago) * 100.0, 2) if c_1h_ago > 0 else 0.0
                 res["change_4h_pct"] = round(((curr_c - c_4h_ago) / c_4h_ago) * 100.0, 2) if c_4h_ago > 0 else 0.0
 
-                # Compute RSI
+                # Compute Wilder's RSI
                 delta = df["close"].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rs = gain / loss.replace(0, np.nan)
-                rsi = 100 - (100 / (1 + rs))
+                gain = delta.where(delta > 0, 0.0)
+                loss = (-delta).where(delta < 0, 0.0)
+                avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+                avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+                rs = avg_gain / avg_loss.replace(0, np.nan)
+                rsi = 100.0 - (100.0 / (1.0 + rs))
                 res["rsi_15m"] = round(float(rsi.iloc[-1]), 1) if not np.isnan(rsi.iloc[-1]) else 50.0
+
+                # Compute Authentic ADX 14
+                try:
+                    import ta
+                    adx_series = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
+                    res["adx_15m"] = round(float(adx_series.iloc[-1]), 1) if not np.isnan(adx_series.iloc[-1]) else 20.0
+                except Exception:
+                    res["adx_15m"] = 20.0
 
                 # Compute Volume Ratio (current bar vol vs 20-bar avg)
                 mean_vol = float(df["vol"].rolling(20).mean().iloc[-1] or 1.0)
