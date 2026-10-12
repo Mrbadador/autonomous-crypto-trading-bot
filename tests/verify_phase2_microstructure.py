@@ -16,8 +16,14 @@ import time
 import asyncio
 import numpy as np
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 # Ensure workspace root is in sys.path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
@@ -121,6 +127,7 @@ async def test_clean_stationary_flow_pass():
         "mean_residence_time_ms": 850.0,
         "trade_volumes": np.array([25.0, 22.0]),
         "trade_signs": np.array([1.0, -1.0]),
+        "vol_24h": 500000.0,
         "ofi": 0.5,
         "spread": 0.5
     }
@@ -235,6 +242,7 @@ async def test_backward_compatibility_and_failsafe():
 
     # 1. Test minimal context (as sent from BerserkerTrader without Hawkes fields)
     berserker_ctx = {
+        "side": "neutral",
         "ofi": 0.12,
         "trade_volumes": np.array([10.0, 12.0]),
         "trade_signs": np.array([1.0, -1.0]),
@@ -256,8 +264,8 @@ async def test_backward_compatibility_and_failsafe():
     }
     passed, reason = await guard.evaluate_pre_trade_veto(invalid_ctx)
     print(f"Invalid context failsafe call: Passed = {passed} | Reason = {reason}")
-    assert passed is True, "Failsafe must return passed=True to avoid freezing fleet"
-    assert "MicrostructureGuard Error Failsafe" in reason, f"Expected failsafe message, got: {reason}"
+    assert passed is False, "Fail-closed safety must veto corrupted context to protect capital"
+    assert "MicrostructureGuard Error Fail-Closed" in reason, f"Expected fail-closed message, got: {reason}"
 
     print("[PASS] Backward compatibility and failsafe resilience verified!\n")
 

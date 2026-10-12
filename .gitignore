@@ -30,6 +30,9 @@ tmp/
 microstructure_state.json
 sentiment_state.json
 volatility_state.json
+experience_replay.json
+learned_memory.json
+*.tmp
 debug.html
 marl_cockpit_verification.png
 

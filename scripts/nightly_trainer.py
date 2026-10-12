@@ -81,6 +81,15 @@ def calculate_batch_sortino(
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] NIGHTLY_TRAINER: %(message)s")
 log = logging.getLogger("nightly_trainer")
 
+# Configure System Paths for Modular Repository Architecture
+import sys
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+LEGACY_DIR = os.path.join(PROJECT_ROOT, "archive", "legacy_agents")
+if os.path.exists(LEGACY_DIR) and LEGACY_DIR not in sys.path:
+    sys.path.insert(0, LEGACY_DIR)
+
 # Safe Imports of PyTorch Components
 try:
     import torch
@@ -95,9 +104,10 @@ try:
     )
     from core.overlord import PotentialBasedRewardShaper
     HAS_TORCH = True
-except ImportError:
+except ImportError as err:
     HAS_TORCH = False
-    log.warning("PyTorch ('torch') is not installed in this environment. Running in Graceful Mock Fallback Mode. Run 'pip install torch' to enable Policy Gradient training.")
+    log.warning(f"PyTorch or agent imports unavailable ({err}). Running in Graceful Mock Fallback Mode.")
+
 
 if HAS_TORCH:
     class LSTMCriticNetwork(nn.Module):
@@ -270,14 +280,21 @@ class NightlyTrainer:
             self.pbrs = PotentialBasedRewardShaper(w1=1.0, w2=0.5, w3=0.25, gamma=0.99)
             
             # Safe Model Loading:
-            # 1. Try target model_path if it exists
-            # 2. Otherwise bootstrap from base_model_path
-            load_candidates = [
+            # Check direct path, models/ dir, and project root
+            raw_candidates = [
                 self.model_path,
                 self.base_model_path,
                 "strategist_weights_v26.pth",
                 "policy_model.pth"
             ]
+            load_candidates = []
+            for c in raw_candidates:
+                if not c:
+                    continue
+                load_candidates.append(c)
+                load_candidates.append(os.path.join(PROJECT_ROOT, "models", os.path.basename(c)))
+                load_candidates.append(os.path.join(PROJECT_ROOT, c))
+
             loaded = False
             for cand in load_candidates:
                 if cand and os.path.exists(cand):

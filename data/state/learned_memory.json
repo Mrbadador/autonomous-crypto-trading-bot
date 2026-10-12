@@ -5822,5 +5822,323 @@
       }
     ],
     "rules": []
+  },
+  "audit_20261012_114606": {
+    "timestamp_utc": "2026-10-12T11:46:06.179620+00:00",
+    "metrics": {
+      "total_trades": 6,
+      "wins": 4,
+      "losses": 2,
+      "win_rate": 0.6667,
+      "total_pnl": 4.2,
+      "total_reward": 3.66,
+      "avg_reward": 0.61,
+      "rules": []
+    },
+    "reward_log": [
+      {
+        "id": 3,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 6,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 2,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 5,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 1,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      },
+      {
+        "id": 4,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      }
+    ],
+    "rules": []
+  },
+  "audit_20261012_120623": {
+    "timestamp_utc": "2026-10-12T12:06:23.584564+00:00",
+    "metrics": {
+      "total_trades": 9,
+      "wins": 6,
+      "losses": 3,
+      "win_rate": 0.6667,
+      "total_pnl": 6.3,
+      "total_reward": 5.49,
+      "avg_reward": 0.61,
+      "rules": []
+    },
+    "reward_log": [
+      {
+        "id": 3,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 6,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 9,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 2,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 5,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 8,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 1,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      },
+      {
+        "id": 4,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      },
+      {
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      }
+    ],
+    "rules": []
+  },
+  "audit_20261012_120743": {
+    "timestamp_utc": "2026-10-12T12:07:43.657516+00:00",
+    "metrics": {
+      "total_trades": 12,
+      "wins": 8,
+      "losses": 4,
+      "win_rate": 0.6667,
+      "total_pnl": 8.4,
+      "total_reward": 7.32,
+      "avg_reward": 0.61,
+      "rules": []
+    },
+    "reward_log": [
+      {
+        "id": 3,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 6,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 9,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 12,
+        "symbol": "SOL/USDT",
+        "side": "long",
+        "pnl": -1.2,
+        "duration_mins": 210.0,
+        "reward": -1.41,
+        "outcome": "LOSS",
+        "regime": "CHOPPY"
+      },
+      {
+        "id": 2,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 5,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 8,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 11,
+        "symbol": "ETH/USDT",
+        "side": "short",
+        "pnl": 0.8,
+        "duration_mins": 45.0,
+        "reward": 0.755,
+        "outcome": "WIN",
+        "regime": "RANGING"
+      },
+      {
+        "id": 1,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      },
+      {
+        "id": 4,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      },
+      {
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      },
+      {
+        "id": 10,
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "pnl": 2.5,
+        "duration_mins": 15.0,
+        "reward": 2.485,
+        "outcome": "WIN",
+        "regime": "TRENDING"
+      }
+    ],
+    "rules": []
   }
 }

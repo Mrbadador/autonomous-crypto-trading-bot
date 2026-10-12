@@ -8,7 +8,9 @@ import os
 import sqlite3
 
 # Ensure project root is in sys.path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 import db_manager
 
 async def writer_task(task_id: int, rate_per_sec: int, stop_event: asyncio.Event, stats: dict):

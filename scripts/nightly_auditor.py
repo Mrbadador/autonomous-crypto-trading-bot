@@ -23,9 +23,11 @@ log = logging.getLogger("nightly_auditor")
 
 # ── Absolute Paths ─────────────────────────────────────────────────────────────
 BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
-LIVE_DB_PATH       = os.path.join(BASE_DIR, "trading_data.db")
+PROJECT_ROOT       = os.path.dirname(BASE_DIR)
+LIVE_DB_PATH       = os.path.join(PROJECT_ROOT, "trading_data.db") if os.path.exists(os.path.join(PROJECT_ROOT, "trading_data.db")) else os.path.join(BASE_DIR, "trading_data.db")
 SANDBOX_DB_PATH    = os.path.join(BASE_DIR, "audit_sandbox.db")
-MEMORY_PATH        = os.path.join(BASE_DIR, "learned_memory.json")
+MEMORY_PATH        = os.path.join(PROJECT_ROOT, "data", "state", "learned_memory.json") if os.path.exists(os.path.join(PROJECT_ROOT, "data", "state", "learned_memory.json")) else os.path.join(BASE_DIR, "learned_memory.json")
+
 
 # ── Reward Hyperparameters ────────────────────────────────────────────────────
 MU                 = 0.001   # Time-exposure penalty coefficient (per minute)

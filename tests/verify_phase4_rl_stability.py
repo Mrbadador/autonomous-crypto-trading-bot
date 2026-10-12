@@ -12,14 +12,20 @@ Validates:
 
 import os
 import sys
+import json
 import time
 import hashlib
 import numpy as np
 import torch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+for p in [PROJECT_ROOT, os.path.join(PROJECT_ROOT, "scripts"), os.path.join(PROJECT_ROOT, "archive", "legacy_agents"), BASE_DIR]:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 from strategist_agent import (
     StrategistAgent,
@@ -247,8 +253,9 @@ def test_offline_training_pass_and_weight_promotion():
     print("TEST 6: Offline Training Pass & Safe Weight Promotion to v28")
     print("=" * 70)
 
-    v27_path = os.path.join(BASE_DIR, "strategist_weights_v27.pth")
-    v28_path = os.path.join(BASE_DIR, "strategist_weights_v28.pth")
+    models_dir = os.path.join(PROJECT_ROOT, "models")
+    v27_path = os.path.join(models_dir, "strategist_weights_v27.pth") if os.path.exists(os.path.join(models_dir, "strategist_weights_v27.pth")) else os.path.join(BASE_DIR, "strategist_weights_v27.pth")
+    v28_path = os.path.join(models_dir, "strategist_weights_v28.pth") if os.path.exists(models_dir) else os.path.join(BASE_DIR, "strategist_weights_v28.pth")
 
     assert os.path.exists(v27_path), f"Baseline weights '{v27_path}' missing!"
 
@@ -263,9 +270,23 @@ def test_offline_training_pass_and_weight_promotion():
     v27_hash_before = get_sha256(v27_path)
     print(f"Baseline strategist_weights_v27.pth SHA256: {v27_hash_before[:16]}...")
 
+    # Ensure experience replay buffer has valid test frames for verification
+    mem_file = "experience_replay.json"
+    mock_exps = [
+        {
+            "state": [0.05, 0.5, 0.8, -0.2, 0.1, 0.0, 0.05, -0.01, 100.0, 0.02, 0.3, 0.1, 0.2, 0.0, 0.0],
+            "action": 1,
+            "reward": 0.05,
+            "next_state": [0.06, 0.52, 0.81, -0.18, 0.1, 0.0, 0.05, -0.01, 105.0, 0.02, 0.3, 0.1, 0.2, 0.0, 0.0],
+            "done": False
+        } for _ in range(6)
+    ]
+    with open(mem_file, "w") as f:
+        json.dump(mock_exps, f, indent=2)
+
     # Instantiate trainer targeting v28
     trainer = NightlyTrainer(
-        memory_file="experience_replay.json",
+        memory_file=mem_file,
         model_path=v28_path,
         base_model_path=v27_path
     )

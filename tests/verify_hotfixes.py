@@ -5,8 +5,16 @@ import os
 import sqlite3
 import pandas as pd
 
-# Add workspace to sys path so we can import
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add workspace, legacy agents, and scripts to sys path so we can import
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+LEGACY_DIR = os.path.join(PROJECT_ROOT, "archive", "legacy_agents")
+if os.path.exists(LEGACY_DIR) and LEGACY_DIR not in sys.path:
+    sys.path.insert(0, LEGACY_DIR)
+SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "scripts")
+if os.path.exists(SCRIPTS_DIR) and SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
 
 from microstructure_guard import MicrostructureGuard
 from berserker_trader import BerserkerTrader
@@ -26,8 +34,8 @@ async def test_microstructure_guard_safety_veto():
     
     passed, reason = await guard.evaluate_pre_trade_veto(invalid_context)
     print(f"   Result -> Passed: {passed} | Reason: {reason}")
-    assert passed is True, "MicrostructureGuard must ALLOW/APPROVE trades on error under Observation Mode."
-    assert "MicrostructureGuard Error Failsafe" in reason, "Reason should reflect the safety-first failsafe trigger."
+    assert passed is False, "MicrostructureGuard must VETO trades on corrupted input under institutional fail-closed guard."
+    assert "Fail-Closed" in reason, "Reason should reflect the fail-closed capital safeguard."
     print("   [PASS] MicrostructureGuard safety veto verified.")
 
 async def test_berserker_thread_offloading():

@@ -525,13 +525,18 @@ class VPINClassifier:
         self.classifier = FlowClassifier().to(device)
         
         self.has_weights = False
-        if os.path.exists("flow_classifier.pth"):
+        weights_path = "flow_classifier.pth"
+        if not os.path.exists(weights_path):
+            models_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "flow_classifier.pth")
+            if os.path.exists(models_path):
+                weights_path = models_path
+        if os.path.exists(weights_path):
             try:
-                self.classifier.load_state_dict(torch.load("flow_classifier.pth", map_location=device, weights_only=True))
+                self.classifier.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
                 self.has_weights = True
-                log.info("[INIT] VPIN Flow Classifier weights successfully loaded.")
+                log.info(f"[INIT] VPIN Flow Classifier weights successfully loaded from {weights_path}.")
             except Exception as e:
-                log.warning(f"[INIT-WARN] Could not load flow_classifier.pth: {e}")
+                log.warning(f"[INIT-WARN] Could not load {weights_path}: {e}")
         else:
             log.warning("[INIT-WARN] 'flow_classifier.pth' weights not found. VPIN Classifier will rely on deterministic math overrides until weights are trained/deployed.")
             
