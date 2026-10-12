@@ -161,12 +161,16 @@ def standard_normal_cdf(x: float) -> float:
 class VolumeBucket:
     price_change: float
     volume: float
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+    has_explicit_side: bool = False
 
 
 class VPINCalculator:
     """
     Streaming Volume-Synchronized Probability of Toxicity (VPIN) calculator.
-    Uses Bulk Volume Classification (BVC) across rolling volume buckets.
+    Uses real exchange aggressor side when available, falling back to
+    Bulk Volume Classification (BVC) across rolling volume buckets.
     """
 
     def __init__(self, bucket_volume: float = 100.0, num_buckets: int = 50):
@@ -174,11 +178,18 @@ class VPINCalculator:
         self.num_buckets = max(2, int(num_buckets))
         self.buckets: deque[VolumeBucket] = deque(maxlen=self.num_buckets)
         self.current_bucket_filled = 0.0
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        self.current_has_side = False
         self.prev_trade_price: Optional[float] = None
         self.bucket_start_price: Optional[float] = None
 
-    def update_trade(self, price: float, size: float):
-        """Processes an incoming market fill tick."""
+    def update_trade(self, price: float, size: float, side: Optional[str] = None):
+        """
+        Processes an incoming market fill tick.
+        If side is provided ('buy' or 'sell'), attributes explicit trade aggression.
+        If side is None, uses Bulk Volume Classification based on price change.
+        """
         if price <= 0.0 or size <= 0.0:
             return
 
@@ -186,24 +197,55 @@ class VPINCalculator:
             self.prev_trade_price = price
             self.bucket_start_price = price
 
+        side_norm = side.strip().lower() if side else None
+        is_buy = (side_norm == "buy")
+        is_sell = (side_norm == "sell")
+        has_side = is_buy or is_sell
+
         remaining_size = size
         while self.current_bucket_filled + remaining_size >= self.bucket_volume:
             needed = self.bucket_volume - self.current_bucket_filled
             remaining_size -= needed
+            
+            if has_side:
+                self.current_has_side = True
+                if is_buy:
+                    self.current_buy_vol += needed
+                else:
+                    self.current_sell_vol += needed
+
             price_change = price - (self.bucket_start_price or price)
             self.buckets.append(
-                VolumeBucket(price_change=price_change, volume=self.bucket_volume)
+                VolumeBucket(
+                    price_change=price_change,
+                    volume=self.bucket_volume,
+                    buy_volume=self.current_buy_vol,
+                    sell_volume=self.current_sell_vol,
+                    has_explicit_side=self.current_has_side
+                )
             )
             self.current_bucket_filled = 0.0
+            self.current_buy_vol = 0.0
+            self.current_sell_vol = 0.0
+            self.current_has_side = False
             self.bucket_start_price = price
 
-        self.current_bucket_filled += remaining_size
+        if remaining_size > 0:
+            self.current_bucket_filled += remaining_size
+            if has_side:
+                self.current_has_side = True
+                if is_buy:
+                    self.current_buy_vol += remaining_size
+                else:
+                    self.current_sell_vol += remaining_size
+
         self.prev_trade_price = price
 
     def get_vpin(self) -> float:
         """
         Computes VPIN over current buckets:
             VPIN = (1 / (N * V)) * sum |V_buy - V_sell|
+        Uses explicit aggressor volume split if present, otherwise BVC standard normal CDF.
         Returns float in [0.0, 1.0].
         """
         if len(self.buckets) < 2:
@@ -216,12 +258,15 @@ class VPINCalculator:
 
         abs_imbalances_sum = 0.0
         for b in self.buckets:
-            if sigma > 0.0:
-                p_buy = standard_normal_cdf(b.price_change / sigma)
+            if b.has_explicit_side:
+                abs_imbalance = abs(b.buy_volume - b.sell_volume)
             else:
-                p_buy = 0.5
-            p_sell = 1.0 - p_buy
-            abs_imbalance = abs(p_buy - p_sell) * b.volume
+                if sigma > 0.0:
+                    p_buy = standard_normal_cdf(b.price_change / sigma)
+                else:
+                    p_buy = 0.5
+                p_sell = 1.0 - p_buy
+                abs_imbalance = abs(p_buy - p_sell) * b.volume
             abs_imbalances_sum += abs_imbalance
 
         total_vol = len(self.buckets) * self.bucket_volume

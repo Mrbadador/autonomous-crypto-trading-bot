@@ -116,6 +116,7 @@ class SymbolOFIState:
         self.latest_hawkes_veto = False
         self.last_depth_ts = 0.0
         self.real_trade_count = 0
+        self.last_real_trade_ts = 0.0
 
     def process_trade(self, price: float, size: float, side: str = "buy"):
         """Ingests live trade tape from Bitget trade channel for genuine VPIN and flow toxicity."""
@@ -123,7 +124,7 @@ class SymbolOFIState:
             return
         self.real_trade_count += 1
         self.last_real_trade_ts = time.time()
-        self.vpin_calc_real.update_trade(price=price, size=size)
+        self.vpin_calc_real.update_trade(price=price, size=size, side=side)
 
     def process_depth(self, bids: list, asks: list):
         """
