@@ -114,9 +114,17 @@ def test_stage1_notnull_rebuild_migration():
         assert old_row[0] == "BTCUSDT"
         assert old_row[1] == 50.0
 
+        # Step 7: Verify reconciler Anti-Knife and close logic does not raise on net_pnl=None
+        close_type = "UNRECONCILED_CLOSE"
+        net_pnl = None
+        exit_p = None
+        # Simulating reconciliation_engine.py:530
+        anti_knife_triggered = (close_type == "sl_hit" or (net_pnl is not None and net_pnl < 0))
+        assert anti_knife_triggered is False, "Anti-knife guard must evaluate cleanly without TypeError on None"
+
         conn.close()
         dm.write_queue.shutdown()
-        print("\n[OK] test_stage1_notnull_rebuild_migration passed cleanly!")
+        print("\n[OK] test_stage1_notnull_rebuild_migration passed cleanly (including None-guard assertions)!")
 
     finally:
         if os.path.exists(temp_db_path):

@@ -470,18 +470,23 @@ async def audit_live_exchange_positions():
                                     except Exception:
                                         pass
 
-                                # Accurate Close Attribution: tp_hit only if near TP, breakeven_hit if near BE stop, else sl_hit
-                                is_tp_price = (tp > 0 and ((is_long and exit_p >= tp * 0.998) or (not is_long and exit_p <= tp * 1.002)))
-                                is_breakeven_price = (sl > 0 and ((is_long and abs(exit_p - entry_p * 1.0018) / entry_p < 0.003) or (not is_long and abs(exit_p - entry_p * 0.9982) / entry_p < 0.003)))
-
-                                if is_tp_price:
-                                    close_type = "tp_hit"
-                                elif is_breakeven_price or (abs(net_pnl) < (entry_p * qty * 0.003)):
-                                    close_type = "breakeven_hit"
+                                 if is_unreconciled:
+                                    # Attribution already assigned as UNRECONCILED_CLOSE
+                                    pass
                                 else:
-                                    close_type = "sl_hit"
+                                    is_tp_price = (exit_p is not None and tp > 0 and ((is_long and exit_p >= tp * 0.998) or (not is_long and exit_p <= tp * 1.002)))
+                                    is_breakeven_price = (exit_p is not None and sl > 0 and ((is_long and abs(exit_p - entry_p * 1.0018) / entry_p < 0.003) or (not is_long and abs(exit_p - entry_p * 0.9982) / entry_p < 0.003)))
 
-                                notes_str = f"On-exchange {close_type.upper()} on Bitget UTA (Net: ${net_pnl:+.2f}, Fee: -${est_fee:.3f})"
+                                    if is_tp_price:
+                                        close_type = "tp_hit"
+                                    elif is_breakeven_price or (net_pnl is not None and abs(net_pnl) < (entry_p * qty * 0.003)):
+                                        close_type = "breakeven_hit"
+                                    else:
+                                        close_type = "sl_hit"
+
+                                    pnl_str = f"${net_pnl:+.2f}" if net_pnl is not None else "N/A"
+                                    fee_str = f"-${est_fee:.3f}" if est_fee is not None else "N/A"
+                                    notes_str = f"On-exchange {close_type.upper()} on Bitget UTA (Net: {pnl_str}, Fee: {fee_str})"
                                 
                                 # Check if engine already closed & recorded this trade in closed_tbl recently (last 15 minutes)
                                 recent_close = conn.execute(
@@ -527,7 +532,7 @@ async def audit_live_exchange_positions():
                                 pruned_count += 1
                                 
                                 # Anti-Knife Protection: Add symbol to swing_cooldowns if on-exchange SL fired or trade lost
-                                if close_type == "sl_hit" or net_pnl < 0:
+                                if close_type == "sl_hit" or (net_pnl is not None and net_pnl < 0):
                                     try:
                                         from datetime import timedelta, timezone
                                         cd_hours = 6.0
