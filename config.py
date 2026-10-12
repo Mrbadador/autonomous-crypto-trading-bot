@@ -64,9 +64,8 @@ VOLATILITY_BASELINE          = 0.005 # Baseline for normalizing volatility state
 # Capital & Leverage
 # ---------------------------------------------------------------------------
 INITIAL_BALANCE              = float(os.getenv("INITIAL_BALANCE", "1000.0"))
-RISK_PER_TRADE_PCT           = float(os.getenv("RISK_PER_TRADE_PCT", "1.5"))
+RISK_PER_TRADE_PCT           = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))  # Default 0.5% risk per trade (institutional capital preservation)
 LEVERAGE                     = int(os.getenv("LEVERAGE", "5"))
-BERSERKER_LEVERAGE           = int(os.getenv("BERSERKER_LEVERAGE", "5"))
 MARGIN_MODE                  = os.getenv("MARGIN_MODE", "isolated").lower()
 TRADE_FEE_PERCENT            = float(os.getenv("TRADE_FEE_PERCENT", "0.0004"))
 FEE_RATE                     = TRADE_FEE_PERCENT
@@ -366,13 +365,13 @@ MIN_AI_CONVICTION_SCORE   = 50.0
 MIN_NN_CONFIDENCE         = float(os.getenv("MIN_NN_CONFIDENCE", "0.34"))
 MAX_TRADES_PER_24H        = 3
 MAX_CONCURRENT_TRADES     = int(os.getenv("MAX_CONCURRENT_TRADES", "5"))
-RISK_PER_TRADE_PCT        = float(os.getenv("RISK_PER_TRADE_PCT", "1.5"))  # Single source of truth (1.5% equity risk per trade)
+RISK_PER_TRADE_PCT        = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))  # Single source of truth (0.5% equity risk per trade)
 # P3-PATCH: Raised from 5.0 → 55.0. At 5.0 the gate was functionally dead (any
 # conviction > 5/100 passed). 55.0 creates a meaningful second-tier filter:
 # Boardroom must score ≥50 to signal (MIN_AI_CONVICTION_SCORE), then Berserker
 # must score ≥55 to open — adding a 5-point buffer above the signal floor.
 BERSERKER_VETO_THRESHOLD  = float(os.getenv("BERSERKER_VETO_THRESHOLD", "55.0"))  # AI conviction floor for Berserker entry
-MAX_DD_PER_TRADE_PCT      = 1.5
+MAX_DD_PER_TRADE_PCT      = 0.5
 
 # Adaptive Risk Maps
 ADAPTIVE_SL_MAP = {"normal": 2.0, "sniper": 1.5, "aggressive": 2.5}

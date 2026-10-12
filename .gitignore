@@ -49,3 +49,14 @@ cloudflared*
 .antigravity/
 .vscode/
 .idea/
+
+# Internal scratch, caches & experimental dumps
+cache/
+scratch/
+archive/scratch_cleanup/
+
+# Binary model checkpoints (download via setup script or train locally)
+*.pth
+*.pt
+!models/.gitkeep
+
