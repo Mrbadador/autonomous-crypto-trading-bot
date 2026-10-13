@@ -176,7 +176,7 @@ def run_grid_replay(
     n_bars = len(ind_df)
     active_trade = None
     pending_order = None
-    last_exit_bar = -999
+    last_loss_bar = -999
 
     # Pre-extract numpy arrays for fast row iteration
     ts = ind_df["timestamp"].values
@@ -245,8 +245,9 @@ def run_grid_replay(
                         "net_pnl": net_pnl,
                         "is_maker_exit": False,
                     })
+                    if net_pnl < 0:
+                        last_loss_bar = i
                     active_trade = None
-                    last_exit_bar = i
                     continue
                 elif short_pnl_pct >= 0.45:
                     # 45m harvest
@@ -266,8 +267,9 @@ def run_grid_replay(
                         "net_pnl": net_pnl,
                         "is_maker_exit": False,
                     })
+                    if net_pnl < 0:
+                        last_loss_bar = i
                     active_trade = None
-                    last_exit_bar = i
                     continue
                 else:
                     # Tighten stop
@@ -299,8 +301,9 @@ def run_grid_replay(
                         "net_pnl": net_pnl,
                         "is_maker_exit": True,
                     })
+                    if net_pnl < 0:
+                        last_loss_bar = i
                     active_trade = None
-                    last_exit_bar = i
                     continue
 
                 if sl_hit:
@@ -321,8 +324,8 @@ def run_grid_replay(
                         "net_pnl": net_pnl,
                         "is_maker_exit": False,
                     })
+                    last_loss_bar = i
                     active_trade = None
-                    last_exit_bar = i
                     continue
 
             elif side == "SHORT":
@@ -347,8 +350,9 @@ def run_grid_replay(
                         "net_pnl": net_pnl,
                         "is_maker_exit": True,
                     })
+                    if net_pnl < 0:
+                        last_loss_bar = i
                     active_trade = None
-                    last_exit_bar = i
                     continue
 
                 if sl_hit:
@@ -369,8 +373,8 @@ def run_grid_replay(
                         "net_pnl": net_pnl,
                         "is_maker_exit": False,
                     })
+                    last_loss_bar = i
                     active_trade = None
-                    last_exit_bar = i
                     continue
 
         # -------------------------------------------------------------
@@ -417,9 +421,9 @@ def run_grid_replay(
                 pending_order = None
 
         # -------------------------------------------------------------
-        # 3. Scan New Entry Signals (if flat, no pending order, cooldown passed)
+        # 3. Scan New Entry Signals (if flat, no pending order, loss cooldown passed)
         # -------------------------------------------------------------
-        if active_trade is None and pending_order is None and (i - last_exit_bar) >= cooldown_bars:
+        if active_trade is None and pending_order is None and (i - last_loss_bar) >= cooldown_bars:
             bar_rsi = rsis[i]
             bar_lower = lower_bands[i] if enable_vwap_band else 1e9
             bar_upper = upper_bands[i] if enable_vwap_band else 0.0
