@@ -501,3 +501,429 @@ def run_grid_replay(
                     continue
 
     return trades
+
+
+def run_fleet_grid_replay(
+    dfs: Dict[str, pd.DataFrame],
+    funding_dfs: Optional[Dict[str, pd.DataFrame]] = None,
+    btc_15m_df: Optional[pd.DataFrame] = None,
+    conservative_fills: bool = True,
+    enable_regime_gate: bool = True,
+    enable_vwap_band: bool = True,
+    enable_45m_tightening: bool = True,
+    enable_short_scalps: bool = True,
+    trade_allocation_usd: float = 85.0,
+    leverage: float = 3.0,
+    max_order_ttl_bars: int = 1,
+    cooldown_bars: int = 12,
+    max_long_cap: int = 2,  # FIX 7: Live-faithful fleet cap (super_bot.py max 2 concurrent grid LONGs across fleet)
+    market_adx_ceiling: Optional[float] = None,  # Pre-registered arm: e.g. 20.0 (strict chop filter)
+) -> Dict[str, Any]:
+    """
+    Executes historical 5m multi-asset fleet simulation respecting fleet-wide position caps.
+
+    Tracks:
+    - Fleet-wide concurrent open and pending LONG positions (< max_long_cap, default 2).
+    - Signal-to-fill % (filled limit orders / total placed limit orders).
+    - TP exit share (TP maker exits / total completed trades).
+    """
+    if funding_dfs is None:
+        funding_dfs = {}
+
+    # Precompute BTC 15m regime
+    regime_15m = None
+    if btc_15m_df is not None and not btc_15m_df.empty:
+        regime_15m = precompute_btc_15m_regime(btc_15m_df)
+
+    # Precompute indicators and align timestamps across all symbols
+    symbol_data = {}
+    all_timestamps = set()
+
+    for sym, df in dfs.items():
+        tick_size = TICK_SIZES.get(sym, TICK_SIZES["DEFAULT"])
+        ind_df = precompute_5m_indicators_vectorized(df)
+        if regime_15m is not None:
+            ind_df = pd.merge_asof(
+                ind_df.sort_values("timestamp"),
+                regime_15m,
+                left_on="timestamp",
+                right_on="close_ts",
+                direction="backward"
+            )
+            missing_count = int(ind_df["market_adx"].isna().sum())
+            ind_df["market_adx"] = ind_df["market_adx"].fillna(99.0)
+            ind_df["market_di_spread"] = ind_df["market_di_spread"].fillna(0.0)
+            if missing_count > 0:
+                print(f"[{sym}] Blocked {missing_count} unaligned bars at start of series with market_adx=99.0")
+        else:
+            ind_df["market_adx"] = 99.0
+            ind_df["market_di_spread"] = 0.0
+
+        # Funding rate map
+        f_df = funding_dfs.get(sym)
+        funding_map = {}
+        if f_df is not None and not f_df.empty:
+            rates = f_df["funding_rate"].values
+            med_rate = float(np.median(rates))
+            min_real_ts = int(f_df["timestamp"].min())
+            first_bar_ts = int(ind_df["timestamp"].min())
+            funding_map = dict(zip(f_df["timestamp"].astype(int), f_df["funding_rate"].astype(float)))
+            synth_count = 0
+            cur_synth_ts = (first_bar_ts // 28800000 + 1) * 28800000
+            while cur_synth_ts < min_real_ts:
+                funding_map[cur_synth_ts] = med_rate
+                synth_count += 1
+                cur_synth_ts += 28800000
+            print(f"[FUNDING-FILL] {sym}: prepended {synth_count:,} synthetic 8h funding settlements @ {med_rate:.6e} median rate")
+
+        ind_df = ind_df.set_index("timestamp")
+        symbol_data[sym] = {
+            "ind_df": ind_df,
+            "tick_size": tick_size,
+            "funding_map": funding_map,
+            "active_trade": None,
+            "pending_order": None,
+            "last_loss_idx": -999,
+            "order_placed_count": 0,
+            "order_filled_count": 0,
+        }
+        all_timestamps.update(ind_df.index)
+
+    sorted_timestamps = sorted(list(all_timestamps))
+    completed_trades: List[Dict[str, Any]] = []
+
+    for t_idx, curr_ts in enumerate(sorted_timestamps):
+        if t_idx < 30:
+            continue
+
+        # -------------------------------------------------------------
+        # Step 1: Manage active positions for each symbol
+        # -------------------------------------------------------------
+        for sym, sdata in symbol_data.items():
+            at = sdata["active_trade"]
+            if at is None:
+                continue
+
+            ind_df = sdata["ind_df"]
+            if curr_ts not in ind_df.index:
+                continue
+            row = ind_df.loc[curr_ts]
+
+            curr_open = row["open"]
+            curr_high = row["high"]
+            curr_low = row["low"]
+            curr_close = row["close"]
+            tick_sz = sdata["tick_size"]
+            f_map = sdata["funding_map"]
+
+            entry_p = at["entry_price"]
+            side = at["side"]
+            tp_p = at["take_profit"]
+            sl_p = at["stop_loss"]
+            bars_held = t_idx - at["entry_idx"]
+            mins_held = bars_held * 5
+
+            # Accrue funding if 8h boundary crossed
+            if f_map:
+                prev_ts = sorted_timestamps[t_idx - 1]
+                if (prev_ts // 28800000) != (curr_ts // 28800000):
+                    boundary_ts = int((curr_ts // 28800000) * 28800000)
+                    f_rate = f_map.get(boundary_ts, 0.0)
+                    notional = trade_allocation_usd * leverage
+                    f_usd = -f_rate * notional if side == "LONG" else f_rate * notional
+                    at["funding_usd"] += f_usd
+
+            # Check 45m - 90m dynamic tightening for shorts
+            if enable_45m_tightening and side == "SHORT" and mins_held >= 45:
+                short_pnl_pct = (entry_p - curr_close) / entry_p * 100.0
+                if mins_held >= 90:
+                    exit_p = curr_open
+                    fee_usd = (trade_allocation_usd * leverage) * TAKER_FEE
+                    gross_pnl = (entry_p - exit_p) / entry_p * (trade_allocation_usd * leverage)
+                    net_pnl = gross_pnl - at["entry_fee_usd"] - fee_usd + at["funding_usd"]
+                    completed_trades.append({
+                        **at,
+                        "exit_idx": t_idx,
+                        "exit_ts": curr_ts,
+                        "exit_price": exit_p,
+                        "exit_reason": "SCALP_SHORT_TIME_EXPIRY",
+                        "holding_mins": mins_held,
+                        "exit_fee_usd": fee_usd,
+                        "gross_pnl": gross_pnl,
+                        "net_pnl": net_pnl,
+                        "is_maker_exit": False,
+                    })
+                    if net_pnl < 0:
+                        sdata["last_loss_idx"] = t_idx
+                    sdata["active_trade"] = None
+                    continue
+                elif short_pnl_pct >= 0.45:
+                    exit_p = curr_open
+                    fee_usd = (trade_allocation_usd * leverage) * TAKER_FEE
+                    gross_pnl = (entry_p - exit_p) / entry_p * (trade_allocation_usd * leverage)
+                    net_pnl = gross_pnl - at["entry_fee_usd"] - fee_usd + at["funding_usd"]
+                    completed_trades.append({
+                        **at,
+                        "exit_idx": t_idx,
+                        "exit_ts": curr_ts,
+                        "exit_price": exit_p,
+                        "exit_reason": "SCALP_SHORT_TIME_PROFIT",
+                        "holding_mins": mins_held,
+                        "exit_fee_usd": fee_usd,
+                        "gross_pnl": gross_pnl,
+                        "net_pnl": net_pnl,
+                        "is_maker_exit": False,
+                    })
+                    if net_pnl < 0:
+                        sdata["last_loss_idx"] = t_idx
+                    sdata["active_trade"] = None
+                    continue
+                else:
+                    target_sl = entry_p * (1.0 - 0.0018) if short_pnl_pct >= 0.22 else entry_p * 1.0055
+                    if target_sl < at["stop_loss"]:
+                        at["stop_loss"] = target_sl
+                        sl_p = target_sl
+
+            # TP / SL checks
+            if side == "LONG":
+                tp_hit = (curr_high >= tp_p + tick_sz) if conservative_fills else (curr_high >= tp_p)
+                sl_hit = (curr_low <= sl_p)
+
+                if tp_hit and not sl_hit:
+                    exit_p = tp_p
+                    fee_usd = (trade_allocation_usd * leverage) * MAKER_FEE
+                    gross_pnl = (exit_p - entry_p) / entry_p * (trade_allocation_usd * leverage)
+                    net_pnl = gross_pnl - at["entry_fee_usd"] - fee_usd + at["funding_usd"]
+                    completed_trades.append({
+                        **at,
+                        "exit_idx": t_idx,
+                        "exit_ts": curr_ts,
+                        "exit_price": exit_p,
+                        "exit_reason": "TAKE_PROFIT",
+                        "holding_mins": mins_held,
+                        "exit_fee_usd": fee_usd,
+                        "gross_pnl": gross_pnl,
+                        "net_pnl": net_pnl,
+                        "is_maker_exit": True,
+                    })
+                    if net_pnl < 0:
+                        sdata["last_loss_idx"] = t_idx
+                    sdata["active_trade"] = None
+                    continue
+
+                if sl_hit:
+                    exit_p = min(sl_p, curr_open)
+                    fee_usd = (trade_allocation_usd * leverage) * TAKER_FEE
+                    gross_pnl = (exit_p - entry_p) / entry_p * (trade_allocation_usd * leverage)
+                    net_pnl = gross_pnl - at["entry_fee_usd"] - fee_usd + at["funding_usd"]
+                    completed_trades.append({
+                        **at,
+                        "exit_idx": t_idx,
+                        "exit_ts": curr_ts,
+                        "exit_price": exit_p,
+                        "exit_reason": "STOP_LOSS",
+                        "holding_mins": mins_held,
+                        "exit_fee_usd": fee_usd,
+                        "gross_pnl": gross_pnl,
+                        "net_pnl": net_pnl,
+                        "is_maker_exit": False,
+                    })
+                    sdata["last_loss_idx"] = t_idx
+                    sdata["active_trade"] = None
+                    continue
+
+            elif side == "SHORT":
+                tp_hit = (curr_low <= tp_p - tick_sz) if conservative_fills else (curr_low <= tp_p)
+                sl_hit = (curr_high >= sl_p)
+
+                if tp_hit and not sl_hit:
+                    exit_p = tp_p
+                    fee_usd = (trade_allocation_usd * leverage) * MAKER_FEE
+                    gross_pnl = (entry_p - exit_p) / entry_p * (trade_allocation_usd * leverage)
+                    net_pnl = gross_pnl - at["entry_fee_usd"] - fee_usd + at["funding_usd"]
+                    completed_trades.append({
+                        **at,
+                        "exit_idx": t_idx,
+                        "exit_ts": curr_ts,
+                        "exit_price": exit_p,
+                        "exit_reason": "TAKE_PROFIT",
+                        "holding_mins": mins_held,
+                        "exit_fee_usd": fee_usd,
+                        "gross_pnl": gross_pnl,
+                        "net_pnl": net_pnl,
+                        "is_maker_exit": True,
+                    })
+                    if net_pnl < 0:
+                        sdata["last_loss_idx"] = t_idx
+                    sdata["active_trade"] = None
+                    continue
+
+                if sl_hit:
+                    exit_p = max(sl_p, curr_open)
+                    fee_usd = (trade_allocation_usd * leverage) * TAKER_FEE
+                    gross_pnl = (entry_p - exit_p) / entry_p * (trade_allocation_usd * leverage)
+                    net_pnl = gross_pnl - at["entry_fee_usd"] - fee_usd + at["funding_usd"]
+                    completed_trades.append({
+                        **at,
+                        "exit_idx": t_idx,
+                        "exit_ts": curr_ts,
+                        "exit_price": exit_p,
+                        "exit_reason": "STOP_LOSS",
+                        "holding_mins": mins_held,
+                        "exit_fee_usd": fee_usd,
+                        "gross_pnl": gross_pnl,
+                        "net_pnl": net_pnl,
+                        "is_maker_exit": False,
+                    })
+                    sdata["last_loss_idx"] = t_idx
+                    sdata["active_trade"] = None
+                    continue
+
+        # -------------------------------------------------------------
+        # Step 2: Check pending limit order fills for each symbol
+        # -------------------------------------------------------------
+        for sym, sdata in symbol_data.items():
+            po = sdata["pending_order"]
+            if po is None:
+                continue
+
+            ind_df = sdata["ind_df"]
+            if curr_ts not in ind_df.index:
+                continue
+            row = ind_df.loc[curr_ts]
+
+            curr_high = row["high"]
+            curr_low = row["low"]
+            tick_sz = sdata["tick_size"]
+
+            p_side = po["side"]
+            limit_p = po["price"]
+            bars_pending = t_idx - po["placed_idx"]
+
+            is_filled = False
+            if p_side == "LONG":
+                is_filled = (curr_low <= limit_p - tick_sz) if conservative_fills else (curr_low <= limit_p)
+            elif p_side == "SHORT":
+                is_filled = (curr_high >= limit_p + tick_sz) if conservative_fills else (curr_high >= limit_p)
+
+            if is_filled:
+                sdata["order_filled_count"] += 1
+                entry_fee_usd = (trade_allocation_usd * leverage) * MAKER_FEE
+                sdata["active_trade"] = {
+                    "symbol": sym,
+                    "side": p_side,
+                    "entry_idx": t_idx,
+                    "entry_ts": curr_ts,
+                    "entry_price": limit_p,
+                    "take_profit": po["take_profit"],
+                    "stop_loss": po["stop_loss"],
+                    "regime": po["regime"],
+                    "entry_market_adx": po["market_adx"],
+                    "allocation_usd": trade_allocation_usd,
+                    "leverage": leverage,
+                    "entry_fee_usd": entry_fee_usd,
+                    "funding_usd": 0.0,
+                    "is_maker_entry": True,
+                }
+                sdata["pending_order"] = None
+            elif bars_pending >= max_order_ttl_bars:
+                sdata["pending_order"] = None
+
+        # -------------------------------------------------------------
+        # Step 3: Scan new entry signals (Fleet-Cap Gated)
+        # -------------------------------------------------------------
+        # Count open and pending LONGs across the entire fleet
+        open_long_count = sum(1 for s in symbol_data.values() if s["active_trade"] is not None and s["active_trade"]["side"] == "LONG")
+        pending_long_count = sum(1 for s in symbol_data.values() if s["pending_order"] is not None and s["pending_order"]["side"] == "LONG")
+
+        for sym, sdata in symbol_data.items():
+            if sdata["active_trade"] is not None or sdata["pending_order"] is not None:
+                continue
+            if (t_idx - sdata["last_loss_idx"]) < cooldown_bars:
+                continue
+
+            ind_df = sdata["ind_df"]
+            if curr_ts not in ind_df.index:
+                continue
+            row = ind_df.loc[curr_ts]
+
+            bar_rsi = row["rsi"]
+            bar_lower = row["lower_band"] if enable_vwap_band else 1e9
+            bar_upper = row["upper_band"] if enable_vwap_band else 0.0
+            bar_adx = row["adx_5m"]
+            curr_close = row["close"]
+            m_adx = row["market_adx"]
+            m_di = row["market_di_spread"]
+            has_b_rev = row["has_bearish_reversal"]
+
+            if m_adx < 22.0:
+                current_regime = "CHOP"
+            elif m_adx >= 28.0:
+                current_regime = "TREND"
+            else:
+                current_regime = "HIGH_VOL"
+
+            # LONG GRID SIGNAL
+            long_regime_ok = True
+            if enable_regime_gate:
+                if m_adx >= 28.0 or (m_adx >= 25.0 and m_di < -4.0):
+                    long_regime_ok = False
+            if market_adx_ceiling is not None and m_adx >= market_adx_ceiling:
+                long_regime_ok = False
+
+            # Check Fleet-Cap constraint for LONGs
+            fleet_long_allowed = (open_long_count + pending_long_count) < max_long_cap
+
+            if fleet_long_allowed and long_regime_ok and bar_rsi < 30.0 and curr_close <= bar_lower and bar_adx < 24.0:
+                limit_p = curr_close
+                sdata["order_placed_count"] += 1
+                sdata["pending_order"] = {
+                    "side": "LONG",
+                    "placed_idx": t_idx,
+                    "placed_ts": curr_ts,
+                    "price": limit_p,
+                    "take_profit": limit_p * (1.0 + 0.0135),
+                    "stop_loss": limit_p * (1.0 - 0.0115),
+                    "regime": current_regime,
+                    "market_adx": m_adx,
+                }
+                pending_long_count += 1
+                continue
+
+            # SHORT SCALP SIGNAL
+            if enable_short_scalps:
+                short_regime_ok = True
+                if enable_regime_gate and bar_adx >= 22.0:
+                    short_regime_ok = False
+
+                if short_regime_ok and bar_rsi >= 68.0 and curr_close >= (bar_upper * 0.998) and has_b_rev:
+                    limit_p = curr_close
+                    sdata["order_placed_count"] += 1
+                    sdata["pending_order"] = {
+                        "side": "SHORT",
+                        "placed_idx": t_idx,
+                        "placed_ts": curr_ts,
+                        "price": limit_p,
+                        "take_profit": limit_p * (1.0 - 0.0120),
+                        "stop_loss": limit_p * (1.0 + 0.0100),
+                        "regime": current_regime,
+                        "market_adx": m_adx,
+                    }
+                    continue
+
+    # Compute execution telemetry
+    total_placed = sum(s["order_placed_count"] for s in symbol_data.values())
+    total_filled = sum(s["order_filled_count"] for s in symbol_data.values())
+    signal_to_fill_pct = (total_filled / total_placed * 100.0) if total_placed > 0 else 0.0
+
+    per_symbol_placed = {s: d["order_placed_count"] for s, d in symbol_data.items()}
+    per_symbol_filled = {s: d["order_filled_count"] for s, d in symbol_data.items()}
+
+    return {
+        "trades": completed_trades,
+        "total_placed": total_placed,
+        "total_filled": total_filled,
+        "signal_to_fill_pct": signal_to_fill_pct,
+        "per_symbol_placed": per_symbol_placed,
+        "per_symbol_filled": per_symbol_filled,
+    }
