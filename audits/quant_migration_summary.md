@@ -194,5 +194,30 @@ The independent external benchmark reported that the chop-grid engine exhibits s
 > **No Daemon Restart Required:**
 > `super_bot.py` live trading logic was **NOT** modified in this round (all changes were restricted to backtest harness, ablation scripts, and reporting). The live trading daemons (`super_bot.py`, `start_system.py`, `dashboard.py`) continue running without any restart requirement.
 
+---
+
+## Grid Harness Round 3: Fleet-Cap Fidelity + Metric Hygiene (FIX 7–10)
+
+### Summary of Completed FIX 7–10 Upgrades
+
+| Fix | Component | Description | Commit | Verification Evidence |
+| :--- | :---: | :--- | :---: | :--- |
+| **FIX 7** | **Fleet Cap Harness** | Implemented multi-asset simulation (`run_fleet_grid_replay`) enforcing live-faithful constraint `open_long_count + pending_long_count < 2` across the entire fleet (matching `super_bot.py` live scan). Evaluated uncapped ablation (`cap=99`) | `13f0cb2` | Unit test passed. Fleet cap pruned 258 late-cascade entries (1,755 -> 1,497 Longs) |
+| **FIX 8** | **Metric Hygiene** | Renamed mislabeled `Maker Fill (%)` column to `tp_exit_share` (TP maker exits / total exits). Added `signal_to_fill_pct` measuring filled limit orders over total placed limit orders | `1cf4d2d` | Signal-to-fill % measured at 90.7% (2,899 fills / 3,197 placed) under conservative fill model, 99.9% under optimistic touch model |
+| **FIX 9** | **Regime Fallback Removal** | Removed regime fallback contamination (`market_adx.fillna(adx_5m)`). Unaligned bars now block entries with `market_adx=99.0` (disclosed: 4 bars on BTC, 3 bars on ETH/SOL) | `f9fb44f` | 500-slice rolling consistency test passed cleanly |
+| **FIX 10** | **Synthetic Funding Accrual** | Prepended 2,093 synthetic 8h settlements at each symbol's median observed rate (BTC: 5.75e-5, ETH: 6.50e-5, SOL: 5.10e-5) across the missing ~22-month window prior to mid-2026. Optimized accrual via $O(1)$ timestamp boundary checks | `801a14a` | Replay execution speed optimized to < 1s per asset; all funding settlements accrued accurately |
+
+### Key Findings & Pre-Registered Arm Comparison
+
+1. **Pre-Registered Arm (Market ADX < 20 Entry Ceiling, Fleet Cap = 2):**
+   - Trades: **1,067** (BTC: 343, ETH: 369, SOL: 355)
+   - Win Rate: **47.1%** (ETH: 49.3%, BTC: 47.2%, SOL: 44.8%)
+   - Net EV / Trade: **-$0.1020 [-$0.2655, +$0.0612]** (-0.040% of notional) vs live shield -$0.2300 (-0.090% of notional)
+   - Max Drawdown: Slashed by **51.8%** from **$429.11 down to $207.01** (ETH DD $66.40, BTC DD $72.68, SOL DD $140.11)
+2. **Acceptance Test & External Benchmark Reconciliation:**
+   - Deep chop ($ADX < 20$) consistently outperforms intermediate trend strata ($20 \le ADX < 25$) across all assets: **BTC spread +0.144%**, **ETH spread +0.188%**, **SOL spread +0.031%**.
+   - Residual gap to external benchmark (+0.198% pooled chop EV) decomposes into the strict conservative 1-tick through-penetration fill requirement (~+0.12% EV swing if touch-filled), taker exit fee drag (0.06% on stops vs 0.02% maker on TP), and synthetic 8h funding accruals.
+
+
 
 
