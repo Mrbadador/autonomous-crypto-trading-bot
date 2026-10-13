@@ -46,9 +46,11 @@ def bootstrap_ci(values: List[float], n_bootstrap: int = 1000, ci_level: float =
     return mean_val, lower, upper
 
 
-def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_metrics(trades: List[Dict[str, Any]], signal_to_fill_pct: float = 0.0) -> Dict[str, Any]:
     """
     Computes performance and risk metrics from a list of completed simulated trades.
+    FIX 8: Mislabeled 'Maker Fill (%)' corrected to 'tp_exit_share' (TP maker exits / total exits).
+    'signal_to_fill_pct' measures order fill rate (filled limit orders / placed limit orders).
     """
     if not trades:
         return {
@@ -57,7 +59,8 @@ def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
             "profit_factor": 0.0,
             "ev_mean": 0.0,
             "ev_ci_90": (0.0, 0.0),
-            "maker_fill_pct": 0.0,
+            "signal_to_fill_pct": signal_to_fill_pct,
+            "tp_exit_share": 0.0,
             "avg_hold_mins": 0.0,
             "max_drawdown_usd": 0.0,
             "total_net_pnl": 0.0,
@@ -80,7 +83,8 @@ def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     ev_mean, ev_low, ev_high = bootstrap_ci(list(net_pnls))
 
-    maker_fill_pct = float(tdf["is_maker_exit"].mean() * 100.0)
+    # FIX 8: tp_exit_share is the share of exits executed via passive Take-Profit maker orders
+    tp_exit_share = float(tdf["is_maker_exit"].mean() * 100.0)
     avg_hold_mins = float(tdf["holding_mins"].mean())
 
     # Max Drawdown
@@ -98,7 +102,8 @@ def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "profit_factor": profit_factor,
         "ev_mean": ev_mean,
         "ev_ci_90": (ev_low, ev_high),
-        "maker_fill_pct": maker_fill_pct,
+        "signal_to_fill_pct": signal_to_fill_pct,
+        "tp_exit_share": tp_exit_share,
         "avg_hold_mins": avg_hold_mins,
         "max_drawdown_usd": max_dd,
         "total_net_pnl": float(np.sum(net_pnls)),
@@ -108,14 +113,14 @@ def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def split_engine_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def split_engine_metrics(trades: List[Dict[str, Any]], signal_to_fill_pct: float = 0.0) -> Dict[str, Dict[str, Any]]:
     """Splits a trade list into Grid Longs, Scalp Shorts, and Combined."""
     longs = [t for t in trades if t["side"] == "LONG"]
     shorts = [t for t in trades if t["side"] == "SHORT"]
     return {
-        "combined": compute_metrics(trades),
-        "grid_long": compute_metrics(longs),
-        "scalp_short": compute_metrics(shorts),
+        "combined": compute_metrics(trades, signal_to_fill_pct=signal_to_fill_pct),
+        "grid_long": compute_metrics(longs, signal_to_fill_pct=signal_to_fill_pct),
+        "scalp_short": compute_metrics(shorts, signal_to_fill_pct=signal_to_fill_pct),
     }
 
 
