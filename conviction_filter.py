@@ -276,13 +276,18 @@ class ConvictionBoardroom:
                                 red_team_objection TEXT,
                                 alpha_thesis TEXT,
                                 final_rationale TEXT,
-                                timestamp TEXT
+                                timestamp TEXT,
+                                served_model_id TEXT
                             )
                         """)
+                        # FIX 2: additive model provenance capture (read-only wrt decisioning).
+                        if "served_model_id" not in [c[1] for c in conn_l.execute("PRAGMA table_info(boardroom_debates)").fetchall()]:
+                            conn_l.execute("ALTER TABLE boardroom_debates ADD COLUMN served_model_id TEXT;")
+                        served_model = debate.get("served_model_id")
                         conn_l.execute("""
-                            INSERT INTO boardroom_debates (symbol, side, execute, conviction_score, red_team_objection, alpha_thesis, final_rationale, timestamp)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (symbol_upper, side.upper(), 1 if execute else 0, conv_score, red_obj, alpha_th, rationale, now_str))
+                            INSERT INTO boardroom_debates (symbol, side, execute, conviction_score, red_team_objection, alpha_thesis, final_rationale, timestamp, served_model_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (symbol_upper, side.upper(), 1 if execute else 0, conv_score, red_obj, alpha_th, rationale, now_str, served_model))
                 except Exception as l_err:
                     log.debug(f"[BOARDROOM] Ledger persist note: {l_err}")
 

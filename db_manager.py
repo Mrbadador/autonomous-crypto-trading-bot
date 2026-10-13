@@ -270,6 +270,38 @@ class DBWriteQueue:
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=timeout)
 
+
+def ensure_boardroom_provenance_schema(ledger_db_path: str) -> bool:
+    """
+    FIX 2 (additive, idempotent): guarantee boardroom_debates exists in the ledger DB
+    with a nullable `served_model_id TEXT` column. Never rewrites or deletes rows;
+    no non-default values are backfilled. Returns True when the column is present.
+    """
+    if not os.path.exists(ledger_db_path):
+        return False
+    with sqlite3.connect(ledger_db_path, timeout=30.0) as conn:
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS boardroom_debates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                side TEXT,
+                execute INTEGER,
+                conviction_score REAL,
+                red_team_objection TEXT,
+                alpha_thesis TEXT,
+                final_rationale TEXT,
+                timestamp TEXT,
+                served_model_id TEXT
+            )
+        """)
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(boardroom_debates)").fetchall()]
+        if "served_model_id" not in cols:
+            conn.execute("ALTER TABLE boardroom_debates ADD COLUMN served_model_id TEXT;")
+            log.info("[FIX 2] boardroom_debates.served_model_id column added (nullable, additive).")
+        return True
+
+
 class DatabaseManager:
     def __init__(self, db_path=None):
         if db_path is None:
@@ -703,6 +735,14 @@ class DatabaseManager:
                 except Exception as mig_err:
                     log.critical(f"Database migration 1.3 FAILED: {mig_err}", exc_info=True)
                     raise mig_err
+
+            # Migration 1.4 (FIX 2): model provenance — additive served_model_id on boardroom_debates
+            # lives in trading_ledger.db, not this DB; helper is idempotent and additive-only.
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                ensure_boardroom_provenance_schema(os.path.join(base_dir, "trading_ledger.db"))
+            except Exception as prov_err:
+                log.warning(f"[MIGRATION-1.4] boardroom provenance column note: {prov_err}")
 
             conn.commit()
         log.info(f"Database initialized at {self.db_path} with WAL mode.")

@@ -1,6 +1,6 @@
 # LLM Boardroom Counterfactual Audit — Shadow Replay (HONEST EDITION)
 
-**Generated:** 2026-10-13T20:29:05.017010+00:00  
+**Generated:** 2026-10-13T20:40:35.622815+00:00  
 **Data horizon:** ledger rows with timestamp >= 2026-10-01T00:00:00 (decision log, NOT training-cutoff verified)  
 **MODEL PROVENANCE: unpinned pool; post-cutoff scoring paused** — 0/50 debates carry `served_model_id`; decisions cannot yet be attributed to a model training cutoff.  
 

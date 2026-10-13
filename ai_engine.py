@@ -295,6 +295,9 @@ async def _query_groq_cloud_with_rotation(session: aiohttp.ClientSession, payloa
                         text = await resp.text()
             
             if status == 200:
+                # FIX 2 (provenance, read-only): tag which pool model answered
+                if isinstance(resp_json, dict):
+                    resp_json.setdefault("model_used", resp_json.get("model") or active_model)
                 return resp_json
             
             # V28.9 Self-Healing: Amputate invalid/dead API key on 401/403 Unauthorized responses
@@ -1061,6 +1064,7 @@ async def red_team_deliberation(
                 "red_team_objection": str(verdict.get("bear_objection", "Red team flagged potential volatility.")),
                 "alpha_thesis": str(verdict.get("bull_thesis", "Alpha hunter confirmed directional trend.")),
                 "final_rationale": str(verdict.get("rationale", "Adversarial deliberation concluded.")),
+                "served_model_id": str(resp.get("model_used") or resp.get("model") or "cloud_response_unattributed"),
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         except Exception as ae:
@@ -1081,6 +1085,7 @@ async def red_team_deliberation(
         "red_team_objection": "Cloud AI deliberation unavailable — fail-closed safety veto active.",
         "alpha_thesis": "Deliberation offline.",
         "final_rationale": "Boardroom LLM offline or timed out; fail-closed capital preservation active.",
+        "served_model_id": None,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
