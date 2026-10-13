@@ -105,10 +105,28 @@ def precompute_5m_indicators_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     return res
 
 
+def precompute_btc_15m_regime(df_15m: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes Wilder ADX(14) and DI spread on BTC 15m candles with zero lookahead.
+    A 15m bar starting at timestamp T closes at T + 15m (T + 900,000 ms).
+    It is available to 5m bars whose start timestamp t >= T + 900,000 ms.
+    """
+    res = df_15m.copy()
+    adx_obj = ta.trend.ADXIndicator(res["high"], res["low"], res["close"], window=14)
+    res["market_adx"] = adx_obj.adx().fillna(0.0)
+    res["market_plus_di"] = adx_obj.adx_pos().fillna(0.0)
+    res["market_minus_di"] = adx_obj.adx_neg().fillna(0.0)
+    res["market_di_spread"] = (res["market_plus_di"] - res["market_minus_di"]).fillna(0.0)
+    # Candle availability timestamp: close of the 15m candle
+    res["close_ts"] = res["timestamp"] + 15 * 60 * 1000
+    return res[["close_ts", "market_adx", "market_di_spread"]].sort_values("close_ts")
+
+
 def run_grid_replay(
     df: pd.DataFrame,
     symbol: str = "BTCUSDT",
     funding_df: Optional[pd.DataFrame] = None,
+    btc_15m_df: Optional[pd.DataFrame] = None,
     conservative_fills: bool = True,
     enable_regime_gate: bool = True,
     enable_vwap_band: bool = True,
@@ -131,6 +149,23 @@ def run_grid_replay(
     """
     tick_size = TICK_SIZES.get(symbol, TICK_SIZES["DEFAULT"])
     ind_df = precompute_5m_indicators_vectorized(df)
+
+    # Attach BTC 15m market regime feed if provided (zero-lookahead merge_asof)
+    if btc_15m_df is not None and not btc_15m_df.empty:
+        regime_15m = precompute_btc_15m_regime(btc_15m_df)
+        ind_df = pd.merge_asof(
+            ind_df.sort_values("timestamp"),
+            regime_15m,
+            left_on="timestamp",
+            right_on="close_ts",
+            direction="backward"
+        )
+        ind_df["market_adx"] = ind_df["market_adx"].fillna(ind_df["adx_5m"])
+        ind_df["market_di_spread"] = ind_df["market_di_spread"].fillna(ind_df["di_spread"])
+    else:
+        # Fallback to asset 5m indicators if no external 15m BTC feed
+        ind_df["market_adx"] = ind_df["adx_5m"]
+        ind_df["market_di_spread"] = ind_df["di_spread"]
 
     # Funding rate map: timestamp -> rate
     funding_map = {}
@@ -156,6 +191,8 @@ def run_grid_replay(
     vwaps = ind_df["vwap"].values
     di_spreads = ind_df["di_spread"].values
     has_bearish_rev = ind_df["has_bearish_reversal"].values
+    market_adx_arr = ind_df["market_adx"].values
+    market_di_spread_arr = ind_df["market_di_spread"].values
 
     for i in range(30, n_bars):
         curr_ts = ts[i]
@@ -367,6 +404,7 @@ def run_grid_replay(
                     "take_profit": pending_order["take_profit"],
                     "stop_loss": pending_order["stop_loss"],
                     "regime": pending_order["regime"],
+                    "entry_market_adx": pending_order["market_adx"],
                     "allocation_usd": trade_allocation_usd,
                     "leverage": leverage,
                     "entry_fee_usd": entry_fee_usd,
@@ -387,12 +425,14 @@ def run_grid_replay(
             bar_upper = upper_bands[i] if enable_vwap_band else 0.0
             bar_adx = adx_5m[i]
             bar_di = di_spreads[i]
+            m_adx = market_adx_arr[i]
+            m_di = market_di_spread_arr[i]
 
-            # Regime assignment based on 5m ADX proxy:
+            # Regime assignment based on Market ADX (BTC 15m)
             # Low ADX (< 22.0) = CHOP, High ADX (>= 28.0) = TREND, High DI spread = HIGH_VOL
-            if bar_adx < 22.0:
+            if m_adx < 22.0:
                 current_regime = "CHOP"
-            elif bar_adx >= 28.0:
+            elif m_adx >= 28.0:
                 current_regime = "TREND"
             else:
                 current_regime = "HIGH_VOL"
@@ -400,7 +440,7 @@ def run_grid_replay(
             # LONG GRID SIGNAL
             long_regime_ok = True
             if enable_regime_gate:
-                if bar_adx >= 28.0 or (bar_adx >= 25.0 and bar_di < -4.0):
+                if m_adx >= 28.0 or (m_adx >= 25.0 and m_di < -4.0):
                     long_regime_ok = False
 
             if long_regime_ok and bar_rsi < 30.0 and curr_close <= bar_lower and bar_adx < 24.0:
@@ -413,6 +453,7 @@ def run_grid_replay(
                     "take_profit": limit_p * (1.0 + 0.0135),
                     "stop_loss": limit_p * (1.0 - 0.0115),
                     "regime": current_regime,
+                    "market_adx": m_adx,
                 }
                 continue
 
@@ -432,6 +473,7 @@ def run_grid_replay(
                         "take_profit": limit_p * (1.0 - 0.0120),
                         "stop_loss": limit_p * (1.0 + 0.0100),
                         "regime": current_regime,
+                        "market_adx": m_adx,
                     }
                     continue
 
