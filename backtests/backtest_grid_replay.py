@@ -40,7 +40,7 @@ from super_bot import (
 TICK_SIZES = {
     "BTCUSDT": 0.1,
     "ETHUSDT": 0.01,
-    "SOLUSDT": 0.01,
+    "SOLUSDT": 0.001,
     "DEFAULT": 0.01,
 }
 
