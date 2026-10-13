@@ -241,6 +241,15 @@ def run_full_suite() -> Dict[str, Any]:
         )
         res_no_45m_split = split_engine_metrics(trades_no_45m, signal_to_fill_pct=fleet_res_cap2["signal_to_fill_pct"])
 
+        # D3 Ablation: Funding Regime Gate (ON - suppress longs if funding > 80th pct / > 1 bp)
+        trades_funding_gate = run_grid_replay(
+            df, symbol=sym, funding_df=f_df, btc_15m_df=btc_15m_df,
+            conservative_fills=True, enable_regime_gate=True,
+            enable_vwap_band=True, enable_45m_tightening=True,
+            max_order_ttl_bars=1, enable_funding_regime_gate=True
+        )
+        res_funding_gate_split = split_engine_metrics(trades_funding_gate, signal_to_fill_pct=fleet_res_cap2["signal_to_fill_pct"])
+
         # 7. Stratification of Grid Longs by Market ADX (BTC 15m)
         long_trades_cons = [t for t in trades_cons if t["side"] == "LONG"]
         chop_deep = [t for t in long_trades_cons if t.get("entry_market_adx", 0.0) < 20.0]
@@ -258,6 +267,7 @@ def run_full_suite() -> Dict[str, Any]:
             "no_regime": res_no_regime_split,
             "no_vwap": res_no_vwap_split,
             "no_45m": res_no_45m_split,
+            "funding_gate": res_funding_gate_split,
             "stratified_long": {
                 "deep_chop_lt20": compute_metrics(chop_deep, signal_to_fill_pct=fleet_res_cap2["signal_to_fill_pct"]),
                 "mid_chop_20_25": compute_metrics(chop_mid, signal_to_fill_pct=fleet_res_cap2["signal_to_fill_pct"]),
@@ -372,11 +382,12 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
                 ("Ablate Regime Gate (OFF)", d["no_regime"]["grid_long"]),
                 ("Ablate VWAP Band Filter (OFF)", d["no_vwap"]["grid_long"]),
                 ("Ablate 45m Tightening (OFF)", d["no_45m"]["grid_long"]),
+                ("Funding Regime Gate (ON)", d["funding_gate"]["grid_long"]),
             ]
             for label, m in rows:
                 ci_str = f"${m['ev_mean']:+.3f} [${m['ev_ci_90'][0]:+.3f}, ${m['ev_ci_90'][1]:+.3f}]"
                 f.write(f"| {label} | Grid Long | {m['n_trades']} | {m['win_rate']:.1f}% | {m['profit_factor']:.2f} | {m['signal_to_fill_pct']:.1f}% | {m['tp_exit_share']:.1f}% | {m['avg_hold_mins']:.1f}m | ${m['max_drawdown_usd']:.2f} | {ci_str} |\n")
-            f.write("\n")
+            f.write(f"\n*Funding Drag Note:* Total funding paid by standalone {sym} longs was **${d['conservative']['grid_long']['total_funding_usd']:+.2f}** across {d['conservative']['grid_long']['n_trades']} trades.\n\n")
 
         f.write("---\n\n")
 
