@@ -213,6 +213,8 @@ def run_grid_replay(
     max_order_ttl_bars: int = 1,
     cooldown_bars: int = 12,
     enable_funding_regime_gate: bool = False,  # D3 ablation arm: suppress longs if trailing funding > 80th pct
+    seeded_positions: Optional[List[Dict[str, Any]]] = None,  # FIX 1: boardroom veto shadow — pre-place a position at entry_ts (taker market entry), skip signal scanning
+    scan_signals: bool = True,  # FIX 1: set False for pure exit-management replays
 ) -> List[Dict[str, Any]]:
     """
     Executes historical 5m replay simulation.
@@ -223,6 +225,12 @@ def run_grid_replay(
     A longer TTL (e.g. max_order_ttl_bars=6 / 30m) introduces severe negative selection bias:
     orders left standing fill preferentially during sharp, sustained market collapses through
     the bid, artificially exaggerating losses and negative EV.
+
+    SEEDED POSITIONS (FIX 1, counterfactual shadow replay):
+    Each seed dict: {side, entry_price, take_profit, stop_loss, entry_ts, symbol, label}.
+    The position is opened taker at the entry bar's close (entry_price must equal that close;
+    the caller is responsible for reconstruction), then managed by the identical TP/SL/funding
+    state machine used by signal-driven replays. scan_signals=False disables new signal entry.
     """
     tick_size = TICK_SIZES.get(symbol, TICK_SIZES["DEFAULT"])
     effective_fill_model = fill_model if fill_model is not None else ("one_tick" if conservative_fills else "touch")
@@ -274,6 +282,41 @@ def run_grid_replay(
     active_trade = None
     pending_order = None
     last_loss_bar = -999
+
+    # FIX 1: instantiate seeded positions (single seed per replay run)
+    seed_meta = None
+    if seeded_positions:
+        if len(seeded_positions) != 1:
+            raise ValueError("run_grid_replay supports exactly one seeded position per run")
+        seed = seeded_positions[0]
+        ts_index = ind_df["timestamp"].astype("int64")
+        entry_bar_arr = np.where(ts_index.values == int(seed["entry_ts"]))[0]
+        if len(entry_bar_arr) == 0:
+            seed_meta = {**seed, "outcome": "NO_BAR", "net_pnl": None}
+        else:
+            e_idx = int(entry_bar_arr[0])
+            if e_idx >= n_bars - 1:
+                seed_meta = {**seed, "outcome": "EDGE_OF_DATA", "net_pnl": None}
+            else:
+                close_at_entry = float(ind_df["close"].iloc[e_idx])
+                notional = trade_allocation_usd * leverage
+                active_trade = {
+                    "symbol": seed.get("symbol", symbol),
+                    "side": seed["side"],
+                    "entry_bar": e_idx,
+                    "entry_ts": int(seed["entry_ts"]),
+                    "entry_price": float(seed["entry_price"]),
+                    "take_profit": float(seed["take_profit"]),
+                    "stop_loss": float(seed["stop_loss"]),
+                    "regime": seed.get("regime", "SEEDED"),
+                    "label": seed.get("label", ""),
+                    "allocation_usd": trade_allocation_usd,
+                    "leverage": leverage,
+                    "entry_fee_usd": notional * TAKER_FEE,
+                    "funding_usd": 0.0,
+                    "is_maker_entry": False,
+                }
+                seed_meta = {**seed, "outcome": "OPEN", "net_pnl": None, "signal_close_at_entry": close_at_entry}
 
     # Pre-extract numpy arrays for fast row iteration
     ts = ind_df["timestamp"].values
@@ -543,7 +586,7 @@ def run_grid_replay(
         # -------------------------------------------------------------
         # 3. Scan New Entry Signals (if flat, no pending order, loss cooldown passed)
         # -------------------------------------------------------------
-        if active_trade is None and pending_order is None and (i - last_loss_bar) >= cooldown_bars:
+        if scan_signals and active_trade is None and pending_order is None and (i - last_loss_bar) >= cooldown_bars:
             bar_rsi = rsis[i]
             bar_lower = lower_bands[i] if enable_vwap_band else 1e9
             bar_upper = upper_bands[i] if enable_vwap_band else 0.0
@@ -607,6 +650,52 @@ def run_grid_replay(
                         "market_adx": m_adx,
                     }
                     continue
+
+    # FIX 1: seeded-position lifecycle accounting
+    if seeded_positions:
+        if active_trade is not None:
+            # Still open at edge of data: mark out at last close (taker), flagged unresolved
+            exit_p = float(closes[-1])
+            notional = trade_allocation_usd * leverage
+            fee_usd = notional * TAKER_FEE
+            if active_trade["side"] == "LONG":
+                gross_pnl = (exit_p - active_trade["entry_price"]) / active_trade["entry_price"] * notional
+            else:
+                gross_pnl = (active_trade["entry_price"] - exit_p) / active_trade["entry_price"] * notional
+            net_pnl = gross_pnl - active_trade["entry_fee_usd"] - fee_usd + active_trade["funding_usd"]
+            trades.append({
+                **active_trade,
+                "exit_bar": n_bars - 1,
+                "exit_ts": int(ts[-1]),
+                "exit_price": exit_p,
+                "exit_reason": "OPEN_AT_EDGE_MARK_OUT",
+                "holding_mins": (n_bars - 1 - active_trade["entry_bar"]) * 5,
+                "exit_fee_usd": fee_usd,
+                "gross_pnl": gross_pnl,
+                "net_pnl": net_pnl,
+                "is_maker_exit": False,
+                "unresolved": True,
+            })
+        if seed_meta is not None and seed_meta["outcome"] in ("NO_BAR", "EDGE_OF_DATA"):
+            trades.append({
+                "symbol": seed_meta.get("symbol", symbol),
+                "side": seed_meta["side"],
+                "label": seed_meta.get("label", ""),
+                "entry_ts": int(seed_meta["entry_ts"]),
+                "entry_price": float(seed_meta["entry_price"]),
+                "take_profit": float(seed_meta["take_profit"]),
+                "stop_loss": float(seed_meta["stop_loss"]),
+                "exit_ts": int(seed_meta["entry_ts"]),
+                "exit_price": float(seed_meta["entry_price"]),
+                "exit_reason": seed_meta["outcome"],
+                "gross_pnl": 0.0,
+                "net_pnl": 0.0,
+                "funding_usd": 0.0,
+                "entry_fee_usd": 0.0,
+                "exit_fee_usd": 0.0,
+                "holding_mins": 0,
+                "unresolved": True,
+            })
 
     return trades
 
