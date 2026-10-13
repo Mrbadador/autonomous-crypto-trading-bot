@@ -160,12 +160,16 @@ def run_grid_replay(
             right_on="close_ts",
             direction="backward"
         )
-        ind_df["market_adx"] = ind_df["market_adx"].fillna(ind_df["adx_5m"])
-        ind_df["market_di_spread"] = ind_df["market_di_spread"].fillna(ind_df["di_spread"])
+        # FIX 9: Missing market regime must block entries (treat as ADX 99.0, DI spread 0.0), no fallback contamination
+        missing_count = int(ind_df["market_adx"].isna().sum())
+        ind_df["market_adx"] = ind_df["market_adx"].fillna(99.0)
+        ind_df["market_di_spread"] = ind_df["market_di_spread"].fillna(0.0)
+        if missing_count > 0:
+            print(f"[{symbol}] Blocked {missing_count} unaligned bars at start of series with market_adx=99.0")
     else:
-        # Fallback to asset 5m indicators if no external 15m BTC feed
-        ind_df["market_adx"] = ind_df["adx_5m"]
-        ind_df["market_di_spread"] = ind_df["di_spread"]
+        # If no external 15m BTC feed, block entries by default or treat as unaligned
+        ind_df["market_adx"] = 99.0
+        ind_df["market_di_spread"] = 0.0
 
     # Funding rate map: timestamp -> rate
     funding_map = {}
