@@ -172,9 +172,24 @@ def run_grid_replay(
         ind_df["market_di_spread"] = 0.0
 
     # Funding rate map: timestamp -> rate
+    # FIX 10: Bitget funding dataset starts in mid-2026. Prepend synthetic 8h settlements
+    # at symbol's median observed rate across the missing ~22-month window.
     funding_map = {}
     if funding_df is not None and not funding_df.empty:
-        funding_map = dict(zip(funding_df["timestamp"], funding_df["funding_rate"]))
+        rates = funding_df["funding_rate"].values
+        med_rate = float(np.median(rates))
+        min_real_ts = int(funding_df["timestamp"].min())
+        first_bar_ts = int(ind_df["timestamp"].min())
+        funding_map = dict(zip(funding_df["timestamp"].astype(int), funding_df["funding_rate"].astype(float)))
+
+        # Prepend synthetic 8h settlements (00:00, 08:00, 16:00 UTC = every 28,800,000 ms)
+        synth_count = 0
+        cur_synth_ts = (first_bar_ts // 28800000 + 1) * 28800000
+        while cur_synth_ts < min_real_ts:
+            funding_map[cur_synth_ts] = med_rate
+            synth_count += 1
+            cur_synth_ts += 28800000
+        print(f"[FUNDING-FILL] {symbol}: prepended {synth_count:,} synthetic 8h funding settlements @ {med_rate:.6e} median rate")
 
     trades = []
     n_bars = len(ind_df)
@@ -220,13 +235,13 @@ def run_grid_replay(
             # Bitget funding epochs: 00:00, 08:00, 16:00 UTC (every 28,800,000 ms)
             if funding_map:
                 prev_ts = ts[i - 1]
-                # Check if an 8h timestamp falls between prev_ts and curr_ts
-                for f_ts, f_rate in funding_map.items():
-                    if prev_ts < f_ts <= curr_ts:
-                        notional = trade_allocation_usd * leverage
-                        # Long pays if positive funding, short receives
-                        f_usd = -f_rate * notional if side == "LONG" else f_rate * notional
-                        active_trade["funding_usd"] += f_usd
+                if (prev_ts // 28800000) != (curr_ts // 28800000):
+                    boundary_ts = int((curr_ts // 28800000) * 28800000)
+                    f_rate = funding_map.get(boundary_ts, 0.0)
+                    notional = trade_allocation_usd * leverage
+                    # Long pays if positive funding, short receives
+                    f_usd = -f_rate * notional if side == "LONG" else f_rate * notional
+                    active_trade["funding_usd"] += f_usd
 
             # Check 45m - 90m dynamic tightening
             if enable_45m_tightening and side == "SHORT" and mins_held >= 45:
