@@ -3,6 +3,10 @@ tests/test_depth_recorder.py — Verification of D1 Depth Recorder Bootstrap and
 """
 
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import unittest
 import sqlite3
 from depth_recorder import DepthRecorder, get_daily_db_path, init_depth_db
