@@ -448,6 +448,18 @@ class DatabaseManager:
                 )
             """)
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS prereg_registry (
+                    id TEXT PRIMARY KEY,
+                    hypothesis_name TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    target_sample_size INTEGER NOT NULL,
+                    metric_target TEXT NOT NULL,
+                    status TEXT DEFAULT 'ACTIVE',
+                    created_at TEXT NOT NULL,
+                    notes TEXT
+                )
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS swing_open_positions (
                     symbol TEXT PRIMARY KEY,
                     side TEXT NOT NULL,
