@@ -116,11 +116,18 @@ def run_grid_replay(
     enable_short_scalps: bool = True,
     trade_allocation_usd: float = 85.0,
     leverage: float = 3.0,
-    max_order_ttl_bars: int = 6,  # 30s TTL in live bot is roughly within current/next bar
+    max_order_ttl_bars: int = 1,  # Live bot TTL is ~30s; 1 bar tests fill on signal bar's successor only
     cooldown_bars: int = 12,      # 1 hour anti-churn cooldown after exit
 ) -> List[Dict[str, Any]]:
     """
     Executes historical 5m replay simulation.
+
+    NOTE ON ORDER TTL BIAS:
+    Live execution attempts maker limit fills for ~30 seconds before canceling unfilled orders.
+    A live-faithful replay sets max_order_ttl_bars=1 (successor bar only).
+    A longer TTL (e.g. max_order_ttl_bars=6 / 30m) introduces severe negative selection bias:
+    orders left standing fill preferentially during sharp, sustained market collapses through
+    the bid, artificially exaggerating losses and negative EV.
     """
     tick_size = TICK_SIZES.get(symbol, TICK_SIZES["DEFAULT"])
     ind_df = precompute_5m_indicators_vectorized(df)
