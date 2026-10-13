@@ -36,6 +36,76 @@ RETENTION_DAYS = 90
 BATCH_FLUSH_INTERVAL_SEC = 2.0
 MAX_BATCH_ROWS = 5000
 
+# FIX 3 — staleness health thresholds (seconds)
+WARN_AGE_SEC = 900.0    # 15 minutes
+ERROR_AGE_SEC = 3600.0  # 60 minutes
+
+
+def read_depth_health(now_ts: Optional[float] = None, depth_dir: Optional[str] = None,
+                      date_str: Optional[str] = None) -> Dict[str, Any]:
+    """
+    FIX 3 — PURE, READ-ONLY staleness probe of a daily depth partition.
+
+    Opens the current UTC day's `depth_YYYY-MM-DD.db` via a SQLite `mode=ro` URI and
+    reports how stale MAX(timestamp_ms) is relative to `now_ts` (defaults to wall clock).
+    Never writes and performs no logging, so it is safe to import and unit-test from
+    anywhere (including the supervisor in start_system.py). Does NOT touch the recorder's
+    WS/REST ingestion or the table schema.
+
+    status: MISSING | READ_ERROR | EMPTY | STALE_ERROR (>60min) | STALE_WARN (>15min) | FRESH
+    """
+    if now_ts is None:
+        now_ms = time.time() * 1000.0
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    else:
+        now_ms = float(now_ts) * 1000.0
+        date = datetime.fromtimestamp(float(now_ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    if date_str:
+        date = date_str
+    dir_path = depth_dir or DEPTH_DIR
+    db_path = os.path.join(dir_path, f"depth_{date}.db")
+
+    out: Dict[str, Any] = {
+        "status": "MISSING", "age_sec": None, "rows": 0, "snapshots": 0,
+        "db_path": db_path, "warn_threshold_sec": WARN_AGE_SEC, "error_threshold_sec": ERROR_AGE_SEC,
+    }
+    if not os.path.exists(db_path):
+        return out
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = con.execute(
+                "SELECT MIN(timestamp_ms), MAX(timestamp_ms), COUNT(*) FROM books15_snapshots"
+            ).fetchone()
+            max_ts = row[1] if row else None
+            rows = row[2] if row and row[2] else 0
+            snaps = con.execute(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT timestamp_ms, symbol FROM books15_snapshots)"
+            ).fetchone()[0] or 0
+        finally:
+            con.close()
+    except Exception as e:
+        out["status"] = "READ_ERROR"
+        out["error"] = str(e)
+        return out
+
+    out["rows"] = rows
+    out["snapshots"] = snaps
+    if not max_ts:
+        out["status"] = "EMPTY"
+        return out
+
+    age = max(0.0, (now_ms - float(max_ts)) / 1000.0)
+    out["age_sec"] = age
+    if age > ERROR_AGE_SEC:
+        out["status"] = "STALE_ERROR"
+    elif age > WARN_AGE_SEC:
+        out["status"] = "STALE_WARN"
+    else:
+        out["status"] = "FRESH"
+    return out
+
 
 def get_daily_db_path(ts_ms: Optional[int] = None) -> str:
     """Returns absolute path to the SQLite depth database for the given day."""

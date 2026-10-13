@@ -158,6 +158,38 @@ def _run_in_process_hourly_report(force: bool = False):
         except Exception as e:
             log.error(f"[HOURLY-BRIEFING] In-process hourly briefing error: {e}")
 
+def get_depth_health(now_ts=None, depth_dir=None, date_str=None):
+    """
+    FIX 3 — supervision-facing depth staleness check.
+
+    Delegates the read-only probe to depth_recorder.read_depth_health() and routes the
+    result through the launcher logger: WARNING when age > 15 min, ERROR when age > 60 min.
+    Returns the structured result dict (status/age_sec/rows/snapshots/db_path).
+    """
+    import depth_recorder
+    res = depth_recorder.read_depth_health(now_ts=now_ts, depth_dir=depth_dir, date_str=date_str)
+    status = res.get("status")
+    age = res.get("age_sec")
+    if status == "MISSING":
+        log.error(f"[DEPTH-HEALTH] ERROR: today's depth partition is missing: {res['db_path']}")
+    elif status == "READ_ERROR":
+        log.error(f"[DEPTH-HEALTH] ERROR: cannot read depth partition {res['db_path']}: {res.get('error')}")
+    elif status == "EMPTY":
+        log.warning("[DEPTH-HEALTH] WARNING: depth partition exists but holds zero snapshot rows.")
+    elif status == "STALE_ERROR":
+        log.error(
+            f"[DEPTH-HEALTH] ERROR: books15 depth stream stale {age/60.0:.1f} min (>60min) "
+            f"— recorder likely down (rows={res['rows']}, snapshots={res['snapshots']})."
+        )
+    elif status == "STALE_WARN":
+        log.warning(
+            f"[DEPTH-HEALTH] WARNING: depth stream lagging {age/60.0:.1f} min (>15min) "
+            f"(rows={res['rows']}, snapshots={res['snapshots']})."
+        )
+    else:
+        log.info(f"[DEPTH-HEALTH] OK: depth stream fresh (age {age:.0f}s); rows={res['rows']}, snapshots={res['snapshots']}.")
+    return res
+
 import psutil
 import socket
 
@@ -175,7 +207,7 @@ def _recycle_existing_orchestrator(my_pid):
         "regime_classifier.py", "portfolio_risk_agent.py", "post_mortem_agent.py",
         "macro_sentinel.py", "asset_scout.py", "recovery_agent.py", "reconciliation_engine.py",
         "db_maintenance_daemon.py", "prometheus_exporter.py", "basis_trader.py", "swing_trader.py",
-        "super_bot.py", "executive_briefing.py"
+        "super_bot.py", "executive_briefing.py", "depth_recorder.py"
     ]
     
     procs_to_terminate = []
@@ -259,7 +291,7 @@ def _cleanup_stale_children(my_pid):
         "regime_classifier.py", "portfolio_risk_agent.py", "post_mortem_agent.py",
         "macro_sentinel.py", "asset_scout.py", "recovery_agent.py", "reconciliation_engine.py",
         "db_maintenance_daemon.py", "prometheus_exporter.py", "basis_trader.py",
-        "swing_trader.py", "super_bot.py", "executive_briefing.py"
+        "swing_trader.py", "super_bot.py", "executive_briefing.py", "depth_recorder.py"
     ]
     cleaned = 0
     for p in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -375,6 +407,13 @@ def main():
         [sys.executable, "db_maintenance_daemon.py"],
         [sys.executable, "prometheus_exporter.py"],
     ])
+    # FIX 3: supervised books15 L2 depth recorder (zero-order public-data daemon).
+    # Accrues queue-model calibration snapshots (TRIAL-003 target: >=50,000 across >=14 days).
+    if getattr(config, "DEPTH_RECORDER_ENABLED", True):
+        log.info("[FLEET-ROUTER] 📡 books15 depth recorder ENABLED (supervised; auto-restart + backoff).")
+        subprocess_configs.append([sys.executable, "depth_recorder.py"])
+    else:
+        log.info("[FLEET-ROUTER] 📡 books15 depth recorder disabled via DEPTH_RECORDER_ENABLED=false.")
     if getattr(config, "BASIS_TRADER_ENABLED", False):
         subprocess_configs.append([sys.executable, "basis_trader.py"])
     subprocess_configs.append([sys.executable, "-m", "streamlit", "run", "dashboard.py", "--server.port", "8501"])
@@ -410,6 +449,8 @@ def main():
     _last_shepherd_time = time.time()
     _last_relative_strength_time = time.time()
     _last_hourly_report_time = time.time()
+    # FIX 3: fire the depth staleness health check immediately on boot, then every 5 minutes.
+    _last_depth_health_time = time.time() - 300.0
     try:
         import sqlite3
         conn_h = sqlite3.connect("trading_ledger.db", timeout=3.0)
@@ -462,6 +503,10 @@ def main():
                         log.info(f"[SUPERVISOR] {script_name} is disabled via SWING_TRADER_ENABLED=false. De-registering process cleanly.")
                         mp.restart_at = -1.0
                         continue
+                    if _get_script_identity(mp.cmd) == "depth_recorder.py" and not getattr(config, "DEPTH_RECORDER_ENABLED", True):
+                        log.info(f"[SUPERVISOR] {script_name} is disabled via DEPTH_RECORDER_ENABLED=false. De-registering process cleanly.")
+                        mp.restart_at = -1.0
+                        continue
                     if mp.restart_at == 0.0:
                         if mp.restarts >= 15:
                             log.critical(f"[SYSTEM] Subprocess {script_name} has exceeded the maximum restart limit (15). HALTING restart attempts.")
@@ -495,6 +540,11 @@ def main():
             if now - _last_briefing_time >= 300.0:
                 _last_briefing_time = now
                 threading.Thread(target=_run_in_process_briefing, daemon=True, name="in_process_briefing").start()
+
+            # FIX 3: books15 depth-recorder staleness health check (every 5 min; WARNING >15min, ERROR >60min)
+            if now - _last_depth_health_time >= 300.0:
+                _last_depth_health_time = now
+                get_depth_health()
 
             # Autonomous in-process 15-minute in-flight position shepherd check
             if now - _last_shepherd_time >= 900.0:
