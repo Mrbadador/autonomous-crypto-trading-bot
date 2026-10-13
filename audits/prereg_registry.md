@@ -11,14 +11,15 @@ Any strategy tuning or allocation adjustment must be registered here prior to ev
 
 ### TRIAL-001: 5m Chop Maker Grid (Fleet-Capped Deep Chop ADX < 20)
 - **Engine:** 5m Chop Maker Grid (`super_bot.py`)
-- **Hypothesis:** Restricting grid limit entries strictly to deep-market-chop environments (BTC 15m ADX < 20.0) under a fleet cap of 2 concurrent longs yields positive net EV net of Bitget taker stop-loss exits and funding carry.
+- **Hypothesis (FIX 4 wording sync):** Confining grid limit entries strictly to deep-market-chop environments (BTC 15m ADX < 20.0) under a fleet cap of 2 concurrent longs **avoids the −0.12…−0.23%/trade bleed measured in the 20–25 trend band**. Backtest deep-chop EV is **statistically indistinguishable from zero** (its 90% CI straddles $0$), so this trial does **not** assume a pre-existing positive edge; it tests whether **forward live EV can clear zero**. Tightening the ADX ceiling is framed strictly as **bleeding avoidance**, never as claimed positive expectancy.
+- **Interpretation guard:** Under the Hard Allocation Gate above, no allocation increase and no mid-sample threshold re-tuning is permitted while the forward bootstrap 90% CI lower bound $\le 0.0$ — which is the current state (backtest EV ≈ 0).
 - **Pre-Registered Parameters:**
   - `market_adx_ceiling = 20.0` (BTC 15m ADX)
   - `max_long_cap = 2`
   - `trade_allocation_usd = 85.0` (leverage 3x)
   - `fill_model = "one_tick"`
-- **Target Sample Size:** $N = 300$ trades
-- **Success Criterion:** Bootstrap 90% CI lower bound $> 0.0$ USD/trade (Net of maker fees, taker SL fees, and 8h funding).
+- **Target Sample Size:** $N = 300$ trades *(unchanged)*
+- **Success Criterion:** *(metric target unchanged)* Forward bootstrap 90% CI lower bound $> 0.0$ USD/trade at $N \ge 300$ (Net of maker fees, taker SL fees, and 8h funding).
 - **Status:** ACTIVE
 - **Date Registered:** 2026-10-13
 

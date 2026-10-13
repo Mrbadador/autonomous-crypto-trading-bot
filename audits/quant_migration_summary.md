@@ -154,6 +154,8 @@ When the operator decides to restart processes to deploy the in-memory code upda
    - **Measured:** Disabling the regime gate increases BTC trades from 987 to 1,673 and deepens drawdown from -$208.37 to -$406.01.
    - **Verdict:** **CONFIRMED DEFENSE**. The regime gate significantly reduces losses by blocking waterfall trend expansions.
 
+> Fill model = `touch` **upper bound** (FIX 4). A queue-priority fill model would be strictly worse and is blocked on TRIAL-003 depth data; where an EV CI straddles $0, read it as breakeven / bleeding-avoidance, never as positive edge.
+
 ---
 
 ## Grid Replay Harness Fidelity Round (Fixes 1–6 Audit & External Benchmark Reconciliation)
@@ -167,26 +169,33 @@ When the operator decides to restart processes to deploy the in-memory code upda
 | **FIX 3** | **Engine-Split** | Separated reporting and headline verdicts into Grid Longs Only, Scalp Shorts Only, and Combined. Evaluated claims (a)/(b)/(c) specifically on the Grid Long population | `e09ab03` | Re-ran evaluation across all 3 assets; split tables and metrics generated |
 | **FIX 4** | **Cooldown Fidelity** | Aligned replay cooldown to fire only after realized losses/stop-hits (`last_loss_bar`), matching live bot anti-churn logic (`self.recent_loss_cooldowns` and `swing_cooldowns`) | `4c1a4aa` | Verified with unit tests; allows consecutive mean-reverting bounces during extended quiet chop |
 | **FIX 5** | **Tick Size & Terminology** | Updated SOLUSDT tick size from 0.01 to 0.001 per Bitget contract specification. Corrected report prose from "maker rebates" to "maker fee (0.02% base tier)". Documented dataset staleness window (ends 2026-08-16) | `21858c2` | Verified via public Bitget swap market specification (`SOL/USDT:USDT` price precision = 0.001) |
-| **FIX 6** | **Directional Acceptance** | Stratified Grid Longs by BTC 15m Market ADX (< 20, 20–25, 25–28). Reconciled against independent external benchmark | (Current) | Market ADX < 20 outperforms 20–25 stratum across all assets (+0.145%/trade on BTC, +0.188%/trade on ETH, +0.031%/trade on SOL) |
+| **FIX 6** | **Directional Acceptance** | Stratified Grid Longs by BTC 15m Market ADX (< 20, 20–25, 25–28). Reconciled against independent external benchmark | (Current) | Deep-chop (ADX < 20) EV is **indistinguishable from zero**; the +0.145%/+0.188%/+0.031% spreads vs the 20–25 band measure **bleeding avoidance**, not positive edge (touch-fill upper bound) |
 
 ### Directional Acceptance Test & Benchmark Reconciliation Evidence
 
-The independent external benchmark reported that the chop-grid engine exhibits strictly superior expectancy when market ADX < 20 compared to intermediate trend states (20–28). Under our updated live-faithful harness:
+> [!WARNING]
+> **Fill model = UPPER BOUND; EV interpretation (FIX 4).** All EV below uses the `touch` optimistic fill
+> assumption (best queue position); a queue-priority model yields worse realized fills, and calibration is
+> **blocked on TRIAL-003 books15 depth data**. Deep-chop (ADX < 20) EV (e.g. +$0.014 / +$0.003) is **within
+> sampling noise of zero — statistically indistinguishable from breakeven, NOT a positive-edge result.** The
+> ceiling's only defensible value is **avoiding the −0.12…−0.23%/trade 20–25 trend-band bleed.**
+
+The independent external benchmark reported that the chop-grid engine exhibits superior expectancy when market ADX < 20 compared to intermediate trend states (20–28). Under our updated live-faithful harness the deep-chop stratum is **breakeven (EV indistinguishable from zero)** while the 20–25 stratum is a **measurable bleed** — so the spread below quantifies **bleeding avoidance, not positive edge:**
 
 - **BTCUSDT Grid Longs:**
-  - Deep Chop (Market ADX < 20): N = 296, WR = 48.6%, EV = **+$0.014** (+0.005% of notional), Net PnL = +$4.10
+  - Deep Chop (Market ADX < 20): N = 296, WR = 48.6%, EV = **+$0.014** (+0.005% of notional — indistinguishable from $0), Net PnL = +$4.10
   - Moderate Trend (20 <= ADX < 25): N = 149, WR = 43.0%, EV = **-$0.355** (-0.139% of notional), Net PnL = -$52.92
-  - **Spread:** **+0.145% per trade** in favor of deep chop.
+  - **Spread:** **+0.145%/trade of bleed avoided** (deep-chop EV ≈ 0, not positive).
 - **ETHUSDT Grid Longs:**
-  - Deep Chop (Market ADX < 20): N = 365, WR = 48.5%, EV = **+$0.003** (+0.001% of notional), Net PnL = +$0.95
+  - Deep Chop (Market ADX < 20): N = 365, WR = 48.5%, EV = **+$0.003** (+0.001% of notional — indistinguishable from $0), Net PnL = +$0.95
   - Moderate Trend (20 <= ADX < 25): N = 168, WR = 41.1%, EV = **-$0.477** (-0.187% of notional), Net PnL = -$80.14
-  - **Spread:** **+0.188% per trade** in favor of deep chop.
+  - **Spread:** **+0.188%/trade of bleed avoided** (deep-chop EV ≈ 0, not positive).
 - **SOLUSDT Grid Longs:**
-  - Deep Chop (Market ADX < 20): N = 406, WR = 45.1%, EV = **-$0.231** (-0.090% of notional), Net PnL = -$93.65
+  - Deep Chop (Market ADX < 20): N = 406, WR = 45.1%, EV = **-$0.231** (-0.090% of notional; CI straddles 0 in the engine-split report), Net PnL = -$93.65
   - Moderate Trend (20 <= ADX < 25): N = 207, WR = 44.0%, EV = **-$0.309** (-0.121% of notional), Net PnL = -$64.02
-  - **Spread:** **+0.031% per trade** in favor of deep chop.
+  - **Spread:** **+0.031%/trade of bleed avoided** (both strata negative; deep-chop is *less* negative, not profitable).
 
-**Conclusion:** Across all three assets, the deep-market-chop block ($ADX < 20$) consistently outperforms intermediate trend regimes, **directionally validating the external benchmark findings**.
+**Conclusion:** Across all three assets the 20–25 trend band is a **measurable bleed (−0.12…−0.23%/trade)** while deep-chop EV sits **at, not above, zero**. Confining entries to deep chop is therefore justified as **bleeding avoidance only** — it does **not** demonstrate positive expectancy, and the external benchmark's "strictly superior" framing reflects an optimistic touch-fill upper bound rather than realizable alpha.
 
 ### Daemon Restart Manifest
 
@@ -212,10 +221,10 @@ The independent external benchmark reported that the chop-grid engine exhibits s
 1. **Pre-Registered Arm (Market ADX < 20 Entry Ceiling, Fleet Cap = 2):**
    - Trades: **1,067** (BTC: 343, ETH: 369, SOL: 355)
    - Win Rate: **47.1%** (ETH: 49.3%, BTC: 47.2%, SOL: 44.8%)
-   - Net EV / Trade: **-$0.1020 [-$0.2655, +$0.0612]** (-0.040% of notional) vs live shield -$0.2300 (-0.090% of notional)
+   - Net EV / Trade: **-$0.1020 [-$0.2655, +$0.0612]** (-0.040% of notional) vs live shield -$0.2300 (-0.090% of notional). The arm's CI **straddles zero** → EV indistinguishable from breakeven; its value is **avoiding the −0.12…−0.23%/trade 20–25 trend-band bleed**, under an optimistic `touch` fill **upper bound** (a queue-priority model would be worse; blocked on TRIAL-003).
    - Max Drawdown: Slashed by **51.8%** from **$429.11 down to $207.01** (ETH DD $66.40, BTC DD $72.68, SOL DD $140.11)
 2. **Acceptance Test & External Benchmark Reconciliation:**
-   - Deep chop ($ADX < 20$) consistently outperforms intermediate trend strata ($20 \le ADX < 25$) across all assets: **BTC spread +0.144%**, **ETH spread +0.188%**, **SOL spread +0.031%**.
+   - Confining entries to deep chop ($ADX < 20$) **avoids the measurable bleed in the 20–25 trend band** across all assets: **BTC spread +0.144%**, **ETH spread +0.188%**, **SOL spread +0.031%** of bleed dodged per trade. Deep-chop EV itself is indistinguishable from zero, so these spreads are **bleeding-avoidance**, not positive expectancy.
    - Residual gap to external benchmark (+0.198% pooled chop EV) decomposes into the strict conservative 1-tick through-penetration fill requirement (~+0.12% EV swing if touch-filled), taker exit fee drag (0.06% on stops vs 0.02% maker on TP), and synthetic 8h funding accruals.
 
 
