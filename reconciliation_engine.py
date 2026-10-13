@@ -174,6 +174,7 @@ def audit_paper_positions():
                         log.info(f"[{bot}] Auto-healing orphan {side.upper()} on {symbol}: Price ${live_p:,.2f} crossed threshold. Closing with PnL: ${pnl:+.2f}")
                         
                         # Log to closed trade table
+                        ledger_write_ok = False
                         try:
                             cur = conn.execute(
                                 f"INSERT INTO {closed_table} (timestamp, symbol, side, entry_price, exit_price, pnl, exit_reason) "
@@ -195,13 +196,18 @@ def audit_paper_positions():
                                 )
                             except Exception as cal_err:
                                 log.debug(f"Calibration log note: {cal_err}")
+                            ledger_write_ok = cur.rowcount == 1
                         except Exception as ce:
                             # Table structure fallback
-                            log.debug(f"Closed table insert note: {ce}")
+                            ledger_write_ok = False
+                            log.warning(f"[{bot}] Closed-table insert failed for {symbol} — retaining open row: {ce}")
                             
-                        # Delete from open positions
-                        conn.execute(f"DELETE FROM {table} WHERE symbol = ?", (symbol,))
-                        audit_summary["desyncs_healed"] += 1
+                        # Delete from open positions — only when the ledger row is confirmed
+                        if ledger_write_ok:
+                            conn.execute(f"DELETE FROM {table} WHERE symbol = ?", (symbol,))
+                            audit_summary["desyncs_healed"] += 1
+                        else:
+                            log.warning(f"[{bot}] DEFERRING prune of {symbol} in {table} — closed-trade row not written; retry next pass")
 
         except Exception as e:
             log.error(f"Error auditing table {table}: {e}")
@@ -470,7 +476,7 @@ async def audit_live_exchange_positions():
                                     except Exception:
                                         pass
 
-                                 if is_unreconciled:
+                                if is_unreconciled:
                                     # Attribution already assigned as UNRECONCILED_CLOSE
                                     pass
                                 else:
@@ -494,6 +500,7 @@ async def audit_live_exchange_positions():
                                     (s_sym, s_sym.replace('/', ''), entry_p, entry_p)
                                 ).fetchone()
                                 
+                                ledger_write_ok = True
                                 if not recent_close:
                                     try:
                                         intended_entry_val = row_dict.get("intended_entry_price") or entry_p
@@ -503,7 +510,7 @@ async def audit_live_exchange_positions():
                                         rec_status = "UNRECONCILED" if is_unreconciled else "CLOSED"
 
                                         if closed_tbl == "swing_trades":
-                                            conn.execute(
+                                            cur_ins = conn.execute(
                                                 """INSERT INTO swing_trades (
                                                     timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct,
                                                     holding_hours, exit_reason, notes, intended_entry_price, actual_fill_price,
@@ -519,17 +526,23 @@ async def audit_live_exchange_positions():
                                                 )
                                             )
                                         else:
-                                            conn.execute(
+                                            cur_ins = conn.execute(
                                                 f"INSERT INTO {closed_tbl} (timestamp, symbol, side, type, entry_price, exit_price, qty, pnl, balance, notes, status, action) "
                                                 "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                                 (s_sym, norm_side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, rec_status, norm_side)
                                             )
+                                        ledger_write_ok = cur_ins.rowcount == 1
                                     except Exception as ins_e:
-                                        log.debug(f"[RECONCILER] Note inserting into {closed_tbl}: {ins_e}")
-                                
-                                # Delete from open positions table
-                                conn.execute(f"DELETE FROM {tbl} WHERE symbol = ? AND side = ?", (s_sym, row_dict.get("side", norm_side)))
-                                pruned_count += 1
+                                        ledger_write_ok = False
+                                        log.error(f"[RECONCILER] Ledger INSERT FAILED into {closed_tbl} for {s_sym} — retaining open-position row for retry: {ins_e}")
+
+                                # Delete from open positions table ONLY when the ledger row is confirmed
+                                # (already recorded by the engine, or our insert reported exactly 1 row).
+                                if ledger_write_ok:
+                                    conn.execute(f"DELETE FROM {tbl} WHERE symbol = ? AND side = ?", (s_sym, row_dict.get("side", norm_side)))
+                                    pruned_count += 1
+                                else:
+                                    log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{s_sym} — closed-trade row not written; will retry next pass")
                                 
                                 # Anti-Knife Protection: Add symbol to swing_cooldowns if on-exchange SL fired or trade lost
                                 if close_type == "sl_hit" or (net_pnl is not None and net_pnl < 0):
@@ -824,18 +837,24 @@ async def audit_live_exchange_positions():
                                 ).fetchone()
                                 
                                 # 1. Log to closed trades table (only if not already recorded)
+                                ledger_write_ok = True
                                 if not recent_close:
                                     try:
-                                        conn.execute(
+                                        cur_ins = conn.execute(
                                             f"INSERT INTO {closed_tbl} (timestamp, symbol, side, type, entry_price, exit_price, qty, pnl, balance, notes, status, action) "
                                             "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?)",
                                             (sym, side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, side)
                                         )
+                                        ledger_write_ok = cur_ins.rowcount == 1
                                     except Exception as ins_e:
-                                        log.debug(f"[RECONCILER] Note inserting into {closed_tbl}: {ins_e}")
+                                        ledger_write_ok = False
+                                        log.error(f"[RECONCILER] Ledger INSERT FAILED into {closed_tbl} for {sym} — retaining open-position row for retry: {ins_e}")
                                 
-                                # 2. Delete from open positions and commit immediately
-                                conn.execute(f"DELETE FROM {tbl} WHERE symbol = ?", (sym,))
+                                # 2. Delete from open positions and commit immediately — only when the ledger row is confirmed
+                                if ledger_write_ok:
+                                    conn.execute(f"DELETE FROM {tbl} WHERE symbol = ?", (sym,))
+                                else:
+                                    log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{sym} — closed-trade row not written; will retry next pass")
                                 if close_type == "sl_hit" or net_pnl < 0:
                                     try:
                                         from datetime import timedelta, timezone
