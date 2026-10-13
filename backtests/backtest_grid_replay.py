@@ -122,20 +122,97 @@ def precompute_btc_15m_regime(df_15m: pd.DataFrame) -> pd.DataFrame:
     return res[["close_ts", "market_adx", "market_di_spread"]].sort_values("close_ts")
 
 
+def evaluate_limit_fill(
+    side: str,
+    limit_price: float,
+    curr_open: float,
+    curr_high: float,
+    curr_low: float,
+    tick_size: float,
+    fill_model: str = "one_tick",
+    depth_ratio: float = 0.5,
+    seed: Optional[int] = None
+) -> bool:
+    """
+    Evaluates whether a passive limit order is filled according to the specified fill model:
+    - 'touch': Fills immediately upon price touching the limit level (Strict-Optimistic).
+    - 'one_tick': Fills only if price strictly trades through the limit level by >= 1 tick (Conservative).
+    - 'logprob': Probabilistic queue fill model: P(fill) = 1 - exp(-k * penetration_ratio).
+    - 'squareprob': Probabilistic queue fill model: P(fill) = (penetration_ratio)^2 clipped [0, 1].
+
+    NOTE: Probabilistic models (logprob, squareprob) represent queue depletion dynamics.
+    Until calibrated against empirical L2 books15 recorded depth snapshots, touch and one_tick
+    serve as upper and lower bounds on execution expectancy.
+    """
+    if side == "LONG":
+        # Price must reach or breach the limit bid
+        if curr_low > limit_price:
+            return False
+        if fill_model == "touch":
+            return True
+        if fill_model == "one_tick":
+            return curr_low <= (limit_price - tick_size)
+
+        # Depth-through penetration
+        penetration = max(0.0, limit_price - curr_low)
+        bar_range = max(curr_high - curr_low, tick_size)
+        rel_penetration = penetration / bar_range
+
+        rng = np.random.default_rng(seed)
+        u = rng.uniform(0.0, 1.0)
+
+        if fill_model == "logprob":
+            # LogProb queue model: P(fill) = 1 - exp(-3.0 * rel_penetration)
+            p_fill = 1.0 - np.exp(-3.0 * rel_penetration)
+            return u <= p_fill
+        elif fill_model == "squareprob":
+            # SquareProb queue model: P(fill) = min(1.0, (rel_penetration * 1.5)^2)
+            p_fill = min(1.0, (rel_penetration * 1.5) ** 2)
+            return u <= p_fill
+        return curr_low <= (limit_price - tick_size)
+
+    elif side == "SHORT":
+        if curr_high < limit_price:
+            return False
+        if fill_model == "touch":
+            return True
+        if fill_model == "one_tick":
+            return curr_high >= (limit_price + tick_size)
+
+        penetration = max(0.0, curr_high - limit_price)
+        bar_range = max(curr_high - curr_low, tick_size)
+        rel_penetration = penetration / bar_range
+
+        rng = np.random.default_rng(seed)
+        u = rng.uniform(0.0, 1.0)
+
+        if fill_model == "logprob":
+            p_fill = 1.0 - np.exp(-3.0 * rel_penetration)
+            return u <= p_fill
+        elif fill_model == "squareprob":
+            p_fill = min(1.0, (rel_penetration * 1.5) ** 2)
+            return u <= p_fill
+        return curr_high >= (limit_price + tick_size)
+
+    return False
+
+
 def run_grid_replay(
     df: pd.DataFrame,
     symbol: str = "BTCUSDT",
     funding_df: Optional[pd.DataFrame] = None,
     btc_15m_df: Optional[pd.DataFrame] = None,
     conservative_fills: bool = True,
+    fill_model: Optional[str] = None,  # 'touch', 'one_tick', 'logprob', 'squareprob'
     enable_regime_gate: bool = True,
     enable_vwap_band: bool = True,
     enable_45m_tightening: bool = True,
     enable_short_scalps: bool = True,
     trade_allocation_usd: float = 85.0,
     leverage: float = 3.0,
-    max_order_ttl_bars: int = 1,  # Live bot TTL is ~30s; 1 bar tests fill on signal bar's successor only
-    cooldown_bars: int = 12,      # 1 hour anti-churn cooldown after exit
+    max_order_ttl_bars: int = 1,
+    cooldown_bars: int = 12,
+    enable_funding_regime_gate: bool = False,  # D3 ablation arm: suppress longs if trailing funding > 80th pct
 ) -> List[Dict[str, Any]]:
     """
     Executes historical 5m replay simulation.
@@ -148,6 +225,7 @@ def run_grid_replay(
     the bid, artificially exaggerating losses and negative EV.
     """
     tick_size = TICK_SIZES.get(symbol, TICK_SIZES["DEFAULT"])
+    effective_fill_model = fill_model if fill_model is not None else ("one_tick" if conservative_fills else "touch")
     ind_df = precompute_5m_indicators_vectorized(df)
 
     # Attach BTC 15m market regime feed if provided (zero-lookahead merge_asof)
@@ -300,7 +378,19 @@ def run_grid_replay(
             # Check TP / SL on current bar
             if side == "LONG":
                 # TP Check (Maker limit fill)
-                tp_hit = (curr_high >= tp_p + tick_size) if conservative_fills else (curr_high >= tp_p)
+                if effective_fill_model:
+                    tp_hit = evaluate_limit_fill(
+                        side="SHORT",  # Exiting a long by selling at limit tp_p
+                        limit_price=tp_p,
+                        curr_open=curr_open,
+                        curr_high=curr_high,
+                        curr_low=curr_low,
+                        tick_size=tick_size,
+                        fill_model=effective_fill_model,
+                        seed=i,
+                    )
+                else:
+                    tp_hit = (curr_high >= tp_p + tick_size) if conservative_fills else (curr_high >= tp_p)
                 sl_hit = (curr_low <= sl_p)
 
                 if tp_hit and not sl_hit:
@@ -349,7 +439,19 @@ def run_grid_replay(
 
             elif side == "SHORT":
                 # TP Check (Maker limit fill)
-                tp_hit = (curr_low <= tp_p - tick_size) if conservative_fills else (curr_low <= tp_p)
+                if effective_fill_model:
+                    tp_hit = evaluate_limit_fill(
+                        side="LONG",  # Exiting a short by buying to cover at limit tp_p
+                        limit_price=tp_p,
+                        curr_open=curr_open,
+                        curr_high=curr_high,
+                        curr_low=curr_low,
+                        tick_size=tick_size,
+                        fill_model=effective_fill_model,
+                        seed=i,
+                    )
+                else:
+                    tp_hit = (curr_low <= tp_p - tick_size) if conservative_fills else (curr_low <= tp_p)
                 sl_hit = (curr_high >= sl_p)
 
                 if tp_hit and not sl_hit:
@@ -404,17 +506,16 @@ def run_grid_replay(
             limit_p = pending_order["price"]
             bars_pending = i - pending_order["placed_bar"]
 
-            is_filled = False
-            if p_side == "LONG":
-                if conservative_fills:
-                    is_filled = (curr_low <= limit_p - tick_size)
-                else:
-                    is_filled = (curr_low <= limit_p)
-            elif p_side == "SHORT":
-                if conservative_fills:
-                    is_filled = (curr_high >= limit_p + tick_size)
-                else:
-                    is_filled = (curr_high >= limit_p)
+            is_filled = evaluate_limit_fill(
+                side=p_side,
+                limit_price=limit_p,
+                curr_open=curr_open,
+                curr_high=curr_high,
+                curr_low=curr_low,
+                tick_size=tick_size,
+                fill_model=effective_fill_model,
+                seed=i,
+            )
 
             if is_filled:
                 entry_fee_usd = (trade_allocation_usd * leverage) * MAKER_FEE
@@ -466,6 +567,13 @@ def run_grid_replay(
                 if m_adx >= 28.0 or (m_adx >= 25.0 and m_di < -4.0):
                     long_regime_ok = False
 
+            # D3: Funding Regime Gate ablation arm: suppress longs if trailing funding is excessively elevated
+            if enable_funding_regime_gate and funding_map:
+                cur_boundary_ts = int((curr_ts // 28800000) * 28800000)
+                cur_f_rate = funding_map.get(cur_boundary_ts, 0.0)
+                if cur_f_rate > 0.0001:  # > 1 bp per 8h
+                    long_regime_ok = False
+
             if long_regime_ok and bar_rsi < 30.0 and curr_close <= bar_lower and bar_adx < 24.0:
                 limit_p = curr_close
                 pending_order = {
@@ -508,6 +616,7 @@ def run_fleet_grid_replay(
     funding_dfs: Optional[Dict[str, pd.DataFrame]] = None,
     btc_15m_df: Optional[pd.DataFrame] = None,
     conservative_fills: bool = True,
+    fill_model: Optional[str] = None,  # 'touch', 'one_tick', 'logprob', 'squareprob'
     enable_regime_gate: bool = True,
     enable_vwap_band: bool = True,
     enable_45m_tightening: bool = True,
@@ -518,6 +627,7 @@ def run_fleet_grid_replay(
     cooldown_bars: int = 12,
     max_long_cap: int = 2,  # FIX 7: Live-faithful fleet cap (super_bot.py max 2 concurrent grid LONGs across fleet)
     market_adx_ceiling: Optional[float] = None,  # Pre-registered arm: e.g. 20.0 (strict chop filter)
+    enable_funding_regime_gate: bool = False,
 ) -> Dict[str, Any]:
     """
     Executes historical 5m multi-asset fleet simulation respecting fleet-wide position caps.
@@ -529,6 +639,8 @@ def run_fleet_grid_replay(
     """
     if funding_dfs is None:
         funding_dfs = {}
+
+    effective_fill_model = fill_model if fill_model is not None else ("one_tick" if conservative_fills else "touch")
 
     # Precompute BTC 15m regime
     regime_15m = None
@@ -686,7 +798,19 @@ def run_fleet_grid_replay(
 
             # TP / SL checks
             if side == "LONG":
-                tp_hit = (curr_high >= tp_p + tick_sz) if conservative_fills else (curr_high >= tp_p)
+                if effective_fill_model:
+                    tp_hit = evaluate_limit_fill(
+                        side="SHORT",
+                        limit_price=tp_p,
+                        curr_open=curr_open,
+                        curr_high=curr_high,
+                        curr_low=curr_low,
+                        tick_size=tick_sz,
+                        fill_model=effective_fill_model,
+                        seed=t_idx,
+                    )
+                else:
+                    tp_hit = (curr_high >= tp_p + tick_sz) if conservative_fills else (curr_high >= tp_p)
                 sl_hit = (curr_low <= sl_p)
 
                 if tp_hit and not sl_hit:
@@ -733,7 +857,19 @@ def run_fleet_grid_replay(
                     continue
 
             elif side == "SHORT":
-                tp_hit = (curr_low <= tp_p - tick_sz) if conservative_fills else (curr_low <= tp_p)
+                if effective_fill_model:
+                    tp_hit = evaluate_limit_fill(
+                        side="LONG",
+                        limit_price=tp_p,
+                        curr_open=curr_open,
+                        curr_high=curr_high,
+                        curr_low=curr_low,
+                        tick_size=tick_sz,
+                        fill_model=effective_fill_model,
+                        seed=t_idx,
+                    )
+                else:
+                    tp_hit = (curr_low <= tp_p - tick_sz) if conservative_fills else (curr_low <= tp_p)
                 sl_hit = (curr_high >= sl_p)
 
                 if tp_hit and not sl_hit:
@@ -792,6 +928,7 @@ def run_fleet_grid_replay(
                 continue
             row = ind_df.loc[curr_ts]
 
+            curr_open = row["open"]
             curr_high = row["high"]
             curr_low = row["low"]
             tick_sz = sdata["tick_size"]
@@ -800,11 +937,16 @@ def run_fleet_grid_replay(
             limit_p = po["price"]
             bars_pending = t_idx - po["placed_idx"]
 
-            is_filled = False
-            if p_side == "LONG":
-                is_filled = (curr_low <= limit_p - tick_sz) if conservative_fills else (curr_low <= limit_p)
-            elif p_side == "SHORT":
-                is_filled = (curr_high >= limit_p + tick_sz) if conservative_fills else (curr_high >= limit_p)
+            is_filled = evaluate_limit_fill(
+                side=p_side,
+                limit_price=limit_p,
+                curr_open=curr_open,
+                curr_high=curr_high,
+                curr_low=curr_low,
+                tick_size=tick_sz,
+                fill_model=effective_fill_model,
+                seed=t_idx,
+            )
 
             if is_filled:
                 sdata["order_filled_count"] += 1
@@ -870,6 +1012,12 @@ def run_fleet_grid_replay(
                     long_regime_ok = False
             if market_adx_ceiling is not None and m_adx >= market_adx_ceiling:
                 long_regime_ok = False
+
+            if enable_funding_regime_gate and sdata["funding_map"]:
+                cur_boundary_ts = int((curr_ts // 28800000) * 28800000)
+                cur_f_rate = sdata["funding_map"].get(cur_boundary_ts, 0.0)
+                if cur_f_rate > 0.0001:
+                    long_regime_ok = False
 
             # Check Fleet-Cap constraint for LONGs
             fleet_long_allowed = (open_long_count + pending_long_count) < max_long_cap
