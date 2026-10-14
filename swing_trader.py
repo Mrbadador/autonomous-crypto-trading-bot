@@ -659,9 +659,13 @@ class SwingArchitectTrader:
             if dir_upper == "LONG":
                 if p_bear >= 0.50:
                     return False, f"Markov Cascade Risk Active: pi(BEAR_CASCADE)={p_bear:.2f} >= 0.50. Long swing entry blocked."
-                # If market is trending, require robust Markov support
-                if market_regime in ("BULL_TREND", "BULLISH") and p_bull < 0.65 and d_bull < 4.0:
-                    return False, f"Markov Trend Persistence Insufficient: pi(BULL_EXPANSION)={p_bull:.2f} < 0.65 or duration={d_bull:.1f} < 4.0 bars."
+                # FIX 3: Log-only until validated; reason string corrected to match boolean operator 'and'
+                # (previously said 'or' while testing 'and'). In uncalibrated baseline, this blocked 145/151 cycles.
+                if market_regime in ("BULL_TREND", "BULLISH") and (p_bull < 0.65 and d_bull < 4.0):
+                    log.info(
+                        f"[SWING-MARKOV-GATE-LOG-ONLY] Advisory Markov check: pi(BULL_EXPANSION)={p_bull:.2f} < 0.65 "
+                        f"and duration={d_bull:.1f} < 4.0 bars. (Entry permitted, gate held log-only)."
+                    )
 
         return True, "Macro clear."
 

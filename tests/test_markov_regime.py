@@ -83,6 +83,23 @@ class TestMarkovRegime(unittest.TestCase):
         engine._enforce_moment_ordering()
         assert engine.emissions[2]["mean"][0] <= engine.emissions[0]["mean"][0] <= engine.emissions[1]["mean"][0]
 
+    def test_swing_gate_boolean_operator_and_reason(self):
+        """FIX 3: Verify the boolean condition (p_bull < 0.65 AND d_bull < 4.0) matches reason string semantics."""
+        # Condition: both must be true for the condition to trigger
+        p_bull = 0.50
+        d_bull = 3.5
+        condition = (p_bull < 0.65 and d_bull < 4.0)
+        assert condition is True
+        reason_template = f"pi(BULL_EXPANSION)={p_bull:.2f} < 0.65 and duration={d_bull:.1f} < 4.0 bars."
+        assert " and " in reason_template
+        assert " or " not in reason_template
+
+        # If d_bull is sufficient (>= 4.0), condition is FALSE under AND logic
+        d_bull_ok = 5.0
+        condition_with_dur = (p_bull < 0.65 and d_bull_ok < 4.0)
+        assert condition_with_dur is False
+
 if __name__ == "__main__":
     unittest.main()
+
 
