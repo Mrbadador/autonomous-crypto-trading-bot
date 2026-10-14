@@ -37,70 +37,121 @@ def init_db(db_path="trading_data.db"):
         raise
 
 def get_top_futures_pairs(limit=50):
-    """Fetches Top USDT futures pairs by 24h quote volume."""
+    """
+    Fetches Top USDT futures pairs by 24h quote volume directly from Bitget V2 Mix Market API.
+    Eliminates cross-exchange basis drift.
+    """
     try:
-        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
         res = requests.get(url, timeout=10)
         res.raise_for_status()
-        data = res.json()
+        data = res.json().get("data", [])
         
-        usdt_pairs = [p for p in data if p['symbol'].endswith('USDT')]
-        usdt_pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
+        usdt_pairs = [p for p in data if p.get('symbol', '').endswith('USDT')]
+        usdt_pairs.sort(key=lambda x: float(x.get('usdtVolume') or x.get('quoteVolume') or 0.0), reverse=True)
         
         return [p['symbol'] for p in usdt_pairs[:limit]]
     except Exception as e:
-        log.error(f"Error fetching Top pairs: {e}")
+        log.error(f"Error fetching Bitget Top pairs: {e}")
         return []
 
 def fetch_futures_ohlcv(symbol, interval="15m", limit=105):
-    """Pulls OHLCV bars from Binance Futures."""
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    """
+    Pulls OHLCV bars directly from Bitget V2 Mix Market API.
+    Matches live execution basis with zero price wick divergence.
+    """
+    clean_sym = symbol.replace('/', '').replace(':USDT', '').replace('-', '').upper()
+    bg_tf_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1h", "4h": "4h", "12h": "12h", "1d": "1Dutc"
+    }
+    granularity = bg_tf_map.get(interval, "15m")
+    url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={clean_sym}&granularity={granularity}&limit={limit}&productType=USDT-FUTURES"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        if response.status_code == 200:
-            klines = response.json()
+        res_json = response.json()
+        if res_json.get("code") == "00000":
+            klines = res_json.get("data", [])
+            if not klines:
+                return None
+            # Bitget format: [ts, open, high, low, close, base_vol, quote_vol]
             df = pd.DataFrame(klines, columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "quote_asset_volume", "number_of_trades",
-                "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+                "open_time", "open", "high", "low", "close", "volume", "quote_asset_volume"
             ])
+            # Bitget returns newest first; sort ascending for chronological indicators
+            df["open_time"] = df["open_time"].astype(int)
+            df = df.sort_values("open_time").reset_index(drop=True)
             for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = df[col].astype(float)
             return df
     except Exception as e:
-        log.error(f"Failed to fetch historical bars for {symbol}: {e}")
+        log.error(f"Failed to fetch Bitget historical bars for {symbol}: {e}")
     return None
 
+def calculate_variance_ratio(prices, q=10):
+    """
+    Lo-MacKinlay (1988) Heteroskedasticity-Robust Variance Ratio Test.
+    Evaluates whether prices follow a random walk, mean-revert, or trend.
+    Returns (VR, z_stat):
+      - z_stat < -1.645: Statistically significant mean-reversion (chop/grid regime)
+      - z_stat > +1.645: Statistically significant persistence (trending regime)
+      - |z_stat| <= 1.645: Pure Gaussian random walk / uninformative
+    """
+    prices = np.asarray(prices, dtype=float)
+    if len(prices) < (2 * q + 10):
+        return 1.0, 0.0
+    try:
+        log_p = np.log(prices)
+        ret_1 = np.diff(log_p)
+        n = len(ret_1)
+        mu = np.mean(ret_1)
+
+        sigma_1_sq = np.sum((ret_1 - mu) ** 2) / (n - 1)
+        if sigma_1_sq <= 1e-14:
+            return 1.0, 0.0
+
+        # Overlapping q-period returns
+        ret_q = log_p[q:] - log_p[:-q]
+        m = q * (n - q + 1) * (1.0 - (q / n))
+        sigma_q_sq = np.sum((ret_q - q * mu) ** 2) / m
+
+        vr = sigma_q_sq / sigma_1_sq
+
+        # Heteroskedasticity-consistent asymptotic variance
+        theta = 0.0
+        denom = np.sum((ret_1 - mu) ** 2) ** 2
+        for j in range(1, q):
+            w = 2.0 * (q - j) / q
+            delta_j = np.sum(((ret_1[j:] - mu) ** 2) * ((ret_1[:-j] - mu) ** 2)) / denom
+            theta += (w ** 2) * delta_j
+
+        z_stat = (vr - 1.0) / np.sqrt(theta) if theta > 1e-12 else 0.0
+        return float(vr), float(z_stat)
+    except Exception as e:
+        log.warning(f"Error calculating Variance Ratio: {e}")
+        return 1.0, 0.0
+
 def calculate_hurst(prices):
-    """Estimates Hurst Exponent over prices using Rescaled Range (R/S) Analysis."""
-    if len(prices) < 50:
+    """
+    Variance-Ratio & Anis-Lloyd Corrected Persistence Metric.
+    Converts robust Lo-MacKinlay Variance Ratio into an equivalent Hurst exponent [0, 1]:
+      - H = 0.50: Random walk (VR = 1.0)
+      - H > 0.50: Trending persistence (VR > 1.0)
+      - H < 0.50: Mean reversion / Chop (VR < 1.0)
+    Free from short-sample upward Anis-Lloyd R/S bias.
+    """
+    if len(prices) < 30:
         return 0.50
     try:
-        returns = np.diff(np.log(prices))
-        N = len(returns)
-        lags = [10, 20, 30, 40, 50]
-        RS_values = []
-        for lag in lags:
-            num_subsets = N // lag
-            if num_subsets == 0:
-                continue
-            rs_sub = []
-            for i in range(num_subsets):
-                sub = returns[i*lag : (i+1)*lag]
-                mean_adj = sub - np.mean(sub)
-                cum_sum = np.cumsum(mean_adj)
-                r = np.max(cum_sum) - np.min(cum_sum)
-                s = np.std(sub)
-                if s > 0:
-                    rs_sub.append(r / s)
-            if rs_sub:
-                RS_values.append(np.mean(rs_sub))
-        if len(RS_values) < 2:
-            return 0.50
-        poly = np.polyfit(np.log(lags[:len(RS_values)]), np.log(RS_values), 1)
-        return float(poly[0])
+        vr, z_stat = calculate_variance_ratio(prices, q=10)
+        # Map VR to Hurst exponent: VR = 2^(2H - 1), so H = 0.5 + log2(VR)/2
+        if vr > 0:
+            h = 0.5 + (np.log2(vr) / 2.0)
+            return float(np.clip(h, 0.05, 0.95))
+        return 0.50
     except Exception as e:
+        log.warning(f"Error calculating Hurst from VR: {e}")
         return 0.50
 
 def run_ai_liquidity_scan():
@@ -373,25 +424,28 @@ def run_scout():
             
             # Phase 3 (V28.8) Funding Rate Yield Arbitrage Sweep
             try:
-                log.info("Harvesting active 8-hour funding rates from Binance...")
-                funding_url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+                log.info("Harvesting active 8-hour funding rates directly from Bitget V2...")
+                funding_url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
                 resp = requests.get(funding_url, timeout=15)
                 if resp.status_code == 200:
-                    data = resp.json()
+                    data = resp.json().get("data", [])
                     if isinstance(data, list):
                         funding_rates = {}
                         for item in data:
                             sym = item.get('symbol')
-                            rate_str = item.get('lastFundingRate')
+                            rate_str = item.get('fundingRate')
                             if sym and rate_str is not None:
-                                funding_rates[sym] = float(rate_str)
+                                try:
+                                    funding_rates[sym] = float(rate_str)
+                                except Exception:
+                                    pass
                         
                         valid_opps = yield_hunter.evaluate_opportunities(funding_rates)
                         for opp in valid_opps:
                             yield_pct = opp["annualized_yield"] * 100.0
                             log.info(f"[YIELD-HUNTER] Delta-Neutral Arbitrage: {opp['symbol']} | Net Yield: {yield_pct:.2f}% | Dir: {opp['direction']}")
                 else:
-                    log.warning(f"Binance premiumIndex returned status {resp.status_code}")
+                    log.warning(f"Bitget tickers returned status {resp.status_code}")
             except Exception as e:
                 log.error(f"Failed to execute yield hunter sweep: {e}")
 
