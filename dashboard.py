@@ -3388,15 +3388,23 @@ with tab_risk:
         fc_bull = float(raw_fc[1])
         fc_bear = float(raw_fc[2])
 
-    # Top 4 Markov KPI Cards
-    mk1, mk2, mk3, mk4 = st.columns(4)
+    # Extract new Deep Research Playbook metrics
+    is_tradable = bool(m_tel.get("is_tradable", True))
+    tradable_rsn = str(m_tel.get("tradability_reason", "Tradable"))
+    sizing_mult = float(m_tel.get("sizing_multiplier", 1.0) or 1.0)
+
+    tradable_color = "#00ff66" if is_tradable else "#ff003c"
+    tradable_badge = "TRADABLE" if is_tradable else "UNTRADEABLE CHURN"
+
+    # Top 6 Markov & Playbook KPI Cards
+    mk1, mk2, mk3, mk4, mk5, mk6 = st.columns(6)
     with mk1:
         dom_color = "#00ff66" if dom_regime == "BULL_EXPANSION" else ("#ff003c" if dom_regime == "BEAR_CASCADE" else "#f59e0b")
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {dom_color}; border-radius: 6px; padding: 12px 14px;">
-            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Active Markov State (π_t)</div>
-            <div style="font-size: 1.15rem; font-weight: 800; color: {dom_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{dom_regime}</div>
-            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Confidence: <b style="color: {dom_color};">{max(p_chop, p_bull, p_bear)*100:.1f}%</b></div>
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Active State (π_t)</div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: {dom_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{dom_regime}</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Conf: <b style="color: {dom_color};">{max(p_chop, p_bull, p_bear)*100:.1f}%</b></div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -3404,29 +3412,47 @@ with tab_risk:
         exp_d = durations.get(dom_regime, 3.3)
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #00e5ff; border-radius: 6px; padding: 12px 14px;">
-            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Expected Duration E[D]</div>
-            <div style="font-size: 1.15rem; font-weight: 800; color: #00e5ff; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{exp_d:.1f} Bars</div>
-            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Self-Persistence: 1 / (1 - P_ii)</div>
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Expected Duration</div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: #00e5ff; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{exp_d:.1f} Bars</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">E[D] = 1 / (1 - P_ii)</div>
         </div>
         """, unsafe_allow_html=True)
 
     with mk3:
-        bd_col = "#ff003c" if bd_risk >= 0.50 else ("#f59e0b" if bd_risk >= 0.30 else "#00ff66")
-        bd_lbl = "HIGH VETO" if bd_risk >= 0.60 else ("ELEVATED" if bd_risk >= 0.35 else "STABLE")
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {bd_col}; border-radius: 6px; padding: 12px 14px;">
-            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">4-Step Breakdown Risk</div>
-            <div style="font-size: 1.15rem; font-weight: 800; color: {bd_col}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{bd_risk*100:.1f}%</div>
-            <div style="color: {bd_col}; font-size: 0.72rem; margin-top: 2px; font-weight: bold;">[{bd_lbl}] P(Chop+Cascade)</div>
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {tradable_color}; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Tradability Gate</div>
+            <div style="font-size: 1.05rem; font-weight: 800; color: {tradable_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">[{tradable_badge}]</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;" title="{tradable_rsn}">E[D] ≥ 3.5b Fee Shield</div>
         </div>
         """, unsafe_allow_html=True)
 
     with mk4:
         st.markdown(f"""
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #38bdf8; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Risk Multiplier</div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: #38bdf8; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{sizing_mult:.2f}x</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Continuous π-Scaling</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with mk5:
+        bd_col = "#ff003c" if bd_risk >= 0.50 else ("#f59e0b" if bd_risk >= 0.30 else "#00ff66")
+        bd_lbl = "HIGH" if bd_risk >= 0.60 else ("ELEV" if bd_risk >= 0.35 else "STABLE")
+        st.markdown(f"""
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {bd_col}; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">4-Step Cascade Risk</div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: {bd_col}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{bd_risk*100:.1f}%</div>
+            <div style="color: {bd_col}; font-size: 0.70rem; margin-top: 2px; font-weight: bold;">[{bd_lbl}] P(Cascade)</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with mk6:
+        st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #a855f7; border-radius: 6px; padding: 12px 14px;">
-            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Stationary Equilibrium (π*)</div>
-            <div style="font-size: 1.05rem; font-weight: 800; color: #a855f7; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{st_chop*100:.0f}% / {st_bull*100:.0f}% / {st_bear*100:.0f}%</div>
-            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Chop / Bull / Bear Equilibrium</div>
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Equilibrium (π*)</div>
+            <div style="font-size: 0.95rem; font-weight: 800; color: #a855f7; font-family: 'JetBrains Mono', monospace; margin-top: 4px;">{st_chop*100:.0f}%/{st_bull*100:.0f}%/{st_bear*100:.0f}%</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Chop/Bull/Bear</div>
         </div>
         """, unsafe_allow_html=True)
 
