@@ -647,10 +647,26 @@ class SuperBotTrader:
                     # Markov Regime Cascade & Tradability Duration Screen (Playbook Step 9)
                     def _check_markov_telemetry():
                         try:
+                            max_age = float(getattr(config, "REGIME_MAX_AGE_SEC", 900.0) or 900.0)
+                        except (TypeError, ValueError):
+                            max_age = 900.0
+                        try:
                             with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
-                                row = conn.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                row = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
                                 if row and row[0]:
-                                    return json.loads(row[0])
+                                    raw_val, raw_ts = row[0], row[1]
+                                    age = self._regime_row_age_sec(raw_ts)
+                                    if age is not None and age > max_age:
+                                        log.warning(f"[GRID-MARKOV-STALE] ⚠️ markov_regime_telemetry is stale ({age:.1f}s > {max_age:.1f}s). Skipping Markov gate.")
+                                        return {}
+                                    parsed = json.loads(raw_val)
+                                    if "is_tradable" not in parsed:
+                                        age_str = f"{age:.1f}s" if age is not None else "unknown"
+                                        log.warning(f"[GRID-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'is_tradable' key (age: {age_str}).")
+                                    if "sizing_multiplier" not in parsed:
+                                        age_str = f"{age:.1f}s" if age is not None else "unknown"
+                                        log.warning(f"[GRID-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'sizing_multiplier' key (age: {age_str}).")
+                                    return parsed
                         except Exception:
                             pass
                         return {}
@@ -805,10 +821,23 @@ class SuperBotTrader:
                         markov_mult = 1.0
                         def _get_markov_mult():
                             try:
+                                max_age = float(getattr(config, "REGIME_MAX_AGE_SEC", 900.0) or 900.0)
+                            except (TypeError, ValueError):
+                                max_age = 900.0
+                            try:
                                 with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
-                                    row = conn.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                    row = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
                                     if row and row[0]:
-                                        m_d = json.loads(row[0])
+                                        raw_val, raw_ts = row[0], row[1]
+                                        age = self._regime_row_age_sec(raw_ts)
+                                        if age is not None and age > max_age:
+                                            log.warning(f"[{engine_tag}-MARKOV-STALE] ⚠️ markov_regime_telemetry is stale ({age:.1f}s > {max_age:.1f}s). Defaulting sizing_multiplier to 1.0.")
+                                            return 1.0
+                                        m_d = json.loads(raw_val)
+                                        if "sizing_multiplier" not in m_d:
+                                            age_str = f"{age:.1f}s" if age is not None else "unknown"
+                                            log.warning(f"[{engine_tag}-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'sizing_multiplier' key (age: {age_str}). Defaulting to 1.0.")
+                                            return 1.0
                                         return float(m_d.get("sizing_multiplier", 1.0) or 1.0)
                             except Exception:
                                 pass

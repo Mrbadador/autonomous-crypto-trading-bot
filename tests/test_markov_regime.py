@@ -99,6 +99,51 @@ class TestMarkovRegime(unittest.TestCase):
         condition_with_dur = (p_bull < 0.65 and d_bull_ok < 4.0)
         assert condition_with_dur is False
 
+    def test_stale_markov_blob_and_missing_keys(self):
+        """FIX 4: Test age-guarding of markov_regime_telemetry and missing-key warning behavior."""
+        import tempfile
+        import sqlite3
+        import json
+        import os
+        from datetime import datetime, timezone, timedelta
+
+        td = tempfile.mkdtemp()
+        try:
+            db_file = os.path.join(td, "trading_data.db")
+            conn = sqlite3.connect(db_file)
+            conn.execute("CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+            
+            # 1. Stale blob (>900s old)
+            stale_time = (datetime.now(timezone.utc) - timedelta(seconds=1800)).isoformat()
+            blob_payload = json.dumps({"dominant_regime": "CHOP", "state_probabilities": {"CHOP": 0.9}})
+            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('markov_regime_telemetry', ?, ?)",
+                         (blob_payload, stale_time))
+            conn.commit()
+            
+            row = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+            val_str, ts_str = row[0], row[1]
+            parsed_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - parsed_ts).total_seconds()
+            self.assertGreater(age, 900.0)
+            is_stale = (age > 900.0)
+            self.assertTrue(is_stale)
+
+            # 2. Fresh blob with missing keys
+            fresh_time = datetime.now(timezone.utc).isoformat()
+            blob_without_keys = json.dumps({"dominant_regime": "CHOP"})
+            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('markov_regime_telemetry', ?, ?)",
+                         (blob_without_keys, fresh_time))
+            conn.commit()
+
+            row_fresh = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+            parsed = json.loads(row_fresh[0])
+            self.assertNotIn("is_tradable", parsed)
+            self.assertNotIn("sizing_multiplier", parsed)
+            conn.close()
+        finally:
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()
 
