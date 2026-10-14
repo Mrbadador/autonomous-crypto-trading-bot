@@ -566,8 +566,8 @@ class BitgetUTAClient:
                 if lp_side == pos_side:
                     live_total = float(lp.get("total", 0.0) or lp.get("available", 0.0) or 0.0)
                     if live_total > 0.0:
-                        # If closing full or close to full position, use live_total
-                        if qty >= (live_total * 0.8) or qty < 0.01:
+                        # Only clamp up to live_total when intent is a full or near-full close (within rounding tolerance)
+                        if qty >= (live_total * 0.98):
                             qty = live_total
                         break
         except Exception as q_err:
