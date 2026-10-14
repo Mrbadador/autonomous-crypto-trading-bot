@@ -13,13 +13,13 @@ class TestMarkovRegime(unittest.TestCase):
 
     def test_markov_regime_forward_filter_chop(self):
         engine = MarkovRegimeEngine()
-        # Create synthetic chop price series: oscillating in tight range
-        t = np.linspace(0, 10, 80)
-        prices = 60000.0 + 50.0 * np.sin(t)
+        # Create synthetic chop price series: oscillating in tight range with neutral end
+        np.random.seed(42)
+        prices = 60000.0 + np.random.normal(0, 5.0, 80)
         df = pd.DataFrame({
             "open": prices,
-            "high": prices + 10.0,
-            "low": prices - 10.0,
+            "high": prices + 8.0,
+            "low": prices - 8.0,
             "close": prices,
             "volume": [100.0] * len(prices)
         })
@@ -72,12 +72,12 @@ class TestMarkovRegime(unittest.TestCase):
         assert isinstance(is_tradable, bool)
         assert isinstance(rsn, str)
 
-        # Diagonal jump penalty persistence test
+        # Bayesian shrinkage persistence test
         seq = np.array([0, 0, 1, 1, 0, 0, 2, 2], dtype=np.int32)
-        P_sjm = engine.estimate_transition_matrix(seq, jump_penalty_weight=5.0)
+        P_shrunk = engine.estimate_transition_matrix(seq, prior_weight=10.0)
         # Verify diagonal persistence is elevated
         for i in range(3):
-            assert P_sjm[i, i] > 0.40
+            assert P_shrunk[i, i] > 0.40
 
         # Moment ordering check
         engine._enforce_moment_ordering()

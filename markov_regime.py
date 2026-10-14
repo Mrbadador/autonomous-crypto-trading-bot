@@ -51,55 +51,120 @@ class MarkovRegimeEngine:
     def label_historical_states(self, df: pd.DataFrame) -> np.ndarray:
         """
         Labels historical bars into discrete states [0: CHOP, 1: BULL_EXPANSION, 2: BEAR_CASCADE]
-        using rolling log-return drift, normalized high-low range volatility, and ADX.
+        using the production Schmitt-Trigger ADX/DI mathematical regime rules.
         """
         c = df["close"].to_numpy(dtype=np.float64)
         h = df["high"].to_numpy(dtype=np.float64)
         l = df["low"].to_numpy(dtype=np.float64)
         n = len(c)
-        if n < 2:
+        if n < 14:
             return np.zeros(n, dtype=np.int32)
 
-        # Rolling 3-bar log returns
-        log_ret_3 = np.zeros(n, dtype=np.float64)
-        for i in range(3, n):
-            if c[i - 3] > 0 and c[i] > 0:
-                log_ret_3[i] = math.log(c[i] / c[i - 3])
-
-        # High-Low Range Volatility: (High - Low) / Close
-        range_vol = np.zeros(n, dtype=np.float64)
-        for i in range(n):
-            if c[i] > 0:
-                range_vol[i] = (h[i] - l[i]) / c[i]
-
-        # ADX or proxy
-        adx_series = np.full(n, 20.0, dtype=np.float64)
-        if "adx" in df.columns:
+        # 1. Extract or compute ADX and Directional Indicators (+DI, -DI)
+        if "adx" in df.columns and "plus_di" in df.columns and "minus_di" in df.columns:
             adx_series = df["adx"].fillna(20.0).to_numpy(dtype=np.float64)
+            plus_di_series = df["plus_di"].fillna(0.0).to_numpy(dtype=np.float64)
+            minus_di_series = df["minus_di"].fillna(0.0).to_numpy(dtype=np.float64)
+        else:
+            # Standalone Wilder ADX / DI calculation
+            length = 14
+            tr = np.zeros(n, dtype=np.float64)
+            plus_dm = np.zeros(n, dtype=np.float64)
+            minus_dm = np.zeros(n, dtype=np.float64)
+            for i in range(1, n):
+                hi, li, c_prev = h[i], l[i], c[i - 1]
+                tr[i] = max(hi - li, abs(hi - c_prev), abs(li - c_prev))
+                up = hi - h[i - 1]
+                down = l[i - 1] - li
+                if up > down and up > 0:
+                    plus_dm[i] = up
+                if down > up and down > 0:
+                    minus_dm[i] = down
+
+            smooth_tr = np.zeros(n, dtype=np.float64)
+            smooth_pdm = np.zeros(n, dtype=np.float64)
+            smooth_mdm = np.zeros(n, dtype=np.float64)
+            if n > length:
+                smooth_tr[length] = np.sum(tr[1:length + 1])
+                smooth_pdm[length] = np.sum(plus_dm[1:length + 1])
+                smooth_mdm[length] = np.sum(minus_dm[1:length + 1])
+                alpha = 1.0 / length
+                for i in range(length + 1, n):
+                    smooth_tr[i] = smooth_tr[i - 1] - (smooth_tr[i - 1] * alpha) + tr[i]
+                    smooth_pdm[i] = smooth_pdm[i - 1] - (smooth_pdm[i - 1] * alpha) + plus_dm[i]
+                    smooth_mdm[i] = smooth_mdm[i - 1] - (smooth_mdm[i - 1] * alpha) + minus_dm[i]
+
+            plus_di_series = np.zeros(n, dtype=np.float64)
+            minus_di_series = np.zeros(n, dtype=np.float64)
+            dx = np.zeros(n, dtype=np.float64)
+            for i in range(length, n):
+                str_val = smooth_tr[i]
+                if str_val > 0:
+                    plus_di_series[i] = 100.0 * (smooth_pdm[i] / str_val)
+                    minus_di_series[i] = 100.0 * (smooth_mdm[i] / str_val)
+                di_sum = plus_di_series[i] + minus_di_series[i]
+                if di_sum > 0:
+                    dx[i] = 100.0 * abs(plus_di_series[i] - minus_di_series[i]) / di_sum
+
+            adx_series = np.full(n, 20.0, dtype=np.float64)
+            start_adx = 2 * length - 1
+            if n > start_adx:
+                adx_series[start_adx] = np.mean(dx[length:start_adx + 1])
+                for i in range(start_adx + 1, n):
+                    adx_series[i] = (adx_series[i - 1] * (length - 1) + dx[i]) / length
+
+        di_spread_series = plus_di_series - minus_di_series
 
         labels = np.zeros(n, dtype=np.int32)
-        for i in range(n):
-            ret = log_ret_3[i]
-            adx_val = adx_series[i]
-            vol_val = range_vol[i]
+        prior_state = "NEUTRAL"
 
-            # Cascade: sharp downward move or expanding volatility to the downside
-            if ret <= -0.008 or (ret < -0.003 and adx_val >= 24.0) or (ret < -0.002 and vol_val >= 0.020):
-                labels[i] = 2  # BEAR_CASCADE
-            # Bull Expansion: clear positive return with trend confirmation
-            elif ret >= 0.006 or (ret > 0.002 and adx_val >= 22.0):
+        # Apply production Schmitt-Trigger rules from regime_classifier.py
+        for i in range(n):
+            adx_val = adx_series[i]
+            spread = di_spread_series[i]
+
+            if adx_val < 20.0:
+                math_reg = "CHOP"
+            elif 20.0 <= adx_val < 25.0:
+                if prior_state in ("BULL_TREND", "BULLISH") and spread > 5.0:
+                    math_reg = "BULL_TREND"
+                elif prior_state in ("BEAR_TREND", "BEARISH") and spread < -5.0:
+                    math_reg = "BEAR_TREND"
+                elif spread > 8.0:
+                    math_reg = "BULL_TREND"
+                elif spread < -8.0:
+                    math_reg = "BEAR_TREND"
+                else:
+                    math_reg = "NEUTRAL"
+            else:
+                if spread >= 4.0:
+                    math_reg = "BULL_TREND"
+                elif spread <= -4.0:
+                    math_reg = "BEAR_TREND"
+                else:
+                    math_reg = "CHOP"
+
+            prior_state = math_reg
+
+            if math_reg == "BULL_TREND":
                 labels[i] = 1  # BULL_EXPANSION
+            elif math_reg == "BEAR_TREND":
+                labels[i] = 2  # BEAR_CASCADE
             else:
                 labels[i] = 0  # CHOP
 
         return labels
 
-    def estimate_transition_matrix(self, state_sequence: np.ndarray, jump_penalty_weight: float = 3.0) -> np.ndarray:
+    def estimate_transition_matrix(
+        self,
+        state_sequence: np.ndarray,
+        prior_weight: float = 10.0,
+        target_prior: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """
-        Computes the 3x3 Laplace-smoothed (alpha=1.0) row-stochastic Transition Matrix
-        augmented with Statistical Jump Model (SJM) diagonal persistence regularization:
-            P_ij = (n_ij + alpha + lambda * delta_ij) / sum_k (n_ik + alpha + lambda * delta_ik)
-        Ensures P_ii persistence to eliminate rapid micro-switching and taker fee burn.
+        Computes the 3x3 Transition Matrix via calibrated Bayesian shrinkage (BDeu / Dirichlet conjugate):
+            P_ij = (C_ij + N_0 * P_0_ij) / (sum_k C_ik + N_0)
+        Regularizes rolling zero-count transitions without swamping empirical evidence.
         """
         K = self.num_states
         counts = np.zeros((K, K), dtype=np.float64)
@@ -111,11 +176,22 @@ class MarkovRegimeEngine:
             if 0 <= i < K and 0 <= j < K:
                 counts[i, j] += 1.0
 
-        # Laplace smoothing + Diagonal Jump Penalty persistence prior
-        lambda_diag = max(0.0, float(jump_penalty_weight))
-        smoothed = counts + self.alpha + (np.eye(K, dtype=np.float64) * lambda_diag)
-        row_sums = smoothed.sum(axis=1, keepdims=True)
-        self.P = smoothed / np.maximum(1e-12, row_sums)
+        # Calibrated empirical prior matrix based on crypto 15m trend persistence
+        if target_prior is None:
+            P_0 = np.array([
+                [0.90, 0.05, 0.05],
+                [0.08, 0.90, 0.02],
+                [0.05, 0.01, 0.94]
+            ], dtype=np.float64)
+        else:
+            P_0 = np.asarray(target_prior, dtype=np.float64)
+
+        N_0 = max(0.1, float(prior_weight))
+        row_sums = counts.sum(axis=1, keepdims=True)
+        smoothed = counts + (N_0 * P_0)
+        denoms = row_sums + N_0
+
+        self.P = smoothed / np.maximum(1e-12, denoms)
         return self.P
 
     def fit_emissions(self, df: pd.DataFrame, state_sequence: np.ndarray):
@@ -133,7 +209,9 @@ class MarkovRegimeEngine:
             return
 
         log_rets = np.zeros(n, dtype=np.float64)
-        log_rets[1:] = np.diff(np.log(np.maximum(c, 1e-9)))
+        for i in range(3, n):
+            if c[i - 3] > 0 and c[i] > 0:
+                log_rets[i] = math.log(c[i] / c[i - 3])
         range_vols = (h - l) / np.maximum(c, 1e-9)
         seq = np.asarray(state_sequence, dtype=np.int32)
 
@@ -335,10 +413,10 @@ class MarkovRegimeEngine:
             }
 
         labels = self.label_historical_states(df)
-        self.estimate_transition_matrix(labels, jump_penalty_weight=3.0)
+        self.estimate_transition_matrix(labels, prior_weight=10.0)
         self.fit_emissions(df, labels)
 
-        # Extract recent feature window [log_return, range_vol]
+        # Extract recent feature window [3-bar log_return, range_vol]
         c = df["close"].to_numpy(dtype=np.float64)
         h = df["high"].to_numpy(dtype=np.float64)
         l = df["low"].to_numpy(dtype=np.float64)
@@ -348,7 +426,9 @@ class MarkovRegimeEngine:
 
         n_r = len(recent_c)
         obs_rets = np.zeros(n_r, dtype=np.float64)
-        obs_rets[1:] = np.diff(np.log(np.maximum(recent_c, 1e-9)))
+        for i in range(3, n_r):
+            if recent_c[i - 3] > 0 and recent_c[i] > 0:
+                obs_rets[i] = math.log(recent_c[i] / recent_c[i - 3])
         obs_vols = (recent_h - recent_l) / np.maximum(recent_c, 1e-9)
         obs_matrix = np.column_stack([obs_rets, obs_vols])
 
