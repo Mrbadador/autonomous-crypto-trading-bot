@@ -644,8 +644,8 @@ class SuperBotTrader:
                         log.warning(f"[GRID-VETO] 🛑 Microstructure Toxicity Veto for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f}, Kyle Pctile={kyle_pct:.2f}. Dip-buy skipped.")
                         continue
 
-                    # Markov Regime Cascade Check
-                    def _check_markov_cascade():
+                    # Markov Regime Cascade & Tradability Duration Screen (Playbook Step 9)
+                    def _check_markov_telemetry():
                         try:
                             with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
                                 row = conn.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
@@ -654,11 +654,19 @@ class SuperBotTrader:
                         except Exception:
                             pass
                         return {}
-                    m_data = await asyncio.to_thread(_check_markov_cascade)
+                    m_data = await asyncio.to_thread(_check_markov_telemetry)
                     if m_data:
+                        # 1. Bear cascade gate
                         p_bear = float(m_data.get("state_probabilities", {}).get("BEAR_CASCADE", 0.0) or 0.0)
                         if p_bear >= 0.55:
                             log.warning(f"[GRID-VETO] 🛑 Markov Bear Cascade Probability {p_bear:.2f} >= 0.55 for {symbol}. Skipping dip-buy into cascade.")
+                            continue
+
+                        # 2. Tradability duration gate (anti-churn fee shield)
+                        is_tradable = m_data.get("is_tradable", True)
+                        if not is_tradable:
+                            tradable_rsn = m_data.get("tradability_reason", "Duration too short")
+                            log.warning(f"[GRID-VETO] 🛑 Markov Tradability Screen Veto for {symbol}: {tradable_rsn}. Blocking entry to prevent fee churn.")
                             continue
 
                     # Avellaneda-Stoikov Reservation Price & LVR-Compensated Geometry
@@ -785,16 +793,31 @@ class SuperBotTrader:
 
                     target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
                     
-                    # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight
+                    # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Multiplier
                     try:
                         from risk_manager import RiskManager
                         rm = RiskManager()
                         kelly_frac = rm.calculate_empirical_kelly_fraction()
                         conv_mult = max(0.5, min(1.2, conv_score))
                         finrl_mult = self._get_finrl_strategy_weight(engine_tag)
-                        target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult
+                        
+                        # Continuous Markov Risk Multiplier (Playbook Step 8)
+                        markov_mult = 1.0
+                        def _get_markov_mult():
+                            try:
+                                with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                                    row = conn.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                    if row and row[0]:
+                                        m_d = json.loads(row[0])
+                                        return float(m_d.get("sizing_multiplier", 1.0) or 1.0)
+                            except Exception:
+                                pass
+                            return 1.0
+                        markov_mult = await asyncio.to_thread(_get_markov_mult)
+                        
+                        target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
                         target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
-                        log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL Sharpe Mult: {finrl_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
+                        log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
                     except Exception as ke:
                         log.debug(f"[{engine_tag}-KELLY-NOTE] {ke}")
 

@@ -61,5 +61,28 @@ class TestMarkovRegime(unittest.TestCase):
         assert "CHOP" in durations
         assert durations["CHOP"] >= 1.0
 
+    def test_playbook_tradability_and_sizing_multiplier(self):
+        engine = MarkovRegimeEngine()
+        # Initial priors: CHOP=0.333, BULL=0.333, BEAR=0.333
+        mult = engine.get_regime_sizing_multiplier()
+        assert 0.20 <= mult <= 1.0
+
+        # Tradability screen check
+        is_tradable, rsn = engine.is_regime_tradable(min_duration_bars=2.0)
+        assert isinstance(is_tradable, bool)
+        assert isinstance(rsn, str)
+
+        # Diagonal jump penalty persistence test
+        seq = np.array([0, 0, 1, 1, 0, 0, 2, 2], dtype=np.int32)
+        P_sjm = engine.estimate_transition_matrix(seq, jump_penalty_weight=5.0)
+        # Verify diagonal persistence is elevated
+        for i in range(3):
+            assert P_sjm[i, i] > 0.40
+
+        # Moment ordering check
+        engine._enforce_moment_ordering()
+        assert engine.emissions[2]["mean"][0] <= engine.emissions[0]["mean"][0] <= engine.emissions[1]["mean"][0]
+
 if __name__ == "__main__":
     unittest.main()
+
