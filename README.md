@@ -5,7 +5,7 @@
 [![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit%20Enterprise-red.svg)](https://streamlit.io/)
 [![Exchange](https://img.shields.io/badge/Exchange-Bitget%20UTA-green.svg)](https://www.bitget.com/)
 
-A production-grade, multi-asset crypto futures trading system featuring a **Dual-Regime Execution Engine** (4H Trend Swing & 5m Chop Maker Grid), high-frequency **Order Flow Imbalance (OFI)** microstructure filtering, and an autonomous **Multi-Agent AI Risk Boardroom** with real-time LLM failover.
+A production-grade, multi-asset crypto futures trading system featuring a **Dual-Regime Execution Engine** (4H Trend Swing & 5m Chop Maker Grid), high-frequency **Order Flow Imbalance (OFI)** microstructure filtering, a **Bayesian Markov Regime & Transition Engine (DTMC)** with Jump-Model persistence, and an autonomous **Multi-Agent AI Risk Boardroom** with real-time LLM failover.
 
 ---
 
@@ -14,8 +14,17 @@ A production-grade, multi-asset crypto futures trading system featuring a **Dual
 - **Dual-Regime Execution Architecture**:
   - **4H Bull Trend Swing**: Trend-following breakout strategy using custom Ichimoku Kumo bands, volatility expansion, and dynamic trailing stop-loss ratchets.
   - **5m Chop Maker Grid**: Low-latency, post-only limit order grid designed to capture mean-reverting chop while earning maker fee rebates.
-- **Microstructure & Order Flow Filtering (OFI)**:
-  - Real-time Level-2 order book depth tracking, flow toxicity estimation (VPIN), and empirical position sizing via Quarter-Kelly criterion.
+  - **Avellaneda–Stoikov Reservation Pricing**: Inventory-skewed limit placement $r(s, q) = s - q\gamma\sigma^2$ with LVR-compensated take-profit geometry.
+- **Bayesian Markov Regime & Transition Engine (DTMC)**:
+  - Online Discrete-Time Markov Chain with **Forward Bayesian Filtering**, Laplace smoothing, and Statistical Jump Model (SJM) diagonal persistence regularization ($\lambda=3.0$).
+  - **Tradability Duration Gate**: Computes expected duration $E[D_i] = \frac{1}{1 - P_{ii}}$ and blocks execution if $E[D] < 3.5$ bars, eliminating whipsaw fee churn during micro-regimes.
+  - **Empirical Moment Ordering Invariant**: Enforces $\mu(\text{Bear}) \le \mu(\text{Chop}) \le \mu(\text{Bull})$ to guarantee zero silent state permutations across rolling refits.
+  - **Continuous Risk Multiplier**: Dynamically scales position sizing $[0.20\times, 1.0\times]$ as a linear expectation of the posterior belief vector $\pi_t$.
+- **High-Frequency Microstructure & Adverse Selection Shield**:
+  - **Multi-Level Order Flow Imbalance (MLOFI)**: 10-level geometric decay depth tracking across real-time Bitget order books.
+  - **Kyle's $\lambda$ & Adverse Selection Impact**: Continuous covariance-to-volume ratio measuring informed toxic flow, rolling percentiles, and automatic pre-trade toxicity halts.
+  - **Loss-Versus-Rebalancing (LVR) Volatility Tax**: Continuous arbitrage drag calculation ($\sigma^2/8$) embedded into take-profit targets.
+  - **Hawkes Process LOB Anti-Spoof Guard**: Self-exciting point process tracking order cancellation clusters and spectral radius ($\rho \ge 1.0$) cascades.
 - **Causal Quantitative Indicator Pipeline**:
   - Zero lookahead bias (`row t` strictly depends on closes $\le t$), strict OHLCV integrity validation, and cold-start warm-up verification ($N \ge 600$ bars required for EMA200).
   - Causal Tom DeMark Setup engine (`td_setup_counts`) requiring price-flip initiation and completing cleanly at TD-9 without indefinite rollover.
@@ -28,8 +37,8 @@ A production-grade, multi-asset crypto futures trading system featuring a **Dual
   - Global portfolio margin utilization ceiling (hard cap at 70%).
   - Hard stops placed directly on-exchange upon fill to prevent liquidation during network outages or loop stalls.
   - Strict high-water mark (HWM) drawdown circuit breakers.
-- **Real-Time Streamlit HUD**:
-  - Complete situational awareness dashboard showing live position execution cards, interactive Plotly candlestick charts, order flow depth meters, and token quota telemetry.
+- **Real-Time Streamlit HUD (Port 8501)**:
+  - Complete situational awareness dashboard showing live position execution cards, interactive Plotly candlestick charts, $3\times3$ Bayesian Markov transition heatmaps, multi-horizon probability forecasts, Kyle's $\lambda$ / LVR matrix, and token quota telemetry.
 
 ---
 
@@ -86,17 +95,19 @@ The system uses a decoupled, event-driven architecture designed to prevent singl
 ```mermaid
 flowchart TD
     subgraph Market_Ingest["Market Ingest & Daemons"]
-        MD["Bitget UTA WebSocket / REST"] --> OFI["OFI & Microstructure Daemon"]
-        MD --> REG["Regime Classifier (ADX / Hurst)"]
+        MD["Bitget UTA WebSocket / REST"] --> OFI["OFI Daemon (Kyle's λ, VPIN, LVR Tax, Hawkes Spoof)"]
+        MD --> REG["Regime Classifier (ADX / Hurst / Variance Ratio)"]
+        MD --> MARKOV["Bayesian Markov Engine (DTMC Forward Filter + SJM Prior)"]
         MD --> SENT["Sentiment & RSS Macro Sentinel"]
     end
 
     subgraph Strategy_Orchestrator["Strategy Orchestrator"]
         OFI --> SB["Super Bot Dual-Regime Engine"]
         REG --> SB
+        MARKOV -->|Duration Gate & Risk Mult| SB
         SENT --> SB
-        SB -->|Bull Trend Detected| SWING["4H Swing Architect"]
-        SB -->|Sideways Chop Detected| CHOP["5m Chop Maker Grid"]
+        SB -->|Bull Trend Detected| SWING["4H Swing Architect (Ichimoku Kumo + ATR Runway)"]
+        SB -->|Sideways Chop Detected| CHOP["5m Chop Maker Grid (Avellaneda-Stoikov + LVR TP)"]
     end
 
     subgraph AI_Boardroom["AI Boardroom Filter"]
@@ -106,9 +117,9 @@ flowchart TD
     end
 
     subgraph Risk_Execution["Risk & Execution"]
-        VETO -->|Approved| RM["Risk Manager (1/4 Kelly & 70% Margin Ceiling)"]
+        VETO -->|Approved| RM["Risk Manager (Quarter-Kelly, Markov Mult & 70% Margin Cap)"]
         RM --> EX["Bitget UTA Execution Client"]
-        EX --> STOP["On-Exchange Native SL / TP Orders"]
+        EX --> STOP["On-Exchange Native SL / TP Orders (3-Attempt Abort Shield)"]
     end
 
     subgraph Telemetry_Supervision["Telemetry & Supervision"]
@@ -153,13 +164,16 @@ flowchart TD
 ├── data/state/                  # Static AI rule memory, replay buffers & cache state
 ├── docs/assets/                 # Architecture diagrams & high-res HUD visual assets
 ├── archive/legacy_agents/       # Deprecated/experimental fleet agents & scrapers
-├── super_bot.py                 # Dual-regime orchestrator (Swing + Chop Maker Grid)
+├── markov_regime.py             # Bayesian Markov Chain DTMC (Forward Filter, SJM prior, E[D] duration)
+├── microstructure_metrics.py    # Kyle's Lambda, LVR volatility tax & Hawkes point process
+├── super_bot.py                 # Dual-regime orchestrator (Swing + AS Chop Maker Grid)
 ├── swing_trader.py              # 4H Ichimoku trend breakout execution engine
+├── inflight_shepherd.py         # Autonomous in-flight sentinel & Markov breakdown risk stop-tightening
 ├── bitget_uta_client.py         # Direct Bitget UTA REST/WebSocket exchange connector
-├── conviction_filter.py         # Multi-agent AI boardroom & entry validator
+├── conviction_filter.py         # Multi-agent AI boardroom & entry validator (Carry + BIS shield)
 ├── ai_engine.py                 # Multi-LLM provider router (Gemini 2.5 Flash + Groq pool)
-├── ofi_daemon.py                # Level-2 Order Flow Imbalance (OFI) streamer
-├── regime_classifier.py         # ADX / Hurst market regime classification daemon
+├── ofi_daemon.py                # Level-2 Order Flow Imbalance (OFI) streamer (10-level MLOFI)
+├── regime_classifier.py         # ADX / Hurst / Lo-MacKinlay Variance Ratio regime daemon
 ├── risk_manager.py              # Empirical Quarter-Kelly position sizing & risk gates
 ├── portfolio_risk_agent.py      # Real-time portfolio margin ceiling daemon (70% hard cap)
 ├── macro_sentinel.py            # Funding rate skew & open interest monitor
