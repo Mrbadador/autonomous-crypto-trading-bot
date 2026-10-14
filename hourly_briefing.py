@@ -439,7 +439,7 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
 
     max_fleet_slots = getattr(config, "GLOBAL_MAX_POSITIONS", 8)
 
-    html = f"""
+    email_html = f"""
     <!DOCTYPE html>
     <html>
     <head>
@@ -572,7 +572,7 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
     </body>
     </html>
     """
-    return html
+    return email_html
 
 
 def send_hourly_briefing_email(force: bool = False) -> bool:
