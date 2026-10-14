@@ -60,14 +60,14 @@ async def run_recovery_loop():
                 positions = []
                 
                 try:
-                    cursor = conn.execute("SELECT symbol, side, entry_price, qty FROM open_positions")
+                    cursor = conn.execute("SELECT symbol, side, entry_price, qty, stop_loss FROM open_positions")
                     for row in cursor.fetchall():
                         positions.append(("open_positions", *row))
                 except sqlite3.OperationalError as oe:
                     log.warning(f"[RECOVERY] Sniper positions read failed: {oe}")
                     
                 try:
-                    cursor = conn.execute("SELECT symbol, side, entry_price, qty FROM berserker_open_positions")
+                    cursor = conn.execute("SELECT symbol, side, entry_price, qty, stop_loss FROM berserker_open_positions")
                     for row in cursor.fetchall():
                         positions.append(("berserker_open_positions", *row))
                 except sqlite3.OperationalError as oe:
@@ -75,7 +75,7 @@ async def run_recovery_loop():
                 
                 conn.close()
                 
-                for table_name, symbol, side, entry_price, qty in positions:
+                for table_name, symbol, side, entry_price, qty, stop_loss in positions:
                     try:
                         fetch_sym = symbol
                         if ex_id == "bitget" and ":USDT" not in fetch_sym:
@@ -135,6 +135,13 @@ async def run_recovery_loop():
                                 log.warning(f"[RECOVERY] MAX DCA LIMIT (3) reached for {symbol} ({side}). Aborting further DCAs to prevent liquidation.")
                             else:
                                 dca_qty = qty * 0.5
+                                new_qty = qty + dca_qty
+                                new_entry_price = ((entry_price * qty) + (current_price * dca_qty)) / new_qty
+                                
+                                # Proportional Stop Loss Recalculation (precomputed before order execution)
+                                sl_val = float(stop_loss) if (stop_loss is not None and float(stop_loss) > 0) else (entry_price * 0.97 if side == "long" else entry_price * 1.03)
+                                old_sl_dist_pct = abs(entry_price - sl_val) / entry_price if entry_price > 0 else 0.03
+                                new_sl = new_entry_price * (1.0 - old_sl_dist_pct) if side == "long" else new_entry_price * (1.0 + old_sl_dist_pct)
                                 
                                 # Execute DCA Recovery Order on the Exchange!
                                 try:
@@ -150,14 +157,30 @@ async def run_recovery_loop():
                                     log.error(f"[RECOVERY] Exchange Order FAILED for {symbol}. Aborting DB update. Err: {e}")
                                     continue # Skip DB update if the actual trade fails
                                 
-                                new_qty = qty + dca_qty
-                                new_entry_price = ((entry_price * qty) + (current_price * dca_qty)) / new_qty
-                                
-                                # Proportional Stop Loss Recalculation to prevent liquidation
-                                # Maintain original stop percentage distance relative to new entry
-                                old_sl_dist_pct = abs(entry_price - stop_loss) / entry_price if (stop_loss and entry_price > 0) else 0.03
-                                new_sl = new_entry_price * (1.0 - old_sl_dist_pct) if side == "long" else new_entry_price * (1.0 + old_sl_dist_pct)
-                                
+                                # CRITICAL: Immediately persist DCA cooldown & counter in DB to eliminate crash loops
+                                conn_dca = None
+                                try:
+                                    conn_dca = sqlite3.connect(db_path, timeout=10.0)
+                                    conn_dca.execute("PRAGMA journal_mode=WAL;")
+                                    conn_dca.execute("PRAGMA busy_timeout=30000;")
+                                    dca_meta["count"] = current_dca_count + 1
+                                    dca_meta["last_ts"] = time.time()
+                                    import json as _json
+                                    conn_dca.execute(
+                                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                                        (dca_state_key, _json.dumps(dca_meta))
+                                    )
+                                    conn_dca.execute(
+                                        f"UPDATE {table_name} SET qty = ?, entry_price = ?, stop_loss = ? WHERE symbol = ? AND LOWER(side) = ?",
+                                        (new_qty, new_entry_price, new_sl, symbol, side.lower())
+                                    )
+                                    conn_dca.commit()
+                                except Exception as dca_db_err:
+                                    log.error(f"[RECOVERY] Failed to persist DCA state to DB for {symbol}: {dca_db_err}")
+                                finally:
+                                    if conn_dca:
+                                        conn_dca.close()
+
                                 # Update native strategy stop loss order on Bitget
                                 if ex_id == "bitget":
                                     try:
@@ -168,25 +191,6 @@ async def run_recovery_loop():
                                     except Exception as sl_mod_err:
                                         log.warning(f"[RECOVERY] Could not modify exchange SL after DCA: {sl_mod_err}")
 
-                                # Execute DCA Recovery DB Update (strictly scoped by symbol AND side)
-                                conn_dca = sqlite3.connect(db_path, timeout=10.0)
-                                conn_dca.execute("PRAGMA journal_mode=WAL;")
-                                conn_dca.execute("PRAGMA busy_timeout=30000;")
-                                conn_dca.execute(
-                                    f"UPDATE {table_name} SET qty = ?, entry_price = ?, stop_loss = ? WHERE symbol = ? AND LOWER(side) = ?",
-                                    (new_qty, new_entry_price, new_sl, symbol, side.lower())
-                                )
-                                # Persist DCA state to survive restarts
-                                dca_meta["count"] = current_dca_count + 1
-                                dca_meta["last_ts"] = time.time()
-                                import json as _json
-                                conn_dca.execute(
-                                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
-                                    (dca_state_key, _json.dumps(dca_meta))
-                                )
-                                conn_dca.commit()
-                                conn_dca.close()
-                                
                                 # Log AFTER the DB update to confirm end-to-end success
                                 log.info(f"[RECOVERY] Position {symbol} ({side}) underwater. Macro valid. Safety DCA #{dca_meta['count']} completed.")
                                 log.info(f"           -> Old Entry: {entry_price:.4f} | New Entry: {new_entry_price:.4f} | New SL: {new_sl:.4f} | Qty: {new_qty:.4f}")
