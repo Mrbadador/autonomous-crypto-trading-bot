@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import logging
 import os
+import re
 from dotenv import load_dotenv
 from datetime import datetime, UTC
 
@@ -27,6 +28,11 @@ except ImportError:
 except Exception as _ta_import_err:  # pragma: no cover - broken install
     _pandas_ta = None
     log.warning(f"pandas_ta import failed ({_ta_import_err}) - ADX will use the internal Wilder calculation.")
+
+# Row cap for the append-only market_regime history. At the ~5 minute classification cadence
+# this keeps roughly 100 days of regime transitions for gate debugging without growing the
+# live trading database without bound.
+REGIME_HISTORY_ROWS = 30000
 
 # ENV INTEGRITY CHECK
 _api_key = os.getenv("BITGET_API_KEY", "")
@@ -55,7 +61,7 @@ class RegimeClassifier:
         self._init_db()
 
     def _init_db(self):
-        """Ensures the market_regime gate table exists in trading_data.db with AI columns."""
+        """Ensures the market_regime history table exists in trading_data.db with AI columns."""
         try:
             conn = sqlite3.connect(self.db_path)
             with conn:
@@ -65,13 +71,19 @@ class RegimeClassifier:
                         timestamp TEXT,
                         regime TEXT,
                         hurst REAL,
-                        adx REAL
+                        adx REAL,
+                        source_close_ts TEXT,
+                        math_regime TEXT
                     )
                 """)
                 for col, col_type in [
                     ("plus_di", "REAL"), ("minus_di", "REAL"), ("macro_trend", "TEXT"),
                     ("ai_bias", "TEXT"), ("trap_risk", "REAL"), ("ai_thesis", "TEXT"),
-                    ("turbulence_index", "REAL"), ("turbulence_threshold", "REAL"), ("turbulence_state", "TEXT")
+                    ("turbulence_index", "REAL"), ("turbulence_threshold", "REAL"), ("turbulence_state", "TEXT"),
+                    # `timestamp` is the publication time of the row; `source_close_ts` is the close
+                    # time of the newest 15m bar it was computed from. Keeping them apart is the only
+                    # way a reader can tell a live producer analysing old data from a stalled one.
+                    ("source_close_ts", "TEXT"), ("math_regime", "TEXT")
                 ]:
                     try:
                         conn.execute(f"ALTER TABLE market_regime ADD COLUMN {col} {col_type}")
@@ -99,6 +111,24 @@ class RegimeClassifier:
                     return df
         except Exception as e:
             log.error(f"Failed to fetch Bitget historical bars: {e}")
+            return None
+
+    @staticmethod
+    def _bar_close_ts(df, interval):
+        """ISO-8601 UTC close time of the newest bar in a Bitget OHLCV frame.
+
+        Bitget returns `open_time` in milliseconds; the close time is open_time plus the
+        bar duration. Returns None (stored as NULL) rather than a guessed value.
+        """
+        try:
+            match = re.fullmatch(r"(\d+)\s*([mhd])", str(interval).strip().lower())
+            if not match:
+                raise ValueError(f"unparsable granularity '{interval}'")
+            seconds = int(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+            last_open_ms = int(float(df["open_time"].iloc[-1]))
+            return datetime.fromtimestamp((last_open_ms + seconds * 1000) / 1000.0, UTC).isoformat()
+        except Exception as e:
+            log.warning(f"Could not derive source bar close time from '{interval}' bars: {e}")
             return None
 
     def calculate_hurst(self, prices):
@@ -634,21 +664,28 @@ class RegimeClassifier:
             )
 
         timestamp = datetime.now(UTC).isoformat()
+        source_close_ts = self._bar_close_ts(df, "15m")
         try:
             conn = sqlite3.connect(self.db_path)
             with conn:
+                # Append-only history: every classification is a new row. Readers that want the
+                # current gate use ORDER BY id/rowid DESC LIMIT 1, which is unchanged by this.
                 conn.execute("""
-                    INSERT OR REPLACE INTO market_regime (
-                        id, timestamp, regime, hurst, adx, plus_di, minus_di,
+                    INSERT INTO market_regime (
+                        timestamp, source_close_ts, regime, math_regime, hurst, adx, plus_di, minus_di,
                         macro_trend, ai_bias, trap_risk, ai_thesis,
                         turbulence_index, turbulence_threshold, turbulence_state
                     )
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    timestamp, regime, hurst, adx, plus_di, minus_di,
+                    timestamp, source_close_ts, regime, math_regime, hurst, adx, plus_di, minus_di,
                     macro_trend, ai_bias, trap_risk, ai_thesis,
                     turb_idx, turb_thresh, turb_state
                 ))
+                conn.execute(
+                    "DELETE FROM market_regime WHERE id <= (SELECT MAX(id) - ? FROM market_regime)",
+                    (REGIME_HISTORY_ROWS,),
+                )
                 conn.execute("""
                     INSERT OR REPLACE INTO system_state (key, value, updated_at)
                     VALUES ('recommended_leverage', ?, ?)

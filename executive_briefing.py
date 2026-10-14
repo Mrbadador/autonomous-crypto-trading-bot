@@ -165,7 +165,8 @@ async def build_briefing_async(cycle_num: int = 1) -> Dict[str, Any]:
     # 3. Market Regime & Active Engine
     market_regime = query_system_state("market_regime_label", "CHOP")
     macro_regime = query_system_state("macro_regime", "NEUTRAL")
-    regime_rows = safe_query(TRADING_DATA_DB, "SELECT adx, hurst, regime FROM market_regime WHERE id = 1")
+    # market_regime is append-only history: the current gate is the highest id, not id = 1.
+    regime_rows = safe_query(TRADING_DATA_DB, "SELECT adx, hurst, regime FROM market_regime ORDER BY id DESC LIMIT 1")
     if regime_rows and regime_rows[0].get("adx") is not None:
         adx_val = f"{float(regime_rows[0]['adx']):.1f}"
         hurst_val = f"{float(regime_rows[0]['hurst']):.2f}"
