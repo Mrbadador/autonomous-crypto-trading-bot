@@ -16,6 +16,18 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] REGIME_CLASSIFIER: %(message)s")
 log = logging.getLogger("regime_classifier")
 
+# Optional accelerator for ADX. Not declared in requirements.txt, so its absence is the normal
+# case; calculate_adx() then uses the Wilder fallback. Imported once here instead of per call so
+# the ImportError is reported once rather than swallowed on every classification pass.
+try:
+    import pandas_ta as _pandas_ta
+except ImportError:
+    _pandas_ta = None
+    log.debug("pandas_ta not installed - ADX will use the internal Wilder calculation.")
+except Exception as _ta_import_err:  # pragma: no cover - broken install
+    _pandas_ta = None
+    log.warning(f"pandas_ta import failed ({_ta_import_err}) - ADX will use the internal Wilder calculation.")
+
 # ENV INTEGRITY CHECK
 _api_key = os.getenv("BITGET_API_KEY", "")
 if _api_key:
@@ -137,84 +149,93 @@ class RegimeClassifier:
         Calculates 14-period Average Directional Index (ADX) along with +DI and -DI.
         Returns: (adx_val, plus_di_val, minus_di_val)
         """
+        if _pandas_ta is not None:
+            try:
+                adx_df = _pandas_ta.adx(df['high'], df['low'], df['close'], length=length)
+                adx_val = float(adx_df[f'ADX_{length}'].iloc[-1])
+                plus_di = float(adx_df[f'DMP_{length}'].iloc[-1])
+                minus_di = float(adx_df[f'DMN_{length}'].iloc[-1])
+                if not np.isnan(adx_val) and not np.isnan(plus_di) and not np.isnan(minus_di):
+                    return adx_val, plus_di, minus_di
+                log.warning("pandas_ta returned NaN ADX/DI; falling back to the Wilder calculation.")
+            except Exception as ta_err:
+                log.warning(f"pandas_ta ADX failed ({ta_err}); falling back to the Wilder calculation.")
+
+        # Wilder fallback. TR and +/-DM must be seeded with the SUM of the first `length` values
+        # before Wilder's recurrence is applied. The previous code seeded with a rolling mean, so
+        # the smoothed series carried a seed error of (length-1)/length that only decays with
+        # bars. Seeding at index `length` (excluding bar 0, whose TR has no prior close) matches
+        # reference Wilder implementations such as ta.trend.ADXIndicator to machine precision.
         try:
-            import pandas_ta as ta
-            adx_df = ta.adx(df['high'], df['low'], df['close'], length=length)
-            adx_val = float(adx_df[f'ADX_{length}'].iloc[-1])
-            plus_di = float(adx_df[f'DMP_{length}'].iloc[-1])
-            minus_di = float(adx_df[f'DMN_{length}'].iloc[-1])
-            if not np.isnan(adx_val) and not np.isnan(plus_di) and not np.isnan(minus_di):
-                return adx_val, plus_di, minus_di
-        except Exception:
-            pass
-            
-        # Mathematical Pandas Fallback
-        try:
-            df = df.copy()
-            df['up_move'] = df['high'].diff()
-            df['down_move'] = -df['low'].diff()
-            
-            df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
-            df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0.0)
-            
-            df['tr'] = np.maximum(
-                df['high'] - df['low'],
-                np.maximum(
-                    abs(df['high'] - df['close'].shift(1)),
-                    abs(df['low'] - df['close'].shift(1))
+            high = np.asarray(df['high'], dtype=float)
+            low = np.asarray(df['low'], dtype=float)
+            close = np.asarray(df['close'], dtype=float)
+            n = len(high)
+
+            if n < 2 * length + 1:
+                log.warning(
+                    f"ADX fallback needs at least {2 * length + 1} bars, got {n}; "
+                    "returning neutral 20.0/0.0/0.0 instead of a partially smoothed value."
                 )
-            )
-            df['tr'] = df['tr'].fillna(df['high'] - df['low'])
-            
-            tr_smooth = df['tr'].rolling(window=length).mean()
-            plus_dm_smooth = df['plus_dm'].rolling(window=length).mean()
-            minus_dm_smooth = df['minus_dm'].rolling(window=length).mean()
-            
-            tr_smooth_val = tr_smooth.values.copy()
-            plus_dm_smooth_val = plus_dm_smooth.values.copy()
-            minus_dm_smooth_val = minus_dm_smooth.values.copy()
-            
-            tr_val = df['tr'].values
-            plus_dm_val = df['plus_dm'].values
-            minus_dm_val = df['minus_dm'].values
-            
-            for i in range(length, len(df)):
-                if np.isnan(tr_smooth_val[i-1]):
-                    continue
-                tr_smooth_val[i] = tr_smooth_val[i-1] - (tr_smooth_val[i-1] / length) + tr_val[i]
-                plus_dm_smooth_val[i] = plus_dm_smooth_val[i-1] - (plus_dm_smooth_val[i-1] / length) + plus_dm_val[i]
-                minus_dm_smooth_val[i] = minus_dm_smooth_val[i-1] - (minus_dm_smooth_val[i-1] / length) + minus_dm_val[i]
-                
-            df['tr_smooth'] = tr_smooth_val
-            df['plus_dm_smooth'] = plus_dm_smooth_val
-            df['minus_dm_smooth'] = minus_dm_smooth_val
-            
-            plus_di = 100.0 * (df['plus_dm_smooth'] / (df['tr_smooth'] + 1e-9))
-            minus_di = 100.0 * (df['minus_dm_smooth'] / (df['tr_smooth'] + 1e-9))
-            
-            dx = 100.0 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
-            
-            adx_series = dx.rolling(window=length).mean()
-            adx_series_val = adx_series.values.copy()
-            dx_val = dx.values
-            _adx_seed_idx = 2 * length - 2
-            
-            for i in range(_adx_seed_idx + 1, len(df)):
-                if np.isnan(adx_series_val[i-1]):
-                    continue
-                adx_series_val[i] = (adx_series_val[i-1] * (length - 1) + dx_val[i]) / length
-                    
-            adx_val = float(adx_series_val[-1])
-            plus_di_val = float(plus_di.iloc[-1] if hasattr(plus_di, 'iloc') else plus_di[-1])
-            minus_di_val = float(minus_di.iloc[-1] if hasattr(minus_di, 'iloc') else minus_di[-1])
-            
+                return 20.0, 0.0, 0.0
+
+            up_move = np.full(n, np.nan)
+            down_move = np.full(n, np.nan)
+            if n > 1:
+                up_move[1:] = high[1:] - high[:-1]
+                down_move[1:] = low[:-1] - low[1:]
+
+            plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+            minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+            tr = np.empty(n)
+            tr[0] = high[0] - low[0]
+            if n > 1:
+                prev_close = close[:-1]
+                tr[1:] = np.maximum(
+                    high[1:] - low[1:],
+                    np.maximum(np.abs(high[1:] - prev_close), np.abs(low[1:] - prev_close)),
+                )
+
+            def _wilder(values):
+                out = np.full(n, np.nan)
+                out[length] = values[1:length + 1].sum()
+                for i in range(length + 1, n):
+                    out[i] = out[i - 1] - (out[i - 1] / length) + values[i]
+                return out
+
+            tr_smooth = _wilder(tr)
+            plus_dm_smooth = _wilder(plus_dm)
+            minus_dm_smooth = _wilder(minus_dm)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                active = tr_smooth > 0
+                plus_di_arr = np.where(active, 100.0 * plus_dm_smooth / tr_smooth, 0.0)
+                minus_di_arr = np.where(active, 100.0 * minus_dm_smooth / tr_smooth, 0.0)
+                di_sum = plus_di_arr + minus_di_arr
+                raw_dx = np.where(di_sum > 0, 100.0 * np.abs(plus_di_arr - minus_di_arr) / di_sum, 0.0)
+
+            dx = np.full(n, np.nan)
+            dx[active] = raw_dx[active]
+
+            adx_series = np.full(n, np.nan)
+            seed_idx = 2 * length - 1
+            adx_series[seed_idx] = dx[length:seed_idx + 1].mean()
+            for i in range(seed_idx + 1, n):
+                adx_series[i] = (adx_series[i - 1] * (length - 1) + dx[i]) / length
+
+            adx_val = float(adx_series[-1])
+            plus_di_val = float(plus_di_arr[-1])
+            minus_di_val = float(minus_di_arr[-1])
+
             if np.isnan(adx_val):
+                log.warning("ADX fallback produced NaN; defaulting to 20.0 (Choppy).")
                 adx_val = 20.0
             if np.isnan(plus_di_val):
                 plus_di_val = 0.0
             if np.isnan(minus_di_val):
                 minus_di_val = 0.0
-                
+
             return adx_val, plus_di_val, minus_di_val
         except Exception as e:
             log.warning(f"ADX calculation error: {e}. Defaulting to 20.0 (Choppy).")
