@@ -280,6 +280,11 @@ class SuperBotTrader:
         self.turbulence_index = 0.0
         self.turbulence_threshold = 22.0
         self.turbulence_state = "CALM_NORMAL"
+        # Fail-closed regime health: new entries are blocked while the regime row is missing,
+        # stale, unparseable or non-finite. Position management/exits ignore this flag.
+        self.regime_data_ok = False
+        self.regime_stale_reason = "no regime read yet"
+        self._regime_health_logged = None
         
         self._init_database()
 
@@ -363,8 +368,48 @@ class SuperBotTrader:
         except Exception as e:
             log.error(f"[SYNC-ERR] Error adopting positions: {e}")
 
+    @staticmethod
+    def _regime_row_age_sec(raw_ts):
+        """Age in seconds of a regime row's publication timestamp; None if unparseable."""
+        if not raw_ts:
+            return None
+        try:
+            cleaned = str(raw_ts).strip().replace("Z", "+00:00")
+            if "T" not in cleaned and " " in cleaned:
+                cleaned = cleaned.replace(" ", "T")
+            parsed = datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return max(0.0, time.time() - parsed.timestamp())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _finite_or_none(value):
+        try:
+            as_float = float(value)
+        except (TypeError, ValueError):
+            return None
+        return as_float if np.isfinite(as_float) else None
+
+    def _note_regime_health(self, is_ok, reason):
+        """Log once per health transition rather than on every 5-second routing loop."""
+        if self._regime_health_logged == is_ok:
+            return
+        self._regime_health_logged = is_ok
+        if is_ok:
+            log.info("[REGIME-GATE] ✅ Regime telemetry valid again — new entries re-enabled.")
+        else:
+            log.warning(f"[REGIME-GATE] 🛑 Blocking NEW entries: {reason}. Live positions keep being managed and exited normally.")
+
     def _get_market_regime_sync(self):
-        """Reads current market regime & FinRL Mahalanobis Turbulence determined by regime_classifier.py (Fail-Closed)."""
+        """Reads current market regime & FinRL Mahalanobis Turbulence determined by regime_classifier.py.
+
+        Fail-closed for NEW entries: an absent row, a missing/too-old/unparseable publication
+        timestamp, an UNKNOWN label, or non-finite ADX/Hurst/DI telemetry leaves
+        self.regime_data_ok False so the router stops opening positions. Trailing stops,
+        breakeven ratchets, profit floors and exits are deliberately not gated on it.
+        """
         regime = "UNKNOWN"
         adx = 0.0
         hurst = 0.50
@@ -372,30 +417,70 @@ class SuperBotTrader:
         turb_idx = 0.0
         turb_thresh = 22.0
         turb_state = "UNKNOWN"
+        problem = None
+
+        max_age = self._finite_or_none(getattr(config, "REGIME_MAX_AGE_SEC", None))
+        if max_age is None or max_age <= 0:
+            max_age = 900.0
+
         try:
             with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                 row = conn.execute(
-                    "SELECT regime, adx, hurst, plus_di, minus_di, turbulence_index, turbulence_threshold, turbulence_state "
+                    "SELECT regime, adx, hurst, plus_di, minus_di, turbulence_index, turbulence_threshold, turbulence_state, timestamp "
                     "FROM market_regime ORDER BY id DESC LIMIT 1"
                 ).fetchone()
-                if row:
-                    regime = str(row[0] or "UNKNOWN").upper()
-                    if row[1] is not None: adx = float(row[1])
-                    if row[2] is not None: hurst = float(row[2])
-                    p_di = float(row[3]) if row[3] is not None else 0.0
-                    m_di = float(row[4]) if row[4] is not None else 0.0
+
+            if not row:
+                problem = "market_regime table has no rows"
+            else:
+                regime = str(row[0] or "").strip().upper() or "UNKNOWN"
+                adx_val = self._finite_or_none(row[1])
+                hurst_val = self._finite_or_none(row[2])
+                p_di = self._finite_or_none(row[3])
+                m_di = self._finite_or_none(row[4])
+                raw_ts = row[8] if len(row) > 8 else None
+                age = self._regime_row_age_sec(raw_ts)
+
+                if adx_val is not None:
+                    adx = adx_val
+                if hurst_val is not None:
+                    hurst = hurst_val
+                if p_di is not None and m_di is not None:
                     di_spread = p_di - m_di
-                    if len(row) > 5 and row[5] is not None: turb_idx = float(row[5])
-                    if len(row) > 6 and row[6] is not None: turb_thresh = float(row[6])
-                    if len(row) > 7 and row[7] is not None: turb_state = str(row[7] or "CALM_NORMAL")
-                else:
-                    regime = "UNKNOWN"
-                    adx = 0.0
+                if len(row) > 5:
+                    tv = self._finite_or_none(row[5])
+                    if tv is not None:
+                        turb_idx = tv
+                    tv = self._finite_or_none(row[6])
+                    if tv is not None:
+                        turb_thresh = tv
+                    if row[7]:
+                        turb_state = str(row[7])
+
+                if adx_val is None:
+                    problem = f"ADX is missing or non-finite ({row[1]!r})"
+                elif not 0.0 <= adx_val <= 100.0:
+                    problem = f"ADX out of range ({adx_val:.2f})"
+                elif hurst_val is None or not 0.0 <= hurst_val <= 1.0:
+                    problem = f"Hurst is missing, non-finite or out of range ({row[2]!r})"
+                elif p_di is None or m_di is None:
+                    problem = f"+DI/-DI missing or non-finite ({row[3]!r}, {row[4]!r})"
+                elif age is None:
+                    problem = f"regime timestamp missing or unparseable ({raw_ts!r})"
+                elif age > max_age:
+                    problem = f"regime row is {age:.0f}s old (max {max_age:.0f}s)"
+                elif regime == "UNKNOWN":
+                    problem = "regime label is UNKNOWN"
         except Exception as e:
             log.warning(f"[REGIME-READ-FAIL-CLOSED] Error reading market_regime: {e}. Forcing regime=UNKNOWN.")
             regime = "UNKNOWN"
             adx = 0.0
-            
+            problem = f"market_regime read failed: {e}"
+
+        self.regime_data_ok = problem is None
+        self.regime_stale_reason = problem or "regime telemetry valid"
+        self._note_regime_health(self.regime_data_ok, problem)
+
         self.current_regime = regime
         self.regime_adx = adx
         self.regime_hurst = hurst
@@ -1197,7 +1282,12 @@ class SuperBotTrader:
                 is_chop = (not is_bear) and any(x in regime for x in ("CHOP", "SIDEWAYS", "UNKNOWN", "RANGING", "NEUTRAL", "CONSOLIDATION"))
 
                 # 3. Route Scans Based on Live Regime
-                if is_bear:
+                if not self.regime_data_ok:
+                    # Fail-closed: no NEW entries while regime telemetry is absent, stale,
+                    # UNKNOWN or non-finite. Position management already ran above this loop,
+                    # so trailing stops, breakeven ratchets and exits are unaffected.
+                    log.debug(f"[REGIME-GATE] Entry scans skipped this cycle: {self.regime_stale_reason}")
+                elif is_bear:
                     # Bear Mode: BEAR_SHIELD Active (Zero Longs, 100% Cash Preservation)
                     if now_ts - last_4h_scan >= self.check_interval_4h:
                         log.info(f"[REGIME: BEAR_SHIELD] 🛡️ (ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) -> Bear Shield Active (Zero Longs).")
