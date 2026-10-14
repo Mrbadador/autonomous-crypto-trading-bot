@@ -14,7 +14,9 @@ from microstructure_metrics import (
     compute_mlofi_step,
     HawkesSpoofGuard,
     VPINCalculator,
-    verify_bitget_crc32_checksum
+    verify_bitget_crc32_checksum,
+    KyleLambdaCalculator,
+    calculate_lvr_tax_bps
 )
 
 # Import symbols from config if available, fallback to top active coins
@@ -92,6 +94,15 @@ class SymbolOFIState:
         self.real_trade_count = 0
         self.last_real_trade_ts = 0.0
 
+        # State-dependent Kyle's Lambda & LVR Tax (Upgrade 2)
+        self.kyle_calc = KyleLambdaCalculator(window_seconds=1800.0, kappa_basis=0.05)
+        self.latest_kyle_lambda = 0.0
+        self.latest_kyle_pctile = 0.50
+        self.last_mid_price = 0.0
+        self.recent_log_returns: deque = deque(maxlen=60)
+        self.latest_lvr_tax_bps = 0.0
+        self.latest_toxicity_halt = False
+
     def reset(self):
         """Resets state machine on WebSocket reconnection to avoid spurious spikes."""
         self.prev_bid_p.fill(0.0)
@@ -117,6 +128,13 @@ class SymbolOFIState:
         self.last_depth_ts = 0.0
         self.real_trade_count = 0
         self.last_real_trade_ts = 0.0
+        self.kyle_calc = KyleLambdaCalculator(window_seconds=1800.0, kappa_basis=0.05)
+        self.latest_kyle_lambda = 0.0
+        self.latest_kyle_pctile = 0.50
+        self.last_mid_price = 0.0
+        self.recent_log_returns.clear()
+        self.latest_lvr_tax_bps = 0.0
+        self.latest_toxicity_halt = False
 
     def process_trade(self, price: float, size: float, side: str = "buy"):
         """Ingests live trade tape from Bitget trade channel for genuine VPIN and flow toxicity."""
@@ -265,6 +283,47 @@ class SymbolOFIState:
         self.latest_micro_price = float(mp)
         self.latest_micro_bps = float(mp_bps)
 
+        # Update Kyle's Lambda (λ_t) & LVR Volatility Tax
+        curr_mid = (float(self.curr_bid_p[0]) + float(self.curr_ask_p[0])) / 2.0
+        if curr_mid > 0:
+            if self.last_mid_price > 0:
+                d_p = curr_mid - self.last_mid_price
+                log_r = math.log(curr_mid / self.last_mid_price)
+                self.recent_log_returns.append(log_r)
+                # Volumetric proxy for delta buy/sell: level additions/cancels
+                tot_buy_flow = float(self.curr_bid_q[0] + tick_adds)
+                tot_sell_flow = float(self.curr_ask_q[0] + tick_cancels)
+                self.kyle_calc.update_tick(price_delta=d_p, buy_volume=tot_buy_flow, sell_volume=tot_sell_flow, basis_bps=mp_bps, timestamp=now)
+            self.last_mid_price = curr_mid
+
+        cur_lam, cur_pctile = self.kyle_calc.get_current_lambda_and_percentile()
+        self.latest_kyle_lambda = cur_lam
+        self.latest_kyle_pctile = cur_pctile
+
+        # Realized volatility over recent ticks
+        if len(self.recent_log_returns) >= 5:
+            sigma_ticks = float(np.std(self.recent_log_returns))
+            self.latest_lvr_tax_bps = float(calculate_lvr_tax_bps(sigma_ticks))
+        else:
+            self.latest_lvr_tax_bps = 0.50
+
+        # Toxicity Halt Evaluation (Upgrade 2)
+        vpin_val = self.vpin_calc_real.get_vpin() if self.real_trade_count >= 10 else self.vpin_calc.get_vpin()
+        try:
+            import config as _cfg
+            rho_cut = float(getattr(_cfg, "HAWKES_CASCADE_RHO_THRESHOLD", 1.05))
+            spoof_cut = float(getattr(_cfg, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
+        except Exception:
+            rho_cut = 1.05
+            spoof_cut = 0.78
+
+        self.latest_toxicity_halt = bool(
+            (vpin_val >= 0.68) or
+            (self.latest_hawkes_rho >= rho_cut) or
+            (self.latest_hawkes_spoof >= spoof_cut) or
+            (self.latest_kyle_pctile >= 0.90)
+        )
+
         # Streaming VPIN update
         mid_p = (self.curr_bid_p[0] + self.curr_ask_p[0]) / 2.0
         top_vol = (self.curr_bid_q[0] + self.curr_ask_q[0]) / 2.0
@@ -337,6 +396,10 @@ class SymbolOFIState:
             "hawkes_spoof_index": round(self.latest_hawkes_spoof, 4),
             "hawkes_rho": round(self.latest_hawkes_rho, 4),
             "hawkes_veto": self.latest_hawkes_veto,
+            "kyle_lambda": round(self.latest_kyle_lambda, 6),
+            "kyle_lambda_pctile": round(self.latest_kyle_pctile, 4),
+            "lvr_tax_bps": round(self.latest_lvr_tax_bps, 2),
+            "toxicity_halt": self.latest_toxicity_halt,
             "order_additions_count": n_a,
             "order_cancellations_count": n_c,
             "mean_residence_time_ms": round(mean_tau, 2),
@@ -403,6 +466,10 @@ class MultiSymbolOFIDaemon:
             "hawkes_spoof_index": primary.get("hawkes_spoof_index", 0.0),
             "hawkes_rho": primary.get("hawkes_rho", 0.0),
             "hawkes_veto": primary.get("hawkes_veto", False),
+            "kyle_lambda": primary.get("kyle_lambda", 0.0),
+            "kyle_lambda_pctile": primary.get("kyle_lambda_pctile", 0.5),
+            "lvr_tax_bps": primary.get("lvr_tax_bps", 0.0),
+            "toxicity_halt": primary.get("toxicity_halt", False),
             "order_additions_count": primary.get("order_additions_count", 0),
             "order_cancellations_count": primary.get("order_cancellations_count", 0),
             "mean_residence_time_ms": primary.get("mean_residence_time_ms", 250.0),

@@ -1829,12 +1829,18 @@ with tab_live:
                     r_h_spoof = float(r_sym_info.get("hawkes_spoof_index", 0.0) or 0.0)
                     r_h_rho = float(r_sym_info.get("hawkes_rho", 0.0) or 0.0)
                     r_h_veto = bool(r_sym_info.get("hawkes_veto", False))
+                    r_kyle = float(r_sym_info.get("kyle_lambda", 0.0) or 0.0)
+                    r_kyle_pct = float(r_sym_info.get("kyle_lambda_pctile", 0.5) or 0.5)
+                    r_lvr = float(r_sym_info.get("lvr_tax_bps", 0.0) or 0.0)
+                    r_tox_halt = bool(r_sym_info.get("toxicity_halt", False))
                     
                     r_v_col = "#00ff66" if r_vpin < 0.45 else ("#f59e0b" if r_vpin < 0.70 else "#ff003c")
                     r_v_lbl = "Benign Flow" if r_vpin < 0.45 else ("Caution Flow" if r_vpin < 0.70 else "TOXIC CASCADE")
                     r_m_col = "#00ff66" if r_mlofi > 0.05 else ("#ff003c" if r_mlofi < -0.05 else "#94a3b8")
                     r_h_col = "#ff003c" if r_h_veto or r_h_spoof > 0.72 or r_h_rho >= 1.0 else ("#f59e0b" if r_h_spoof > 0.45 else "#00ff66")
                     r_h_lbl = "VETO" if r_h_veto else ("ELEVATED" if r_h_spoof > 0.45 else "STATIONARY")
+                    r_kyle_col = "#00ff66" if r_kyle_pct < 0.60 else ("#f59e0b" if r_kyle_pct < 0.85 else "#ff003c")
+                    r_lvr_badge = "<b style='color: #ff003c;'>[TOXIC HALT]</b>" if r_tox_halt else ""
                     
                     st.markdown(f"""
                     <div style="background: rgba(13, 18, 31, 0.85); border: 1px solid #1e293b; border-left: 3px solid #00e5ff; border-radius: 6px; padding: 10px 16px; margin-top: 10px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; font-size: 0.82rem; font-family: 'JetBrains Mono', monospace;">
@@ -1843,6 +1849,8 @@ with tab_live:
                         <span>MLOFI (10-Level): <b style="color: {r_m_col};">{r_mlofi:+.2f}</b></span>
                         <span>VPIN: <b style="color: {r_v_col};">{r_vpin:.3f} [{r_v_lbl}]</b></span>
                         <span>Hawkes Spoof: <b style="color: {r_h_col};">{r_h_spoof:.3f} (ρ={r_h_rho:.2f}) [{r_h_lbl}]</b></span>
+                        <span>Kyle's λ (Impact): <b style="color: {r_kyle_col};">{r_kyle:.4f} ({r_kyle_pct*100:.0f}%)</b></span>
+                        <span>LVR Tax (σ²/8): <b style="color: {'#ff003c' if r_lvr >= 10.0 else '#38bdf8'};">{r_lvr:.2f} bps</b> {r_lvr_badge}</span>
                         <span style="color: #94a3b8; font-size: 0.75rem;">🛡️ CRC32 Verified</span>
                     </div>
                     """, unsafe_allow_html=True)
@@ -3195,6 +3203,10 @@ with tab_risk:
     hawkes_spoof_val = 0.0
     hawkes_rho_val = 0.0
     hawkes_veto_val = False
+    kyle_lambda_val = 0.0
+    kyle_pctile_val = 0.5
+    lvr_tax_bps_val = 0.0
+    tox_halt_val = False
     try:
         if os.path.exists("microstructure_state.json"):
             with open("microstructure_state.json", "r", encoding="utf-8") as f_ms:
@@ -3206,6 +3218,10 @@ with tab_risk:
                 hawkes_spoof_val = float(ms_json.get("hawkes_spoof_index", 0.0) or 0.0)
                 hawkes_rho_val = float(ms_json.get("hawkes_rho", 0.0) or 0.0)
                 hawkes_veto_val = bool(ms_json.get("hawkes_veto", False))
+                kyle_lambda_val = float(ms_json.get("kyle_lambda", 0.0) or 0.0)
+                kyle_pctile_val = float(ms_json.get("kyle_lambda_pctile", 0.5) or 0.5)
+                lvr_tax_bps_val = float(ms_json.get("lvr_tax_bps", 0.0) or 0.0)
+                tox_halt_val = bool(ms_json.get("toxicity_halt", False))
     except Exception:
         pass
 
@@ -3224,8 +3240,10 @@ with tab_risk:
     micro_color = "#00ff66" if micro_bps > 0 else ("#ff003c" if micro_bps < 0 else "#94a3b8")
     hawkes_color = "#ff003c" if (hawkes_veto_val or hawkes_spoof_val > 0.72 or hawkes_rho_val >= 1.0) else ("#f59e0b" if hawkes_spoof_val > 0.45 else "#00ff66")
     hawkes_badge = "🔴 VETO TRIGGERED" if hawkes_veto_val else ("🟡 ELEVATED FLUX" if hawkes_spoof_val > 0.45 else "🟢 STATIONARY")
+    kyle_color = "#ff003c" if (tox_halt_val or kyle_pctile_val >= 0.90) else ("#f59e0b" if kyle_pctile_val >= 0.75 else "#00ff66")
+    kyle_badge = "🔴 TOXICITY HALT" if tox_halt_val else (f"Pctile: {kyle_pctile_val*100:.0f}%")
 
-    qcol1, qcol2, qcol3, qcol4, qcol5 = st.columns(5)
+    qcol1, qcol2, qcol3, qcol4, qcol5, qcol6 = st.columns(6)
     with qcol1:
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {mlofi_color}; border-radius: 6px; padding: 12px 14px;">
@@ -3265,6 +3283,15 @@ with tab_risk:
 
     with qcol5:
         st.markdown(f"""
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {kyle_color}; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">λ Kyle / LVR Tax</div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: {kyle_color}; font-family: 'JetBrains Mono', monospace;">{lvr_tax_bps_val:.1f} bps</div>
+            <div style="color: {kyle_color}; font-size: 0.72rem; margin-top: 2px; font-weight: bold;">{kyle_badge}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with qcol6:
+        st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #38bdf8; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">📐 Dynamic Kelly</div>
             <div style="font-size: 1.25rem; font-weight: 800; color: #38bdf8; font-family: 'JetBrains Mono', monospace;">{live_kelly_pct:.1f}%</div>
@@ -3273,6 +3300,231 @@ with tab_risk:
         """, unsafe_allow_html=True)
 
     st.markdown("<div style='margin-bottom: 16px;'></div>", unsafe_allow_html=True)
+
+    # ── Bayesian Markov Chain & Regime Transition Telemetry Deck ──────────────
+    st.markdown("#### 🎲 Bayesian Markov Regime Engine & Transition Matrix (Live Forward Filter)")
+    
+    # Safe retrieval & default extraction
+    markov_raw = query_system_state("markov_regime_telemetry", "{}")
+    m_tel = {}
+    try:
+        if markov_raw and markov_raw != "{}":
+            m_tel = json.loads(markov_raw)
+    except Exception:
+        m_tel = {}
+
+    states_list = ["CHOP", "BULL_EXPANSION", "BEAR_CASCADE"]
+    default_P = np.array([
+        [0.70, 0.15, 0.15],
+        [0.20, 0.70, 0.10],
+        [0.20, 0.10, 0.70]
+    ], dtype=np.float64)
+
+    # If telemetry is absent or incomplete, compute fallback
+    if not m_tel or "state_probabilities" not in m_tel:
+        try:
+            from markov_regime import MarkovRegimeEngine
+            m_eng = MarkovRegimeEngine()
+            dur_fb = m_eng.get_expected_regime_durations()
+            stat_fb = m_eng.get_stationary_distribution()
+            fc_fb = m_eng.forecast_k_steps(k=4)
+            m_tel = {
+                "dominant_regime": "CHOP",
+                "state_probabilities": {"CHOP": 0.60, "BULL_EXPANSION": 0.25, "BEAR_CASCADE": 0.15},
+                "expected_durations_bars": dur_fb,
+                "breakdown_risk_4step": fc_fb.get("breakdown_risk", 0.35),
+                "transition_matrix": default_P.tolist(),
+                "forecast_probabilities": fc_fb.get("forecast_probabilities", {"CHOP": 0.50, "BULL_EXPANSION": 0.30, "BEAR_CASCADE": 0.20}),
+                "stationary_distribution": {"CHOP": float(stat_fb[0]), "BULL_EXPANSION": float(stat_fb[1]), "BEAR_CASCADE": float(stat_fb[2])}
+            }
+        except Exception:
+            m_tel = {
+                "dominant_regime": "CHOP",
+                "state_probabilities": {"CHOP": 0.60, "BULL_EXPANSION": 0.25, "BEAR_CASCADE": 0.15},
+                "expected_durations_bars": {"CHOP": 3.33, "BULL_EXPANSION": 3.33, "BEAR_CASCADE": 3.33},
+                "breakdown_risk_4step": 0.35,
+                "transition_matrix": default_P.tolist(),
+                "forecast_probabilities": {"CHOP": 0.50, "BULL_EXPANSION": 0.30, "BEAR_CASCADE": 0.20},
+                "stationary_distribution": {"CHOP": 0.333, "BULL_EXPANSION": 0.333, "BEAR_CASCADE": 0.333}
+            }
+
+    dom_regime = m_tel.get("dominant_regime", "CHOP")
+    probs = m_tel.get("state_probabilities", {})
+    durations = m_tel.get("expected_durations_bars", {})
+    bd_risk = float(m_tel.get("breakdown_risk_4step", 0.0) or 0.0)
+    fc_probs = m_tel.get("forecast_probabilities", {})
+    stat_dist = m_tel.get("stationary_distribution", {})
+
+    p_chop = float(probs.get("CHOP", 0.0) or 0.0)
+    p_bull = float(probs.get("BULL_EXPANSION", 0.0) or 0.0)
+    p_bear = float(probs.get("BEAR_CASCADE", 0.0) or 0.0)
+
+    d_chop = float(durations.get("CHOP", 0.0) or 0.0)
+    d_bull = float(durations.get("BULL_EXPANSION", 0.0) or 0.0)
+    d_bear = float(durations.get("BEAR_CASCADE", 0.0) or 0.0)
+
+    # Top 4 Markov KPI Cards
+    mk1, mk2, mk3, mk4 = st.columns(4)
+    with mk1:
+        dom_color = "#00ff66" if dom_regime == "BULL_EXPANSION" else ("#ff003c" if dom_regime == "BEAR_CASCADE" else "#f59e0b")
+        st.markdown(f"""
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {dom_color}; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Active Markov State (π_t)</div>
+            <div style="font-size: 1.15rem; font-weight: 800; color: {dom_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{dom_regime}</div>
+            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Confidence: <b style="color: {dom_color};">{max(p_chop, p_bull, p_bear)*100:.1f}%</b></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with mk2:
+        exp_d = durations.get(dom_regime, 3.3)
+        st.markdown(f"""
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #00e5ff; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Expected Duration E[D]</div>
+            <div style="font-size: 1.15rem; font-weight: 800; color: #00e5ff; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{exp_d:.1f} Bars</div>
+            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Self-Persistence: 1 / (1 - P_ii)</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with mk3:
+        bd_col = "#ff003c" if bd_risk >= 0.50 else ("#f59e0b" if bd_risk >= 0.30 else "#00ff66")
+        bd_lbl = "HIGH VETO" if bd_risk >= 0.60 else ("ELEVATED" if bd_risk >= 0.35 else "STABLE")
+        st.markdown(f"""
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {bd_col}; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">4-Step Breakdown Risk</div>
+            <div style="font-size: 1.15rem; font-weight: 800; color: {bd_col}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{bd_risk*100:.1f}%</div>
+            <div style="color: {bd_col}; font-size: 0.72rem; margin-top: 2px; font-weight: bold;">[{bd_lbl}] P(Chop+Cascade)</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with mk4:
+        st_chop = float(stat_dist.get("CHOP", 0.33) or 0.33) * 100
+        st_bull = float(stat_dist.get("BULL_EXPANSION", 0.33) or 0.33) * 100
+        st_bear = float(stat_dist.get("BEAR_CASCADE", 0.33) or 0.33) * 100
+        st.markdown(f"""
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #a855f7; border-radius: 6px; padding: 12px 14px;">
+            <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Stationary Equilibrium (π*)</div>
+            <div style="font-size: 1.05rem; font-weight: 800; color: #a855f7; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{st_chop:.0f}% / {st_bull:.0f}% / {st_bear:.0f}%</div>
+            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Chop / Bull / Bear Equilibrium</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-bottom: 12px;'></div>", unsafe_allow_html=True)
+
+    # 2-Column Plotly Visualizations: Transition Matrix Heatmap & Multi-Horizon Probabilities
+    col_hm, col_bars = st.columns([1, 1])
+
+    # Parse or format transition matrix P
+    raw_P = m_tel.get("transition_matrix", default_P.tolist())
+    try:
+        mat_P = np.array(raw_P, dtype=np.float64)
+        if mat_P.shape != (3, 3):
+            mat_P = default_P
+    except Exception:
+        mat_P = default_P
+
+    with col_hm:
+        # Hover annotations and text labels with E[D] on diagonal
+        text_matrix = []
+        for i, s_from in enumerate(states_list):
+            row_text = []
+            for j, s_to in enumerate(states_list):
+                val = mat_P[i, j]
+                if i == j:
+                    e_d = durations.get(s_from, 1.0 / max(1e-3, 1.0 - val))
+                    row_text.append(f"{val:.2f}<br><span style='font-size:9px; color:#38bdf8;'>E[D]={e_d:.1f}b</span>")
+                else:
+                    row_text.append(f"{val:.2f}")
+            text_matrix.append(row_text)
+
+        fig_hm = go.Figure(data=go.Heatmap(
+            z=mat_P,
+            x=["To CHOP", "To BULL", "To BEAR"],
+            y=["From CHOP", "From BULL", "From BEAR"],
+            text=text_matrix,
+            texttemplate="%{text}",
+            textfont={"size": 12, "family": "JetBrains Mono"},
+            colorscale=[
+                [0.0, "#0d121f"],
+                [0.25, "#1e293b"],
+                [0.5, "#0284c7"],
+                [0.75, "#00e5ff"],
+                [1.0, "#00ff66"]
+            ],
+            zmin=0.0,
+            zmax=1.0,
+            showscale=False
+        ))
+        fig_hm.update_layout(
+            title={"text": "<b>3×3 Bayesian Transition Matrix P(S_j | S_i)</b>", "font": {"size": 13, "color": "#cbd5e1"}},
+            template="plotly_dark",
+            paper_bgcolor="#0d121f",
+            plot_bgcolor="#0d121f",
+            height=280,
+            margin=dict(l=40, r=20, t=40, b=30),
+            yaxis=dict(autorange="reversed")
+        )
+        st.plotly_chart(fig_hm, use_container_width=True, config={"displayModeBar": False})
+
+    with col_bars:
+        # Comparison: Current Belief π_t vs. 4-step Forecast π_{t+4} vs. Stationary π*
+        labels_x = ["CHOP", "BULL_EXP", "BEAR_CAS"]
+        pi_curr_vals = [p_chop, p_bull, p_bear]
+        pi_fc_vals = [
+            float(fc_probs.get("CHOP", p_chop) or 0.0),
+            float(fc_probs.get("BULL_EXPANSION", p_bull) or 0.0),
+            float(fc_probs.get("BEAR_CASCADE", p_bear) or 0.0)
+        ]
+        pi_stat_vals = [
+            float(stat_dist.get("CHOP", 0.33) or 0.33),
+            float(stat_dist.get("BULL_EXPANSION", 0.33) or 0.33),
+            float(stat_dist.get("BEAR_CASCADE", 0.33) or 0.33)
+        ]
+
+        fig_bars = go.Figure()
+        fig_bars.add_trace(go.Bar(
+            name="Current π_t",
+            x=labels_x,
+            y=pi_curr_vals,
+            marker_color="#00e5ff"
+        ))
+        fig_bars.add_trace(go.Bar(
+            name="Forecast π_{t+4}",
+            x=labels_x,
+            y=pi_fc_vals,
+            marker_color="#a855f7"
+        ))
+        fig_bars.add_trace(go.Bar(
+            name="Equilibrium π*",
+            x=labels_x,
+            y=pi_stat_vals,
+            marker_color="#64748b"
+        ))
+
+        # Add 0.65 entry hysteresis threshold line
+        fig_bars.add_hline(
+            y=0.65,
+            line_dash="dot",
+            line_color="#ff9900",
+            annotation_text="0.65 Hysteresis Gate",
+            annotation_position="top right",
+            annotation_font={"size": 10, "color": "#ff9900"}
+        )
+
+        fig_bars.update_layout(
+            title={"text": "<b>Markov Horizon: Posterior vs Forecast vs Equilibrium</b>", "font": {"size": 13, "color": "#cbd5e1"}},
+            template="plotly_dark",
+            paper_bgcolor="#0d121f",
+            plot_bgcolor="#0d121f",
+            barmode="group",
+            height=280,
+            margin=dict(l=30, r=20, t=40, b=30),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+            yaxis=dict(range=[0, 1.0], gridcolor="#1e293b")
+        )
+        st.plotly_chart(fig_bars, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("<div style='margin-bottom: 16px;'></div>", unsafe_allow_html=True)
+
 
     # ── Multi-Asset Fleet Microstructure & Toxicity Matrix ─────────────────────
     if os.path.exists("microstructure_state.json"):
@@ -3295,9 +3547,14 @@ with tab_risk:
                     s_h_rho = float(sym_info.get("hawkes_rho", 0.0) or 0.0)
                     s_h_veto = bool(sym_info.get("hawkes_veto", False))
                     
+                    s_kyle_pct = float(sym_info.get("kyle_lambda_pctile", 0.5) or 0.5)
+                    s_lvr_tax = float(sym_info.get("lvr_tax_bps", 0.0) or 0.0)
+                    s_tox_halt = bool(sym_info.get("toxicity_halt", False))
+                    
                     v_stat = "🟢 Benign (<0.45)" if s_vpin < 0.45 else ("🟡 Caution (0.45-0.70)" if s_vpin < 0.70 else "🔴 TOXIC CASCADE")
                     flow_posture = "🟢 Buyer Depth" if s_mlofi > 5.0 else ("🔴 Seller Depth" if s_mlofi < -5.0 else "⚪ Balanced")
                     h_stat = "🔴 VETO ACTIVE" if (s_h_veto or s_h_spoof > 0.72 or s_h_rho >= 1.0) else ("🟡 Elevated" if s_h_spoof > 0.45 else "🟢 Stationary")
+                    tox_stat = "🔴 HALT ACTIVE" if s_tox_halt else (f"🟢 Normal ({s_kyle_pct*100:.0f}%)" if s_kyle_pct < 0.80 else f"🟡 High ({s_kyle_pct*100:.0f}%)")
                     
                     fleet_rows.append({
                         "Asset": s_disp,
@@ -3307,6 +3564,8 @@ with tab_risk:
                         "Spread Bias": f"{s_bps:+.2f} bps",
                         "MLOFI (10-Level)": f"{s_mlofi:+.2f}",
                         "VPIN (Toxicity)": f"{s_vpin:.3f}",
+                        "Kyle Flow Risk": tox_stat,
+                        "LVR Tax": f"{s_lvr_tax:.1f} bps",
                         "Hawkes Spoof": f"{s_h_spoof:.3f}",
                         "Spectral Radius (ρ)": f"{s_h_rho:.2f}",
                         "LOB Anti-Spoof": h_stat,

@@ -150,39 +150,60 @@ class FundingArbitrageur:
     Constructs delta-neutral baskets exploiting perp/spot rate differentials.
     Allocates specified capital across high-yield pairs.
     """
-    def __init__(self, capital: float = 500.0, min_annual_yield: float = 0.08):
+    def __init__(self, capital: float = 500.0, min_annual_yield: float = 0.08, est_roundtrip_fee_bps: float = 24.0):
         self.capital = capital
         self.min_annual_yield = min_annual_yield
+        self.est_roundtrip_fee_bps = est_roundtrip_fee_bps
+        self.ema_yields: Dict[str, float] = {}
 
-    def evaluate_opportunities(self, funding_rates: Dict[str, float]) -> List[Dict[str, Any]]:
+    def evaluate_opportunities(
+        self,
+        funding_rates: Dict[str, float],
+        markov_expected_duration_bars: float = 8.0
+    ) -> List[Dict[str, Any]]:
         """
         Ranks arrays of funding rates and returns precise delta-neutral allocations.
-        Binance funding rates occur every 8 hours (3 times/day).
+        Funding rates occur every 8 hours (3 times/day).
+        Enforces Markov-gated carry persistence: E[D_carry] >= 2 * k_breakeven.
         """
         valid_opps = []
+        fee_drag_pct = (self.est_roundtrip_fee_bps / 10000.0) # e.g. 24 bps = 0.0024
         
         for symbol, rate in funding_rates.items():
-            # Rate is usually decimal, e.g., 0.0001 = 0.01% per 8h
-            annualized_yield = float(rate) * 3.0 * 365.0
+            rate_val = float(rate)
+            annualized_yield = rate_val * 3.0 * 365.0
             
-            abs_yield = abs(annualized_yield)
+            # Smooth yield via EWMA
+            prior_ema = self.ema_yields.get(symbol, annualized_yield)
+            current_ema = 0.7 * prior_ema + 0.3 * annualized_yield
+            self.ema_yields[symbol] = current_ema
+
+            abs_yield = abs(current_ema)
             if abs_yield >= self.min_annual_yield:
-                direction = "SHORT_PERP_LONG_SPOT" if rate > 0 else "LONG_PERP_SHORT_SPOT"
+                # Breakeven periods needed to cover roundtrip execution fee drag
+                per_period_yield = abs(rate_val)
+                k_breakeven = (fee_drag_pct / per_period_yield) if per_period_yield > 0 else 999.0
                 
-                # Dynamic delta-neutral allocation sizing
+                # Markov persistence gate: Expected carry duration in 8h bars must comfortably exceed 2x breakeven
+                if markov_expected_duration_bars < (2.0 * k_breakeven):
+                    log.debug(f"[CARRY-GATE] {symbol} carry skipped: E[D]={markov_expected_duration_bars:.1f} < 2*k_be={2.0*k_breakeven:.1f}")
+                    continue
+
+                direction = "SHORT_PERP_LONG_SPOT" if rate_val > 0 else "LONG_PERP_SHORT_SPOT"
                 notional_per_leg = self.capital / 2.0
                 
                 valid_opps.append({
                     "symbol": symbol,
-                    "funding_rate_8h": float(rate),
+                    "funding_rate_8h": rate_val,
                     "annualized_yield": float(annualized_yield),
+                    "ema_annualized_yield": float(current_ema),
+                    "k_breakeven_periods": round(float(k_breakeven), 1),
                     "direction": direction,
                     "spot_allocation": float(notional_per_leg),
                     "perp_allocation": float(notional_per_leg)
                 })
 
-        # Sort by absolute yield descending
-        valid_opps.sort(key=lambda x: abs(x["annualized_yield"]), reverse=True)
+        valid_opps.sort(key=lambda x: abs(x["ema_annualized_yield"]), reverse=True)
         return valid_opps
 
 

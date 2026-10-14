@@ -68,8 +68,8 @@ class TestQuantAlphaGates(unittest.TestCase):
         self.assertFalse(vp["in_value_area"])
 
     def test_td_sequential_nine_count(self):
-        # 12 consecutive candles each closing higher than close 4 bars prior
-        closes = [10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 25, 26]
+        # Established price flip on bar 5 followed by 9 consecutive higher closes than close 4 bars prior
+        closes = [20, 20, 20, 20, 19, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         df = pd.DataFrame({"close": closes})
         td = compute_td_sequential(df)
 
@@ -79,8 +79,8 @@ class TestQuantAlphaGates(unittest.TestCase):
         self.assertFalse(td["is_td9_downward_exhaustion"])
 
     def test_td_sequential_downward_nine_count(self):
-        # 12 consecutive candles each closing lower than close 4 bars prior
-        closes = [30, 29, 28, 27, 25, 24, 23, 22, 20, 19, 18, 17, 15, 14]
+        # Established price flip on bar 5 followed by 9 consecutive lower closes than close 4 bars prior
+        closes = [20, 20, 20, 20, 21, 19, 18, 17, 16, 15, 14, 13, 12, 11]
         df = pd.DataFrame({"close": closes})
         td = compute_td_sequential(df)
 

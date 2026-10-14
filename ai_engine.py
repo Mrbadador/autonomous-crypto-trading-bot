@@ -1207,9 +1207,57 @@ async def generate_macro_synthesis(
 async def analyze_order_flow_tape(ofi_packet: dict, timeout_sec: float = 8.0) -> dict:
     """
     Feature 2: High-Speed AI Order Flow Tape & Iceberg Absorption Interpreter.
-    Dispatched exclusively via Groq Cloud 3-key rotation pool for sub-second inference (<300ms)
-    and zero Gemini token consumption.
+    Dispatched via deterministic quantitative fast-path if enabled, or Groq Cloud 3-key rotation pool (<300ms).
     """
+    if getattr(config, "USE_DETERMINISTIC_MICROSTRUCTURE", True):
+        # Deterministic sub-millisecond quantitative evaluation
+        norm_ofi = float(ofi_packet.get("normalized_ofi", 0.0) or 0.0)
+        vpin = float(ofi_packet.get("vpin", 0.0) or 0.0)
+        hawkes_rho = float(ofi_packet.get("hawkes_rho", 0.0) or 0.0)
+        kyle_pctile = float(ofi_packet.get("kyle_lambda_pctile", 0.5) or 0.5)
+        toxicity_halt = bool(ofi_packet.get("toxicity_halt", False))
+
+        if toxicity_halt or vpin >= 0.70 or (kyle_pctile >= 0.90 and norm_ofi < -0.3):
+            return {
+                "tape_condition": "BEARISH_ABSORPTION" if norm_ofi < 0 else "SPOOF_SUSPECTED",
+                "absorption_side": "ASK" if norm_ofi < 0 else "BID",
+                "confidence": 0.95,
+                "headline": "Quantitative Fast-Path: High flow toxicity / adverse Kyle lambda detected.",
+                "execution_veto": "BLOCK_LONGS",
+                "deterministic": True,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        elif norm_ofi >= 0.50 and vpin < 0.60:
+            return {
+                "tape_condition": "BULLISH_ABSORPTION",
+                "absorption_side": "BID",
+                "confidence": 0.88,
+                "headline": "Quantitative Fast-Path: Robust positive OFI with low flow toxicity.",
+                "execution_veto": "BLOCK_SHORTS",
+                "deterministic": True,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        elif norm_ofi <= -0.50 and vpin < 0.60:
+            return {
+                "tape_condition": "BEARISH_ABSORPTION",
+                "absorption_side": "ASK",
+                "confidence": 0.88,
+                "headline": "Quantitative Fast-Path: Heavy ask-side delta pressure.",
+                "execution_veto": "BLOCK_LONGS",
+                "deterministic": True,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        else:
+            return {
+                "tape_condition": "NEUTRAL_BALANCED",
+                "absorption_side": "NONE",
+                "confidence": 0.70,
+                "headline": "Quantitative Fast-Path: Order flow depth balanced within normal dispersion.",
+                "execution_veto": "CLEAR",
+                "deterministic": True,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+
     client = get_llm("tape_whisperer")
     client.session = _ensure_active_session(client)
 
@@ -1553,10 +1601,40 @@ async def evaluate_runner_vs_harvest(position_context: dict, timeout_sec: float 
 async def detect_spoof_and_ghost_walls(depth_packet: dict, timeout_sec: float = 8.0) -> dict:
     """
     Engine 2: Order Book Ghost Wall & Spoofing Detector.
-    Dispatched via Groq Cloud 3-key pool for sub-300ms execution.
-    Evaluates 10-level additions, cancellations, and residence times to identify
-    phantom spoofing walls (<250ms residence) vs genuine institutional iceberg anchors (>2500ms).
+    Dispatched via deterministic quantitative fast-path if enabled, or Groq Cloud 3-key pool (<300ms).
     """
+    if getattr(config, "USE_DETERMINISTIC_MICROSTRUCTURE", True):
+        hawkes_rho = float(depth_packet.get("hawkes_rho", 0.0) or 0.0)
+        hawkes_spoof = float(depth_packet.get("hawkes_spoof_index", 0.0) or 0.0)
+        hawkes_veto = bool(depth_packet.get("hawkes_veto", False))
+        mean_res = float(depth_packet.get("mean_residence_time_ms", 250.0) or 250.0)
+        norm_ofi = float(depth_packet.get("normalized_ofi", 0.0) or 0.0)
+
+        # Quantitative spoofing condition: Hawkes criticality rho >= 0.85 or spoof index >= 0.70 with sub-300ms residence
+        is_spoof = hawkes_veto or (hawkes_rho >= 0.85 and hawkes_spoof >= 0.65) or (mean_res < 150.0 and hawkes_spoof >= 0.75)
+        spoof_side = "NONE"
+        if is_spoof:
+            spoof_side = "BID" if norm_ofi > 0 else "ASK"
+            advisory = "VETO_BUY_SPOOF" if spoof_side == "BID" else "VETO_SELL_SPOOF"
+            risk_pct = min(95.0, round(hawkes_rho * 100.0, 1))
+            headline = f"Quantitative Fast-Path: Phantom spoofing detected on {spoof_side} (Hawkes rho={hawkes_rho:.2f}, residence={mean_res:.0f}ms)."
+        else:
+            advisory = "ALLOW"
+            risk_pct = max(5.0, round(hawkes_rho * 50.0, 1))
+            headline = f"Quantitative Fast-Path: Order book depth stable (Hawkes rho={hawkes_rho:.2f}, residence={mean_res:.0f}ms)."
+
+        return {
+            "spoof_detected": is_spoof,
+            "spoof_side": spoof_side,
+            "phantom_walls": [],
+            "genuine_anchors": [],
+            "execution_advisory": advisory,
+            "manipulation_risk_pct": risk_pct,
+            "headline": headline,
+            "deterministic": True,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
     client = get_llm("ghost_wall_detector")
     client.session = _ensure_active_session(client)
 

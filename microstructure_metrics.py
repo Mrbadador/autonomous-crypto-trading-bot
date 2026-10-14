@@ -584,3 +584,77 @@ def calculate_bayesian_smoothed_kelly(
     scaled = f_star * fraction
     return float(max(min_cap, min(scaled, max_cap)))
 
+
+# =============================================================================
+# 9. STATE-DEPENDENT KYLE'S LAMBDA (λ) & LVR ADVERSE SELECTION TAX
+# =============================================================================
+
+class KyleLambdaCalculator:
+    """
+    Rolling 30-Minute State-Dependent Kyle's Lambda (λ_t) Estimator.
+    Measures empirical price impact per unit of signed volume:
+        λ_t = [ sum(|ΔP_i|) / (sum(|V_buy,i - V_sell,i|) + ε) ] * (1 + κ_basis * |basis_bps|)
+
+    Academic Basis:
+        - Kozlowski, Lehmann & Uhlig (arXiv:2212.06888 v7, 2026): price impact is state-dependent on basis dislocations.
+        - Pindza (2026): Rolling 30m Kyle's lambda percentile ranking.
+    """
+    def __init__(self, window_seconds: float = 1800.0, kappa_basis: float = 0.05):
+        self.window_seconds = window_seconds
+        self.kappa_basis = kappa_basis
+        self.ticks: deque = deque()  # (ts, abs_delta_p, abs_signed_vol, basis_bps)
+        self.lambda_history: deque = deque(maxlen=200)
+
+    def update_tick(
+        self,
+        price_delta: float,
+        buy_volume: float,
+        sell_volume: float,
+        basis_bps: float = 0.0,
+        timestamp: Optional[float] = None
+    ) -> float:
+        import time as _time
+        now = timestamp if timestamp is not None else _time.time()
+        abs_dp = abs(float(price_delta))
+        signed_vol = abs(float(buy_volume) - float(sell_volume))
+
+        self.ticks.append((now, abs_dp, signed_vol, abs(float(basis_bps))))
+        while self.ticks and now - self.ticks[0][0] > self.window_seconds:
+            self.ticks.popleft()
+
+        total_dp = sum(t[1] for t in self.ticks)
+        total_sv = sum(t[2] for t in self.ticks)
+        avg_basis = sum(t[3] for t in self.ticks) / len(self.ticks) if self.ticks else abs(float(basis_bps))
+
+        raw_lambda = total_dp / (total_sv + 1e-6)
+        state_lambda = raw_lambda * (1.0 + self.kappa_basis * (avg_basis / 100.0))
+        self.lambda_history.append(state_lambda)
+        return float(state_lambda)
+
+    def get_current_lambda_and_percentile(self) -> Tuple[float, float]:
+        if not self.lambda_history:
+            return 0.0, 0.50
+        curr = float(self.lambda_history[-1])
+        arr = sorted(self.lambda_history)
+        rank = sum(1 for x in arr if x <= curr)
+        pctile = float(rank / len(arr))
+        return curr, pctile
+
+
+def calculate_lvr_tax_bps(realized_volatility: float) -> float:
+    """
+    Milionis–Moallemi–Roughgarden Loss-Versus-Rebalancing (LVR) Adverse Selection Tax.
+    Formula:
+        LVR_bps = (σ^2 / 8) * 10,000
+
+    Args:
+        realized_volatility (float): Rolling realized return volatility (standard deviation of log returns).
+
+    Returns:
+        float: LVR adverse selection tax in basis points (bps).
+    """
+    sigma = max(0.0, float(realized_volatility))
+    lvr_ratio = (sigma ** 2) / 8.0
+    return float(lvr_ratio * 10000.0)
+
+

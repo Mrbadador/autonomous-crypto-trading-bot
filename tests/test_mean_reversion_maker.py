@@ -28,7 +28,9 @@ def compute_adx(high, low, close, period=14):
     return dx.rolling(period).mean()
 
 print("Loading historical data once...")
-df = pd.read_csv("historical_btc_usdt_5m.csv")
+import os
+csv_path = "data/historical/BTCUSDT_5m.csv" if os.path.exists("data/historical/BTCUSDT_5m.csv") else ("data/historical/historical_btc_usdt_5m.csv" if os.path.exists("data/historical/historical_btc_usdt_5m.csv") else "historical_btc_usdt_5m.csv")
+df = pd.read_csv(csv_path)
 c, h, l = df['close'], df['high'], df['low']
 df['rsi'] = compute_rsi(c, 14)
 df['atr'] = compute_atr(h, l, c, 14)

@@ -12,6 +12,8 @@ venv/
 env/
 ENV/
 .ruff_cache/
+Python/
+morning_briefing.txt
 
 # Databases & local state
 *.db

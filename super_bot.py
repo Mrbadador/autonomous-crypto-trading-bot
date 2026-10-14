@@ -629,16 +629,61 @@ class SuperBotTrader:
                 )
 
                 if is_sig:
-                    log.info(f"[GRID-OPPORTUNITY] [SIGNAL] {symbol} Oversold Dip! Price: ${curr_price:,.4f} <= Lower Band: ${lower_band:,.4f} | RSI: {rsi:.1f} <= {self.grid_rsi_thresh:.1f}")
+                    # Microstructure & Markov Gates for Dip-Buy
+                    from microstructure_guard import MicrostructureStateCache
+                    ms_state = MicrostructureStateCache.get_state(clean_sym)
+                    tox_halt = bool(ms_state.get("toxicity_halt", False))
+                    vpin_val = float(ms_state.get("vpin", 0.0) or 0.0)
+                    kyle_pct = float(ms_state.get("kyle_lambda_pctile", 0.5) or 0.5)
+                    lvr_bps = float(ms_state.get("lvr_tax_bps", 0.0) or 0.0)
+                    micro_p = float(ms_state.get("micro_price", 0.0) or curr_price)
+                    if micro_p <= 0.0:
+                        micro_p = curr_price
+
+                    if tox_halt or vpin_val >= 0.68 or kyle_pct >= 0.90:
+                        log.warning(f"[GRID-VETO] 🛑 Microstructure Toxicity Veto for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f}, Kyle Pctile={kyle_pct:.2f}. Dip-buy skipped.")
+                        continue
+
+                    # Markov Regime Cascade Check
+                    def _check_markov_cascade():
+                        try:
+                            with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                                row = conn.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                if row and row[0]:
+                                    return json.loads(row[0])
+                        except Exception:
+                            pass
+                        return {}
+                    m_data = await asyncio.to_thread(_check_markov_cascade)
+                    if m_data:
+                        p_bear = float(m_data.get("state_probabilities", {}).get("BEAR_CASCADE", 0.0) or 0.0)
+                        if p_bear >= 0.55:
+                            log.warning(f"[GRID-VETO] 🛑 Markov Bear Cascade Probability {p_bear:.2f} >= 0.55 for {symbol}. Skipping dip-buy into cascade.")
+                            continue
+
+                    # Avellaneda-Stoikov Reservation Price & LVR-Compensated Geometry
+                    # r(s, q) = s_micro * (1 - q * gamma * sigma^2)
+                    gamma = float(getattr(config, "AS_GAMMA_RISK_AVERSION", 1.5))
+                    atr_pct = float(ind.get("atr", 0.0) / curr_price) if curr_price > 0 else 0.015
+                    vol_sq = atr_pct ** 2
+                    q_inventory = len(self.active_positions)
+                    res_price = micro_p * (1.0 - (q_inventory * gamma * vol_sq * 0.1))
+                    maker_entry_price = min(curr_price, res_price)
+
+                    # Dynamic LVR-Compensated TP
+                    lvr_pct = (lvr_bps / 10000.0)
+                    target_tp_pct = max(self.grid_tp_pct, self.grid_tp_pct + lvr_pct)
+
+                    log.info(f"[GRID-OPPORTUNITY] [SIGNAL] {symbol} Oversold Dip! Price: ${curr_price:,.4f} | ResPrice: ${maker_entry_price:,.4f} | LVR Tax: {lvr_bps:.1f} bps")
                     
                     conv_score = 0.75
-                    rationale = f"Maker Grid dip confirmed: RSI {rsi:.1f} <= {self.grid_rsi_thresh:.0f}, Lower VWAP Band touch (${lower_band:,.4f})"
-                    log.info(f"[GRID-APPROVED] ⚡ {symbol} Approved via Clean Maker Dip-Buy Engine (Score: {conv_score:.2f} | {rationale})")
+                    rationale = f"AS-Maker Grid dip: RSI {rsi:.1f}, MicroPrice ${micro_p:,.4f}, AS-ResPrice ${maker_entry_price:,.4f}, LVR TP +{target_tp_pct*100:.2f}%"
+                    log.info(f"[GRID-APPROVED] ⚡ {symbol} Approved via AS-Maker Engine (Score: {conv_score:.2f} | {rationale})")
                         
                     # Execute Post-Only Maker Order
                     await self._execute_grid_maker_entry(
                         symbol=symbol,
-                        current_price=curr_price,
+                        current_price=maker_entry_price,
                         rsi=rsi,
                         conv_score=conv_score,
                         rationale=rationale

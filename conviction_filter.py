@@ -50,7 +50,20 @@ class ConvictionBoardroom:
                         (context_data.get("timeframe") == "5m" and float(context_data.get("rsi", 50.0) or 50.0) <= 30.0)
                     )
 
-                    # 2. Bitcoin Anchor (Cross-Market Contagion Filter)
+                    # 2. Bitcoin Anchor & BIS Crash-Risk Contagion Filter
+                    if "LONG" in side.upper():
+                        # BIS Crash-Risk Contagion Shield: Funding > +0.045% while 4H ROC <= 0
+                        row_crash = conn.execute("SELECT value FROM system_state WHERE key = 'funding_crash_risk'").fetchone()
+                        if row_crash and str(row_crash[0]).upper() == "CRITICAL":
+                            res["veto"] = {
+                                "execute": False,
+                                "conviction_score": 0.0,
+                                "stage": "bis_crash_shield",
+                                "final_rationale": "BIS Crash-Risk Shield Veto: Overheated perpetual funding (> +0.045%) with negative momentum detected across fleet. Long entries frozen."
+                            }
+                            res["log_warning"] = f"[BOARDROOM] 🚨 BIS CRASH SHIELD VETO: Extreme funding squeeze contagion detected. Blocking LONG entry for {symbol}."
+                            return res
+
                     if "LONG" in side.upper() and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
                         row_pause = conn.execute("SELECT value FROM system_state WHERE key IN ('ALT_LONG_PAUSE', 'alt_long_pause')").fetchall()
                         row_state = conn.execute("SELECT value FROM system_state WHERE key = 'btc_anchor_state'").fetchone()

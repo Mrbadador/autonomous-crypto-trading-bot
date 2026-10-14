@@ -514,7 +514,19 @@ class SwingArchitectTrader:
         bearish_kumo = (c < cloud_bottom) and (c < k) and chikou_bear_clear and ((t <= k * 1.005) or (c < cloud_bottom * 0.998))
 
         ts_col = "timestamp" if "timestamp" in df.columns else ("ts" if "ts" in df.columns else None)
-        candle_ts = int(df[ts_col].iloc[-1]) if ts_col else int(time.time() // 14400 * 14400)
+        if ts_col:
+            val = df[ts_col].iloc[-1]
+            if hasattr(val, "timestamp"):
+                candle_ts = int(val.timestamp() * 1000)
+            elif isinstance(val, (int, float, np.integer, np.floating)):
+                candle_ts = int(val)
+            else:
+                try:
+                    candle_ts = int(pd.to_datetime(val).timestamp() * 1000)
+                except Exception:
+                    candle_ts = int(time.time() // 14400 * 14400)
+        else:
+            candle_ts = int(time.time() // 14400 * 14400)
         vol_col = "volume" if "volume" in df.columns else ("vol" if "vol" in df.columns else None)
         vol_ratio_20ma = 1.0
         if vol_col and len(df) >= 20:
@@ -624,6 +636,33 @@ class SwingArchitectTrader:
             return False, f"Macro/Regime is {macro_bias}/{market_regime}. Halting long swing entries (anti-dead-cat-bounce)."
         if dir_upper == "SHORT" and (macro_bias.upper() not in ("BEARISH", "DEFENSIVE_BEAR", "BEAR_TREND") and market_regime not in ("BEAR_TREND", "BEARISH")):
             return False, f"Macro Bias is {macro_bias} and Regime is {market_regime}. Halting short swing entries (requires confirmed bear regime to avoid short squeezes)."
+
+        # Bayesian Markov Chain Gate
+        def _read_markov():
+            try:
+                with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                    row = conn.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                    if row and row[0]:
+                        return json.loads(row[0])
+            except Exception:
+                pass
+            return {}
+
+        markov_telemetry = await asyncio.to_thread(_read_markov)
+        if markov_telemetry:
+            probs = markov_telemetry.get("state_probabilities", {})
+            durations = markov_telemetry.get("expected_durations_bars", {})
+            p_bull = float(probs.get("BULL_EXPANSION", 0.0) or 0.0)
+            p_bear = float(probs.get("BEAR_CASCADE", 0.0) or 0.0)
+            d_bull = float(durations.get("BULL_EXPANSION", 0.0) or 0.0)
+
+            if dir_upper == "LONG":
+                if p_bear >= 0.50:
+                    return False, f"Markov Cascade Risk Active: pi(BEAR_CASCADE)={p_bear:.2f} >= 0.50. Long swing entry blocked."
+                # If market is trending, require robust Markov support
+                if market_regime in ("BULL_TREND", "BULLISH") and p_bull < 0.65 and d_bull < 4.0:
+                    return False, f"Markov Trend Persistence Insufficient: pi(BULL_EXPANSION)={p_bull:.2f} < 0.65 or duration={d_bull:.1f} < 4.0 bars."
+
         return True, "Macro clear."
 
     async def _check_news_veto(self, symbol: str, direction: str = "LONG") -> tuple[bool, str]:

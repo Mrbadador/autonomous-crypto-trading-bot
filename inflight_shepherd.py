@@ -584,6 +584,33 @@ class InflightPositionShepherd:
                         except Exception as carry_err:
                             log.warning(f"[CARRY-OPTIMIZER-NOTE] {std_sym}: {carry_err}")
 
+                    # Feature 6: Bayesian Markov Lookahead Breakdown Shield
+                    # If position has achieved profit (>= +1.0R) and 4-step Markov forecast indicates high breakdown risk (>= 0.60),
+                    # ratchet stop to breakeven / lock in profit immediately.
+                    if r_multiple >= 1.0 and verdict not in ("HARVEST_CLIMAX_EXECUTED", "EARLY_REVERSAL_EXIT"):
+                        try:
+                            def _read_markov_risk():
+                                try:
+                                    with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                                        row = conn.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                        if row and row[0]:
+                                            return json.loads(row[0])
+                                except Exception:
+                                    pass
+                                return {}
+                            m_tel = await asyncio.to_thread(_read_markov_risk)
+                            if m_tel:
+                                bd_risk = float(m_tel.get("breakdown_risk_4step", 0.0) or 0.0)
+                                if bd_risk >= 0.60:
+                                    log.warning(f"[MARKOV-SHEPHERD-SHIELD] 🛡️ High 4-step breakdown risk ({bd_risk:.2f} >= 0.60) detected for {std_sym} at {r_multiple:+.2f}R! Ratcheting stop to protect capital.")
+                                    tighten_sl = True
+                                    if "LONG" in pos_side and entry_p > current_sl:
+                                        suggested_sl = max(suggested_sl or 0.0, entry_p + (atr_val * 0.25))
+                                        verdict = "MOMENTUM_STALL"
+                                        diagnosis = f"Markov Breakdown Shield Active (Risk={bd_risk:.2f}): Stop ratcheted to lock gains."
+                        except Exception as m_err:
+                            log.debug(f"Markov shepherd check note: {m_err}")
+
                     sl_ratcheted = False
                     # Execute SL Ratchet if approved and valid
                     if tighten_sl and suggested_sl is not None and verdict not in ("HARVEST_CLIMAX_EXECUTED", "EARLY_REVERSAL_EXIT", "FUNDING_CARRY_HARVEST"):

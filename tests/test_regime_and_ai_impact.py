@@ -2,7 +2,9 @@ import pandas as pd
 import numpy as np
 
 # Load 15m BTC data (70,080 bars = 2 full years)
-df = pd.read_csv('historical_btc_usdt_15m.csv')
+import os
+csv_path = "data/historical/BTCUSDT_15m.csv" if os.path.exists("data/historical/BTCUSDT_15m.csv") else ("data/historical/historical_btc_usdt_15m.csv" if os.path.exists("data/historical/historical_btc_usdt_15m.csv") else "historical_btc_usdt_15m.csv")
+df = pd.read_csv(csv_path)
 c, h, l, v = df['close'], df['high'], df['low'], df['volume']
 
 # Technical Indicators

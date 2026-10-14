@@ -739,6 +739,17 @@ class MicrostructureGuard:
                     log.warning(f"[OBSERVATION MODE] High Toxicity Flow ({symbol} VPIN: {eff_vpin:.2f}), allowing execution for data harvest.")
                     return True, f"[OBSERVATION MODE] VPIN Toxicity Veto (VPIN: {eff_vpin:.2f})"
 
+            # Kyle's Lambda and Toxicity Halt Gate
+            cached_tox_halt = bool(cached_ms.get("toxicity_halt", False))
+            cached_kyle_pct = float(cached_ms.get("kyle_lambda_pctile", 0.5) or 0.5)
+            if cached_tox_halt:
+                if self.active_veto:
+                    log.warning(f"[VETO] State-Dependent Toxicity Halt active for {symbol} (Kyle Lambda Pctile: {cached_kyle_pct:.2f}). Blocking trade.")
+                    return False, f"Toxicity Halt Active (Kyle Lambda Pctile: {cached_kyle_pct:.2f})"
+                else:
+                    log.warning(f"[OBSERVATION MODE] Toxicity Halt active ({symbol}), allowing execution for data harvest.")
+                    return True, f"[OBSERVATION MODE] Toxicity Halt Active (Kyle Lambda Pctile: {cached_kyle_pct:.2f})"
+
             # 4. Live Order Book Microstructure Table Inspection (oracle_microstructure)
             try:
                 import sqlite3 as _sqlite3

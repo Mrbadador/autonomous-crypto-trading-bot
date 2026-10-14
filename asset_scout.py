@@ -55,7 +55,7 @@ def get_top_futures_pairs(limit=50):
         log.error(f"Error fetching Bitget Top pairs: {e}")
         return []
 
-def fetch_futures_ohlcv(symbol, interval="15m", limit=105):
+def fetch_futures_ohlcv(symbol, interval="15m", limit=300):
     """
     Pulls OHLCV bars directly from Bitget V2 Mix Market API.
     Matches live execution basis with zero price wick divergence.
@@ -440,6 +440,26 @@ def run_scout():
                                 except Exception:
                                     pass
                         
+                        # BIS Crash-Risk Contagion Shield: Funding > +0.045% while 4H ROC <= 0
+                        high_funding = any(float(r) >= 0.00045 for r in funding_rates.values())
+                        btc_df_4h = fetch_futures_ohlcv("BTCUSDT", interval="4h", limit=10)
+                        btc_roc_negative = False
+                        if btc_df_4h is not None and len(btc_df_4h) >= 2:
+                            c_now = float(btc_df_4h["close"].iloc[-1])
+                            c_prev = float(btc_df_4h["close"].iloc[-2])
+                            btc_roc_negative = (c_now <= c_prev)
+
+                        funding_crash_state = "CRITICAL" if (high_funding and btc_roc_negative) else "NORMAL"
+                        for db_name in ["trading_data.db", "trading_ledger.db"]:
+                            try:
+                                with sqlite3.connect(db_name, timeout=5.0) as conn_cr:
+                                    conn_cr.execute("""
+                                        INSERT OR REPLACE INTO system_state (key, value, updated_at)
+                                        VALUES ('funding_crash_risk', ?, ?)
+                                    """, (funding_crash_state, datetime.now(timezone.utc).isoformat()))
+                            except Exception:
+                                pass
+
                         valid_opps = yield_hunter.evaluate_opportunities(funding_rates)
                         for opp in valid_opps:
                             yield_pct = opp["annualized_yield"] * 100.0

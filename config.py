@@ -460,10 +460,11 @@ LLM_ATTEMPT_TIMEOUT = int(os.getenv("LLM_ATTEMPT_TIMEOUT", "180"))
 # Vol Gate Multipliers (V11.0 — extracted from hardcoded bot.py values)
 # ---------------------------------------------------------------------------
 SNIPER_VOL_GATE_MULT    = float(os.getenv("SNIPER_VOL_GATE_MULT", "1.5"))
-BERSERKER_VOL_GATE_MULT = float(os.getenv("BERSERKER_VOL_GATE_MULT", "1.25"))
-
-
-
+# ---------------------------------------------------------------------------
+# Quantitative Microstructure & Reservation Price Parameters
+# ---------------------------------------------------------------------------
+USE_DETERMINISTIC_MICROSTRUCTURE = os.getenv("USE_DETERMINISTIC_MICROSTRUCTURE", "true").lower() in ("true", "1")
+AS_GAMMA_RISK_AVERSION           = float(os.getenv("AS_GAMMA_RISK_AVERSION", "1.5"))
 # DIAGNOSTIC BOOT (V11.0 — uses logger, not print, to avoid stdout pollution)
 CACHE_TTL_SECONDS  = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 _log.info(f"[SYSTEM] Config Loaded: Balance=${INITIAL_BALANCE}, Risk={RISK_PER_TRADE_PCT}%")

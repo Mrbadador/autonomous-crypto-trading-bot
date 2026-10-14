@@ -1,0 +1,44 @@
+PRE-FLIGHT DATABASE TELEMETRY & SNAPSHOT AUDIT
+Timestamp: 2026-10-14T21:32:00Z
+Local: 2026-10-14 23:32:00 (UTC+2)
+
+1. DATABASE FILE ARTIFACTS
+trading_data.db:   44,208,128 bytes (LastWriteTime: 2026-10-14 23:21:20)
+trading_ledger.db: 58,314,752 bytes (LastWriteTime: 2026-10-14 23:21:20)
+
+2. CORE POSITION & EXECUTION TABLE COUNTS
+trading_data.db -> open_positions:       0 rows
+trading_data.db -> swing_open_positions: 0 rows
+trading_data.db -> trades:               365 rows
+trading_data.db -> swing_trades:         170 rows
+trading_data.db -> market_regime:        1 rows
+
+3. PRE-FLIGHT market_regime TABLE DEFINITION & COLUMNS
+Table exists in trading_data.db: YES (14 legacy columns)
+Columns: ['id', 'timestamp', 'regime', 'hurst', 'adx', 'plus_di', 'minus_di', 'macro_trend', 'ai_bias', 'trap_risk', 'ai_thesis', 'turbulence_index', 'turbulence_threshold', 'turbulence_state']
+Missing columns to be added on restart: ['symbol', 'bar_end_ts', 'source_close_ts']
+
+Table exists in trading_ledger.db: NO (Will be created via DDL migration on boot)
+
+4. PRE-FLIGHT SYSTEM STATE SNAPSHOT (Key Macro & Regime Telemetry)
+market_regime_label:        ('BEAR_TREND', '2026-10-14T21:19:20.648520+00:00')
+ai_macro_bias:              ('BEARISH', '2026-10-14T21:15:55.422940+00:00')
+btc_anchor_state:           ('DISTRIBUTION_DUMP_RISK', '2026-10-14T21:15:55.422940+00:00')
+alt_long_pause:             ('1', '2026-10-14T21:15:55.422940+00:00')
+macro_global_killswitch:    ('0', '2026-10-14T20:43:19.117856+00:00')
+
+New Post-Fix Keys Currently Absent (Expected None Pre-Flight):
+macro_killswitch_state:     None
+macro_killswitch_asof:      None
+ai_macro_posture_held:      None
+ai_macro_posture_asof:      None
+btc_anchor_held:            None
+
+5. DEPENDENCY PARITY
+pandas_ta: NOT INSTALLED in .venv (Expected. Pure Python fallback active & verified).
+
+6. REGRESSION SUITE VERIFICATION
+All 7 regime P0 test suites passed cleanly (0 errors, 0 failures, 105 total unit assertions).
+All 5 core files passed py_compile.
+Fleet position status: COMPLETELY FLAT (0 open positions across all engines).
+RESTART GATE: PASS (SAFE TO RESTART).

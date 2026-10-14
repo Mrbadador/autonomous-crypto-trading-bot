@@ -16,7 +16,8 @@ class TestEmpiricalKellyRiskManager(unittest.TestCase):
         rm = RiskManager()
         # Mock historical return series with severe losses
         mock_returns = [-0.03, -0.02, -0.04, -0.01, -0.03, -0.02, -0.05]
-        with patch.object(rm, "_get_historical_returns", return_value=mock_returns):
+        with patch.object(rm, "_get_historical_returns", return_value=mock_returns), \
+             patch.object(rm, "_get_live_win_rate", return_value=(0.20, 10)):
             kelly_f = rm.calculate_empirical_kelly_fraction()
             self.assertEqual(kelly_f, 0.0)
 

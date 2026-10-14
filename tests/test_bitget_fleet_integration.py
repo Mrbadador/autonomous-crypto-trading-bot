@@ -90,7 +90,7 @@ def compute_indicators(df):
 
 print("[*] 1. Loading Bitget Perpetual Derivatives Markets...")
 markets = exchange.load_markets()
-print(f"  ✓ Successfully loaded {len(markets)} Bitget contract specifications.\n")
+print(f"  [OK] Successfully loaded {len(markets)} Bitget contract specifications.\n")
 
 print("[*] 2. Auditing Real-Time Multi-Timeframe Feeds & Market Sizing for Fleet:")
 print(f"  {'Symbol':<16} {'Price':>10} {'Min Qty':>10} {'Tick Size':>10} {'1H ADX':>8} {'15m RSI':>8} {'5m Vol':>8}")

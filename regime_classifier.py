@@ -73,6 +73,12 @@ class RegimeClassifier:
             "evaluated_at_utc": None,
             "evaluated_at_epoch": 0.0,
         }
+        try:
+            from markov_regime import MarkovRegimeEngine
+            self.markov_engine = MarkovRegimeEngine()
+        except Exception as me_err:
+            log.warning(f"Could not initialize MarkovRegimeEngine: {me_err}")
+            self.markov_engine = None
         self._init_db()
 
     def _init_db(self):
@@ -901,6 +907,16 @@ class RegimeClassifier:
                 f"(State: {turb_state}). Capping leverage to {recommended_leverage}x and activating Turbulence Shield!"
             )
 
+        # -----------------------------------------------------------------------
+        # Bayesian Markov Chain & Regime Transition Engine
+        # -----------------------------------------------------------------------
+        markov_telemetry = {}
+        if getattr(self, "markov_engine", None):
+            try:
+                markov_telemetry = self.markov_engine.process_bars(df)
+            except Exception as me_err:
+                log.warning(f"[MARKOV-REGIME-ERROR] Failed to process bars: {me_err}")
+
         timestamp = datetime.now(UTC).isoformat()
         source_close_ts = self._bar_close_ts(df, "15m")
         try:
@@ -979,6 +995,11 @@ class RegimeClassifier:
                     INSERT OR REPLACE INTO system_state (key, value, updated_at)
                     VALUES ('finrl_turbulence_json', ?, ?)
                 """, (json.dumps(turb_info), timestamp))
+                if markov_telemetry:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO system_state (key, value, updated_at)
+                        VALUES ('markov_regime_telemetry', ?, ?)
+                    """, (json.dumps(markov_telemetry), timestamp))
             conn.close()
             
             log.info(
