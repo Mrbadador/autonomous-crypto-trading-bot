@@ -20,16 +20,25 @@ class ConvictionBoardroom:
             res = {"veto": None}
             try:
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                    # 1. Dynamic symbol whitelist in SQLite system_state
+                    # 1. Config-owned symbol whitelist (falls back to config.SYMBOLS)
                     row = conn.execute("SELECT value FROM system_state WHERE key = 'ALLOWED_SYMBOLS'").fetchone()
+                    import config as _cfg
                     if row and row[0]:
-                        allowed = json.loads(row[0])
+                        try:
+                            allowed = json.loads(row[0])
+                        except Exception:
+                            allowed = getattr(_cfg, "SYMBOLS", [])
+                    else:
+                        allowed = getattr(_cfg, "SYMBOLS", [])
+
+                    if allowed:
                         sym_clean = symbol.upper().replace("/", "").replace("-", "")
                         allowed_clean = [s.upper().replace("/", "").replace("-", "") for s in allowed]
                         if sym_clean not in allowed_clean:
                             res["veto"] = {
                                 "execute": False,
                                 "conviction_score": 0.0,
+                                "stage": "whitelist_gate",
                                 "final_rationale": f"Asset {symbol} filtered out — ALLOWED_SYMBOLS fleet constraint active."
                             }
                             res["log"] = f"[BOARDROOM] VETO: {symbol} is not in ALLOWED_SYMBOLS whitelist ({allowed}). Bypassing entry."
@@ -76,6 +85,7 @@ class ConvictionBoardroom:
                                 res["veto"] = {
                                     "execute": False,
                                     "conviction_score": 0.0,
+                                    "stage": "bitcoin_anchor",
                                     "final_rationale": f"Bitcoin Anchor Contagion Veto: BTC is under institutional distribution ({btc_st}). Alt longs paused."
                                 }
                                 res["log_warning"] = f"[BOARDROOM] ⚓ BITCOIN ANCHOR VETO: Altcoin long on {symbol} blocked. BTC state: {btc_st}, ALT_LONG_PAUSE=1."
@@ -93,6 +103,7 @@ class ConvictionBoardroom:
                                 res["veto"] = {
                                     "execute": False,
                                     "conviction_score": 0.0,
+                                    "stage": "leader_gate",
                                     "final_rationale": f"Leader Gate Veto: Asset {symbol} is currently flagged on the AI Avoid/Chop List. Capital reserved for alpha leaders."
                                 }
                                 res["log_warning"] = f"[BOARDROOM] 🚫 LEADER GATE VETO: {symbol} is in the AI Avoid/Chop List ({avoid_raw}). Vetoing entry."
@@ -102,6 +113,7 @@ class ConvictionBoardroom:
                 res["veto"] = {
                     "execute": False,
                     "conviction_score": 0.0,
+                    "stage": "db_error_fail_closed",
                     "final_rationale": f"Boardroom Pre-Filter Veto (Fail-Closed on DB Error): {e}"
                 }
                 res["log_warning"] = f"[BOARDROOM] 🛡️ FAIL-CLOSED SAFETY VETO: Error reading system_state pre-filters: {e}"
@@ -130,25 +142,28 @@ class ConvictionBoardroom:
                                 agents_votes_json TEXT,
                                 rationale TEXT,
                                 subsequent_12h_pnl REAL,
-                                counterfactual_outcome TEXT
+                                counterfactual_outcome TEXT,
+                                served_model_id TEXT
                             )
                         """)
                         v_time = datetime.now(timezone.utc).isoformat()
+                        v_stage = pre_filter_res["veto"].get("stage", "pre_filter")
                         v_rat = pre_filter_res["veto"].get("final_rationale", "Pre-Filter Veto")
                         conn_v.execute("""
-                            INSERT INTO boardroom_decisions
-                            (timestamp, symbol, direction, conviction_score, verdict, agents_votes_json, rationale, subsequent_12h_pnl, counterfactual_outcome)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO boardroom_decisions 
+                            (timestamp, symbol, direction, conviction_score, verdict, agents_votes_json, rationale, subsequent_12h_pnl, counterfactual_outcome, served_model_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             v_time,
                             str(symbol).upper(),
                             str(side).upper(),
                             0.0,
                             "VETOED",
-                            json.dumps({"stage": "pre_filter", "error": pre_filter_res.get("err")}),
+                            json.dumps({"stage": v_stage, "reason": v_rat, "error": pre_filter_res.get("err")}),
                             v_rat,
                             None,
-                            "PENDING"
+                            "PENDING",
+                            "deterministic_pre_filter"
                         ))
                 except Exception as ve:
                     log.debug(f"[BOARDROOM] Pre-filter veto persist note: {ve}")
@@ -237,7 +252,8 @@ class ConvictionBoardroom:
                                 agents_votes_json TEXT,
                                 rationale TEXT,
                                 subsequent_12h_pnl REAL,
-                                counterfactual_outcome TEXT
+                                counterfactual_outcome TEXT,
+                                served_model_id TEXT
                             )
                         """)
                         votes_json = json.dumps({
@@ -248,8 +264,8 @@ class ConvictionBoardroom:
                         })
                         conn.execute("""
                             INSERT INTO boardroom_decisions 
-                            (timestamp, symbol, direction, conviction_score, verdict, agents_votes_json, rationale, subsequent_12h_pnl, counterfactual_outcome)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (timestamp, symbol, direction, conviction_score, verdict, agents_votes_json, rationale, subsequent_12h_pnl, counterfactual_outcome, served_model_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             now_str,
                             symbol_upper,
@@ -259,7 +275,8 @@ class ConvictionBoardroom:
                             votes_json,
                             rationale,
                             None,
-                            "PENDING"
+                            "PENDING",
+                            debate.get("served_model_id") or "unattributed"
                         ))
                 except Exception as dbe:
                     log.debug(f"[BOARDROOM] State persist note: {dbe}")

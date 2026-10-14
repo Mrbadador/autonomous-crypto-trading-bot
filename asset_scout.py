@@ -356,7 +356,7 @@ def run_ai_mtf_confluence_scan():
         res = asyncio.run(ai_engine.evaluate_mtf_confluence(mtf_packet, timeout_sec=25.0))
         if res:
             # Deterministic quantitative enforcement on LLM output:
-            min_runway_pct = float(getattr(config, "MTF_MIN_RUNWAY_PCT", 0.010)) * 100.0  # e.g. 1.0%
+            min_runway_pct = float(getattr(config, "MTF_MIN_RUNWAY_PCT", 0.004)) * 100.0  # matches config default 0.4%
             c_matrix = res.get("confluence_matrix", {})
             for s, entry in c_matrix.items():
                 m_info = batch_mtf.get(s)
@@ -510,13 +510,8 @@ def run_scout():
                             
                             conn.execute("DELETE FROM active_fleet_config WHERE id > ?", (len(top_10),))
                             
-                            # Connect directly to ALLOWED_SYMBOLS gate in conviction_filter.py
-                            import json as _json
-                            conn.execute("""
-                                INSERT OR REPLACE INTO system_state (key, value, updated_at)
-                                VALUES ('ALLOWED_SYMBOLS', ?, ?)
-                            """, (_json.dumps(formatted_symbols), timestamp))
-
+                            # P0-1 FIX: asset_scout writes advisory fleet metrics to active_fleet_config
+                            # but does NOT overwrite ALLOWED_SYMBOLS in system_state (which is config-owned).
                             conn.execute("""
                                 INSERT OR REPLACE INTO system_state (key, value, updated_at)
                                 VALUES ('asset_scout_last_sweep_timestamp', ?, ?)
