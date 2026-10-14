@@ -14,6 +14,7 @@ import requests
 import socket
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Any
+import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -3363,6 +3364,30 @@ with tab_risk:
     d_bull = float(durations.get("BULL_EXPANSION", 0.0) or 0.0)
     d_bear = float(durations.get("BEAR_CASCADE", 0.0) or 0.0)
 
+    # Normalize stationary distribution (dict or list)
+    st_chop, st_bull, st_bear = 0.333, 0.333, 0.333
+    raw_stat = m_tel.get("stationary_distribution")
+    if isinstance(raw_stat, dict):
+        st_chop = float(raw_stat.get("CHOP", 0.333) or 0.333)
+        st_bull = float(raw_stat.get("BULL_EXPANSION", 0.333) or 0.333)
+        st_bear = float(raw_stat.get("BEAR_CASCADE", 0.333) or 0.333)
+    elif isinstance(raw_stat, (list, tuple, np.ndarray)) and len(raw_stat) >= 3:
+        st_chop = float(raw_stat[0])
+        st_bull = float(raw_stat[1])
+        st_bear = float(raw_stat[2])
+
+    # Normalize 4-step forecast probabilities (dict or list, check forecast_4step or forecast_probabilities)
+    fc_chop, fc_bull, fc_bear = p_chop, p_bull, p_bear
+    raw_fc = m_tel.get("forecast_probabilities") or m_tel.get("forecast_4step")
+    if isinstance(raw_fc, dict):
+        fc_chop = float(raw_fc.get("CHOP", p_chop) or 0.0)
+        fc_bull = float(raw_fc.get("BULL_EXPANSION", p_bull) or 0.0)
+        fc_bear = float(raw_fc.get("BEAR_CASCADE", p_bear) or 0.0)
+    elif isinstance(raw_fc, (list, tuple, np.ndarray)) and len(raw_fc) >= 3:
+        fc_chop = float(raw_fc[0])
+        fc_bull = float(raw_fc[1])
+        fc_bear = float(raw_fc[2])
+
     # Top 4 Markov KPI Cards
     mk1, mk2, mk3, mk4 = st.columns(4)
     with mk1:
@@ -3397,13 +3422,10 @@ with tab_risk:
         """, unsafe_allow_html=True)
 
     with mk4:
-        st_chop = float(stat_dist.get("CHOP", 0.33) or 0.33) * 100
-        st_bull = float(stat_dist.get("BULL_EXPANSION", 0.33) or 0.33) * 100
-        st_bear = float(stat_dist.get("BEAR_CASCADE", 0.33) or 0.33) * 100
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #a855f7; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Stationary Equilibrium (π*)</div>
-            <div style="font-size: 1.05rem; font-weight: 800; color: #a855f7; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{st_chop:.0f}% / {st_bull:.0f}% / {st_bear:.0f}%</div>
+            <div style="font-size: 1.05rem; font-weight: 800; color: #a855f7; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{st_chop*100:.0f}% / {st_bull*100:.0f}% / {st_bear*100:.0f}%</div>
             <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Chop / Bull / Bear Equilibrium</div>
         </div>
         """, unsafe_allow_html=True)
@@ -3469,16 +3491,8 @@ with tab_risk:
         # Comparison: Current Belief π_t vs. 4-step Forecast π_{t+4} vs. Stationary π*
         labels_x = ["CHOP", "BULL_EXP", "BEAR_CAS"]
         pi_curr_vals = [p_chop, p_bull, p_bear]
-        pi_fc_vals = [
-            float(fc_probs.get("CHOP", p_chop) or 0.0),
-            float(fc_probs.get("BULL_EXPANSION", p_bull) or 0.0),
-            float(fc_probs.get("BEAR_CASCADE", p_bear) or 0.0)
-        ]
-        pi_stat_vals = [
-            float(stat_dist.get("CHOP", 0.33) or 0.33),
-            float(stat_dist.get("BULL_EXPANSION", 0.33) or 0.33),
-            float(stat_dist.get("BEAR_CASCADE", 0.33) or 0.33)
-        ]
+        pi_fc_vals = [fc_chop, fc_bull, fc_bear]
+        pi_stat_vals = [st_chop, st_bull, st_bear]
 
         fig_bars = go.Figure()
         fig_bars.add_trace(go.Bar(
