@@ -7,6 +7,7 @@ import numpy as np
 import logging
 import os
 import re
+import time
 from dotenv import load_dotenv
 from datetime import datetime, UTC
 
@@ -94,8 +95,70 @@ class RegimeClassifier:
             log.critical(f"Failed to initialize database table: {e}")
             raise
 
+    @staticmethod
+    def _interval_seconds(interval):
+        """Seconds covered by a Bitget granularity string ('15m', '4h', '1d'); None if unparsable."""
+        match = re.fullmatch(r"(\d+)\s*([mhd])", str(interval).strip().lower())
+        if not match:
+            return None
+        return int(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+    def _normalize_bars(self, df, interval, symbol="BTCUSDT"):
+        """Returns strictly closed, sorted, de-duplicated bars with no forward-dated row.
+
+        Bitget's candle endpoint always appends the bar that is still forming; its close,
+        high and low mutate between calls. Feeding it to ADX/Hurst/turbulence means the
+        regime verdict is partly a function of an incomplete bar, so any bar whose close
+        time has not passed yet is dropped here. Out-of-order and duplicate timestamps are
+        repaired; genuine gaps in the history are reported, never fabricated.
+        """
+        if df is None or df.empty:
+            return df
+        bars = df.copy()
+        try:
+            bars["open_time"] = bars["open_time"].astype("int64")
+            for col in ("open", "high", "low", "close", "volume"):
+                if col in bars.columns:
+                    bars[col] = bars[col].astype(float)
+        except (TypeError, ValueError) as conv_err:
+            log.warning(f"[BARS] {symbol} {interval}: non-numeric candle payload ({conv_err}); using rows as returned.")
+            return bars
+
+        bars = bars.dropna(subset=[c for c in ("open", "high", "low", "close") if c in bars.columns])
+        bars = bars.sort_values("open_time", kind="mergesort")
+        dupes = int(bars.duplicated(subset="open_time").sum())
+        if dupes:
+            log.warning(f"[BARS] {symbol} {interval}: dropped {dupes} duplicate open_time row(s).")
+            bars = bars.drop_duplicates(subset="open_time", keep="last")
+
+        step_sec = self._interval_seconds(interval)
+        if step_sec is not None:
+            cutoff_ms = int(time.time() * 1000)
+            closed = bars[bars["open_time"] + step_sec * 1000 <= cutoff_ms]
+            dropped = int(len(bars) - len(closed))
+            if dropped:
+                log.debug(f"[BARS] {symbol} {interval}: discarded {dropped} still-forming bar(s) from regime input.")
+            bars = closed
+
+        bars = bars.reset_index(drop=True)
+
+        if step_sec is not None and len(bars) >= 2:
+            steps = bars["open_time"].diff().dropna().astype("int64").to_numpy()
+            expected = step_sec * 1000
+            broken = steps[steps != expected]
+            if broken.size:
+                log.warning(
+                    f"[BARS] {symbol} {interval}: {broken.size} discontinuous step(s) in closed history "
+                    f"(expected {expected} ms, worst {int(max(broken))} ms). Indicator memory is shorter than nominal."
+                )
+        return bars
+
     def fetch_ohlcv(self, symbol="BTCUSDT", interval="15m", limit=105):
-        """Pulls OHLCV bars directly from the public Bitget USDT-FUTURES API."""
+        """Pulls OHLCV bars directly from the public Bitget USDT-FUTURES API.
+
+        The returned frame is normalised by `_normalize_bars`: closed bars only, sorted
+        and de-duplicated by `open_time`.
+        """
         clean_sym = symbol.replace("/", "").replace("-", "").upper()
         url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={clean_sym}&granularity={interval}&limit={limit}&productType=USDT-FUTURES"
         try:
@@ -108,7 +171,7 @@ class RegimeClassifier:
                     ])
                     for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = df[col].astype(float)
-                    return df
+                    return self._normalize_bars(df, interval, symbol=clean_sym)
         except Exception as e:
             log.error(f"Failed to fetch Bitget historical bars: {e}")
             return None
@@ -118,13 +181,14 @@ class RegimeClassifier:
         """ISO-8601 UTC close time of the newest bar in a Bitget OHLCV frame.
 
         Bitget returns `open_time` in milliseconds; the close time is open_time plus the
-        bar duration. Returns None (stored as NULL) rather than a guessed value.
+        bar duration. Because fetch_ohlcv() discards still-forming bars this is the close
+        time of the last *completed* bar, i.e. a market timestamp the data already
+        reflects. Returns None (stored as NULL) rather than a guessed value.
         """
         try:
-            match = re.fullmatch(r"(\d+)\s*([mhd])", str(interval).strip().lower())
-            if not match:
+            seconds = RegimeClassifier._interval_seconds(interval)
+            if seconds is None:
                 raise ValueError(f"unparsable granularity '{interval}'")
-            seconds = int(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
             last_open_ms = int(float(df["open_time"].iloc[-1]))
             return datetime.fromtimestamp((last_open_ms + seconds * 1000) / 1000.0, UTC).isoformat()
         except Exception as e:
@@ -132,24 +196,31 @@ class RegimeClassifier:
             return None
 
     def calculate_hurst(self, prices):
-        """Estimates Hurst Exponent over prices using Rescaled Range (R/S) Analysis."""
+        """Estimates Hurst Exponent over prices using Rescaled Range (R/S) Analysis.
+
+        R/S is computed over every overlapping window of each lag, so the newest bars are
+        always inside the sample. The previous implementation sliced the series into
+        num_subsets = N // lag *disjoint* blocks starting at index 0, which silently threw
+        away the trailing N % lag returns: for the live 99-return window at lag 50 only the
+        oldest 50 returns were used, so a violent move in the most recent 25 bars could not
+        change the exponent at all.
+        """
         if len(prices) < 50:
             return 0.50
         try:
             # Convert series to logarithmic returns
             returns = np.diff(np.log(prices))
             N = len(returns)
-            
+
             lags = [10, 20, 30, 40, 50]
             valid_pairs = []
-            
+
             for lag in lags:
-                num_subsets = N // lag
-                if num_subsets == 0:
+                if N < lag:
                     continue
                 rs_sub = []
-                for i in range(num_subsets):
-                    sub = returns[i*lag : (i+1)*lag]
+                for start in range(0, N - lag + 1):
+                    sub = returns[start:start + lag]
                     mean_adj = sub - np.mean(sub)
                     cum_sum = np.cumsum(mean_adj)
                     r = np.max(cum_sum) - np.min(cum_sum)
@@ -600,7 +671,10 @@ class RegimeClassifier:
 
                 telemetry = {
                     "symbol": "BTC/USDT",
+                    # fetch_ohlcv() discards still-forming bars, so this is the last completed
+                    # 15m close. The as-of stamp stops the arbiter mistaking it for a live tick.
                     "price": float(df["close"].iloc[-1]),
+                    "price_as_of_utc": self._bar_close_ts(df, "15m"),
                     "adx": round(float(adx), 2),
                     "plus_di": round(float(plus_di), 2),
                     "minus_di": round(float(minus_di), 2),
