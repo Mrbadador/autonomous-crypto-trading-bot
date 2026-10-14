@@ -830,21 +830,47 @@ async def audit_live_exchange_positions():
 
                                 notes_str = f"On-exchange {close_type.upper()} on Bitget UTA (Net: ${net_pnl:+.2f}, Fee: -${est_fee:.3f})"
                                 
-                                # Check if engine already closed & recorded this trade in closed_tbl recently
+                                # Check if engine already closed & recorded this trade in closed_tbl recently (last 15 minutes)
                                 recent_close = conn.execute(
-                                    f"SELECT timestamp FROM {closed_tbl} WHERE symbol = ? ORDER BY rowid DESC LIMIT 1",
-                                    (sym,)
+                                    f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND (timestamp >= datetime('now', '-15 minutes') OR timestamp >= datetime('now', '-15 minutes', 'utc')) ORDER BY rowid DESC LIMIT 1",
+                                    (sym, sym.replace('/', ''), entry_p, entry_p)
                                 ).fetchone()
                                 
                                 # 1. Log to closed trades table (only if not already recorded)
                                 ledger_write_ok = True
                                 if not recent_close:
                                     try:
-                                        cur_ins = conn.execute(
-                                            f"INSERT INTO {closed_tbl} (timestamp, symbol, side, type, entry_price, exit_price, qty, pnl, balance, notes, status, action) "
-                                            "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?)",
-                                            (sym, side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, side)
+                                        roe_val = (
+                                            ((exit_p - entry_p) / entry_p * lev * 100.0) if (is_long and entry_p > 0)
+                                            else (((entry_p - exit_p) / entry_p * lev * 100.0) if entry_p > 0 else 0.0)
                                         )
+                                        intended_entry_val = row_dict.get("intended_entry_price") or entry_p
+                                        actual_fill_entry_val = row_dict.get("actual_fill_price") or entry_p
+                                        slippage_bps_val = row_dict.get("slippage_bps") or 0.0
+                                        gates_snap_val = row_dict.get("gates_snapshot")
+
+                                        if closed_tbl == "swing_trades":
+                                            cur_ins = conn.execute(
+                                                """INSERT INTO swing_trades (
+                                                    timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct,
+                                                    holding_hours, exit_reason, notes, intended_entry_price, actual_fill_price,
+                                                    slippage_bps, fee_paid_usd, fee_maker_usd, fee_taker_usd, funding_usd,
+                                                    funding_source, gates_snapshot, status
+                                                )
+                                                VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                                (
+                                                    sym, side, entry_p, exit_p, qty, net_pnl, roe_val,
+                                                    holding_hours, close_type, notes_str, intended_entry_val, actual_fill_entry_val,
+                                                    slippage_bps_val, est_fee, 0.0, est_fee, funding_val,
+                                                    "reconciler", gates_snap_val, "CLOSED"
+                                                )
+                                            )
+                                        else:
+                                            cur_ins = conn.execute(
+                                                f"INSERT INTO {closed_tbl} (timestamp, symbol, side, type, entry_price, exit_price, qty, pnl, balance, notes, status, action) "
+                                                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?)",
+                                                (sym, side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, side)
+                                            )
                                         ledger_write_ok = cur_ins.rowcount == 1
                                     except Exception as ins_e:
                                         ledger_write_ok = False
@@ -853,6 +879,7 @@ async def audit_live_exchange_positions():
                                 # 2. Delete from open positions and commit immediately — only when the ledger row is confirmed
                                 if ledger_write_ok:
                                     conn.execute(f"DELETE FROM {tbl} WHERE symbol = ?", (sym,))
+                                    pruned_count += 1
                                 else:
                                     log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{sym} — closed-trade row not written; will retry next pass")
                                 if close_type == "sl_hit" or net_pnl < 0:
@@ -869,7 +896,6 @@ async def audit_live_exchange_positions():
                                     except Exception as cd_err:
                                         log.debug(f"[RECONCILER-COOLDOWN-NOTE] {cd_err}")
                                 conn.commit()
-                                pruned_count += 1
                                 
                                 # 3. Dispatch Email Alert (Deduplicated with 15-minute cooldown and engine close check)
                                 import time as _tm

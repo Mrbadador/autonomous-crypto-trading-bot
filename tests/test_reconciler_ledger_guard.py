@@ -12,13 +12,10 @@ Safety: throwaway temp DB + fake BitgetUTAClient injected via sys.modules.
 No live DB, no network, no orders, no email. Table DDL mirrors trading_data.db as of
 2026-10-13 (captured from sqlite_master).
 
-Known limitation deliberately encoded: the finalize site
-(reconciliation_engine.py:843-847) issues a generic INSERT containing the columns
-type/qty/balance/action, which production `swing_trades` does not have. For swing rows that
-INSERT always raises, so the guard converts a former silent trade loss into a deferred prune.
-test_swing_finalize_schema_mismatch_defers_prune is a CHARACTERIZATION test locking in that
-behaviour - if the insert site is fixed to use the swing_trades column set, this test must be
-updated to assert a successful write + prune instead.
+TASK 6 fix coverage: the finalize site used to issue a generic INSERT (type/qty/balance/action)
+that production swing_trades does not have, so every swing row raised and deferred forever. It
+now routes swing_trades through the swing column set, and its recent_close dedup probe is
+windowed to 15 minutes instead of matching ANY historical row for the symbol.
 """
 
 import asyncio
@@ -247,14 +244,66 @@ class ReconcilerLedgerGuardTest(unittest.IsolatedAsyncioTestCase):
         counts = self._table_counts()
         self.assertEqual(counts["open_positions"], 1, "P2 guard: open row must survive a failed ledger INSERT")
 
-    async def test_swing_finalize_schema_mismatch_defers_prune(self):
-        """Characterization test (see module docstring): production swing_trades cannot accept
-        the finalize-site INSERT, so the guard must retain the row rather than drop the trade."""
+    async def test_swing_finalize_writes_ledger_and_prunes(self):
+        """TASK 6: swing rows must be recorded through the swing_trades column set, not deferred.
+
+        Inverted from the previous characterization test, which asserted this INSERT always
+        raised against production DDL.
+        """
         await rec.audit_live_exchange_positions()
 
         counts = self._table_counts()
-        self.assertEqual(counts["swing_trades"], 0, "finalize-site INSERT is expected to fail on production swing_trades DDL")
-        self.assertEqual(counts["swing_open_positions"], 1, "P2 guard: swing open row must not be pruned without a ledger row")
+        self.assertEqual(counts["swing_trades"], 1, "finalize site must write a swing_trades ledger row")
+        self.assertEqual(counts["swing_open_positions"], 0, "swing open row prunes only after that row is confirmed")
+
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT side, size, roe_pct, holding_hours, exit_reason, fee_paid_usd, funding_usd, funding_source, status "
+                "FROM swing_trades"
+            ).fetchone()
+        side, size, roe, hours, reason, fee, funding, source, status = row
+        self.assertEqual(side, "long")
+        self.assertAlmostEqual(size, 1.0)
+        self.assertIsNotNone(roe)
+        self.assertGreater(hours, 0.0)
+        self.assertIn(reason, ("tp_hit", "breakeven_hit", "sl_hit"))
+        self.assertGreaterEqual(fee, 0.0)
+        self.assertIsNotNone(funding)
+        self.assertEqual(source, "reconciler")
+        self.assertEqual(status, "CLOSED")
+
+    async def test_stale_ledger_history_does_not_suppress_new_ledger_row(self):
+        """TASK 6: the old recent_close probe matched ANY historical row, letting a months-old
+        trade mark ledger_write_ok=True and prune the current position without recording it."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size, pnl, exit_reason, status) "
+                "VALUES (datetime('now', '-40 days'), ?, 'long', 100.0, 97.0, 1.0, -3.0, 'sl_hit', 'CLOSED')",
+                (SWING,),
+            )
+            conn.commit()
+
+        await rec.audit_live_exchange_positions()
+
+        counts = self._table_counts()
+        self.assertEqual(counts["swing_trades"], 2, "a 40-day-old ledger row must not suppress today's write")
+        self.assertEqual(counts["swing_open_positions"], 0)
+
+    async def test_recent_engine_close_suppresses_duplicate_ledger_row(self):
+        """The windowed probe must still dedup a close the engine already recorded (< 15 min ago)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size, pnl, exit_reason, status) "
+                "VALUES (datetime('now', '-3 minutes'), ?, 'long', 100.0, 97.0, 1.0, -3.0, 'sl_hit', 'CLOSED')",
+                (SWING,),
+            )
+            conn.commit()
+
+        await rec.audit_live_exchange_positions()
+
+        counts = self._table_counts()
+        self.assertEqual(counts["swing_trades"], 1, "engine-recorded close must not be doubled")
+        self.assertEqual(counts["swing_open_positions"], 0, "position still resolves as closed; prune is allowed")
 
 
 if __name__ == "__main__":
