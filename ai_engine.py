@@ -14,6 +14,20 @@ from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
+
+def strict_bool(value, default: bool = False) -> bool:
+    """Parse LLM/JSON booleans without the bool('false') -> True trap."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "t"):
+        return True
+    if text in ("false", "0", "no", "f", ""):
+        return False
+    return default
+
 # ---------------------------------------------------------------------------
 # V28.6 High-Performance API Key Rotation Pool
 # ---------------------------------------------------------------------------
@@ -1158,16 +1172,21 @@ async def generate_macro_synthesis(
                 "market_posture": res.get("market_posture", "TACTICAL_DEFENSE"),
                 "macro_bias": res.get("macro_bias", "NEUTRAL_CHOP"),
                 "derivatives_skew_regime": res.get("derivatives_skew_regime", "BALANCED_CHOP"),
-                "derivatives_skew_halt": bool(res.get("derivatives_skew_halt", False)),
+                # strict_bool: bool("false") is True, which used to arm a permanent skew halt from a
+                # string payload.
+                "derivatives_skew_halt": strict_bool(res.get("derivatives_skew_halt"), False),
                 "derivatives_notes": res.get("derivatives_notes", "Funding rates and open interest within standard boundaries."),
                 "executive_summary": res.get("executive_summary", "Global macro environment neutral with balanced liquidity."),
                 "key_risks": res.get("key_risks", ["Volatility clustering", "Choppy range rotation"]),
                 "tactical_guidance": res.get("tactical_guidance", "Maintain standard stops and honor regime constraints."),
+                "synthesis_source": "ai",
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
         except Exception as pe:
             log.warning(f"[MACRO-SYNTH] Parse error: {pe}")
 
+    # No provider answered. Marked so the sentinel can hold the last protective posture instead of
+    # silently disarming a skew halt or killswitch verdict with these soft defaults.
     return {
         "market_posture": "TACTICAL_DEFENSE",
         "macro_bias": "NEUTRAL_CHOP",
@@ -1177,6 +1196,7 @@ async def generate_macro_synthesis(
         "executive_summary": "Macro telemetry stable. Algorithms operating under baseline risk constraints.",
         "key_risks": ["API degradation fallback"],
         "tactical_guidance": "Enforce baseline stop losses and conservative sizing.",
+        "synthesis_source": "fallback",
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -1958,11 +1978,17 @@ async def evaluate_btc_anchor(btc_context: dict, timeout_sec: float = 12.0) -> d
             raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             res = robust_json_decode(raw)
             if res and isinstance(res, dict):
+                # strict_bool: the sentinel and the boardroom both read this flag, and bool("false")
+                # is True.
+                res["alt_long_pause"] = strict_bool(res.get("alt_long_pause"), False)
+                res["anchor_source"] = "ai"
                 res["updated_at"] = datetime.now(timezone.utc).isoformat()
                 return res
         except Exception:
             pass
 
+    # No provider answered: marked so the sentinel holds the last protective anchor state instead of
+    # disarming an active ALT_LONG_PAUSE with these neutral defaults.
     return {
         "btc_anchor_state": "NEUTRAL_RANGE",
         "alt_long_pause": False,
@@ -1970,6 +1996,7 @@ async def evaluate_btc_anchor(btc_context: dict, timeout_sec: float = 12.0) -> d
         "key_btc_pivot": 84000.0,
         "anchor_directive": "Bitcoin range-bound; normal fleet risk parameters active.",
         "confidence": 0.50,
+        "anchor_source": "fallback",
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
 

@@ -44,6 +44,209 @@ def _parse_bool(val, default: bool = False) -> bool:
     return default
 
 
+KILLSWITCH_KEY = "macro_global_killswitch"
+# A protective state may be inherited from the previous cycle; these are the only fields the
+# macro synthesis is allowed to hold, and they are re-measured on every contract-valid verdict.
+SYNTH_PROTECTIVE_FIELDS = ("market_posture", "macro_bias", "derivatives_skew_halt",
+                           "derivatives_skew_regime", "derivatives_notes", "executive_summary")
+ANCHOR_PROTECTIVE_FIELDS = ("btc_anchor_state", "alt_long_pause")
+SYNTH_DEFENSIVE_DEFAULTS = {
+    "market_posture": "TACTICAL_DEFENSE",
+    "macro_bias": "NEUTRAL_CHOP",
+    "derivatives_skew_halt": False,
+    "derivatives_skew_regime": "BALANCED_CHOP",
+    "derivatives_notes": "No contract-valid AI synthesis available; defensive baseline enforced.",
+    "executive_summary": "AI synthesis unavailable; defensive baseline enforced.",
+}
+REGIME_PRECEDENCE_KEYS = ("market_regime_label", "super_bot_regime", "warden_60m_regime")
+
+
+def _row_age_sec(raw_ts, now_epoch: float | None = None):
+    """Age of a system_state row in seconds. None when the timestamp is missing or unusable."""
+    if raw_ts is None or str(raw_ts).strip() == "":
+        return None
+    try:
+        cleaned = str(raw_ts).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(cleaned)
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    if now_epoch is None:
+        now_epoch = time.time()
+    return max(0.0, now_epoch - parsed.timestamp())
+
+
+def _state_max_age_sec() -> float:
+    try:
+        value = float(getattr(config, "REGIME_MAX_AGE_SEC", 900.0))
+    except (TypeError, ValueError):
+        return 900.0
+    if not math.isfinite(value) or value <= 0:
+        return 900.0
+    return value
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        out = float(value or default)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def select_fresh_regime(rows: dict, now_epoch: float | None = None, max_age_sec: float | None = None):
+    """Freshness-ranked regime precedence.
+
+    ``rows`` maps a system_state key to the (value, updated_at) pair read from the ledger.
+    The most recently published label wins. Absent, blank, unparseable or stale candidates are
+    excluded outright, so a days-old warden label can never masquerade as the live regime.
+    Returns (regime, winning_key, age_sec); ("UNKNOWN", None, None) when nothing is usable.
+    """
+    if max_age_sec is None:
+        max_age_sec = _state_max_age_sec()
+    best = None
+    for key in REGIME_PRECEDENCE_KEYS:
+        value, updated_at = rows.get(key, (None, None))
+        if value is None or str(value).strip() == "":
+            continue
+        age = _row_age_sec(updated_at, now_epoch)
+        if age is None:
+            log.warning(f"[REGIME-PRECEDENCE] {key}: unusable updated_at {updated_at!r}; excluded.")
+            continue
+        if age > max_age_sec:
+            log.warning(f"[REGIME-PRECEDENCE] {key}: stale by {age:.0f}s (max {max_age_sec:.0f}s); excluded.")
+            continue
+        if best is None or age < best[2]:
+            best = (str(value).strip(), key, age)
+    if best is None:
+        return "UNKNOWN", None, None
+    return best
+
+
+def read_killswitch_latch(db_path: str):
+    """The persisted killswitch latch as (flag, as_of). Read failure is treated as armed."""
+    try:
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            rows = dict(conn.execute(
+                "SELECT key, value FROM system_state WHERE key IN (?, ?)",
+                (KILLSWITCH_KEY, "macro_killswitch_asof")).fetchall())
+    except Exception as e:
+        log.warning(f"[MACRO-KILLSWITCH] Cannot read the persisted latch ({e}); assuming armed (fail-closed).")
+        return 1, ""
+    flag = 1 if _parse_bool(rows.get(KILLSWITCH_KEY), False) else 0
+    return flag, str(rows.get("macro_killswitch_asof") or "")
+
+
+def resolve_killswitch(data, stored_flag: int, stored_asof: str, now_iso: str) -> dict:
+    """Asymmetric killswitch latch.
+
+    Any cycle that measures SPY may ARM the killswitch, even when DXY is unmeasurable.
+    Only a fully valid (data_ok) cycle may DISCHARGE it; every other outcome holds the last
+    persisted value, so a Yahoo Finance outage cannot silently clear a market-wide halt.
+    """
+    measured = 1 if (data and _parse_bool(data.get("global_killswitch"), False)) else 0
+    data_ok = bool(data and _parse_bool(data.get("data_ok"), False))
+    if measured == 1:
+        return {"active": 1, "state": "MEASURED" if data_ok else "MEASURED_PARTIAL", "asof": now_iso}
+    if data_ok:
+        return {"active": 0, "state": "MEASURED", "asof": now_iso}
+    return {"active": 1 if stored_flag else 0, "state": "HELD", "asof": stored_asof or ""}
+
+
+def normalize_macro_synth(ai_synth, held_synth, now_iso: str):
+    """Hold the last protective synthesis when the AI could not answer.
+
+    Returns (synth, was_held, asof). A provider failure must never soften the posture the fleet
+    is already trading under, so the protective fields are inherited verbatim and marked stale.
+    """
+    if not isinstance(ai_synth, dict):
+        # A non-dict provider answer carries no verdict at all: treat it as an outage.
+        ai_synth = {}
+        source = "fallback"
+    else:
+        # An unmarked payload is not a contract-valid verdict, so it may not soften anything.
+        source = str(ai_synth.get("synthesis_source", "fallback")).strip().lower()
+    if source == "ai":
+        return ai_synth, False, now_iso
+
+    if isinstance(held_synth, dict):
+        for field in SYNTH_PROTECTIVE_FIELDS:
+            ai_synth[field] = held_synth.get(field)
+        asof = str(held_synth.get("_asof") or now_iso)
+    else:
+        for field, default_value in SYNTH_DEFENSIVE_DEFAULTS.items():
+            ai_synth.setdefault(field, default_value)
+        asof = ""
+    ai_synth["posture_held"] = True
+    return ai_synth, True, asof
+
+
+def normalize_btc_anchor(anchor_res, held_anchor, now_iso: str):
+    """Same asymmetric rule for the Bitcoin anchor: AI failure may not disarm ALT_LONG_PAUSE."""
+    if not isinstance(anchor_res, dict):
+        anchor_res = {}
+        source = "fallback"
+    else:
+        source = str(anchor_res.get("anchor_source", "fallback")).strip().lower()
+    if source == "ai":
+        return anchor_res, False, now_iso
+    if isinstance(held_anchor, dict):
+        for field in ANCHOR_PROTECTIVE_FIELDS:
+            anchor_res[field] = held_anchor.get(field)
+        asof = str(held_anchor.get("_asof") or now_iso)
+    else:
+        anchor_res.setdefault("btc_anchor_state", "NEUTRAL_RANGE")
+        anchor_res.setdefault("alt_long_pause", False)
+        asof = ""
+    anchor_res["anchor_held"] = True
+    return anchor_res, True, asof
+
+
+def apply_macro_overrides(ai_synth, active_event_playbook: str, killswitch_active: int, data_ok: bool):
+    """Deterministic, tighten-only posture resolution. Returns (synth, is_skew_halt, skew_regime, skew_notes)."""
+    # An event playbook may never LOOSEN posture over the deterministic gates. A bullish playbook
+    # is therefore advisory: the expansion verdict has to come from the synthesis itself.
+    if active_event_playbook == "SECULAR_SHORT_BREAKDOWN":
+        ai_synth["macro_bias"] = "BEARISH"
+        ai_synth["market_posture"] = "TACTICAL_DEFENSE"
+    elif active_event_playbook == "BULL_MOMENTUM_EXPANSION":
+        if killswitch_active == 1 or not data_ok:
+            log.warning("[AI-MACRO] Refusing BULL_MOMENTUM_EXPANSION posture: Global Killswitch engaged or data invalid.")
+            ai_synth["macro_bias"] = "NEUTRAL"
+            ai_synth["market_posture"] = "TACTICAL_DEFENSE"
+        else:
+            log.info("[AI-MACRO] BULL_MOMENTUM_EXPANSION is advisory only; posture left to the synthesis (tighten-only).")
+
+    is_skew_halt = _parse_bool(ai_synth.get("derivatives_skew_halt", False))
+    skew_regime = str(ai_synth.get("derivatives_skew_regime", "BALANCED_CHOP") or "BALANCED_CHOP")
+    skew_notes = str(ai_synth.get("derivatives_notes", "") or "")
+
+    if killswitch_active == 1:
+        ai_synth["market_posture"] = "RISK_OFF_KILLSWITCH"
+        ai_synth["macro_bias"] = "DEFENSIVE_BEAR"
+    elif is_skew_halt:
+        ai_synth["market_posture"] = "TACTICAL_DEFENSE"
+        ai_synth["macro_bias"] = "DEFENSIVE_CHOP"
+    return ai_synth, is_skew_halt, skew_regime, skew_notes
+
+
+def _persist_system_state(db_targets, values: dict, now_iso: str):
+    """INSERT OR REPLACE a batch of system_state pairs into every ledger DB."""
+    for db_target in db_targets:
+        try:
+            with sqlite3.connect(db_target, timeout=10.0) as conn:
+                conn.execute("PRAGMA busy_timeout=10000;")
+                with conn:
+                    for key, value in values.items():
+                        conn.execute(
+                            "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+                            (key, value, now_iso))
+        except Exception as e:
+            log.warning(f"Failed to persist macro state to {db_target}: {e}")
+
+
+
 def init_db(db_path=None):
     if db_path is None:
         db_path = _get_db_path("trading_ledger.db")
@@ -287,6 +490,11 @@ def update_macro_context():
     asyncio.set_event_loop(macro_loop)
     iteration_count = 0
 
+    held_synth = None
+    held_anchor = None
+    killswitch_log_state = None
+    db_targets = [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]
+
     while not _stop_event.is_set():
         # Clean per-cycle state initialization to prevent cross-cycle variable leakage
         data = None
@@ -295,6 +503,7 @@ def update_macro_context():
         ai_synth = None
         btc_price = 0.0
         warden_regime = "UNKNOWN"
+        warden_regime_source = None
         btc_macro_trend = "UNKNOWN"
         active_event_playbook = "NORMAL_OPERATIONS"
         active_event_headline = ""
@@ -307,8 +516,29 @@ def update_macro_context():
 
         log.info("Polling Yahoo Finance for Macro Context (SPY/UUP/DXY)...")
         data = fetch_macro_data()
-        if data and data.get('data_ok', False):
-            data_ok = True
+        data_ok = bool(data and _parse_bool(data.get("data_ok"), False))
+        stored_flag, stored_asof = read_killswitch_latch(_get_db_path("trading_data.db"))
+        kill = resolve_killswitch(data, stored_flag, stored_asof, now_iso)
+        killswitch_active = kill["active"]
+        if killswitch_log_state != (killswitch_active, kill["state"]):
+            killswitch_log_state = (killswitch_active, kill["state"])
+            if killswitch_active == 1 and kill["state"] == "MEASURED_PARTIAL":
+                log.critical("[MACRO-KILLSWITCH] ⚠️ ARMED on a partial macro cycle (DXY unmeasurable) and persisted "
+                             "despite macro_data_ok=0. Discharge requires a fully valid cycle.")
+            elif kill["state"] == "HELD":
+                log.warning(f"[MACRO-KILLSWITCH] ⚠️ No authoritative measurement this cycle; holding "
+                            f"killswitch={killswitch_active} from {kill['asof'] or 'never-persisted'}.")
+            elif killswitch_active == 1:
+                log.critical("[MACRO-KILLSWITCH] ⚠️ GLOBAL KILLSWITCH ARMED (measured this cycle).")
+            else:
+                log.info("[MACRO-KILLSWITCH] Killswitch clear on a fully valid macro cycle.")
+        _persist_system_state(db_targets, {
+            KILLSWITCH_KEY: str(killswitch_active),
+            "macro_killswitch_state": kill["state"],
+            "macro_killswitch_asof": kill["asof"],
+        }, now_iso)
+
+        if data_ok:
             for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                 try:
                     conn = sqlite3.connect(db_target, timeout=30.0)
@@ -327,7 +557,7 @@ def update_macro_context():
                         ))
                         # Telemetry writes for state manager / HUD
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_global_killswitch', ?, ?)",
-                                     (str(data['global_killswitch']), now_iso))
+                                     (str(killswitch_active), now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_regime', ?, ?)",
                                      (data['macro_regime'], now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_spy_1h_change', ?, ?)",
@@ -348,7 +578,10 @@ def update_macro_context():
             else:
                 log.info(f"Macro Context Updated: {log_msg}")
         else:
-            log.warning("Macro data invalid or unavailable this cycle. Marking macro_data_ok=0 in system_state.")
+            # SPY may still be measurable while DXY is not: _raw_fetch_macro already answers
+            # UNKNOWN in that case, and RISK_OFF_KILLSWITCH when the dump trigger fired.
+            fallback_regime = str(data.get('macro_regime') or 'UNKNOWN') if data else "UNKNOWN"
+            log.warning(f"Macro data invalid or unavailable this cycle. Marking macro_data_ok=0, regime={fallback_regime}.")
             for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                 try:
                     conn = sqlite3.connect(db_target, timeout=10.0)
@@ -356,7 +589,7 @@ def update_macro_context():
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_data_ok', ?, ?)",
                                      ("0", now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_regime', ?, ?)",
-                                     ("UNKNOWN", now_iso))
+                                     (fallback_regime, now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_heartbeat', ?, ?)",
                                      (now_iso, now_iso))
                     conn.close()
@@ -375,17 +608,24 @@ def update_macro_context():
         try:
             try:
                 with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as c_data:
-                    for rk in ['market_regime_label', 'super_bot_regime', 'warden_60m_regime']:
-                        r_row = c_data.execute("SELECT value FROM system_state WHERE key = ?", (rk,)).fetchone()
-                        if r_row and r_row[0]:
-                            warden_regime = r_row[0]
-                            break
-                    r2 = c_data.execute("SELECT value FROM system_state WHERE key = 'btc_macro_trend'").fetchone()
-                    if r2 and r2[0]: btc_macro_trend = r2[0]
+                    candidate_rows = {}
+                    for rk in REGIME_PRECEDENCE_KEYS:
+                        r_row = c_data.execute("SELECT value, updated_at FROM system_state WHERE key = ?", (rk,)).fetchone()
+                        candidate_rows[rk] = (r_row[0], r_row[1]) if r_row else (None, None)
+                    warden_regime, warden_regime_source, warden_age = select_fresh_regime(candidate_rows)
+                    if warden_regime_source is None:
+                        log.warning("[REGIME-PRECEDENCE] ⚠️ No fresh regime label among "
+                                    f"{list(REGIME_PRECEDENCE_KEYS)}; feeding UNKNOWN to the synthesis.")
+                    else:
+                        log.debug(f"[REGIME-PRECEDENCE] Using {warden_regime_source} ({warden_age:.0f}s old): {warden_regime}")
+                    r2 = c_data.execute("SELECT value, updated_at FROM system_state WHERE key = 'btc_macro_trend'").fetchone()
+                    if r2 and r2[0] and _row_age_sec(r2[1]) is not None and _row_age_sec(r2[1]) <= _state_max_age_sec():
+                        btc_macro_trend = str(r2[0])
                     r3 = c_data.execute("SELECT value FROM system_state WHERE key = 'btc_price'").fetchone()
-                    if r3 and r3[0]: btc_price = float(r3[0] or 0.0)
-            except Exception:
-                pass
+                    if r3:
+                        btc_price = _safe_float(r3[0], 0.0)
+            except Exception as state_err:
+                log.warning(f"[REGIME-PRECEDENCE] Could not read regime telemetry: {state_err}. Using UNKNOWN.")
 
             micro_path = os.path.join(BASE_DIR, "microstructure_state.json")
             if btc_price == 0.0 and os.path.exists(micro_path):
@@ -404,20 +644,26 @@ def update_macro_context():
                     if eh_row and eh_row[0]: active_event_headline = eh_row[0]
                     ez_row = c_data.execute("SELECT value FROM system_state WHERE key = 'ai_event_horizon'").fetchone()
                     if ez_row and ez_row[0]: active_event_horizon = ez_row[0]
-            except Exception:
-                pass
+            except Exception as ep_err:
+                log.warning(f"[AI-MACRO] Event playbook telemetry unavailable, running NORMAL_OPERATIONS: {ep_err}")
 
             deriv_skew = fetch_derivatives_skew()
+            # SPY/UUP are still measurable when only DXY failed, so they are passed through on a
+            # partial cycle. DXY is sent as null instead of a fabricated 0.0 that would read as
+            # "dollar collapsed" to the strategist.
             macro_packet = {
-                "spy_price": data['spy_price'] if (data and data_ok) else 0.0,
-                "spy_1h_change": data['spy_1h_change'] if (data and data_ok) else 0.0,
-                "uup_price": data['uup_price'] if (data and data_ok) else 0.0,
-                "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0,
-                "macro_regime": data['macro_regime'] if (data and data_ok) else "UNKNOWN",
-                "global_killswitch": bool(data['global_killswitch']) if data else False,
+                "spy_price": data['spy_price'] if data else 0.0,
+                "spy_1h_change": data['spy_1h_change'] if data else 0.0,
+                "uup_price": data['uup_price'] if data else 0.0,
+                "dxy_price": data.get('dxy_price') if (data and data.get('dxy_valid')) else None,
+                "dxy_valid": bool(data.get('dxy_valid')) if data else False,
+                "macro_regime": str(data.get('macro_regime') or "UNKNOWN") if data else "UNKNOWN",
+                "global_killswitch": killswitch_active == 1,
+                "killswitch_state": kill["state"],
                 "data_ok": data_ok,
                 "btc_price": btc_price,
                 "warden_regime": warden_regime,
+                "warden_regime_source": warden_regime_source or "STALE_OR_ABSENT",
                 "btc_macro_trend": btc_macro_trend,
                 "derivatives_skew": deriv_skew,
                 "active_event_playbook": active_event_playbook,
@@ -426,43 +672,17 @@ def update_macro_context():
             }
 
             ai_synth = macro_loop.run_until_complete(ai_engine.generate_macro_synthesis(macro_packet, timeout_sec=15.0))
-            if not isinstance(ai_synth, dict):
-                ai_synth = {
-                    "macro_bias": "NEUTRAL",
-                    "market_posture": "TACTICAL_DEFENSE",
-                    "derivatives_skew_halt": False,
-                    "derivatives_skew_regime": "BALANCED_CHOP",
-                    "derivatives_notes": "AI synthesis fallback - defensive posture default"
-                }
-
-            # Fast-path event playbook handling with strict asymmetric risk override
-            # An event playbook or AI synthesis can ONLY tighten risk, NEVER loosen it over deterministic triggers.
-            if active_event_playbook == "SECULAR_SHORT_BREAKDOWN":
-                ai_synth["macro_bias"] = "BEARISH"
-                ai_synth["market_posture"] = "TACTICAL_DEFENSE"
-            elif active_event_playbook == "BULL_MOMENTUM_EXPANSION":
-                # Only allow expansion if global killswitch is NOT active and macro data is valid
-                if (data and data.get("global_killswitch", 0) == 1) or not data_ok:
-                    log.warning("[AI-MACRO] Refusing BULL_MOMENTUM_EXPANSION posture: Global Killswitch engaged or data invalid.")
-                    ai_synth["macro_bias"] = "NEUTRAL"
-                    ai_synth["market_posture"] = "TACTICAL_DEFENSE"
-                else:
-                    ai_synth["macro_bias"] = "BULLISH"
-                    ai_synth["market_posture"] = "AGGRESSIVE_EXPANSION"
-            
-            # Derivatives Skew Circuit Breaker Guard (defensive bool parsing)
-            is_skew_halt = _parse_bool(ai_synth.get("derivatives_skew_halt", False))
-            skew_regime = ai_synth.get("derivatives_skew_regime", "BALANCED_CHOP")
-            skew_notes = ai_synth.get("derivatives_notes", "")
-
-            # Deterministic Asymmetric Gate:
-            # If global killswitch is engaged OR derivatives skew halt is triggered, force TACTICAL_DEFENSE / RISK_OFF
-            if (data and data.get("global_killswitch", 0) == 1):
-                ai_synth["market_posture"] = "RISK_OFF_KILLSWITCH"
-                ai_synth["macro_bias"] = "DEFENSIVE_BEAR"
-            elif is_skew_halt:
-                ai_synth["market_posture"] = "TACTICAL_DEFENSE"
-                ai_synth["macro_bias"] = "DEFENSIVE_CHOP"
+            # AI outage may not soften the posture the fleet is already trading under: inherit
+            # the last protective synthesis and publish it as explicitly stale.
+            ai_synth, synth_was_held, synth_asof = normalize_macro_synth(ai_synth, held_synth, now_iso)
+            ai_synth, is_skew_halt, skew_regime, skew_notes = apply_macro_overrides(
+                ai_synth, active_event_playbook, killswitch_active, data_ok)
+            if not synth_was_held:
+                held_synth = {field: ai_synth.get(field) for field in SYNTH_PROTECTIVE_FIELDS}
+                held_synth["_asof"] = now_iso
+            if synth_was_held:
+                log.warning(f"[AI-MACRO] 🛑 Synthesis unavailable; holding posture "
+                            f"{ai_synth.get('market_posture')}/{ai_synth.get('macro_bias')} from {synth_asof or 'defensive defaults'}.")
 
             for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                 try:
@@ -487,6 +707,10 @@ def update_macro_context():
                                      (ai_synth.get("executive_summary", ""), now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_macro_bias', ?, ?)",
                                      (ai_synth.get("macro_bias", "NEUTRAL_CHOP"), now_iso))
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_macro_posture_held', ?, ?)",
+                                     (str(1 if synth_was_held else 0), now_iso))
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_macro_posture_asof', ?, ?)",
+                                     (synth_asof or "", now_iso))
                 except Exception as de:
                     log.warning(f"Error persisting macro briefing to {db_target}: {de}")
 
@@ -526,17 +750,25 @@ def update_macro_context():
                 "btc_funding_rate_8h": btc_fr,
                 "btc_open_interest": btc_oi,
                 "btc_normalized_ofi": btc_ofi,
-                "spy_1h_change": data['spy_1h_change'] if (data and data_ok) else 0.0,
-                "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0
+                "spy_1h_change": data['spy_1h_change'] if data else 0.0,
+                "dxy_price": data.get('dxy_price') if (data and data.get('dxy_valid')) else None
             }
 
             anchor_res = macro_loop.run_until_complete(ai_engine.evaluate_btc_anchor(btc_anchor_packet, timeout_sec=12.0))
+            # An AI outage may not disarm the alt-coin long pause that is protecting the fleet.
+            anchor_res, anchor_was_held, anchor_asof = normalize_btc_anchor(anchor_res, held_anchor, now_iso)
             if anchor_res:
                 btc_state = anchor_res.get("btc_anchor_state", "HEALTHY_EXPANSION")
                 alt_pause = _parse_bool(anchor_res.get("alt_long_pause", False))
-                risk_score = float(anchor_res.get("contagion_risk_score", 20) or 20)
+                risk_score = _safe_float(anchor_res.get("contagion_risk_score"), 20.0)
                 directive = anchor_res.get("anchor_directive", "Normal operations.")
-                key_pivot = float(anchor_res.get("key_btc_pivot", 0.0) or 0.0)
+                key_pivot = _safe_float(anchor_res.get("key_btc_pivot"), 0.0)
+                if not anchor_was_held:
+                    held_anchor = {field: anchor_res.get(field) for field in ANCHOR_PROTECTIVE_FIELDS}
+                    held_anchor["_asof"] = now_iso
+                else:
+                    log.warning(f"[BTC-ANCHOR] 🛑 Anchor unavailable; holding {btc_state} / "
+                                f"ALT_LONG_PAUSE={int(alt_pause)} from {anchor_asof or 'baseline'}.")
 
                 log.info(f"[BTC-ANCHOR] ⚓ BTC State: {btc_state} | AltLongPause: {alt_pause} | ContagionRisk: {risk_score}/100 | {directive}")
 
@@ -557,6 +789,10 @@ def update_macro_context():
                                          (str(key_pivot), now_iso))
                             conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ai_btc_anchor', ?, ?)",
                                          (json.dumps(anchor_res), now_iso))
+                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('btc_anchor_held', ?, ?)",
+                                         (str(1 if anchor_was_held else 0), now_iso))
+                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('btc_anchor_asof', ?, ?)",
+                                         (anchor_asof or "", now_iso))
                     except Exception as de:
                         log.warning(f"Error persisting BTC anchor to {db_target}: {de}")
         except Exception as anchor_err:
@@ -607,10 +843,12 @@ def update_macro_context():
                 "gross_long_dollars": round(net_long_usd, 2),
                 "gross_short_dollars": round(net_short_usd, 2),
                 "open_positions": open_pos_list,
-                "macro_regime": data.get('macro_regime', 'UNKNOWN') if (data and data_ok) else "UNKNOWN",
+                "macro_regime": str(data.get('macro_regime') or 'UNKNOWN') if data else "UNKNOWN",
                 "macro_posture": posture,
-                "spy_1h_change": data.get('spy_1h_change', 0.0) if (data and data_ok) else 0.0,
-                "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0,
+                "global_killswitch": killswitch_active == 1,
+                "killswitch_state": kill["state"],
+                "spy_1h_change": data.get('spy_1h_change', 0.0) if data else 0.0,
+                "dxy_price": data.get('dxy_price') if (data and data.get('dxy_valid')) else None,
                 "weakest_fleet_assets": weakest_list
             }
 
@@ -631,10 +869,10 @@ def update_macro_context():
 
         # Append-Only Telemetry Table Write: commit comprehensive row for auditability
         try:
-            active_kill = 1 if (data and data.get('global_killswitch', 0) == 1) else 0
+            active_kill = killswitch_active
             skew_halt_flag = 1 if (ai_synth and _parse_bool(ai_synth.get("derivatives_skew_halt", False))) else 0
             alt_pause_flag = 1 if (anchor_res and _parse_bool(anchor_res.get("alt_long_pause", False))) else 0
-            curr_regime = data['macro_regime'] if (data and data_ok) else "UNKNOWN"
+            curr_regime = str(data['macro_regime']) if (data and data.get('macro_regime')) else "UNKNOWN"
             curr_posture = ai_synth.get('market_posture', 'TACTICAL_DEFENSE') if ai_synth else "TACTICAL_DEFENSE"
             avg_fr = deriv_skew.get("avg_funding_rate_8h", 0.0) if deriv_skew else 0.0
 
@@ -650,11 +888,11 @@ def update_macro_context():
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             now_iso,
-                            data['spy_price'] if (data and data_ok) else None,
-                            data['uup_price'] if (data and data_ok) else None,
-                            data.get('dxy_price') if (data and data_ok) else None,
-                            data['spy_1h_change'] if (data and data_ok) else None,
-                            data['uup_1h_change'] if (data and data_ok) else None,
+                            data['spy_price'] if data else None,
+                            data['uup_price'] if data else None,
+                            data.get('dxy_price') if (data and data.get('dxy_valid')) else None,
+                            data['spy_1h_change'] if data else None,
+                            data['uup_1h_change'] if data else None,
                             avg_fr,
                             active_kill,
                             skew_halt_flag,
@@ -789,9 +1027,10 @@ def update_macro_context():
                     "session_name": session_name,
                     "btc_price": live_prices.get("BTC/USDT", btc_price),
                     "asset_current_prices": live_prices,
-                    "macro_regime": data.get('macro_regime', 'UNKNOWN') if (data and data_ok) else "UNKNOWN",
-                    "spy_price": data.get('spy_price', 0.0) if (data and data_ok) else 0.0,
-                    "dxy_price": data.get('dxy_price', 0.0) if (data and data_ok) else 0.0,
+                    "macro_regime": str(data.get('macro_regime') or 'UNKNOWN') if data else "UNKNOWN",
+                    "spy_price": data.get('spy_price', 0.0) if data else 0.0,
+                    "dxy_price": data.get('dxy_price') if (data and data.get('dxy_valid')) else None,
+                    "global_killswitch": killswitch_active == 1,
                     "fleet_symbols": fleet_symbols[:10]
                 }
                 daily_bp = macro_loop.run_until_complete(ai_engine.generate_daily_market_blueprint(fleet_symbols[:10], bp_snapshot, timeout_sec=25.0))
