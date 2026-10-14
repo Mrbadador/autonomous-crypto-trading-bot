@@ -35,6 +35,17 @@ except Exception as _ta_import_err:  # pragma: no cover - broken install
 # live trading database without bound.
 REGIME_HISTORY_ROWS = 30000
 
+# Contract for the AI cognitive arbiter verdict. A verdict is cached only if it satisfies
+# this contract, because whatever is cached is applied to the regime label and the leverage
+# recommendation for the next 15 minutes, and a cached `null` used to raise float(None)
+# inside classify_and_save() - which the __main__ loop did not catch, killing the daemon.
+AI_REGIME_BIASES = ("BULL_EXPANSION", "BEAR_DUMP", "DEFENSIVE_CHOP", "LIQUIDITY_HUNT_TRAP")
+AI_LEVERAGE_ALLOWLIST = (2, 3, 5)
+AI_THESIS_MAX_CHARS = 400
+AI_TRAP_RISK_DEFAULT = 0.50
+AI_LEVERAGE_DEFAULT = 3
+AI_OFFLINE_BIAS = "MATH_DEFAULT"
+
 # ENV INTEGRITY CHECK
 _api_key = os.getenv("BITGET_API_KEY", "")
 if _api_key:
@@ -54,10 +65,13 @@ class RegimeClassifier:
         self.ai_eval_interval_sec = 900  # 15 minutes = 96 calls/day
         self.latest_ai_arbiter = {
             "ai_regime_bias": "DEFENSIVE_CHOP",
-            "trap_risk_score": 0.50,
-            "recommended_leverage_cap": 3,
+            "trap_risk_score": AI_TRAP_RISK_DEFAULT,
+            "recommended_leverage_cap": AI_LEVERAGE_DEFAULT,
             "structural_thesis": "Baseline cognitive regime initialization.",
-            "override_math_regime": False
+            "override_math_regime": False,
+            "evaluated_by": "baseline",
+            "evaluated_at_utc": None,
+            "evaluated_at_epoch": 0.0,
         }
         self._init_db()
 
@@ -463,10 +477,101 @@ class RegimeClassifier:
             pass
         return 0.0001
 
+    @staticmethod
+    def _bounded_float(value, default, lo, hi):
+        """float() that can never raise: non-numeric, None, NaN and +-inf fall back to default."""
+        try:
+            as_float = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not np.isfinite(as_float):
+            return float(default)
+        return min(hi, max(lo, as_float))
+
+    @staticmethod
+    def _bounded_int(value, default, allowed):
+        """Snaps a provider-supplied integer to the allowlist; anything else becomes default."""
+        try:
+            as_int = int(round(float(value)))
+        except (TypeError, ValueError):
+            return int(default)
+        return as_int if as_int in allowed else int(default)
+
+    def _validate_ai_payload(self, parsed, source: str):
+        """Returns a normalised verdict dict, or None when the provider output is unusable.
+
+        Runs before caching: an out-of-enum bias, a null/out-of-range trap score or a
+        leverage cap outside {2, 3, 5} must not reach latest_ai_arbiter, the regime row or
+        the leverage the dashboards quote.
+        """
+        if not isinstance(parsed, dict):
+            log.warning(f"[AI-ARBITER-VALIDATION] {source}: payload is {type(parsed).__name__}, not an object - discarded.")
+            return None
+
+        raw_bias = parsed.get("ai_regime_bias")
+        bias = str(raw_bias or "").strip().upper()
+        if bias not in AI_REGIME_BIASES:
+            log.warning(f"[AI-ARBITER-VALIDATION] {source}: ai_regime_bias {raw_bias!r} is not one of {AI_REGIME_BIASES} - discarded.")
+            return None
+
+        raw_score = parsed.get("trap_risk_score")
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            score = float("nan")
+        if not np.isfinite(score) or not 0.0 <= score <= 1.0:
+            log.warning(f"[AI-ARBITER-VALIDATION] {source}: trap_risk_score {raw_score!r} is not a finite 0..1 value - discarded.")
+            return None
+
+        raw_cap = parsed.get("recommended_leverage_cap")
+        try:
+            cap = int(round(float(raw_cap)))
+        except (TypeError, ValueError):
+            cap = None
+        if cap not in AI_LEVERAGE_ALLOWLIST:
+            log.warning(f"[AI-ARBITER-VALIDATION] {source}: recommended_leverage_cap {raw_cap!r} not in {AI_LEVERAGE_ALLOWLIST} - discarded.")
+            return None
+
+        raw_thesis = parsed.get("structural_thesis")
+        thesis = str(raw_thesis if raw_thesis is not None else "").strip()[:AI_THESIS_MAX_CHARS]
+        raw_override = parsed.get("override_math_regime")
+        if isinstance(raw_override, str):
+            override = raw_override.strip().lower() in ("true", "1", "yes")
+        else:
+            override = bool(raw_override)
+
+        return {
+            "ai_regime_bias": bias,
+            "trap_risk_score": score,
+            "recommended_leverage_cap": cap,
+            "structural_thesis": thesis,
+            "override_math_regime": override,
+            "evaluated_by": source,
+        }
+
+    def _offline_ai_fallback(self) -> dict:
+        """Deterministic verdict used when every provider failed or was rejected.
+
+        Deliberately carries no evaluated_at stamp: classify_and_save() treats an
+        unstamped verdict as 'no fresh AI', so it can neither promote nor silently replace
+        a last known protective veto with a permissive default.
+        """
+        return {
+            "ai_regime_bias": AI_OFFLINE_BIAS,
+            "trap_risk_score": 0.35,
+            "recommended_leverage_cap": AI_LEVERAGE_DEFAULT,
+            "structural_thesis": "AI offline — defaulting to deterministic mathematical regime rules.",
+            "override_math_regime": False,
+            "evaluated_by": "offline_fallback",
+        }
+
     def _query_ai_cognitive_arbiter(self, telemetry: dict) -> dict:
         """
         Dispatches a compact prompt to Google Gemini (or Groq failover pool)
         to evaluate whether current momentum is genuine trend expansion or a liquidity trap.
+
+        Only verdicts that pass _validate_ai_payload() are returned as fresh; every other
+        path returns the deterministic offline fallback, so callers never cache garbage.
         """
         import json
         gemini_key = os.getenv("GEMINI_API_KEY", "")
@@ -523,9 +628,15 @@ class RegimeClassifier:
                     if res.status_code == 200:
                         text = res.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                         if text:
-                            parsed = json.loads(text)
-                            log.info(f"[AI-REGIME-ARBITER] Gemini ({model}) synthesis: {parsed.get('ai_regime_bias')} (Trap Risk: {parsed.get('trap_risk_score')})")
-                            return parsed
+                            validated = self._validate_ai_payload(json.loads(text), f"Gemini:{model}")
+                            if validated:
+                                validated["evaluated_at_utc"] = datetime.now(UTC).isoformat()
+                                validated["evaluated_at_epoch"] = time.time()
+                                log.info(f"[AI-REGIME-ARBITER] Gemini ({model}) synthesis: {validated['ai_regime_bias']} (Trap Risk: {validated['trap_risk_score']:.2f})")
+                                return validated
+                            continue
+                    else:
+                        log.debug(f"[AI-REGIME-ARBITER] Gemini ({model}) HTTP {res.status_code}")
                 except Exception as ge:
                     log.debug(f"[AI-REGIME-ARBITER] Gemini ({model}) error: {ge}")
 
@@ -555,19 +666,20 @@ class RegimeClassifier:
                     if res_g.status_code == 200:
                         text_g = res_g.json().get("choices", [{}])[0].get("message", {}).get("content", "")
                         if text_g:
-                            parsed_g = json.loads(text_g)
-                            log.info(f"[AI-REGIME-ARBITER] Groq ({g_model}) synthesis: {parsed_g.get('ai_regime_bias')} (Trap Risk: {parsed_g.get('trap_risk_score')})")
-                            return parsed_g
+                            validated_g = self._validate_ai_payload(json.loads(text_g), f"Groq:{g_model}")
+                            if validated_g:
+                                validated_g["evaluated_at_utc"] = datetime.now(UTC).isoformat()
+                                validated_g["evaluated_at_epoch"] = time.time()
+                                log.info(f"[AI-REGIME-ARBITER] Groq ({g_model}) synthesis: {validated_g['ai_regime_bias']} (Trap Risk: {validated_g['trap_risk_score']:.2f})")
+                                return validated_g
+                            continue
+                    else:
+                        log.debug(f"[AI-REGIME-ARBITER] Groq ({g_model}) HTTP {res_g.status_code}")
                 except Exception as gr_err:
                     log.debug(f"[AI-REGIME-ARBITER] Groq ({g_model}) error: {gr_err}")
 
-        return {
-            "ai_regime_bias": "MATH_DEFAULT",
-            "trap_risk_score": 0.35,
-            "recommended_leverage_cap": 3,
-            "structural_thesis": "AI offline — defaulting to deterministic mathematical regime rules.",
-            "override_math_regime": False
-        }
+        log.warning("[AI-REGIME-ARBITER] ⚠️ No provider returned a contract-valid verdict; holding deterministic math rules.")
+        return self._offline_ai_fallback()
 
     def classify_and_save(self):
         """Runs the directional multi-timeframe classifier pipeline with AI Cognitive Arbitration."""
@@ -602,24 +714,41 @@ class RegimeClassifier:
         adx, plus_di, minus_di = self.calculate_adx(df)
         di_spread = plus_di - minus_di
 
-        # Query prior regime for Schmitt Trigger hysteresis
+        # Query prior regime for Schmitt Trigger hysteresis, plus the prior *mathematical*
+        # label. The published regime can be an AI override, so using it to detect a
+        # transition makes the transition test self-referential: an override to
+        # DEFENSIVE_CHOP looks like a change every following cycle, and a genuine math
+        # flip masked by a persistent override looks like no change at all.
         prior_regime = "NEUTRAL"
+        prior_math_regime = "NEUTRAL"
         try:
             conn_prev = sqlite3.connect(self.db_path)
-            r_prev = conn_prev.execute("SELECT regime FROM market_regime ORDER BY id DESC LIMIT 1").fetchone()
+            try:
+                r_prev = conn_prev.execute(
+                    "SELECT regime, math_regime FROM market_regime ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # Pre-migration database without the additive math_regime column.
+                r_prev = list(conn_prev.execute(
+                    "SELECT regime FROM market_regime ORDER BY id DESC LIMIT 1"
+                ).fetchone() or ()) + [None]
             conn_prev.close()
             if r_prev and r_prev[0]:
                 prior_regime = str(r_prev[0])
+                prior_math_regime = str(r_prev[1]) if len(r_prev) > 1 and r_prev[1] else str(r_prev[0])
         except Exception:
             pass
 
         # Directional Polarity & Schmitt Trigger Decision Matrix
+        # The 20-25 ADX dead zone carries the previous *mathematical* trend forward. Using
+        # the published label here would let an AI override (BULL_TREND -> DEFENSIVE_CHOP,
+        # or a CHOP -> BULL_TREND promotion) masquerade as indicator memory it never had.
         if adx < 20.0:
             math_regime = "CHOP"
         elif 20.0 <= adx < 25.0:
-            if prior_regime in ("BULL_TREND", "BULLISH") and di_spread > 5.0:
+            if prior_math_regime in ("BULL_TREND", "BULLISH") and di_spread > 5.0:
                 math_regime = "BULL_TREND"
-            elif prior_regime in ("BEAR_TREND", "BEARISH") and di_spread < -5.0:
+            elif prior_math_regime in ("BEAR_TREND", "BEARISH") and di_spread < -5.0:
                 math_regime = "BEAR_TREND"
             elif di_spread > 8.0 and macro_trend in ("BULL", "MILD_BULL"):
                 math_regime = "BULL_TREND"
@@ -655,8 +784,9 @@ class RegimeClassifier:
         now_epoch = time.time()
         should_run_ai = (
             (now_epoch - self.last_ai_eval_ts >= self.ai_eval_interval_sec) or
-            (math_regime != prior_regime and prior_regime != "NEUTRAL")
+            (math_regime != prior_math_regime and prior_math_regime != "NEUTRAL")
         )
+        ai_is_fresh = False
 
         if should_run_ai:
             try:
@@ -687,17 +817,41 @@ class RegimeClassifier:
                 }
 
                 ai_res = self._query_ai_cognitive_arbiter(telemetry)
-                if ai_res and isinstance(ai_res, dict):
+                # Only a stamped, contract-valid verdict is cached. The offline fallback and
+                # any rejected payload leave the previous protective verdict in place rather
+                # than silently replacing it with a permissive default.
+                if isinstance(ai_res, dict) and ai_res.get("evaluated_at_utc"):
                     self.latest_ai_arbiter = ai_res
                     self.last_ai_eval_ts = now_epoch
+                    ai_is_fresh = True
+                else:
+                    self.last_ai_eval_ts = now_epoch
+                    log.warning(
+                        "[AI-REGIME-ARBITER] ⚠️ No validated verdict this pass - holding "
+                        f"{self.latest_ai_arbiter.get('ai_regime_bias')} from "
+                        f"{self.latest_ai_arbiter.get('evaluated_at_utc') or 'baseline'}."
+                    )
             except Exception as ai_e:
                 log.warning(f"[AI-REGIME-ARBITER-NOTE] Error querying AI arbiter: {ai_e}")
 
-        # Apply Cognitive Arbitration Rules
-        ai_bias = self.latest_ai_arbiter.get("ai_regime_bias", "DEFENSIVE_CHOP")
-        trap_risk = float(self.latest_ai_arbiter.get("trap_risk_score", 0.5))
-        ai_thesis = str(self.latest_ai_arbiter.get("structural_thesis", ""))
-        ai_lev_cap = int(self.latest_ai_arbiter.get("recommended_leverage_cap", 3))
+        # Apply Cognitive Arbitration Rules.
+        # Every field is coerced through a bounded parser: the cached verdict is external
+        # provider output, and a bare float(None) here used to abort the whole daemon.
+        cached = self.latest_ai_arbiter if isinstance(self.latest_ai_arbiter, dict) else {}
+        raw_bias = str(cached.get("ai_regime_bias") or "").strip().upper()
+        # The offline baseline is a defensive posture, not a provider opinion.
+        ai_bias = raw_bias if raw_bias in AI_REGIME_BIASES else "DEFENSIVE_CHOP"
+        trap_risk = self._bounded_float(cached.get("trap_risk_score"), AI_TRAP_RISK_DEFAULT, 0.0, 1.0)
+        ai_thesis = str(cached.get("structural_thesis") or "")[:AI_THESIS_MAX_CHARS]
+        ai_lev_cap = self._bounded_int(cached.get("recommended_leverage_cap"), AI_LEVERAGE_DEFAULT, AI_LEVERAGE_ALLOWLIST)
+        ai_evaluated_at = cached.get("evaluated_at_utc")
+        ai_eval_epoch = self._bounded_float(cached.get("evaluated_at_epoch"), 0.0, 0.0, now_epoch + 1.0)
+        # Age of the verdict actually being applied, measured from when a provider answered,
+        # not from when this row was published. The classifier runs every 5 minutes against a
+        # 15 minute AI cadence, so without this a verdict can be quoted as if it were current
+        # for hours after the model last spoke.
+        ai_verdict_age_sec = (now_epoch - ai_eval_epoch) if ai_eval_epoch > 0.0 else None
+        ai_verdict_usable = ai_verdict_age_sec is not None and ai_verdict_age_sec <= self.ai_eval_interval_sec
 
         regime = math_regime
         recommended_leverage = math_leverage
@@ -715,17 +869,27 @@ class RegimeClassifier:
             log.info(f"[AI-REGIME-ARBITER] 🛡️ BEAR_TREND confirmed: Preserving 100% USDT shield in super_bot (no counter-trend dip-buys).")
         elif math_regime == "CHOP":
             if ai_bias == "BULL_EXPANSION" and trap_risk < 0.25 and di_spread > 6.0 and macro_trend in ("BULL", "MILD_BULL"):
-                regime = "BULL_TREND"
-                recommended_leverage = ai_lev_cap
-                log.info(f"[AI-REGIME-ARBITER] 🚀 PROMOTION: Math indicated CHOP, but AI detected early institutional BULL_EXPANSION (Trap Risk: {trap_risk:.2f}). Promoting to BULL_TREND.")
+                # Loosening (CHOP -> BULL_TREND, leverage straight from the provider) needs a
+                # verdict a model actually produced inside the cadence. Tightening above may
+                # act on a held verdict; relaxing may not.
+                if not ai_verdict_usable:
+                    log.warning(
+                        f"[AI-REGIME-ARBITER] 🚫 PROMOTION SUPPRESSED: BULL_EXPANSION verdict is "
+                        f"{'untimestamped' if ai_verdict_age_sec is None else f'{ai_verdict_age_sec:.0f}s old'} "
+                        f"(cadence {self.ai_eval_interval_sec:.0f}s) - staying on mathematical CHOP."
+                    )
+                else:
+                    regime = "BULL_TREND"
+                    recommended_leverage = ai_lev_cap
+                    log.info(f"[AI-REGIME-ARBITER] 🚀 PROMOTION: Math indicated CHOP, but AI detected early institutional BULL_EXPANSION (Trap Risk: {trap_risk:.2f}, verdict {ai_verdict_age_sec:.0f}s old). Promoting to BULL_TREND.")
 
         # -----------------------------------------------------------------------
         # FinRL Mahalanobis Cross-Asset Turbulence Index & Two-Tier Circuit Breaker
         # -----------------------------------------------------------------------
         turb_info = self.calculate_mahalanobis_turbulence()
-        turb_idx = float(turb_info.get("turbulence_index", 0.0))
-        turb_thresh = float(turb_info.get("active_threshold", 22.0))
-        turb_state = str(turb_info.get("turbulence_state", "CALM_NORMAL"))
+        turb_idx = self._bounded_float(turb_info.get("turbulence_index"), 0.0, 0.0, 1e9)
+        turb_thresh = self._bounded_float(turb_info.get("active_threshold"), 22.0, 0.01, 1e9)
+        turb_state = str(turb_info.get("turbulence_state") or "CALM_NORMAL")
         turb_breach = bool(turb_info.get("turbulence_breach", False))
 
         if turb_breach:
@@ -800,6 +964,17 @@ class RegimeClassifier:
                     INSERT OR REPLACE INTO system_state (key, value, updated_at)
                     VALUES ('ai_regime_updated_at', ?, ?)
                 """, (timestamp, timestamp))
+                # The publication stamp above says when this row was written; these two say
+                # when a model actually produced the verdict being applied, so a cached
+                # arbiter answer can never be mistaken for a live one (or survive a restart).
+                conn.execute("""
+                    INSERT OR REPLACE INTO system_state (key, value, updated_at)
+                    VALUES ('ai_regime_last_eval_utc', ?, ?)
+                """, (ai_evaluated_at or "", timestamp))
+                conn.execute("""
+                    INSERT OR REPLACE INTO system_state (key, value, updated_at)
+                    VALUES ('ai_regime_eval_age_sec', ?, ?)
+                """, (f"{ai_verdict_age_sec:.0f}" if ai_verdict_age_sec is not None else "-1", timestamp))
                 conn.execute("""
                     INSERT OR REPLACE INTO system_state (key, value, updated_at)
                     VALUES ('finrl_turbulence_json', ?, ?)
@@ -820,6 +995,12 @@ if __name__ == "__main__":
     classifier = RegimeClassifier(db_path="trading_data.db")
     while True:
         log.info("--- REGIME CLASSIFIER starting new update cycle ---")
-        classifier.classify_and_save()
+        try:
+            classifier.classify_and_save()
+        except Exception as cycle_err:
+            # The bot reads market_regime to gate entries. Letting one bad cycle kill this
+            # process freezes that row at whatever it last was; retrying keeps it moving and
+            # any genuinely broken input still surfaces in the log every 5 minutes.
+            log.error(f"[REGIME-CYCLE] Classification cycle failed, will retry next cycle: {cycle_err}", exc_info=True)
         log.info("--- REGIME CLASSIFIER update complete. Sleeping for 5 minutes... ---")
         time.sleep(300)
