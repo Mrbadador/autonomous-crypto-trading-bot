@@ -101,6 +101,43 @@ class ConvictionBoardroom:
                                 res["log_warning"] = f"[BOARDROOM] 🚨 BIS CRASH SHIELD VETO: Extreme funding squeeze contagion detected. Blocking LONG entry for {symbol}."
                                 return res
 
+                        # 2B. TradFi Macro Credit & Spot ETF Gate (Stationary HYG/LQD Spread & SPY Trend)
+                        row_etf_telemetry = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'etf_macro_telemetry'").fetchone()
+                        if row_etf_telemetry and row_etf_telemetry[0]:
+                            try:
+                                etf_data = json.loads(row_etf_telemetry[0])
+                                is_tradfi_veto = bool(etf_data.get("veto_long_entries", False))
+                                conf_weight = float(etf_data.get("confidence_weight", 1.0))
+                                etf_rationale = etf_data.get("rationale", "")
+                                
+                                # Check telemetry staleness (TTL Guard: 6 hours)
+                                etf_ts = row_etf_telemetry[1]
+                                is_etf_stale = False
+                                if etf_ts:
+                                    try:
+                                        ts_clean = str(etf_ts).replace("Z", "+00:00")
+                                        etf_dt = datetime.fromisoformat(ts_clean)
+                                        if etf_dt.tzinfo is None:
+                                            etf_dt = etf_dt.replace(tzinfo=timezone.utc)
+                                        if (datetime.now(timezone.utc) - etf_dt).total_seconds() > 21600.0:
+                                            is_etf_stale = True
+                                    except Exception:
+                                        is_etf_stale = True
+
+                                if not is_etf_stale and is_tradfi_veto and conf_weight >= 0.50:
+                                    res["veto"] = {
+                                        "execute": False,
+                                        "conviction_score": 0.0,
+                                        "stage": "tradfi_macro_credit_shield",
+                                        "final_rationale": f"TradFi Macro/Credit Shield Veto: {etf_rationale}"
+                                    }
+                                    res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Toxic macro credit or equity regime active. Blocking LONG entry for {symbol}."
+                                    return res
+                                elif not is_etf_stale:
+                                    res["tradfi_macro_info"] = f"[BOARDROOM-TRADFI] {etf_rationale} (Confidence: {conf_weight:.2f})"
+                            except Exception as etf_parse_err:
+                                log.debug(f"[BOARDROOM-TRADFI-NOTE] Telemetry parse note: {etf_parse_err}")
+
                     # R-4 FIX: Consistent usage of is_long_side
                     if is_long_side and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
                         row_pause = conn.execute("SELECT value FROM system_state WHERE key IN ('ALT_LONG_PAUSE', 'alt_long_pause')").fetchall()

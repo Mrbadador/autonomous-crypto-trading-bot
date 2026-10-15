@@ -379,6 +379,29 @@ def _raw_fetch_macro():
         else:
             macro_regime = "NEUTRAL"
         
+        # Extended TradFi & Spot ETF Ingestion (HYG, LQD, IBIT)
+        etf_macro_metrics = {}
+        etf_gate_eval = {}
+        try:
+            hyg = yf.Ticker("HYG").history(period="15d", interval="1d", timeout=6.0)
+            lqd = yf.Ticker("LQD").history(period="15d", interval="1d", timeout=6.0)
+            ibit = yf.Ticker("IBIT").history(period="15d", interval="1d", timeout=6.0)
+            
+            if len(hyg) >= 5 and len(lqd) >= 5:
+                from etf_macro_engine import MarketHoursAwareMacroGate
+                gate = MarketHoursAwareMacroGate()
+                # Compute stationary z-scores using daily history + 1h series
+                spy_daily = yf.Ticker("SPY").history(period="60d", interval="1d", timeout=6.0)
+                uup_daily = yf.Ticker("UUP").history(period="30d", interval="1d", timeout=6.0)
+                
+                if len(spy_daily) >= 20 and len(uup_daily) >= 5:
+                    now_utc = datetime.now(timezone.utc)
+                    gate.update_market_feed(spy_daily['Close'], uup_daily['Close'], hyg['Close'], lqd['Close'], now_utc)
+                    etf_gate_eval = gate.evaluate_gate(now_utc)
+                    etf_macro_metrics = etf_gate_eval.get("metrics", {})
+        except Exception as etf_err:
+            log.warning(f"[ETF-MACRO-NOTE] Optional ETF/Credit feed update: {etf_err}")
+
         return {
             'spy_price': spy_latest,
             'uup_price': uup_latest,
@@ -388,7 +411,9 @@ def _raw_fetch_macro():
             'uup_1h_change': uup_change,
             'global_killswitch': global_killswitch,
             'macro_regime': macro_regime,
-            'data_ok': data_ok
+            'data_ok': data_ok,
+            'etf_gate_eval': etf_gate_eval,
+            'etf_macro_metrics': etf_macro_metrics,
         }
     except Exception as e:
         log.error(f"Error fetching macro data: {e}")
@@ -568,6 +593,15 @@ def update_macro_context():
                                      ("1", now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_heartbeat', ?, ?)",
                                      (now_iso, now_iso))
+                        # Persist stationary TradFi macro and ETF gate telemetry
+                        etf_eval = data.get("etf_gate_eval", {})
+                        if etf_eval:
+                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('etf_macro_telemetry', ?, ?)",
+                                         (json.dumps(etf_eval), now_iso))
+                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('tradfi_macro_veto', ?, ?)",
+                                         ("1" if etf_eval.get("veto_long_entries") else "0", now_iso))
+                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('tradfi_confidence_weight', ?, ?)",
+                                         (str(etf_eval.get("confidence_weight", 1.0)), now_iso))
                     conn.close()
                 except Exception as e:
                     log.error(f"Failed to commit macro context to {db_target}: {e}")
