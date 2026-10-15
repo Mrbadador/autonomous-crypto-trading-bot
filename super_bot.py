@@ -832,7 +832,9 @@ class SuperBotTrader:
                     return
 
             # Dynamic Balance Sizing: 70% Wallet Utilization Protocol & 2.0% Hard Risk Cap
-            max_wallet_margin_pct = getattr(config, "GLOBAL_MARGIN_LIMIT", 70.0) / 100.0  # 0.70
+            global_margin_limit = float(getattr(config, "GLOBAL_MARGIN_LIMIT", 70.0))
+            max_wallet_margin_pct = global_margin_limit / 100.0  # 0.70 or 0.80
+            max_margin_per_trade_pct = float(getattr(config, "MAX_MARGIN_PER_TRADE_PCT", 0.20))
             try:
                 live_bal = await self.uta_client.fetch_balance()
                 if not live_bal or live_bal <= 10.0:
@@ -847,7 +849,7 @@ class SuperBotTrader:
                 available_margin_buffer = max(0.0, max_allowed_margin - total_locked_margin)
 
                 if available_margin_buffer < 5.0:
-                    log.warning(f"[GRID-MARGIN-CEILING] 70% Wallet Utilization reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing {pos_side.upper()} entry.")
+                    log.warning(f"[GRID-MARGIN-CEILING] {global_margin_limit:.0f}% Wallet Utilization reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing {pos_side.upper()} entry.")
                     return
 
                 target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
@@ -893,6 +895,12 @@ class SuperBotTrader:
                     log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
                 except Exception as ke:
                     log.debug(f"[{engine_tag}-KELLY-NOTE] {ke}")
+
+                # Q-10 FIX: Clamp target margin per trade to MAX_MARGIN_PER_TRADE_PCT ceiling (e.g. 14% or 20% of equity)
+                max_trade_margin_cap = live_bal * max_margin_per_trade_pct
+                if target_per_trade > max_trade_margin_cap:
+                    log.info(f"[{engine_tag}-MARGIN-CLAMP] Clamping target margin ${target_per_trade:.2f} to {max_margin_per_trade_pct:.0%} per-trade cap (${max_trade_margin_cap:.2f}).")
+                    target_per_trade = max_trade_margin_cap
 
                 margin = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
 
