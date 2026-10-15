@@ -87,7 +87,9 @@ class ConvictionBoardroom:
                                         is_stale = True
                                         log.warning(f"[BOARDROOM-BIS] ⚠️ funding_crash_risk is stale ({age_sec:.1f}s > 14400s). Failing to NORMAL.")
                                 except Exception as ts_err:
-                                    log.warning(f"[BOARDROOM-BIS] Could not parse funding_crash_risk timestamp '{crash_ts}': {ts_err}")
+                                    # R-5 FIX: Corrupted or unparseable timestamps fail-to-NORMAL (is_stale = True) to prevent permanent lockout
+                                    is_stale = True
+                                    log.warning(f"[BOARDROOM-BIS] Could not parse funding_crash_risk timestamp '{crash_ts}': {ts_err}. Failing to NORMAL.")
 
                             if not is_stale and crash_val == "CRITICAL":
                                 res["veto"] = {
@@ -99,7 +101,8 @@ class ConvictionBoardroom:
                                 res["log_warning"] = f"[BOARDROOM] 🚨 BIS CRASH SHIELD VETO: Extreme funding squeeze contagion detected. Blocking LONG entry for {symbol}."
                                 return res
 
-                    if "LONG" in side.upper() and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
+                    # R-4 FIX: Consistent usage of is_long_side
+                    if is_long_side and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
                         row_pause = conn.execute("SELECT value FROM system_state WHERE key IN ('ALT_LONG_PAUSE', 'alt_long_pause')").fetchall()
                         row_state = conn.execute("SELECT value FROM system_state WHERE key = 'btc_anchor_state'").fetchone()
                         is_paused = any(r[0] in ("1", "true", "True") for r in row_pause)

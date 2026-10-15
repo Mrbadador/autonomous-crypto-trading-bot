@@ -82,6 +82,8 @@ class SwingArchitectTrader:
         self._last_ai_health_check_ts = {}  # symbol -> last health check timestamp
         self._ai_veto_cache = {}  # (symbol, direction) -> dict(ts, candle_ts, price, reason)
         self._trap_pass_cache = {}  # (symbol, direction) -> dict(ts, candle_ts, price, score, reason)
+        self._close_retry_counts = {}  # symbol -> int (close attempt counter)
+        self._close_retry_next_ts = {}  # symbol -> float (next timestamp allowed for close retry)
 
         self._init_database()
         self._load_active_positions_sync()
@@ -1262,6 +1264,24 @@ class SwingArchitectTrader:
         else:
             qty = max(float(round(qty)), 1.0)
 
+        # R-6 FIX: Post-rounding dollar risk check to ensure contract minimums do not inflate risk beyond cap
+        actual_notional = qty * entry_price
+        actual_risk_usd = actual_notional * (sl_distance / entry_price if entry_price > 0 else 0.015)
+        # If live_bal was resolved, ensure actual dollar risk does not exceed max_risk_usd * 1.15 (15% grace for contract step rounding)
+        try:
+            max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0
+            if 'live_bal' in locals() and live_bal > 0:
+                max_allowed_risk_usd = live_bal * max_risk_pct * 1.15
+                if actual_risk_usd > max_allowed_risk_usd:
+                    log.warning(
+                        f"[CONTRACT-STEP-RISK-VETO] 🛑 Minimum contract step for {symbol} (qty={qty}) forces dollar risk "
+                        f"${actual_risk_usd:.2f} ({actual_risk_usd/live_bal*100:.2f}%), exceeding budget ${max_allowed_risk_usd:.2f} "
+                        f"({max_risk_pct*1.15*100:.2f}% equity limit). Vetoing entry."
+                    )
+                    return
+        except Exception as step_risk_err:
+            log.debug(f"[STEP-RISK-NOTE] {step_risk_err}")
+
         # 1. Acquire exclusive lock FIRST before placing order
         lock_reason = f"4H_SWING_{direction.upper()}_{quality_tier}"
         lock_acquired = await asyncio.to_thread(self._acquire_lock_sync, symbol, lock_reason)
@@ -1701,8 +1721,16 @@ class SwingArchitectTrader:
         if not self.active_positions:
             return
 
+        now_ts = time.time()
         for symbol, pos in list(self.active_positions.items()):
             try:
+                # S2-01 / R-1 FIX: If position is PENDING_CLOSE and backoff has not expired, skip manage cycle
+                if str(pos.get("status", "")).upper() == "PENDING_CLOSE":
+                    next_retry = float(self._close_retry_next_ts.get(symbol, 0.0))
+                    if now_ts < next_retry:
+                        log.debug(f"[PENDING-CLOSE-BACKOFF] {symbol} close retry delayed ({next_retry - now_ts:.0f}s remaining).")
+                        continue
+
                 # Fetch live ticker price
                 clean_sym = self.uta_client._normalize_symbol(symbol)
                 ticker = await self.uta_client.exchange.fetch_ticker(clean_sym)
@@ -2159,19 +2187,29 @@ class SwingArchitectTrader:
 
         # Safety Check: If close order failed, do NOT delete position or release lock!
         if close_error or not close_res:
+            self._close_retry_counts[symbol] = self._close_retry_counts.get(symbol, 0) + 1
+            attempts = self._close_retry_counts[symbol]
+            # Backoff: Next retry allowed after 2^(attempts-1) * 30 seconds (up to 300s)
+            backoff_sec = min(300.0, (2.0 ** max(0, attempts - 1)) * 30.0)
+            self._close_retry_next_ts[symbol] = time.time() + backoff_sec
+
             def _mark_pending_close():
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                     conn.execute("""
                         UPDATE swing_open_positions
                         SET status = 'PENDING_CLOSE', notes = ?
                         WHERE symbol = ?
-                    """, (f"PENDING_CLOSE: {reason} error: {close_error}", symbol))
+                    """, (f"PENDING_CLOSE (attempt {attempts}): {reason} error: {close_error}", symbol))
                     conn.commit()
             await asyncio.to_thread(_mark_pending_close)
             if symbol in self.active_positions:
                 self.active_positions[symbol]["status"] = "PENDING_CLOSE"
-            log.warning(f"[CLOSE-SAFETY] Position {symbol} marked PENDING_CLOSE. Locks retained; position NOT purged.")
+            log.warning(f"[CLOSE-SAFETY] Position {symbol} marked PENDING_CLOSE (attempt {attempts}). Next retry in {backoff_sec:.0f}s. Locks retained; position NOT purged.")
             return
+
+        # Clear retry state on successful exit
+        self._close_retry_counts.pop(symbol, None)
+        self._close_retry_next_ts.pop(symbol, None)
 
         # Query and Aggregate Order Fills (Multi-tranche / split-fill aggregation)
         order_id = close_res.get("id") or close_res.get("orderId")

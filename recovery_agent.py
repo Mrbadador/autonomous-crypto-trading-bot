@@ -138,17 +138,21 @@ async def run_recovery_loop():
                                 new_qty = qty + dca_qty
                                 new_entry_price = ((entry_price * qty) + (current_price * dca_qty)) / new_qty
                                 
+                                # R-3 FIX: Case-insensitive side normalization to prevent inverted stop losses
+                                side_norm = str(side).strip().lower()
+                                is_long_pos = (side_norm in ("long", "buy"))
+
                                 # Proportional Stop Loss Recalculation (precomputed before order execution)
-                                sl_val = float(stop_loss) if (stop_loss is not None and float(stop_loss) > 0) else (entry_price * 0.97 if side == "long" else entry_price * 1.03)
+                                sl_val = float(stop_loss) if (stop_loss is not None and float(stop_loss) > 0) else (entry_price * 0.97 if is_long_pos else entry_price * 1.03)
                                 old_sl_dist_pct = abs(entry_price - sl_val) / entry_price if entry_price > 0 else 0.03
-                                new_sl = new_entry_price * (1.0 - old_sl_dist_pct) if side == "long" else new_entry_price * (1.0 + old_sl_dist_pct)
+                                new_sl = new_entry_price * (1.0 - old_sl_dist_pct) if is_long_pos else new_entry_price * (1.0 + old_sl_dist_pct)
                                 
                                 # Execute DCA Recovery Order on the Exchange!
                                 try:
-                                    order_side = "buy" if side == "long" else "sell"
+                                    order_side = "buy" if is_long_pos else "sell"
                                     if ex_id == "bitget":
                                         uta = get_bitget_uta_client()
-                                        await uta.create_market_order(symbol, side, dca_qty)
+                                        await uta.create_market_order(symbol, "long" if is_long_pos else "short", dca_qty)
                                         await uta.close()
                                     else:
                                         await exchange.create_market_order(symbol, order_side, dca_qty)

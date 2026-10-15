@@ -634,11 +634,24 @@ class SuperBotTrader:
                     ms_state = MicrostructureStateCache.get_state(clean_sym)
                     tox_halt = bool(ms_state.get("toxicity_halt", False))
                     vpin_val = float(ms_state.get("vpin", 0.0) or 0.0)
-                    kyle_pct = float(ms_state.get("kyle_lambda_pctile", 0.5) or 0.5)
-                    lvr_bps = float(ms_state.get("lvr_tax_bps", 0.0) or 0.0)
                     micro_p = float(ms_state.get("micro_price", 0.0) or curr_price)
                     if micro_p <= 0.0:
                         micro_p = curr_price
+
+                    # R-0 FIX: Extract Hawkes metrics and enforce hard veto for cascade (rho) and spoofing
+                    hawkes_rho = float(ms_state.get("hawkes_rho", 0.0) or 0.0)
+                    hawkes_spoof = float(ms_state.get("hawkes_spoof_index", 0.0) or 0.0)
+                    hawkes_veto = bool(ms_state.get("hawkes_veto", False))
+                    try:
+                        rho_cut = float(getattr(config, "HAWKES_RHO_VETO_THRESHOLD", 1.05))
+                        spoof_cut = float(getattr(config, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
+                    except Exception:
+                        rho_cut = 1.05
+                        spoof_cut = 0.78
+
+                    if hawkes_veto or hawkes_rho >= rho_cut or hawkes_spoof >= spoof_cut:
+                        log.warning(f"[GRID-HAWKES-VETO] 🚨 Order flow self-excitation cascade/spoof detected on {symbol}: rho={hawkes_rho:.2f}>={rho_cut}, spoof={hawkes_spoof:.2f}>={spoof_cut}. Suppressing dip-buy.")
+                        continue
 
                     if tox_halt or vpin_val >= 0.68:
                         log.warning(f"[GRID-VPIN-ADVISORY] ⚠️ Microstructure Toxicity alert for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f} (Advisory log-only until bucket calibration).")
