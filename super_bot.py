@@ -641,8 +641,9 @@ class SuperBotTrader:
                         micro_p = curr_price
 
                     if tox_halt or vpin_val >= 0.68:
-                        log.warning(f"[GRID-VETO] 🛑 Microstructure Toxicity Veto for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f}. Dip-buy skipped.")
-                        continue
+                        log.warning(f"[GRID-VPIN-ADVISORY] ⚠️ Microstructure Toxicity alert for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f} (Advisory log-only until bucket calibration).")
+                        # Held advisory / log-only to prevent false-positive lockouts on low-unit alts
+
 
                     # Markov Regime Cascade & Tradability Duration Screen (Playbook Step 9)
                     def _check_markov_telemetry():
