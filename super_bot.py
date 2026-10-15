@@ -941,6 +941,12 @@ class SuperBotTrader:
 
             notional = margin * self.grid_leverage
             qty = self.uta_client.format_qty_precision(symbol, notional / current_price)
+            if qty <= 0:
+                log.warning(
+                    f"[{engine_tag}-QTY-FLOOR-VETO] 🛑 Formatted order quantity ({qty}) is below exchange minimum contract floor for {symbol}. "
+                    f"Notional ${notional:.2f} at price ${current_price:,.4f} insufficient. Vetoing entry."
+                )
+                return
 
             # Post-Rounding Step Risk Check: Verify contract rounding didn't push risk beyond 2.0% equity cap (+15% step tolerance)
             sl_pct = self.grid_sl_pct if is_long else self.scalp_short_sl_pct
