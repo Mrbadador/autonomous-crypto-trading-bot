@@ -49,5 +49,29 @@ class TestConvictionWhitelist(unittest.TestCase):
         self.assertEqual(res_qqqu.get("stage"), "whitelist_gate")
         self.assertFalse(res_qqqu.get("execute", True))
 
+    def test_bis_crash_risk_ttl_fresh_blocks(self):
+        # Fresh CRITICAL crash risk within 4h should block LONG
+        boardroom = ConvictionBoardroom()
+        with sqlite3.connect("trading_data.db") as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('funding_crash_risk', 'CRITICAL', datetime('now'))"
+            )
+
+        res = asyncio.run(boardroom.get_conviction("BTC/USDT", "BUY", {"strategy": "Test"}))
+        self.assertEqual(res.get("stage"), "bis_crash_shield")
+        self.assertFalse(res.get("execute", True))
+
+    def test_bis_crash_risk_stale_fails_to_normal(self):
+        # Stale CRITICAL crash risk (> 4h old) should fail-to-NORMAL and not block at bis_crash_shield
+        boardroom = ConvictionBoardroom()
+        with sqlite3.connect("trading_data.db") as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('funding_crash_risk', 'CRITICAL', '2020-01-01T00:00:00+00:00')"
+            )
+
+        res = asyncio.run(boardroom.get_conviction("BTC/USDT", "BUY", {"strategy": "Test"}))
+        self.assertNotEqual(res.get("stage"), "bis_crash_shield")
+
 if __name__ == "__main__":
     unittest.main()
+

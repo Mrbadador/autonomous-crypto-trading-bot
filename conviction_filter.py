@@ -66,18 +66,38 @@ class ConvictionBoardroom:
                     )
 
                     # 2. Bitcoin Anchor & BIS Crash-Risk Contagion Filter
-                    if "LONG" in side.upper():
+                    norm_side = side.upper()
+                    is_long_side = ("LONG" in norm_side or "BUY" in norm_side)
+                    if is_long_side:
                         # BIS Crash-Risk Contagion Shield: Funding > +0.045% while 4H ROC <= 0
-                        row_crash = conn.execute("SELECT value FROM system_state WHERE key = 'funding_crash_risk'").fetchone()
-                        if row_crash and str(row_crash[0]).upper() == "CRITICAL":
-                            res["veto"] = {
-                                "execute": False,
-                                "conviction_score": 0.0,
-                                "stage": "bis_crash_shield",
-                                "final_rationale": "BIS Crash-Risk Shield Veto: Overheated perpetual funding (> +0.045%) with negative momentum detected across fleet. Long entries frozen."
-                            }
-                            res["log_warning"] = f"[BOARDROOM] 🚨 BIS CRASH SHIELD VETO: Extreme funding squeeze contagion detected. Blocking LONG entry for {symbol}."
-                            return res
+                        row_crash = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'funding_crash_risk'").fetchone()
+                        if row_crash and row_crash[0]:
+                            crash_val = str(row_crash[0]).upper()
+                            crash_ts = row_crash[1]
+                            # TTL Guard: scout loop runs every 1-4 hours; if older than 4h (14400s), fail-to-NORMAL
+                            is_stale = False
+                            if crash_ts:
+                                try:
+                                    ts_str = str(crash_ts).replace("Z", "+00:00")
+                                    updated_dt = datetime.fromisoformat(ts_str)
+                                    if updated_dt.tzinfo is None:
+                                        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                                    age_sec = (datetime.now(timezone.utc) - updated_dt).total_seconds()
+                                    if age_sec > 14400.0:
+                                        is_stale = True
+                                        log.warning(f"[BOARDROOM-BIS] ⚠️ funding_crash_risk is stale ({age_sec:.1f}s > 14400s). Failing to NORMAL.")
+                                except Exception as ts_err:
+                                    log.warning(f"[BOARDROOM-BIS] Could not parse funding_crash_risk timestamp '{crash_ts}': {ts_err}")
+
+                            if not is_stale and crash_val == "CRITICAL":
+                                res["veto"] = {
+                                    "execute": False,
+                                    "conviction_score": 0.0,
+                                    "stage": "bis_crash_shield",
+                                    "final_rationale": "BIS Crash-Risk Shield Veto: Overheated perpetual funding (> +0.045%) with negative momentum detected across fleet. Long entries frozen."
+                                }
+                                res["log_warning"] = f"[BOARDROOM] 🚨 BIS CRASH SHIELD VETO: Extreme funding squeeze contagion detected. Blocking LONG entry for {symbol}."
+                                return res
 
                     if "LONG" in side.upper() and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
                         row_pause = conn.execute("SELECT value FROM system_state WHERE key IN ('ALT_LONG_PAUSE', 'alt_long_pause')").fetchall()
