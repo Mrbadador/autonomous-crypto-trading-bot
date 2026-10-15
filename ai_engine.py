@@ -1611,18 +1611,19 @@ async def detect_spoof_and_ghost_walls(depth_packet: dict, timeout_sec: float = 
         mean_res = float(depth_packet.get("mean_residence_time_ms", 250.0) or 250.0)
         norm_ofi = float(depth_packet.get("normalized_ofi", 0.0) or 0.0)
 
-        # Quantitative spoofing condition: Hawkes criticality rho >= 0.85 or spoof index >= 0.70 with sub-300ms residence
-        is_spoof = hawkes_veto or (hawkes_rho >= 0.85 and hawkes_spoof >= 0.65) or (mean_res < 150.0 and hawkes_spoof >= 0.75)
+        # Quantitative spoofing condition: Hawkes veto or spoof index >= 0.70 with sub-300ms residence
+        # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314); removed rho comparison from entry veto path
+        is_spoof = hawkes_veto or (hawkes_spoof >= 0.70 and mean_res < 300.0)
         spoof_side = "NONE"
         if is_spoof:
             spoof_side = "BID" if norm_ofi > 0 else "ASK"
             advisory = "VETO_BUY_SPOOF" if spoof_side == "BID" else "VETO_SELL_SPOOF"
-            risk_pct = min(95.0, round(hawkes_rho * 100.0, 1))
-            headline = f"Quantitative Fast-Path: Phantom spoofing detected on {spoof_side} (Hawkes rho={hawkes_rho:.2f}, residence={mean_res:.0f}ms)."
+            risk_pct = min(95.0, round(hawkes_spoof * 100.0, 1))
+            headline = f"Quantitative Fast-Path: Phantom spoofing detected on {spoof_side} (Hawkes spoof={hawkes_spoof:.2f}, residence={mean_res:.0f}ms)."
         else:
             advisory = "ALLOW"
-            risk_pct = max(5.0, round(hawkes_rho * 50.0, 1))
-            headline = f"Quantitative Fast-Path: Order book depth stable (Hawkes rho={hawkes_rho:.2f}, residence={mean_res:.0f}ms)."
+            risk_pct = max(5.0, round(hawkes_spoof * 50.0, 1))
+            headline = f"Quantitative Fast-Path: Order book depth stable (Hawkes spoof={hawkes_spoof:.2f}, residence={mean_res:.0f}ms)."
 
         return {
             "spoof_detected": is_spoof,

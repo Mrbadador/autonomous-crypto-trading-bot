@@ -643,19 +643,14 @@ class SuperBotTrader:
                     if ms_is_degraded:
                         log.info(f"[GRID-MS-DEGRADED] Microstructure state for {clean_sym} is missing or stale (>60s). Scaling margin 50% for defense.")
 
-                    # N-1 FIX: Align Hawkes config keys with config.py (HAWKES_CASCADE_RHO_THRESHOLD)
-                    hawkes_rho = float(ms_state.get("hawkes_rho", 0.0) or 0.0)
+                    # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314) due to static branching ratios.
+                    # Excised rho comparison from entry veto path; hawkes_spoof_index and VPIN remain live controls.
                     hawkes_spoof = float(ms_state.get("hawkes_spoof_index", 0.0) or 0.0)
                     hawkes_veto = bool(ms_state.get("hawkes_veto", False))
-                    try:
-                        rho_cut = float(getattr(config, "HAWKES_CASCADE_RHO_THRESHOLD", getattr(config, "HAWKES_RHO_VETO_THRESHOLD", 1.05)))
-                        spoof_cut = float(getattr(config, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
-                    except Exception:
-                        rho_cut = 1.05
-                        spoof_cut = 0.78
+                    spoof_cut = float(getattr(config, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
 
-                    if hawkes_veto or hawkes_rho >= rho_cut or hawkes_spoof >= spoof_cut:
-                        log.warning(f"[GRID-HAWKES-VETO] 🚨 Order flow self-excitation cascade/spoof detected on {symbol}: rho={hawkes_rho:.2f}>={rho_cut}, spoof={hawkes_spoof:.2f}>={spoof_cut}. Suppressing dip-buy.")
+                    if hawkes_veto or hawkes_spoof >= spoof_cut:
+                        log.warning(f"[GRID-HAWKES-VETO] 🚨 Order flow spoofing detected on {symbol}: spoof={hawkes_spoof:.2f}>={spoof_cut}, veto_flag={hawkes_veto}. Suppressing dip-buy.")
                         continue
 
                     if tox_halt or vpin_val >= 0.68:

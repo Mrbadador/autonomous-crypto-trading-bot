@@ -319,9 +319,9 @@ class SymbolOFIState:
             rho_cut = 1.05
             spoof_cut = 0.78
 
+        # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314); removed rho comparison from toxicity halt
         self.latest_toxicity_halt = bool(
             (vpin_val >= 0.68) or
-            (self.latest_hawkes_rho >= rho_cut) or
             (self.latest_hawkes_spoof >= spoof_cut)
         )
 

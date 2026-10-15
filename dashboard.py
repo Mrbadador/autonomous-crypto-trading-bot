@@ -3239,8 +3239,8 @@ with tab_risk:
     vpin_badge = "🟢 BENIGN FLOW" if vpin_val < 0.45 else ("🟡 CAUTION FLOW" if vpin_val < 0.70 else "🔴 TOXIC CASCADE")
     mlofi_color = "#00ff66" if mlofi_val > 0.05 else ("#ff003c" if mlofi_val < -0.05 else "#94a3b8")
     micro_color = "#00ff66" if micro_bps > 0 else ("#ff003c" if micro_bps < 0 else "#94a3b8")
-    hawkes_color = "#ff003c" if (hawkes_veto_val or hawkes_spoof_val > 0.72 or hawkes_rho_val >= 1.0) else ("#f59e0b" if hawkes_spoof_val > 0.45 else "#00ff66")
-    hawkes_badge = "🔴 VETO TRIGGERED" if hawkes_veto_val else ("🟡 ELEVATED FLUX" if hawkes_spoof_val > 0.45 else "🟢 STATIONARY")
+    hawkes_color = "#ff003c" if (hawkes_veto_val or hawkes_spoof_val > 0.72) else ("#f59e0b" if hawkes_spoof_val > 0.45 else "#00ff66")
+    hawkes_badge = "🔴 VETO TRIGGERED" if hawkes_veto_val else ("🟡 ELEVATED FLUX" if hawkes_spoof_val > 0.45 else "🟢 ORDER FLOW NORMAL")
     kyle_color = "#ff003c" if (tox_halt_val or kyle_pctile_val >= 0.90) else ("#f59e0b" if kyle_pctile_val >= 0.75 else "#00ff66")
     kyle_badge = "🔴 TOXICITY HALT" if tox_halt_val else (f"Pctile: {kyle_pctile_val*100:.0f}%")
 

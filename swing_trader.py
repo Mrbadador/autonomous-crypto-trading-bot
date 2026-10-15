@@ -1056,9 +1056,9 @@ class SwingArchitectTrader:
                 return
 
             h_spoof_max = float(getattr(config, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
-            h_rho_max = float(getattr(config, "HAWKES_CASCADE_RHO_THRESHOLD", 1.05))
-            if h_veto or h_spoof > h_spoof_max or h_rho >= h_rho_max:
-                log.warning(f"[SWING-MICROSTRUCTURE-VETO] {symbol} Hawkes Spoof={h_spoof:.2f} (rho={h_rho:.2f}). Predatory phantom liquidity detected. Blocking entry.")
+            # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314); removed rho comparison from entry veto path
+            if h_veto or h_spoof > h_spoof_max:
+                log.warning(f"[SWING-MICROSTRUCTURE-VETO] {symbol} Hawkes Spoof={h_spoof:.2f} (veto={h_veto}). Predatory phantom liquidity detected. Blocking entry.")
                 return
         except Exception as ms_err:
             log.warning(f"[SWING-MICROSTRUCTURE-VETO] Microstructure guard error (fail-closed) for {symbol}: {ms_err}")
