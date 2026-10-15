@@ -20,6 +20,25 @@ from microstructure_metrics import (
     calculate_lvr_tax_bps
 )
 
+import logging
+
+# Setup structured logger matching fleet standards
+log = logging.getLogger("ofi_daemon")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _fmt = logging.Formatter("%(asctime)s [%(levelname)s] [OFI_DAEMON] %(message)s")
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(_fmt)
+    log.addHandler(_sh)
+
+# Auto-flush sys.stdout on non-TTY environments so logs stream continuously under supervisor
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # Monitor all fleet symbols from config.SYMBOLS; do NOT exclude SWING_BLACKLIST assets from OFI
 # (N-2 FIX: ETH, BNB, etc. must have their own genuine L2 order book metrics instead of falling back to BTC)
 DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT"]
@@ -493,7 +512,7 @@ class MultiSymbolOFIDaemon:
                     break
                 except Exception as e:
                     if i == 4:
-                        print(f"[ERROR] Failed to write microstructure state: {e}")
+                        log.error(f"Failed to write microstructure state: {e}")
                     else:
                         _time.sleep(0.05)
                 finally:
@@ -588,11 +607,11 @@ async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
 
                     if tape_intel:
                         daemon.latest_tape_intel = tape_intel
-                        print(f"[TAPE-WHISPERER] Condition={tape_intel.get('tape_condition')} | Side={tape_intel.get('absorption_side')} | Veto={tape_intel.get('execution_veto')} | Conf={tape_intel.get('confidence')}")
+                        log.info(f"[TAPE-WHISPERER] Condition={tape_intel.get('tape_condition')} | Side={tape_intel.get('absorption_side')} | Veto={tape_intel.get('execution_veto')} | Conf={tape_intel.get('confidence')}")
 
                     if ghost_walls:
                         daemon.latest_ghost_walls = ghost_walls
-                        print(f"[GHOST-WALL] Spoof={ghost_walls.get('spoof_detected')} | Side={ghost_walls.get('spoof_side')} | Advisory={ghost_walls.get('execution_advisory')} | Risk={ghost_walls.get('manipulation_risk_pct')}%")
+                        log.info(f"[GHOST-WALL] Spoof={ghost_walls.get('spoof_detected')} | Side={ghost_walls.get('spoof_side')} | Advisory={ghost_walls.get('execution_advisory')} | Risk={ghost_walls.get('manipulation_risk_pct')}%")
 
                     # Persist to databases
                     def _db_write():
@@ -613,18 +632,18 @@ async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
                                 pass
                     await asyncio.to_thread(_db_write)
         except Exception as e:
-            print(f"[WARN] Error in Tape Whisperer background loop: {e}")
+            log.warning(f"[WARN] Error in Tape Whisperer background loop: {e}")
 
         await asyncio.sleep(300)
 
 
 async def stream_level2_data():
     daemon = MultiSymbolOFIDaemon(symbols=SYMBOLS, window_seconds=60)
-    print("=========================================================")
-    print("   *** STARTING BITGET 15-LEVEL VOLUMETRIC OFI DAEMON ***")
-    print("=========================================================")
-    print(f"Monitored Symbols ({len(SYMBOLS)}): {SYMBOLS}")
-    print(f"Connecting to Bitget Public WebSocket: {WS_URL}")
+    log.info("=========================================================")
+    log.info("   *** STARTING BITGET 15-LEVEL VOLUMETRIC OFI DAEMON ***")
+    log.info("=========================================================")
+    log.info(f"Monitored Symbols ({len(SYMBOLS)}): {SYMBOLS}")
+    log.info(f"Connecting to Bitget Public WebSocket: {WS_URL}")
 
     # Launch background AI Order Flow Tape Whisperer
     whisperer_task = asyncio.create_task(_ai_tape_whisperer_loop(daemon))
@@ -655,10 +674,10 @@ async def stream_level2_data():
         try:
             async with websockets.connect(WS_URL, ping_interval=None) as ws:
                 await ws.send(json.dumps(sub_payload))
-                print(f"[OK] Connection Established. Subscribed to Bitget books15 & trade channels ({len(SYMBOLS)} symbols)...")
+                log.info(f"[OK] Connection Established. Subscribed to Bitget books15 & trade channels ({len(SYMBOLS)} symbols)...")
                 _reconnect_attempt = 0
                 daemon.reset_all()
-                print("[OFI] All symbol state machines reset on WebSocket reconnection.")
+                log.info("[OFI] All symbol state machines reset on WebSocket reconnection.")
 
                 async def _ping_loop():
                     while True:
@@ -708,7 +727,7 @@ async def stream_level2_data():
                             if chk is not None and bids and asks:
                                 try:
                                     if not verify_bitget_crc32_checksum(bids, asks, int(chk)):
-                                        print(f"[WARN] CRC32 Checksum mismatch for {symbol}! Re-syncing book.")
+                                        log.warning(f"[WARN] CRC32 Checksum mismatch for {symbol}! Re-syncing book.")
                                         daemon.symbol_states[symbol].reset()
                                 except Exception:
                                     pass
@@ -721,12 +740,12 @@ async def stream_level2_data():
         except Exception as e:
             _reconnect_attempt += 1
             backoff = min(_BASE_DELAY * (2 ** (_reconnect_attempt - 1)), _MAX_DELAY)
-            print(f"\n[WARN] WebSocket Disconnected (attempt #{_reconnect_attempt}): {e}. Reconnecting in {backoff:.0f}s...")
+            log.warning(f"WebSocket Disconnected (attempt #{_reconnect_attempt}): {e}. Reconnecting in {backoff:.0f}s...")
             await asyncio.sleep(backoff)
 
 if __name__ == "__main__":
     try:
         asyncio.run(stream_level2_data())
     except KeyboardInterrupt:
-        print("\n[STOP] OFI Daemon Terminated.")
+        log.info("OFI Daemon Terminated.")
         sys.exit(0)
