@@ -341,8 +341,13 @@ class SuperBotTrader:
                 # 1. Adopt active 4H Swing and Chop Grid positions (including PENDING_CLOSE)
                 rows_swing = conn.execute("SELECT * FROM swing_open_positions WHERE status IN ('ACTIVE', 'PENDING_CLOSE')").fetchall()
                 active = {}
+                configured_symbols = set(getattr(config, "SYMBOLS", []))
                 for r in rows_swing:
                     pos = dict(r)
+                    sym = pos.get("symbol")
+                    if configured_symbols and sym not in configured_symbols:
+                        log.warning(f"[ADOPT-SKIP-UNKNOWN] ⚠️ Skipping adoption of unknown symbol '{sym}' (not in config.SYMBOLS).")
+                        continue
                     notes = str(pos.get("notes", "")).lower()
                     if "scalp_short" in notes or "scalp short" in notes or "short scalp" in notes:
                         pos["engine_type"] = "SCALP_SHORT"

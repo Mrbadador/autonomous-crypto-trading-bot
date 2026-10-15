@@ -1747,8 +1747,14 @@ class SwingArchitectTrader:
             return
 
         now_ts = time.time()
+        configured_symbols = set(getattr(config, "SYMBOLS", []))
         for symbol, pos in list(self.active_positions.items()):
             try:
+                # Q-4 DEFENSE: Ignore unknown test/mock symbols not present in config.SYMBOLS
+                if configured_symbols and symbol not in configured_symbols:
+                    log.warning(f"[MANAGE-SKIP-UNKNOWN] ⚠️ Skipping position management for unknown symbol '{symbol}' (not in config.SYMBOLS).")
+                    continue
+
                 # Fetch live ticker price first (N-5 FIX: never blackout monitoring during backoff)
                 clean_sym = self.uta_client._normalize_symbol(symbol)
                 ticker = await self.uta_client.exchange.fetch_ticker(clean_sym)
@@ -2162,6 +2168,19 @@ class SwingArchitectTrader:
 
         pos = self.active_positions.get(symbol)
         if not pos:
+            return
+
+        # Q-4 DEFENSE: Refuse to dispatch live exchange close order for unknown non-whitelisted symbols
+        configured_symbols = set(getattr(config, "SYMBOLS", []))
+        if configured_symbols and symbol not in configured_symbols:
+            log.warning(f"[CLOSE-SKIP-UNKNOWN] 🛑 Refusing to dispatch close order to exchange for non-whitelisted symbol '{symbol}'. Cleaning local state only.")
+            self.active_positions.pop(symbol, None)
+            def _clean_unknown_db():
+                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    conn.execute("DELETE FROM swing_open_positions WHERE symbol = ?", (symbol,))
+                    conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (symbol,))
+                    conn.commit()
+            await asyncio.to_thread(_clean_unknown_db)
             return
 
         entry_p = pos["entry_price"]

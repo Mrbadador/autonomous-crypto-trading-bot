@@ -9,21 +9,48 @@ from super_bot import SuperBotTrader
 from swing_trader import SwingArchitectTrader
 
 
+import tempfile
+import os
+import gc
+
+_orig_connect = sqlite3.connect
+
 class TestScalpShortEngine(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.db_path = "trading_data.db"
-        cls.test_symbol = "TEST_SCALP/USDT"
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.db_path = os.path.join(cls.temp_dir.name, "test_trading.db")
+        cls.test_symbol = "NEAR/USDT"
+        with _orig_connect(cls.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS swing_open_positions (
+                    symbol TEXT PRIMARY KEY, side TEXT, entry_price REAL, size REAL,
+                    stop_loss REAL, take_profit REAL, trailing_stop REAL, peak_price REAL,
+                    leverage REAL, opened_at TEXT, updated_at TEXT, status TEXT,
+                    r_multiple REAL, initial_risk_usd REAL, notes TEXT
+                )
+            """)
+            conn.execute("CREATE TABLE IF NOT EXISTS mean_reversion_open_positions (symbol TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS asset_locks (symbol TEXT PRIMARY KEY, locked_by TEXT, heartbeat TEXT)")
+            conn.commit()
+
+    @classmethod
+    def tearDownClass(cls):
+        gc.collect()
+        try:
+            cls.temp_dir.cleanup()
+        except Exception:
+            pass
 
     def setUp(self):
         # Clean test records from DB
-        with sqlite3.connect(self.db_path) as conn:
+        with _orig_connect(self.db_path) as conn:
             conn.execute("DELETE FROM swing_open_positions WHERE symbol = ?", (self.test_symbol,))
             conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (self.test_symbol,))
             conn.commit()
 
     def tearDown(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with _orig_connect(self.db_path) as conn:
             conn.execute("DELETE FROM swing_open_positions WHERE symbol = ?", (self.test_symbol,))
             conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (self.test_symbol,))
             conn.commit()
@@ -51,7 +78,7 @@ class TestScalpShortEngine(unittest.TestCase):
     def test_02_scalp_short_position_adoption(self):
         """Verify SuperBotTrader correctly adopts and tags SCALP_SHORT positions."""
         now_iso = datetime.now(UTC).isoformat()
-        with sqlite3.connect(self.db_path) as conn:
+        with _orig_connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO swing_open_positions 
                 (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price, leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes)
@@ -60,7 +87,8 @@ class TestScalpShortEngine(unittest.TestCase):
             conn.commit()
 
         bot = SuperBotTrader()
-        bot._load_all_positions_sync()
+        with patch('super_bot.sqlite3.connect', side_effect=lambda *a, **kw: _orig_connect(self.temp_db if hasattr(self, 'temp_db') else self.db_path)):
+            bot._load_all_positions_sync()
 
         self.assertIn(self.test_symbol, bot.active_positions)
         pos = bot.active_positions[self.test_symbol]
