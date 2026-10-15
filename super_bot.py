@@ -51,13 +51,17 @@ if not log.handlers:
     _sh = logging.StreamHandler(sys.stdout)
     _sh.setFormatter(_fmt)
     log.addHandler(_sh)
-    try:
-        os.makedirs("logs", exist_ok=True)
-        _fh = logging.FileHandler("logs/super_bot.log", encoding="utf-8")
-        _fh.setFormatter(_fmt)
-        log.addHandler(_fh)
-    except Exception:
-        pass
+    # Note: When spawned under start_system.py, stdout/stderr is already redirected to logs/super_bot.log.
+    # Attaching a redundant FileHandler here causes every log statement to be written twice.
+    # Only attach FileHandler if explicitly requested via SUPER_BOT_FILE_LOGGING or if running standalone interactively.
+    if os.getenv("SUPER_BOT_FILE_LOGGING", "").lower() in ("1", "true"):
+        try:
+            os.makedirs("logs", exist_ok=True)
+            _fh = logging.FileHandler("logs/super_bot.log", encoding="utf-8")
+            _fh.setFormatter(_fmt)
+            log.addHandler(_fh)
+        except Exception:
+            pass
 
 
 def compute_grid_5m_indicators(df: pd.DataFrame) -> dict:
