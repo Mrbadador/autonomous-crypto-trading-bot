@@ -653,9 +653,12 @@ class SuperBotTrader:
                         log.warning(f"[GRID-HAWKES-VETO] 🚨 Order flow spoofing detected on {symbol}: spoof={hawkes_spoof:.2f}>={spoof_cut}, veto_flag={hawkes_veto}. Suppressing dip-buy.")
                         continue
 
-                    if tox_halt or vpin_val >= 0.68:
-                        log.warning(f"[GRID-VPIN-ADVISORY] ⚠️ Microstructure Toxicity alert for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f} (Advisory log-only until bucket calibration).")
-                        # Held advisory / log-only to prevent false-positive lockouts on low-unit alts
+                    vpin_threshold = float(getattr(config, "MICROSTRUCTURE_VPIN_VETO_THRESHOLD", 0.70))
+                    if tox_halt or vpin_val >= vpin_threshold:
+                        # Q-1 FIX: Hard veto on toxicity_halt and high VPIN >= threshold
+                        # Fail-closed: blocks entries during severe adverse informed flow cascades
+                        log.warning(f"[GRID-VPIN-TOXICITY-VETO] 🚨 Microstructure Toxicity veto for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f} >= {vpin_threshold:.2f}. Suppressing dip-buy.")
+                        continue
 
 
                     # Markov Regime Cascade & Tradability Duration Screen (Playbook Step 9)

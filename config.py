@@ -171,6 +171,7 @@ SWING_TD_EXHAUSTION_COUNT         = int(os.getenv("SWING_TD_EXHAUSTION_COUNT", "
 # Microstructure Anti-Spoofing & Cascade Veto Thresholds
 HAWKES_SPOOF_VETO_THRESHOLD       = float(os.getenv("HAWKES_SPOOF_VETO_THRESHOLD", "0.78"))  # Veto only severe flash spoofing (>0.78)
 HAWKES_CASCADE_RHO_THRESHOLD      = float(os.getenv("HAWKES_CASCADE_RHO_THRESHOLD", "1.05")) # Spectral radius ceiling (stationarity cutoff)
+MICROSTRUCTURE_VPIN_VETO_THRESHOLD = float(os.getenv("MICROSTRUCTURE_VPIN_VETO_THRESHOLD", "0.70")) # Hard pre-trade informed flow toxicity cutoff
 TRADFI_FAIL_CLOSED                = os.getenv("TRADFI_FAIL_CLOSED", "true").lower() in ("true", "1")
 
 # Chop Grid Hyperparameters (V36.5 Quantitative Calibration)
