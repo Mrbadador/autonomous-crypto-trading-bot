@@ -21,7 +21,7 @@ import signal
 import sqlite3
 import sys
 import time
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, timezone, UTC, timedelta
 import pandas as pd
 import numpy as np
 import ta
@@ -337,8 +337,8 @@ class SuperBotTrader:
             with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
                 conn.row_factory = sqlite3.Row
                 
-                # 1. Adopt active 4H Swing and Chop Grid positions
-                rows_swing = conn.execute("SELECT * FROM swing_open_positions WHERE status = 'ACTIVE'").fetchall()
+                # 1. Adopt active 4H Swing and Chop Grid positions (including PENDING_CLOSE)
+                rows_swing = conn.execute("SELECT * FROM swing_open_positions WHERE status IN ('ACTIVE', 'PENDING_CLOSE')").fetchall()
                 active = {}
                 for r in rows_swing:
                     pos = dict(r)
@@ -1305,7 +1305,8 @@ class SuperBotTrader:
 
                 # Microstructure Guard & VPIN
                 try:
-                    ms_state = MicrostructureStateCache.get_state(symbol)
+                    clean_sym = symbol.replace("/", "").replace("-", "").upper()
+                    ms_state = MicrostructureStateCache.get_state(clean_sym)
                     vpin_score = float(ms_state.get("vpin", 0.0) or 0.0)
                     if vpin_score >= 0.75:
                         log.info(f"[SCALP-SHORT-VPIN-VETO] [VETO] {symbol} VPIN={vpin_score:.2f} >= 0.75. Toxic flow squeeze risk. Skipping.")
@@ -1414,6 +1415,19 @@ class SuperBotTrader:
                 if now_ts - last_telemetry >= 60:
                     last_telemetry = now_ts
                     now_iso = datetime.now(UTC).isoformat()
+                    # S2-11 FIX: Compute truthful aggregate unrealized PnL from active positions
+                    total_unrealized_pnl = 0.0
+                    for p in self.active_positions.values():
+                        try:
+                            e_price = float(p.get("entry_price", 0.0) or 0.0)
+                            c_price = float(p.get("current_price", e_price) or e_price)
+                            p_size = float(p.get("size", 0.0) or 0.0)
+                            p_side = str(p.get("side", "long")).lower()
+                            if e_price > 0 and p_size > 0:
+                                pos_upnl = (c_price - e_price) * p_size if "long" in p_side else (e_price - c_price) * p_size
+                                total_unrealized_pnl += pos_upnl
+                        except Exception:
+                            pass
                     def _write_telemetry():
                         with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                             conn.execute("""
@@ -1424,7 +1438,7 @@ class SuperBotTrader:
                                 now_iso, regime, adx, hurst,
                                 len([p for p in self.active_positions.values() if p.get("engine_type") == "SWING_4H"]),
                                 len([p for p in self.active_positions.values() if p.get("engine_type") in ("GRID_MAKER", "SCALP_SHORT")]),
-                                0.0, "OPERATIONAL"
+                                round(total_unrealized_pnl, 4), "OPERATIONAL"
                             ))
                             conn.commit()
                     await asyncio.to_thread(_write_telemetry)

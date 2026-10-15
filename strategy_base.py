@@ -177,7 +177,7 @@ class SwingKumoStrategy(BaseStrategy):
     timeframe: str = "4h"
 
     def __init__(self):
-        self.min_adx = float(getattr(config, "SWING_MIN_ADX", 25.0))
+        self.min_adx = float(getattr(config, "SWING_MIN_ADX", 22.0))
         self.atr_sl_mult = float(getattr(config, "SWING_ATR_SL_MULT", 2.5))
         self.runner_tp_mult = float(getattr(config, "SWING_RUNNER_TP_MULT", 4.0))
         self.min_sl_pct = float(getattr(config, "SWING_MIN_SL_PCT", 0.015))
@@ -538,10 +538,23 @@ class BearScalpShortStrategy(BaseStrategy):
         if low_p <= tp:
             return ExitOrRatchetAction(action="CLOSE_TP", exit_price=tp, reason="TAKE_PROFIT")
 
-        # Explicitly check entry_bar; if not set, fallback to 0 so time decay can fire
+        # S2-10 FIX: Derive bars_held from entry_bar or opened_at timestamp
         entry_bar = int(pos.get("entry_bar", 0))
-        bars_held = ctx.bar_index - entry_bar if entry_bar > 0 else 0
-        if entry_bar > 0 and bars_held >= self.max_hold_bars_5m:
+        bars_held = 0
+        if entry_bar > 0 and ctx.bar_index >= entry_bar:
+            bars_held = ctx.bar_index - entry_bar
+        elif pos.get("opened_at") and ctx.bar_timestamp > 0:
+            try:
+                raw_opened = str(pos["opened_at"]).replace("Z", "+00:00")
+                if "T" not in raw_opened and " " in raw_opened: raw_opened = raw_opened.replace(" ", "T")
+                if "+" not in raw_opened: raw_opened += "+00:00"
+                opened_ts = datetime.fromisoformat(raw_opened).timestamp()
+                sec_held = max(0.0, (ctx.bar_timestamp / 1000.0 if ctx.bar_timestamp > 1e11 else ctx.bar_timestamp) - opened_ts)
+                bars_held = int(sec_held // 300)
+            except Exception:
+                bars_held = 0
+
+        if bars_held >= self.max_hold_bars_5m and bars_held > 0:
             return ExitOrRatchetAction(action="CLOSE_TIME_DECAY", exit_price=ctx.current_price, reason="TIME_DECAY_45M")
 
         trough = min(float(pos.get("peak_price", entry)), low_p)

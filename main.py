@@ -258,9 +258,11 @@ def get_heartbeat_data():
         _db_path = os.path.join(BASE_DIR, "trading_data.db")
         with _sq.connect(_db_path, timeout=5.0) as _c:
             _row = _c.execute("SELECT value FROM system_state WHERE key='balance_marl_live'").fetchone()
-            marl_live_bal = float(_row[0]) if _row else (sniper_bal + berserker_bal)
+            # S2-14 FIX: Use standard UTC date boundary for marl_live_trades query
+            from datetime import UTC as _UTC
+            today_utc = datetime.now(_UTC).strftime('%Y-%m-%d')
             _row2 = _c.execute("SELECT COALESCE(SUM(pnl),0.0) FROM marl_live_trades WHERE timestamp LIKE ?",
-                               (datetime.now().strftime('%Y-%m-%d') + '%',)).fetchone()
+                               (f"{today_utc}%",)).fetchone()
             marl_live_pnl = float(_row2[0]) if _row2 else 0.0
     except Exception:
         marl_live_bal = sniper_bal + berserker_bal
@@ -1042,7 +1044,12 @@ def main():
                 def get_hb():
                     conn = sqlite3.connect(db_path, timeout=30.0)
                     try:
-                        r = conn.execute("SELECT value FROM system_state WHERE key LIKE 'heartbeat_berserker-%' ORDER BY value DESC LIMIT 1").fetchone()
+                        # S2-12 FIX: Check general fleet/berserker heartbeat keys
+                        r = conn.execute("""
+                            SELECT value FROM system_state 
+                            WHERE key LIKE 'heartbeat_%' OR key LIKE 'HEARTBEAT_%' OR key IN ('reconciliation_heartbeat', 'macro_heartbeat')
+                            ORDER BY updated_at DESC LIMIT 1
+                        """).fetchone()
                         return r[0] if r else None
                     finally:
                         conn.close()

@@ -321,7 +321,8 @@ class SwingArchitectTrader:
         try:
             with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
                 conn.row_factory = sqlite3.Row
-                rows = conn.execute("SELECT * FROM swing_open_positions WHERE status = 'ACTIVE'").fetchall()
+                # S2-01 FIX: Adopt both ACTIVE and PENDING_CLOSE positions so failed exits are not orphaned
+                rows = conn.execute("SELECT * FROM swing_open_positions WHERE status IN ('ACTIVE', 'PENDING_CLOSE')").fetchall()
                 active = {}
                 for r in rows:
                     pos = dict(r)
@@ -1138,16 +1139,25 @@ class SwingArchitectTrader:
             ai_tp = float(geom_res.get("suggested_tp") or 0.0)
             conf = float(geom_res.get("confidence", 0.0))
             if ai_sl > 0.0 and ai_tp > 0.0 and conf >= 0.70:
-                ai_dist = abs(entry_price - ai_sl)
-                if ai_dist >= min_sl_dist:
-                    reward = abs(ai_tp - entry_price)
-                    if reward >= 1.8 * ai_dist:
-                        log.info(f"[EXIT-GEOMETRY] 📐 AI Structure-Calibrated SL/TP adopted for {symbol}: SL ${stop_loss} -> ${ai_sl} ({geom_res.get('structural_anchor_sl')}) | TP ${take_profit} -> ${ai_tp} ({geom_res.get('structural_anchor_tp')}) | R:R={reward/ai_dist:.2f}R")
-                        stop_loss = round(ai_sl, 4)
-                        take_profit = round(ai_tp, 4)
-                        risk_per_unit = ai_dist
-                        sl_distance = ai_dist
-                        ai_geometry_adopted = True
+                # S2-02 FIX: Strict directional polarity enforcement (prevent inverted SL/TP)
+                is_valid_direction = (is_long and ai_sl < entry_price and ai_tp > entry_price) or \
+                                     (not is_long and ai_sl > entry_price and ai_tp < entry_price)
+                if not is_valid_direction:
+                    log.warning(
+                        f"[EXIT-GEOMETRY-REJECT] Inverted AI SL/TP for {symbol} ({'LONG' if is_long else 'SHORT'}): "
+                        f"Entry=${entry_price}, AI_SL=${ai_sl}, AI_TP=${ai_tp}. Falling back to baseline ATR geometry."
+                    )
+                else:
+                    ai_dist = abs(entry_price - ai_sl)
+                    if ai_dist >= min_sl_dist:
+                        reward = abs(ai_tp - entry_price)
+                        if reward >= 1.8 * ai_dist:
+                            log.info(f"[EXIT-GEOMETRY] 📐 AI Structure-Calibrated SL/TP adopted for {symbol}: SL ${stop_loss} -> ${ai_sl} ({geom_res.get('structural_anchor_sl')}) | TP ${take_profit} -> ${ai_tp} ({geom_res.get('structural_anchor_tp')}) | R:R={reward/ai_dist:.2f}R")
+                            stop_loss = round(ai_sl, 4)
+                            take_profit = round(ai_tp, 4)
+                            risk_per_unit = ai_dist
+                            sl_distance = ai_dist
+                            ai_geometry_adopted = True
         except Exception as geom_err:
             log.debug(f"[EXIT-GEOMETRY-NOTE] {symbol}: {geom_err}")
 
@@ -1206,20 +1216,37 @@ class SwingArchitectTrader:
                 if sl_pct_actual > 0 and assigned_leverage > 0:
                     max_risk_usd = live_bal * max_risk_pct
                     max_margin_by_risk = max_risk_usd / (assigned_leverage * sl_pct_actual)
+                    if max_margin_by_risk < 6.0:
+                        # S2-03 FIX: Enforce hard risk veto if account equity / SL cannot accommodate exchange minimum margin
+                        log.warning(
+                            f"[RISK-CAP-VETO] 🛑 Cannot safely enter {symbol}: required margin cap (${max_margin_by_risk:.2f}) "
+                            f"is below exchange minimum ($6.00). Entering would risk {((6.0 * assigned_leverage * sl_pct_actual) / live_bal)*100:.2f}% "
+                            f"(exceeding {max_risk_pct*100:.1f}% limit). Vetoing entry."
+                        )
+                        await asyncio.to_thread(self._release_lock_sync, symbol)
+                        return
                     if margin_collateral > max_margin_by_risk:
+                        margin_collateral = round(max_margin_by_risk, 2)
                         log.info(
-                            f"[RISK-CAP] Clamping {symbol} margin ${margin_collateral:.2f} -> ${max_margin_by_risk:.2f} "
+                            f"[RISK-CAP] Clamped {symbol} margin to ${margin_collateral:.2f} "
                             f"to enforce {max_risk_pct*100:.1f}% max equity risk (${max_risk_usd:.2f} on {sl_pct_actual*100:.2f}% SL at {assigned_leverage}x)."
                         )
-                        margin_collateral = max(6.0, round(max_margin_by_risk, 2))
         except Exception as be:
             log.warning(f"[BALANCE-NOTE] Using fallback allocation (${margin_collateral:,.2f} USDT): {be}")
 
         # Apply Sentinel WARNING size-down multiplier (e.g. 0.5x on caution news)
         news_mult = float(self._news_size_multipliers.get(symbol, 1.0))
         if 0.0 < news_mult < 1.0:
+            scaled_margin = round(margin_collateral * news_mult, 2)
+            if scaled_margin < 6.0:
+                log.warning(
+                    f"[SENTINEL-SIZE-VETO] 🛑 News-downscaled margin (${scaled_margin:.2f}) falls below $6.00 minimum. "
+                    f"Vetoing {symbol} entry to maintain capital safety."
+                )
+                await asyncio.to_thread(self._release_lock_sync, symbol)
+                return
             prev_margin = margin_collateral
-            margin_collateral = max(6.0, round(margin_collateral * news_mult, 2))
+            margin_collateral = scaled_margin
             log.warning(f"[SENTINEL-SIZE-DOWN] {symbol} WARNING tier active -> scaling margin ${prev_margin:.2f} -> ${margin_collateral:.2f} ({news_mult:.2f}x)")
 
         target_notional = margin_collateral * assigned_leverage
@@ -1508,6 +1535,20 @@ class SwingArchitectTrader:
                     risk_per_unit = abs(entry_price - stop_loss)
 
             if not order_success:
+                # S2-16 FIX: Verify against real exchange positions before placing market order
+                try:
+                    active_ex_pos = await self.uta_client.get_open_position(symbol)
+                    if active_ex_pos and float(active_ex_pos.get("total", 0.0) or 0.0) > 0.0:
+                        log.critical(
+                            f"[PRE-TRADE-DRIFT-VETO] 🚨 Exchange reports existing open position on {symbol} "
+                            f"(size: {active_ex_pos.get('total')}) untracked by local active_positions! "
+                            f"Aborting new entry to avoid inadvertent position stacking."
+                        )
+                        await asyncio.to_thread(self._release_lock_sync, symbol)
+                        return
+                except Exception as pos_chk_err:
+                    log.warning(f"[PRE-TRADE-CHECK-NOTE] Could not check exchange position for {symbol}: {pos_chk_err}")
+
                 # Route live market order to Bitget UTA with assigned tiered leverage
                 res = await self.uta_client.create_market_order(
                     symbol=symbol,
@@ -2564,6 +2605,20 @@ class SwingArchitectTrader:
                     "breakout_trap": {"pass": True, "score": float(trap_score if 'trap_score' in locals() else 0.0), "reason": str(trap_rsn if 'trap_rsn' in locals() else "cached")},
                     "boardroom_conviction": {"score": float(score), "rationale": str(rationale)}
                 }
+
+                # S2-08 FIX: Re-verify cooldown once setup direction is resolved
+                dir_cooldown = await asyncio.to_thread(self._get_cooldown_sync, symbol, cand_direction)
+                if dir_cooldown:
+                    try:
+                        clean_dcd = str(dir_cooldown).replace("Z", "+00:00")
+                        if "T" not in clean_dcd and " " in clean_dcd: clean_dcd = clean_dcd.replace(" ", "T")
+                        if "+" not in clean_dcd: clean_dcd += "+00:00"
+                        dcd_epoch = datetime.fromisoformat(clean_dcd).timestamp()
+                        if dcd_epoch > datetime.now(UTC).timestamp():
+                            log.warning(f"[COOLDOWN-GATE] Skipping {symbol} {cand_direction}: active cool-off until {dir_cooldown} (Anti-Whipsaw Rule #166)")
+                            continue
+                    except Exception as cd_parse_err:
+                        log.debug(f"[COOLDOWN-PARSE] {symbol} {cand_direction}: {cd_parse_err}")
 
                 # 6. Open swing position & acquire exclusive lock
                 await self.open_swing_position(
