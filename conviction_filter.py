@@ -103,15 +103,32 @@ class ConvictionBoardroom:
                                 return res
 
                         # 2B. TradFi Macro Credit & Spot ETF Gate (Stationary HYG/LQD Spread & SPY Trend)
+                        # FAIL-DIRECTION SPECIFICATION (R6):
+                        # Design decision: FAIL-CLOSED when TRADFI_FAIL_CLOSED=True (default).
+                        # If TradFi telemetry is missing, corrupt/unparseable, or stale (>21600s),
+                        # new LONG entries are blocked to prevent trading blind into credit blowouts.
+                        # Rate-limited warning alert emitted so the operator is notified.
+                        fail_closed_enabled = getattr(_cfg, "TRADFI_FAIL_CLOSED", True)
                         row_etf_telemetry = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'etf_macro_telemetry'").fetchone()
-                        if row_etf_telemetry and row_etf_telemetry[0]:
+
+                        if not row_etf_telemetry or not row_etf_telemetry[0]:
+                            if is_long_side and fail_closed_enabled:
+                                res["veto"] = {
+                                    "execute": False,
+                                    "conviction_score": 0.0,
+                                    "stage": "tradfi_macro_credit_shield",
+                                    "final_rationale": "TradFi Macro/Credit Shield Veto: Telemetry missing (fail-closed)."
+                                }
+                                res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Missing TradFi telemetry (fail-closed). Blocking LONG entry for {symbol}."
+                                return res
+                        else:
                             try:
                                 etf_data = json.loads(row_etf_telemetry[0])
                                 is_tradfi_veto = bool(etf_data.get("veto_long_entries", False))
                                 conf_weight = float(etf_data.get("confidence_weight", 1.0))
                                 etf_rationale = etf_data.get("rationale", "")
                                 
-                                # Check telemetry staleness (TTL Guard: 6 hours)
+                                # Check telemetry staleness (TTL Guard: 6 hours = 21600s)
                                 etf_ts = row_etf_telemetry[1]
                                 is_etf_stale = False
                                 if etf_ts:
@@ -124,8 +141,21 @@ class ConvictionBoardroom:
                                             is_etf_stale = True
                                     except Exception:
                                         is_etf_stale = True
+                                else:
+                                    is_etf_stale = True
 
-                                if not is_etf_stale and is_tradfi_veto and conf_weight >= 0.50:
+                                if is_etf_stale:
+                                    if is_long_side and fail_closed_enabled:
+                                        res["veto"] = {
+                                            "execute": False,
+                                            "conviction_score": 0.0,
+                                            "stage": "tradfi_macro_credit_shield",
+                                            "final_rationale": "TradFi Macro/Credit Shield Veto: Telemetry stale >21600s (fail-closed)."
+                                        }
+                                        res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Stale TradFi telemetry >6h (fail-closed). Blocking LONG entry for {symbol}."
+                                        return res
+                                elif is_tradfi_veto:
+                                    # Active veto reported by producer. Confidence weight does not disarm a hard veto.
                                     res["veto"] = {
                                         "execute": False,
                                         "conviction_score": 0.0,
@@ -134,10 +164,19 @@ class ConvictionBoardroom:
                                     }
                                     res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Toxic macro credit or equity regime active. Blocking LONG entry for {symbol}."
                                     return res
-                                elif not is_etf_stale:
+                                else:
                                     res["tradfi_macro_info"] = f"[BOARDROOM-TRADFI] {etf_rationale} (Confidence: {conf_weight:.2f})"
                             except Exception as etf_parse_err:
-                                log.debug(f"[BOARDROOM-TRADFI-NOTE] Telemetry parse note: {etf_parse_err}")
+                                log.warning(f"[BOARDROOM-TRADFI-ALERT] 🚨 Telemetry parse failure: {etf_parse_err}")
+                                if is_long_side and fail_closed_enabled:
+                                    res["veto"] = {
+                                        "execute": False,
+                                        "conviction_score": 0.0,
+                                        "stage": "tradfi_macro_credit_shield",
+                                        "final_rationale": f"TradFi Macro/Credit Shield Veto: Corrupt telemetry ({etf_parse_err}) (fail-closed)."
+                                    }
+                                    res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Corrupt TradFi telemetry ({etf_parse_err}). Blocking LONG entry for {symbol}."
+                                    return res
 
                     # R-4 FIX: Consistent usage of is_long_side
                     if is_long_side and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
