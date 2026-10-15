@@ -2152,6 +2152,14 @@ class SwingArchitectTrader:
 
     async def close_swing_position(self, symbol: str, exit_price: float, reason: str):
         """Closes position on Bitget UTA, records closed trade, and releases mutex lock."""
+        # P1-1 FIX: Gate close dispatch on _close_retry_next_ts to prevent hammering exchange during backoff
+        now_ts = time.time()
+        next_retry_ts = float(self._close_retry_next_ts.get(symbol, 0.0))
+        if reason != "PENDING_CLOSE_RETRY" and now_ts < next_retry_ts:
+            rem_sec = next_retry_ts - now_ts
+            log.warning(f"[CLOSE-BACKOFF-GATE] ⏳ Close dispatch for {symbol} suppressed: active backoff ({rem_sec:.1f}s remaining). Reason attempted: {reason}")
+            return
+
         pos = self.active_positions.get(symbol)
         if not pos:
             return
@@ -2233,7 +2241,7 @@ class SwingArchitectTrader:
                         f"close_esc_alert_{symbol}"
                     )
                 except Exception as mail_esc_err:
-                    log.debug(f"[CLOSE-ALERT-NOTE] {mail_esc_err}")
+                    log.warning(f"[CLOSE-ALERT-FAIL] Failed to dispatch close escalation alert for {symbol}: {mail_esc_err}")
 
             def _mark_pending_close():
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
