@@ -788,6 +788,28 @@ class SuperBotTrader:
                 log.warning(f"[{engine_tag}-NEWS-VETO] {symbol} ({pos_side.upper()}) blocked: {news_rsn}")
                 return
 
+            # P0-6 DEFENSE: Boardroom Pre-Filters (BIS Crash Shield, TradFi Macro Credit, ALT_LONG_PAUSE, Whitelist)
+            # FAIL-DIRECTION SPECIFICATION (R6): Fail-closed on DB error or critical macro/credit signals.
+            boardroom_ctx = {
+                "strategy": "Mean Reversion Maker Dip-Buy" if is_long else "Scalp Short Maker Fade",
+                "timeframe": "5m",
+                "rsi": rsi,
+                "current_price": current_price
+            }
+            try:
+                boardroom_eval = await self.boardroom.get_conviction(symbol, pos_side, boardroom_ctx)
+                if isinstance(boardroom_eval, dict):
+                    if boardroom_eval.get("execute") is False or boardroom_eval.get("conviction_score", 1.0) == 0.0:
+                        stage = boardroom_eval.get("stage", "boardroom_veto")
+                        rationale_v = boardroom_eval.get("final_rationale", "Boardroom pre-filter veto")
+                        log.warning(f"[{engine_tag}-BOARDROOM-VETO] 🛑 {symbol} {pos_side.upper()} vetoed at stage '{stage}': {rationale_v}")
+                        return
+                    if "conviction_score" in boardroom_eval:
+                        conv_score = float(boardroom_eval.get("conviction_score", conv_score) or conv_score)
+            except Exception as b_err:
+                log.warning(f"[{engine_tag}-BOARDROOM-VETO] 🛑 Exception evaluating Boardroom pre-filters for {symbol}: {b_err}. Failing closed.")
+                return
+
             # Enforce Fleet-Wide Long Cap (Strictly Max 2 Active Longs Across Fleet)
             if is_long:
                 in_mem_longs = len([p for p in self.active_positions.values() if "long" in str(p.get("side", "long")).lower()])
