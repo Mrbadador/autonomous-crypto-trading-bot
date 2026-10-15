@@ -701,8 +701,9 @@ def main():
                                     await send_alert_async("URGENT: Whale Danger", f"Mega-move detected: {w_data.get('last_mega_move')}")
                     except: pass
                 else:
-                    log.error(f"[SYSTEM] Whale Watcher failed: {res.stderr}")
-                    await send_alert_async("Agent Error: Whale Watcher", f"Whale audit failed: {res.stderr[:200]}")
+                    err_msg = res.stderr if res else "whale_watcher.py script not found"
+                    log.error(f"[SYSTEM] Whale Watcher failed: {err_msg}")
+                    await send_alert_async("Agent Error: Whale Watcher", f"Whale audit failed: {err_msg[:200]}")
             except Exception as e:
                 log.error(f"[SYSTEM] Failed to dispatch Whale Watcher: {e}")
             
@@ -1116,6 +1117,8 @@ def main():
                         else:
                             target, args = _run_berserker, ("berserker",)
                             
+                        import multiprocessing as mp
+                        ctx = mp.get_context("spawn")
                         new_p = ctx.Process(target=target, args=args, name=p.name, daemon=False)
                         new_p.start()
                         log.info(f"[LAUNCHER] {new_p.name} restarted (PID {new_p.pid})")
