@@ -20,16 +20,31 @@ class ConvictionBoardroom:
             res = {"veto": None}
             try:
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                    # 1. Config-owned symbol whitelist (falls back to config.SYMBOLS)
+                    # 1. Config-owned symbol whitelist (intersected with config.SYMBOLS)
                     row = conn.execute("SELECT value FROM system_state WHERE key = 'ALLOWED_SYMBOLS'").fetchone()
                     import config as _cfg
+                    cfg_symbols = getattr(_cfg, "SYMBOLS", [])
+                    cfg_clean_map = {s.upper().replace("/", "").replace("-", ""): s for s in cfg_symbols}
+                    
                     if row and row[0]:
                         try:
-                            allowed = json.loads(row[0])
+                            allowed_raw = json.loads(row[0])
                         except Exception:
-                            allowed = getattr(_cfg, "SYMBOLS", [])
+                            allowed_raw = cfg_symbols
                     else:
-                        allowed = getattr(_cfg, "SYMBOLS", [])
+                        allowed_raw = cfg_symbols
+
+                    # Intersect stored whitelist with config.SYMBOLS to discard wrong-venue symbols
+                    allowed = []
+                    for s in allowed_raw:
+                        s_clean = s.upper().replace("/", "").replace("-", "")
+                        if s_clean in cfg_clean_map:
+                            allowed.append(cfg_clean_map[s_clean])
+                        else:
+                            log.warning(f"[BOARDROOM-WHITELIST] Dropping symbol '{s}' from active whitelist: not present in config.SYMBOLS venue scope.")
+
+                    if not allowed and cfg_symbols:
+                        allowed = cfg_symbols
 
                     if allowed:
                         sym_clean = symbol.upper().replace("/", "").replace("-", "")
