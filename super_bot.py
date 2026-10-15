@@ -796,69 +796,92 @@ class SuperBotTrader:
                     log.warning(f"[GRID-LONG-CAP-VETO] 🛑 Fleet already holds >= 2 active LONG positions. Vetoing {symbol} LONG execution.")
                     return
 
-            # Dynamic Balance Sizing: 70% Wallet Utilization Protocol
+            # Dynamic Balance Sizing: 70% Wallet Utilization Protocol & 2.0% Hard Risk Cap
             max_wallet_margin_pct = getattr(config, "GLOBAL_MARGIN_LIMIT", 70.0) / 100.0  # 0.70
-            margin = self.grid_allocation_usdt
             try:
                 live_bal = await self.uta_client.fetch_balance()
-                if live_bal and live_bal > 10.0:
-                    total_locked_margin = sum(
-                        (float(p.get("size", 0.0)) * float(p.get("entry_price", 0.0))) / max(1.0, float(p.get("leverage", 3.0)))
-                        for p in self.active_positions.values()
-                    )
-                    max_allowed_margin = live_bal * max_wallet_margin_pct
-                    available_margin_buffer = max(0.0, max_allowed_margin - total_locked_margin)
+                if not live_bal or live_bal <= 10.0:
+                    log.warning(f"[{engine_tag}-BALANCE-VETO] 🛑 Live balance unresolved or invalid (${live_bal}). Vetoing {symbol} entry to enforce strict risk caps.")
+                    return
 
-                    if available_margin_buffer < 5.0:
-                        log.warning(f"[GRID-MARGIN-CEILING] 70% Wallet Utilization reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing {pos_side.upper()} entry.")
-                        return
+                total_locked_margin = sum(
+                    (float(p.get("size", 0.0)) * float(p.get("entry_price", 0.0))) / max(1.0, float(p.get("leverage", 3.0)))
+                    for p in self.active_positions.values()
+                )
+                max_allowed_margin = live_bal * max_wallet_margin_pct
+                available_margin_buffer = max(0.0, max_allowed_margin - total_locked_margin)
 
-                    target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+                if available_margin_buffer < 5.0:
+                    log.warning(f"[GRID-MARGIN-CEILING] 70% Wallet Utilization reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing {pos_side.upper()} entry.")
+                    return
+
+                target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+                
+                # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Multiplier
+                try:
+                    from risk_manager import RiskManager
+                    rm = RiskManager()
+                    kelly_frac = await asyncio.to_thread(rm.calculate_empirical_kelly_fraction)
+                    conv_mult = max(0.5, min(1.2, conv_score))
+                    finrl_mult = self._get_finrl_strategy_weight(engine_tag)
                     
-                    # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Multiplier
-                    try:
-                        from risk_manager import RiskManager
-                        rm = RiskManager()
-                        kelly_frac = rm.calculate_empirical_kelly_fraction()
-                        conv_mult = max(0.5, min(1.2, conv_score))
-                        finrl_mult = self._get_finrl_strategy_weight(engine_tag)
-                        
-                        # Continuous Markov Risk Multiplier (Playbook Step 8)
-                        markov_mult = 1.0
-                        def _get_markov_mult():
-                            try:
-                                max_age = float(getattr(config, "REGIME_MAX_AGE_SEC", 900.0) or 900.0)
-                            except (TypeError, ValueError):
-                                max_age = 900.0
-                            try:
-                                with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
-                                    row = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
-                                    if row and row[0]:
-                                        raw_val, raw_ts = row[0], row[1]
-                                        age = self._regime_row_age_sec(raw_ts)
-                                        if age is not None and age > max_age:
-                                            log.warning(f"[{engine_tag}-MARKOV-STALE] ⚠️ markov_regime_telemetry is stale ({age:.1f}s > {max_age:.1f}s). Defaulting sizing_multiplier to 1.0.")
-                                            return 1.0
-                                        m_d = json.loads(raw_val)
-                                        if "sizing_multiplier" not in m_d:
-                                            age_str = f"{age:.1f}s" if age is not None else "unknown"
-                                            log.warning(f"[{engine_tag}-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'sizing_multiplier' key (age: {age_str}). Defaulting to 1.0.")
-                                            return 1.0
-                                        return float(m_d.get("sizing_multiplier", 1.0) or 1.0)
-                            except Exception:
-                                pass
-                            return 1.0
-                        markov_mult = await asyncio.to_thread(_get_markov_mult)
-                        
-                        target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
-                        target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
-                        log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
-                    except Exception as ke:
-                        log.debug(f"[{engine_tag}-KELLY-NOTE] {ke}")
+                    # Continuous Markov Risk Multiplier (Playbook Step 8)
+                    markov_mult = 0.50
+                    def _get_markov_mult():
+                        try:
+                            max_age = float(getattr(config, "REGIME_MAX_AGE_SEC", 900.0) or 900.0)
+                        except (TypeError, ValueError):
+                            max_age = 900.0
+                        try:
+                            with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                                row = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                if row and row[0]:
+                                    raw_val, raw_ts = row[0], row[1]
+                                    age = self._regime_row_age_sec(raw_ts)
+                                    if age is not None and age > max_age:
+                                        log.warning(f"[{engine_tag}-MARKOV-STALE] ⚠️ markov_regime_telemetry is stale ({age:.1f}s > {max_age:.1f}s). Defaulting sizing_multiplier to 0.50 (defensive).")
+                                        return 0.50
+                                    m_d = json.loads(raw_val)
+                                    if "sizing_multiplier" not in m_d:
+                                        age_str = f"{age:.1f}s" if age is not None else "unknown"
+                                        log.warning(f"[{engine_tag}-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'sizing_multiplier' key (age: {age_str}). Defaulting to 0.50 (defensive).")
+                                        return 0.50
+                                    return float(m_d.get("sizing_multiplier", 1.0) or 1.0)
+                        except Exception:
+                            pass
+                        log.warning(f"[{engine_tag}-MARKOV-DEFENSIVE] ⚠️ Unable to load Markov telemetry. Applying defensive 0.50x multiplier.")
+                        return 0.50
+                    markov_mult = await asyncio.to_thread(_get_markov_mult)
+                    
+                    target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
+                    target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
+                    log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
+                except Exception as ke:
+                    log.debug(f"[{engine_tag}-KELLY-NOTE] {ke}")
 
-                    margin = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
+                margin = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
+
+                # Enforce Hard Equity Risk Cap per Trade (Strict 2.0% Dollar Risk Ceiling)
+                max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0  # 0.02
+                max_risk_usd = live_bal * max_risk_pct
+                sl_pct = self.grid_sl_pct if is_long else self.scalp_short_sl_pct
+                max_margin_by_risk = max_risk_usd / (self.grid_leverage * sl_pct)
+                if max_margin_by_risk < 6.0:
+                    log.warning(
+                        f"[{engine_tag}-RISK-CAP-VETO] 🛑 Max allowed margin by risk (${max_margin_by_risk:.2f}) is below exchange minimum $6.00. "
+                        f"Account balance ${live_bal:.2f} cannot support a {sl_pct*100:.2f}% SL within {max_risk_pct*100:.1f}% risk ceiling. Vetoing entry."
+                    )
+                    return
+                if margin > max_margin_by_risk:
+                    margin = round(max_margin_by_risk, 2)
+                    log.info(
+                        f"[{engine_tag}-RISK-CAP] Clamped {symbol} margin to ${margin:.2f} "
+                        f"to enforce {max_risk_pct*100:.1f}% max equity risk (${max_risk_usd:.2f} on {sl_pct*100:.2f}% SL at {self.grid_leverage}x)."
+                    )
+
             except Exception as be:
-                log.warning(f"[{engine_tag}-BALANCE-NOTE] Using fallback allocation (${margin:,.2f} USDT): {be}")
+                log.warning(f"[{engine_tag}-BALANCE-VETO] 🛑 Exception fetching balance for {symbol}: {be}. Vetoing entry to protect capital.")
+                return
 
             # Apply Sentinel WARNING size-down multiplier (0.5x on caution news)
             news_mult = float(getattr(self.swing_engine, "_news_size_multipliers", {}).get(symbol, 1.0))
@@ -875,6 +898,17 @@ class SuperBotTrader:
 
             notional = margin * self.grid_leverage
             qty = self.uta_client.format_qty_precision(symbol, notional / current_price)
+
+            # Post-Rounding Step Risk Check: Verify contract rounding didn't push risk beyond 2.0% equity cap (+15% step tolerance)
+            sl_pct = self.grid_sl_pct if is_long else self.scalp_short_sl_pct
+            actual_risk_usd = (qty * current_price) * sl_pct
+            max_allowed_post_round_risk = live_bal * max_risk_pct * 1.15
+            if actual_risk_usd > max_allowed_post_round_risk:
+                log.warning(
+                    f"[{engine_tag}-ROUNDING-RISK-VETO] 🛑 Post-rounding risk (${actual_risk_usd:.2f}) exceeds max allowed "
+                    f"(${max_allowed_post_round_risk:.2f} = {max_risk_pct*100:.1f}% equity * 1.15 step tol) for {symbol}. Vetoing entry."
+                )
+                return
             
             # Formulate TP & SL
             if is_long:
