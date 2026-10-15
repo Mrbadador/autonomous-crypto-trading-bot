@@ -7,7 +7,7 @@ import json
 import asyncio
 import os
 import math
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timezone
 import yfinance as yf
 import ai_engine
 import config
