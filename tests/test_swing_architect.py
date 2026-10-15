@@ -4,20 +4,56 @@ import pandas as pd
 import numpy as np
 import os
 import sys
+import tempfile
+import shutil
+import logging
 from datetime import datetime, UTC
 
 import config
-from swing_trader import SwingArchitectTrader
 
 class TestSwingArchitectAndMutex(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.db_path = "trading_data.db"
+        cls.repo_cwd = os.getcwd()
+        cls.tmp_dir = tempfile.mkdtemp(prefix="swing_arch_test_")
         cls.test_symbol = "TEST/USDT"
+        cls.db_path = os.path.join(cls.tmp_dir, "trading_data.db")
+        
+        # Divert log handlers to temporary log so production logs stay clean
+        cls.test_log_file = os.path.join(cls.tmp_dir, "test_super_bot.log")
+        for log_name in ("swing_architect", "super_bot"):
+            logger = logging.getLogger(log_name)
+            for h in list(logger.handlers):
+                if isinstance(h, logging.FileHandler):
+                    logger.removeHandler(h)
+            th = logging.FileHandler(cls.test_log_file, encoding="utf-8")
+            logger.addHandler(th)
+
+        # Chdir into temp dir so any relative 'trading_data.db' access opens the temp fixture
+        os.chdir(cls.tmp_dir)
+
+        # FIX 8 Guard: Assert that any relative or absolute DB connection opens our temp DB
+        assert os.path.abspath("trading_data.db") == os.path.abspath(cls.db_path)
+        assert os.path.abspath("trading_data.db") != os.path.join(cls.repo_cwd, "trading_data.db"), "TEST ISOLATION VIOLATION: Live trading_data.db would be opened!"
+
+        # Mock heavy dependencies that make network/DB calls during init
+        from unittest.mock import MagicMock, patch
+        with patch("conviction_filter.ConvictionBoardroom", MagicMock()), \
+             patch("sentinel_agent.SentinelAgent", MagicMock()), \
+             patch("db_manager.DBWriteQueue.get_instance", MagicMock()):
+            from swing_trader import SwingArchitectTrader
+            cls.trader_cls = SwingArchitectTrader
+            trader = SwingArchitectTrader()
+            trader._init_database()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.chdir(cls.repo_cwd)
+        shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def test_01_mutex_lock_lifecycle(self):
         """Verify lock acquisition, capacity enforcement, and release."""
-        trader = SwingArchitectTrader()
+        trader = self.trader_cls()
         
         # Ensure clean state for test symbol
         trader._release_lock_sync(self.test_symbol)
@@ -66,7 +102,7 @@ class TestSwingArchitectAndMutex(unittest.TestCase):
 
     def test_03_ichimoku_and_adx_computation(self):
         """Verify mathematical calculation of Ichimoku Kumo and ADX on synthetic 4H data."""
-        trader = SwingArchitectTrader()
+        trader = self.trader_cls()
 
         # Generate 100 periods of synthetic trending OHLCV data
         np.random.seed(42)
@@ -110,7 +146,7 @@ class TestSwingArchitectAndMutex(unittest.TestCase):
 
     def test_05_dynamic_tiered_leverage(self):
         """Verify dynamic 3x / 5x tiered leverage evaluation rules."""
-        trader = SwingArchitectTrader()
+        trader = self.trader_cls()
         self.assertEqual(trader.standard_leverage, 3)
         self.assertEqual(trader.high_quality_leverage, 5)
 
@@ -165,7 +201,7 @@ class TestSwingArchitectAndMutex(unittest.TestCase):
     def test_06_direction_aware_cooldowns(self):
         """Verify direction-aware cooldowns: short stop-outs do not block long entries and LONG_ prefixes remain authoritative."""
         from datetime import timedelta
-        trader = SwingArchitectTrader()
+        trader = self.trader_cls()
         sym = "ZZTEST_CD/USDT"
         now = datetime.now(UTC)
         fut = (now + timedelta(hours=6)).isoformat()
