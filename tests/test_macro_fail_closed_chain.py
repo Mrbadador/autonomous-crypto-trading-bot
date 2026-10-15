@@ -623,5 +623,36 @@ class TestNoLiveWrites(unittest.TestCase):
                              os.path.join(os.sep + "fixture_only", "trading_data.db"))
 
 
+class TestETFMacroTelemetryPersistence(MacroChainFixture):
+    def test_etf_telemetry_guaranteed_on_failed_macro_cycle(self):
+        """Q-5 verification: When macro data fetch fails/times out (data_ok=False), etf_macro_telemetry MUST be persisted with fail-closed veto."""
+        cycle_failed = macro_cycle(spy_change=0.0, dxy=None, killswitch=0, data_ok=False, regime="UNKNOWN")
+        state, ledger_state = self.run_cycles([cycle_failed])
+        self.assertIn("etf_macro_telemetry", state)
+        self.assertIn("etf_macro_telemetry", ledger_state)
+        
+        telemetry = json.loads(state["etf_macro_telemetry"])
+        self.assertEqual(telemetry.get("status"), "ERROR")
+        self.assertTrue(telemetry.get("veto_long_entries"))
+        self.assertEqual(telemetry.get("confidence_weight"), 0.0)
+
+    def test_etf_telemetry_guaranteed_on_valid_macro_cycle(self):
+        """When macro cycle is valid, etf_macro_telemetry is persisted."""
+        cycle_good = macro_cycle(spy_change=0.5, dxy=104.0, killswitch=0, data_ok=True, regime="NEUTRAL")
+        cycle_good["etf_gate_eval"] = {
+            "status": "ACTIVE_TRADFI_MONITORED",
+            "veto_long_entries": False,
+            "confidence_weight": 1.0,
+            "rationale": "TradFi stable",
+            "metrics": {"spy_trend_z": 0.5}
+        }
+        state, ledger_state = self.run_cycles([cycle_good])
+        self.assertIn("etf_macro_telemetry", state)
+        telemetry = json.loads(state["etf_macro_telemetry"])
+        self.assertEqual(telemetry.get("status"), "ACTIVE_TRADFI_MONITORED")
+        self.assertFalse(telemetry.get("veto_long_entries"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

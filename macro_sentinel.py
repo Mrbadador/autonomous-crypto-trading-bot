@@ -602,9 +602,16 @@ def update_macro_context():
                                      (now_iso, now_iso))
                         # Persist stationary TradFi macro and ETF gate telemetry
                         etf_eval = data.get("etf_gate_eval", {})
-                        if etf_eval:
-                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('etf_macro_telemetry', ?, ?)",
-                                         (json.dumps(etf_eval), now_iso))
+                        if not etf_eval:
+                            etf_eval = {
+                                "status": "WARN_EMPTY",
+                                "veto_long_entries": False,
+                                "confidence_weight": 0.5,
+                                "rationale": "TradFi macro gate evaluation empty; default neutral.",
+                                "metrics": {},
+                            }
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('etf_macro_telemetry', ?, ?)",
+                                     (json.dumps(etf_eval), now_iso))
                     conn.close()
                 except Exception as e:
                     log.error(f"Failed to commit macro context to {db_target}: {e}")
@@ -619,6 +626,18 @@ def update_macro_context():
             # UNKNOWN in that case, and RISK_OFF_KILLSWITCH when the dump trigger fired.
             fallback_regime = str(data.get('macro_regime') or 'UNKNOWN') if data else "UNKNOWN"
             log.warning(f"Macro data invalid or unavailable this cycle. Marking macro_data_ok=0, regime={fallback_regime}.")
+            
+            # Fail-closed fallback payload for ETF/TradFi macro telemetry
+            fallback_etf_eval = (data.get("etf_gate_eval", {}) if data else {}) or {
+                "status": "ERROR",
+                "error": "Macro data unavailable/timed out this cycle",
+                "veto_long_entries": True,
+                "confidence_weight": 0.0,
+                "rationale": "Macro sentinel cycle failed; fail-closed safety veto active.",
+                "metrics": {},
+            }
+            fallback_etf_json = json.dumps(fallback_etf_eval)
+
             for db_target in [_get_db_path("trading_ledger.db"), _get_db_path("trading_data.db")]:
                 try:
                     conn = sqlite3.connect(db_target, timeout=10.0)
@@ -629,9 +648,24 @@ def update_macro_context():
                                      (fallback_regime, now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_heartbeat', ?, ?)",
                                      (now_iso, now_iso))
+                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('etf_macro_telemetry', ?, ?)",
+                                     (fallback_etf_json, now_iso))
                     conn.close()
                 except Exception as de:
                     log.error(f"Failed to commit macro fallback status to {db_target}: {de}")
+
+        # Check for TradFi / ETF telemetry staleness (> 2 cycles = 30 minutes = 1800s)
+        try:
+            with sqlite3.connect(_get_db_path("trading_data.db"), timeout=5.0) as c_chk:
+                r_etf = c_chk.execute("SELECT updated_at FROM system_state WHERE key = 'etf_macro_telemetry'").fetchone()
+                if r_etf and r_etf[0]:
+                    etf_age = _row_age_sec(r_etf[0])
+                    if etf_age is not None and etf_age > 1800.0:
+                        log.critical(f"[ETF-MACRO-ALERT] ⚠️ etf_macro_telemetry is stale by {etf_age:.0f}s (>1800s / 2 cycles)! Provider or sentinel update lag.")
+                else:
+                    log.warning("[ETF-MACRO-ALERT] ⚠️ etf_macro_telemetry row not found in trading_data.db.")
+        except Exception as stale_chk_err:
+            log.warning(f"Error checking ETF telemetry staleness: {stale_chk_err}")
 
         # Economic Calendar Event Check
         try:
