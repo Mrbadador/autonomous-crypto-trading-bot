@@ -400,7 +400,14 @@ def _raw_fetch_macro():
                     etf_gate_eval = gate.evaluate_gate(now_utc)
                     etf_macro_metrics = etf_gate_eval.get("metrics", {})
         except Exception as etf_err:
-            log.warning(f"[ETF-MACRO-NOTE] Optional ETF/Credit feed update: {etf_err}")
+            log.error(f"[ETF-MACRO-ERROR] ETF/Credit feed update failed: {etf_err}")
+            etf_gate_eval = {
+                "status": "ERROR",
+                "error": str(etf_err),
+                "veto_long_entries": True,
+                "confidence_weight": 0.0,
+                "rationale": f"ETF/Credit feed update failed: {etf_err}",
+            }
 
         return {
             'spy_price': spy_latest,
@@ -598,10 +605,6 @@ def update_macro_context():
                         if etf_eval:
                             conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('etf_macro_telemetry', ?, ?)",
                                          (json.dumps(etf_eval), now_iso))
-                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('tradfi_macro_veto', ?, ?)",
-                                         ("1" if etf_eval.get("veto_long_entries") else "0", now_iso))
-                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('tradfi_confidence_weight', ?, ?)",
-                                         (str(etf_eval.get("confidence_weight", 1.0)), now_iso))
                     conn.close()
                 except Exception as e:
                     log.error(f"Failed to commit macro context to {db_target}: {e}")
