@@ -262,6 +262,7 @@ class SuperBotTrader:
         self.db_queue = DBWriteQueue.get_instance("trading_data.db")
         self._stop_event = asyncio.Event()
         self._background_tasks = set()
+        self._chop_grid_adx_active = True  # Q-2: stateful hysteresis tracker for Market ADX chop gate
         
         # Sub-engine for Swing Architecture + Declarative Strategy Registry (Jesse Pattern)
         self.swing_engine = SwingArchitectTrader()
@@ -1485,10 +1486,17 @@ class SuperBotTrader:
                             await self.swing_engine.scan_fleet(allowed_direction="LONG")
                         last_4h_scan = now_ts
 
-                    # 3b. Clean Sept 30 Chop Maker Grid Dip-Buy Scan (in CHOP regime when ADX < 25.0)
+                    # 3b. Clean Sept 30 Chop Maker Grid Dip-Buy Scan (in CHOP regime with ADX dead-band hysteresis)
                     if is_chop:
-                        if adx >= 25.0:
-                            log.info(f"[CHOP-GRID-VETO] Market ADX={adx:.1f} >= 25.0 indicates directional expansion. Chop Grid dip-buying suppressed.")
+                        # Q-2 FIX: Market ADX dead-band hysteresis to prevent toggle noise around 25.0
+                        # Deactivates at ADX >= 25.5 (expansion); reactivates once ADX cools down <= 24.5.
+                        if self._chop_grid_adx_active and adx >= 25.5:
+                            self._chop_grid_adx_active = False
+                        elif not self._chop_grid_adx_active and adx <= 24.5:
+                            self._chop_grid_adx_active = True
+
+                        if not self._chop_grid_adx_active:
+                            log.info(f"[CHOP-GRID-VETO] Market ADX={adx:.1f} >= 25.0 (hysteresis ceiling 25.5) indicates directional expansion. Chop Grid dip-buying suppressed.")
                         else:
                             await self.scan_chop_grid_opportunities()
                         if self.scalp_short_enabled:
