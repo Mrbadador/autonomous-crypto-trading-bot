@@ -62,14 +62,17 @@ def fetch_futures_ohlcv(symbol, interval="15m", limit=300):
     """
     clean_sym = symbol.replace('/', '').replace(':USDT', '').replace('-', '').upper()
     bg_tf_map = {
-        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-        "1h": "1h", "4h": "4h", "12h": "12h", "1d": "1Dutc"
+        "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1H", "1H": "1H", "4h": "4H", "4H": "4H", "6h": "6H", "6H": "6H",
+        "12h": "12H", "12H": "12H", "1d": "1Dutc", "1D": "1Dutc"
     }
-    granularity = bg_tf_map.get(interval, "15m")
+    granularity = bg_tf_map.get(interval, interval if interval in ("1H", "4H", "6H", "12H") else "15m")
     url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={clean_sym}&granularity={granularity}&limit={limit}&productType=USDT-FUTURES"
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status()
+        if response.status_code != 200:
+            log.error(f"Bitget candles API error for {symbol} ({granularity}): HTTP {response.status_code} - {response.text}")
+            return None
         res_json = response.json()
         if res_json.get("code") == "00000":
             klines = res_json.get("data", [])
@@ -85,8 +88,10 @@ def fetch_futures_ohlcv(symbol, interval="15m", limit=300):
             for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = df[col].astype(float)
             return df
+        else:
+            log.error(f"Bitget candles API returned non-success code for {symbol} ({granularity}): code={res_json.get('code')} msg={res_json.get('msg')}")
     except Exception as e:
-        log.error(f"Failed to fetch Bitget historical bars for {symbol}: {e}")
+        log.error(f"Failed to fetch Bitget historical bars for {symbol} ({granularity}): {e}")
     return None
 
 def calculate_variance_ratio(prices, q=10):
@@ -418,7 +423,7 @@ def run_scout():
         # 2. Real-Time 15-Minute Multi-Timeframe Confluence Gate (15m + 1h + 4h)
         run_ai_mtf_confluence_scan()
 
-        # 2. 4-Hour Heavy Fleet Sweep (Every 16 cycles of 15m)
+        # 3. 4-Hour Heavy Fleet Sweep (Every 16 cycles of 15m = 4 hours)
         if cycle_count % 16 == 0:
             log.info(f"Starting 4-hour Asset Scout & Funding Rate sweep (Cycle #{cycle_count})...")
             

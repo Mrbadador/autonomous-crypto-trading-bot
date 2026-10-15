@@ -49,6 +49,14 @@ class TestAssetScoutBitgetParity(unittest.TestCase):
         # Verify positive non-zero prices
         self.assertTrue((df["close"] > 0).all(), "All close prices must be positive")
 
+    def test_bitget_ohlcv_granularities_1h_and_4h(self):
+        """Verify Q-6: Bitget v2 requires uppercase 1H and 4H granularity mappings."""
+        for tf in ["1h", "1H", "4h", "4H"]:
+            df = fetch_futures_ohlcv("BTCUSDT", interval=tf, limit=10)
+            self.assertIsNotNone(df, f"fetch_futures_ohlcv failed for interval {tf}")
+            self.assertGreaterEqual(len(df), 5)
+            self.assertTrue((df["close"] > 0).all())
+
     def test_variance_ratio_synthetic_series(self):
         # 1. Random Walk: VR should be close to 1.0, |z| small
         np.random.seed(42)
