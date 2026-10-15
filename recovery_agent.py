@@ -77,13 +77,17 @@ async def run_recovery_loop():
                 
                 for table_name, symbol, side, entry_price, qty, stop_loss in positions:
                     try:
+                        # N-12 FIX: Normalize side to lowercase immediately upon row unpacking
+                        side_norm = str(side).strip().lower()
+                        is_long_side = (side_norm in ("long", "buy"))
+
                         fetch_sym = symbol
                         if ex_id == "bitget" and ":USDT" not in fetch_sym:
                             fetch_sym = f"{symbol}:USDT"
                         ticker = await exchange.fetch_ticker(fetch_sym)
                         current_price = float(ticker['last'])
                         
-                        if side == "long":
+                        if is_long_side:
                             pnl_pct = (current_price - entry_price) / entry_price
                         else:
                             pnl_pct = (entry_price - current_price) / entry_price
@@ -102,17 +106,17 @@ async def run_recovery_loop():
 
                             # Require both global BTC and the specific asset to be aligned in trend
                             regime_aligned = (
-                                (side == "long" and btc_regime == "LONG_ONLY" and asset_regime == "LONG_ONLY") or
-                                (side == "short" and btc_regime == "SHORT_ONLY" and asset_regime == "SHORT_ONLY")
+                                (is_long_side and btc_regime == "LONG_ONLY" and asset_regime == "LONG_ONLY") or
+                                (not is_long_side and btc_regime == "SHORT_ONLY" and asset_regime == "SHORT_ONLY")
                             )
 
                             if not regime_aligned:
-                                log.warning(f"[RECOVERY] DCA Veto for {symbol} ({side}): Regime misaligned (BTC={btc_regime}, Asset={asset_regime}). Blocking DCA to avoid averaging into structural trend collapse.")
+                                log.warning(f"[RECOVERY] DCA Veto for {symbol} ({side_norm}): Regime misaligned (BTC={btc_regime}, Asset={asset_regime}). Blocking DCA to avoid averaging into structural trend collapse.")
                                 continue
 
                             # P1-PATCH: Persist DCA count & cooldown in SQLite system_state to survive daemon restarts
                             DCA_COOLDOWN_SECONDS = 4 * 3600  # 4 hours
-                            dca_state_key = f"dca_state_{symbol}_{side}"
+                            dca_state_key = f"dca_state_{symbol}_{side_norm}"
                             dca_meta = {"count": 0, "last_ts": 0.0}
                             try:
                                 conn_st = sqlite3.connect(db_path, timeout=5.0)

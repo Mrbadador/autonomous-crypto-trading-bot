@@ -20,15 +20,16 @@ from microstructure_metrics import (
     calculate_lvr_tax_bps
 )
 
-# Import symbols from config if available, fallback to top active coins
+# Monitor all fleet symbols from config.SYMBOLS; do NOT exclude SWING_BLACKLIST assets from OFI
+# (N-2 FIX: ETH, BNB, etc. must have their own genuine L2 order book metrics instead of falling back to BTC)
 DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT"]
 try:
     import config
     raw_symbols = getattr(config, "SYMBOLS", [])
-    blacklist = [s.replace("/", "").upper() for s in getattr(config, "SWING_BLACKLIST", [])]
-    SYMBOLS = [s.replace("/", "").upper() for s in raw_symbols if s and s.replace("/", "").upper() not in blacklist]
+    # Ingest all trading symbols in config, stripping delimiters
+    SYMBOLS = [s.replace("/", "").upper() for s in raw_symbols if s]
     if not SYMBOLS:
-        SYMBOLS = [s for s in DEFAULT_SYMBOLS if s not in blacklist]
+        SYMBOLS = DEFAULT_SYMBOLS
     if "BTCUSDT" not in SYMBOLS:
         SYMBOLS.insert(0, "BTCUSDT")
 except Exception:

@@ -1225,7 +1225,7 @@ class SwingArchitectTrader:
                             f"is below exchange minimum ($6.00). Entering would risk {((6.0 * assigned_leverage * sl_pct_actual) / live_bal)*100:.2f}% "
                             f"(exceeding {max_risk_pct*100:.1f}% limit). Vetoing entry."
                         )
-                        await asyncio.to_thread(self._release_lock_sync, symbol)
+                        # N-8 FIX: Do NOT call _release_lock_sync here! Lock is only acquired later at line 1287.
                         return
                     if margin_collateral > max_margin_by_risk:
                         margin_collateral = round(max_margin_by_risk, 2)
@@ -1233,8 +1233,14 @@ class SwingArchitectTrader:
                             f"[RISK-CAP] Clamped {symbol} margin to ${margin_collateral:.2f} "
                             f"to enforce {max_risk_pct*100:.1f}% max equity risk (${max_risk_usd:.2f} on {sl_pct_actual*100:.2f}% SL at {assigned_leverage}x)."
                         )
+                else:
+                    # N-10 FIX: Live balance could not be resolved or is below threshold -> Fail-Closed
+                    log.warning(f"[BALANCE-VETO] 🛑 Live balance unresolved or invalid (${live_bal}). Vetoing {symbol} entry to enforce strict risk caps.")
+                    return
         except Exception as be:
-            log.warning(f"[BALANCE-NOTE] Using fallback allocation (${margin_collateral:,.2f} USDT): {be}")
+            # N-10 FIX: Fail-closed on balance query error
+            log.warning(f"[BALANCE-VETO] 🛑 Exception fetching balance for {symbol}: {be}. Vetoing entry to protect capital.")
+            return
 
         # Apply Sentinel WARNING size-down multiplier (e.g. 0.5x on caution news)
         news_mult = float(self._news_size_multipliers.get(symbol, 1.0))
@@ -1245,7 +1251,7 @@ class SwingArchitectTrader:
                     f"[SENTINEL-SIZE-VETO] 🛑 News-downscaled margin (${scaled_margin:.2f}) falls below $6.00 minimum. "
                     f"Vetoing {symbol} entry to maintain capital safety."
                 )
-                await asyncio.to_thread(self._release_lock_sync, symbol)
+                # N-8 FIX: Do NOT release lock here (not acquired yet)
                 return
             prev_margin = margin_collateral
             margin_collateral = scaled_margin
@@ -1264,23 +1270,23 @@ class SwingArchitectTrader:
         else:
             qty = max(float(round(qty)), 1.0)
 
-        # R-6 FIX: Post-rounding dollar risk check to ensure contract minimums do not inflate risk beyond cap
+        # R-6 / N-9 FIX: Strict 2.0% equity cap (no 1.15x relaxation)
         actual_notional = qty * entry_price
         actual_risk_usd = actual_notional * (sl_distance / entry_price if entry_price > 0 else 0.015)
-        # If live_bal was resolved, ensure actual dollar risk does not exceed max_risk_usd * 1.15 (15% grace for contract step rounding)
         try:
             max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0
             if 'live_bal' in locals() and live_bal > 0:
-                max_allowed_risk_usd = live_bal * max_risk_pct * 1.15
+                max_allowed_risk_usd = live_bal * max_risk_pct  # Strict 1.0x cap (2.0% max)
                 if actual_risk_usd > max_allowed_risk_usd:
                     log.warning(
                         f"[CONTRACT-STEP-RISK-VETO] 🛑 Minimum contract step for {symbol} (qty={qty}) forces dollar risk "
-                        f"${actual_risk_usd:.2f} ({actual_risk_usd/live_bal*100:.2f}%), exceeding budget ${max_allowed_risk_usd:.2f} "
-                        f"({max_risk_pct*1.15*100:.2f}% equity limit). Vetoing entry."
+                        f"${actual_risk_usd:.2f} ({actual_risk_usd/live_bal*100:.2f}%), exceeding strict budget ${max_allowed_risk_usd:.2f} "
+                        f"({max_risk_pct*100:.1f}% equity limit). Vetoing entry."
                     )
                     return
         except Exception as step_risk_err:
-            log.debug(f"[STEP-RISK-NOTE] {step_risk_err}")
+            log.warning(f"[STEP-RISK-WARNING] Risk step check error: {step_risk_err}")
+            return
 
         # 1. Acquire exclusive lock FIRST before placing order
         lock_reason = f"4H_SWING_{direction.upper()}_{quality_tier}"
@@ -1724,18 +1730,20 @@ class SwingArchitectTrader:
         now_ts = time.time()
         for symbol, pos in list(self.active_positions.items()):
             try:
-                # S2-01 / R-1 FIX: If position is PENDING_CLOSE and backoff has not expired, skip manage cycle
-                if str(pos.get("status", "")).upper() == "PENDING_CLOSE":
-                    next_retry = float(self._close_retry_next_ts.get(symbol, 0.0))
-                    if now_ts < next_retry:
-                        log.debug(f"[PENDING-CLOSE-BACKOFF] {symbol} close retry delayed ({next_retry - now_ts:.0f}s remaining).")
-                        continue
-
-                # Fetch live ticker price
+                # Fetch live ticker price first (N-5 FIX: never blackout monitoring during backoff)
                 clean_sym = self.uta_client._normalize_symbol(symbol)
                 ticker = await self.uta_client.exchange.fetch_ticker(clean_sym)
                 curr_price = float(ticker.get("last", 0.0) or ticker.get("close", 0.0))
                 if curr_price <= 0:
+                    continue
+
+                is_pending_close = (str(pos.get("status", "")).upper() == "PENDING_CLOSE")
+                next_close_retry = float(self._close_retry_next_ts.get(symbol, 0.0))
+
+                # N-6 FIX: If position is PENDING_CLOSE and backoff has expired, re-dispatch the close immediately!
+                if is_pending_close and now_ts >= next_close_retry:
+                    log.warning(f"[PENDING-CLOSE-RETRY] 🔄 Retrying market exit on {symbol} (backoff expired).")
+                    await self.close_swing_position(symbol, exit_price=curr_price, reason="PENDING_CLOSE_RETRY")
                     continue
 
                 entry_p = pos["entry_price"]
@@ -2192,6 +2200,21 @@ class SwingArchitectTrader:
             # Backoff: Next retry allowed after 2^(attempts-1) * 30 seconds (up to 300s)
             backoff_sec = min(300.0, (2.0 ** max(0, attempts - 1)) * 30.0)
             self._close_retry_next_ts[symbol] = time.time() + backoff_sec
+
+            # N-7 FIX: Escalation alert on repeated close failures (>= 3 attempts)
+            if attempts >= 3:
+                log.critical(f"[CLOSE-ESCALATION] 🚨 CRITICAL: Position {symbol} close has failed {attempts} consecutive times! Err: {close_error}. Manual intervention recommended.")
+                try:
+                    from email_dispatcher import send_risk_alert_async
+                    self._track_task(
+                        send_risk_alert_async(
+                            subject=f"CRITICAL: Close Failure Escalation on {symbol}",
+                            body=f"Automated close for {symbol} has failed {attempts} times.\nReason: {reason}\nError: {close_error}\nNext retry: in {backoff_sec:.0f}s."
+                        ),
+                        f"close_esc_alert_{symbol}"
+                    )
+                except Exception as mail_esc_err:
+                    log.debug(f"[CLOSE-ALERT-NOTE] {mail_esc_err}")
 
             def _mark_pending_close():
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:

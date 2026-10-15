@@ -284,7 +284,10 @@ class MicrostructureStateCache:
         symbols = cls._cached_data.get("symbols", {})
         if symbol in symbols:
             return symbols[symbol]
-        return cls._cached_data
+        # N-2 FIX: Return empty dict if symbol is not explicitly in symbols dictionary.
+        # Do NOT fall back to root BTCUSDT payload, which caused non-monitored assets (ETH/BNB)
+        # to be gated and priced using BTC's order book.
+        return {}
 
 
 # =============================================================================

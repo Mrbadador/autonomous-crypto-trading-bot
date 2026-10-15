@@ -638,12 +638,17 @@ class SuperBotTrader:
                     if micro_p <= 0.0:
                         micro_p = curr_price
 
-                    # R-0 FIX: Extract Hawkes metrics and enforce hard veto for cascade (rho) and spoofing
+                    # N-3 FIX: If microstructure state is empty (missing key or stale daemon), apply defensive sizing
+                    ms_is_degraded = (not ms_state)
+                    if ms_is_degraded:
+                        log.info(f"[GRID-MS-DEGRADED] Microstructure state for {clean_sym} is missing or stale (>60s). Scaling margin 50% for defense.")
+
+                    # N-1 FIX: Align Hawkes config keys with config.py (HAWKES_CASCADE_RHO_THRESHOLD)
                     hawkes_rho = float(ms_state.get("hawkes_rho", 0.0) or 0.0)
                     hawkes_spoof = float(ms_state.get("hawkes_spoof_index", 0.0) or 0.0)
                     hawkes_veto = bool(ms_state.get("hawkes_veto", False))
                     try:
-                        rho_cut = float(getattr(config, "HAWKES_RHO_VETO_THRESHOLD", 1.05))
+                        rho_cut = float(getattr(config, "HAWKES_CASCADE_RHO_THRESHOLD", getattr(config, "HAWKES_RHO_VETO_THRESHOLD", 1.05)))
                         spoof_cut = float(getattr(config, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
                     except Exception:
                         rho_cut = 1.05

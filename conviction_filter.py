@@ -87,9 +87,10 @@ class ConvictionBoardroom:
                                         is_stale = True
                                         log.warning(f"[BOARDROOM-BIS] ⚠️ funding_crash_risk is stale ({age_sec:.1f}s > 14400s). Failing to NORMAL.")
                                 except Exception as ts_err:
-                                    # R-5 FIX: Corrupted or unparseable timestamps fail-to-NORMAL (is_stale = True) to prevent permanent lockout
-                                    is_stale = True
-                                    log.warning(f"[BOARDROOM-BIS] Could not parse funding_crash_risk timestamp '{crash_ts}': {ts_err}. Failing to NORMAL.")
+                                    # N-11 FIX: Bounded fail-safe. If timestamp is corrupt, do NOT blindly fail-open if the reading is CRITICAL.
+                                    # Maintain defensive shield to prevent bypassing risk during telemetry corruption.
+                                    is_stale = False
+                                    log.critical(f"[BOARDROOM-BIS] 🚨 Corrupt funding_crash_risk timestamp '{crash_ts}': {ts_err}. Enforcing defensive fail-safe (veto preserved).")
 
                             if not is_stale and crash_val == "CRITICAL":
                                 res["veto"] = {
