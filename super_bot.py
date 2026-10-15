@@ -640,8 +640,8 @@ class SuperBotTrader:
                     if micro_p <= 0.0:
                         micro_p = curr_price
 
-                    if tox_halt or vpin_val >= 0.68 or kyle_pct >= 0.90:
-                        log.warning(f"[GRID-VETO] 🛑 Microstructure Toxicity Veto for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f}, Kyle Pctile={kyle_pct:.2f}. Dip-buy skipped.")
+                    if tox_halt or vpin_val >= 0.68:
+                        log.warning(f"[GRID-VETO] 🛑 Microstructure Toxicity Veto for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f}. Dip-buy skipped.")
                         continue
 
                     # Markov Regime Cascade & Tradability Duration Screen (Playbook Step 9)

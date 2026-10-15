@@ -1214,15 +1214,14 @@ async def analyze_order_flow_tape(ofi_packet: dict, timeout_sec: float = 8.0) ->
         norm_ofi = float(ofi_packet.get("normalized_ofi", 0.0) or 0.0)
         vpin = float(ofi_packet.get("vpin", 0.0) or 0.0)
         hawkes_rho = float(ofi_packet.get("hawkes_rho", 0.0) or 0.0)
-        kyle_pctile = float(ofi_packet.get("kyle_lambda_pctile", 0.5) or 0.5)
         toxicity_halt = bool(ofi_packet.get("toxicity_halt", False))
-
-        if toxicity_halt or vpin >= 0.70 or (kyle_pctile >= 0.90 and norm_ofi < -0.3):
+ 
+        if toxicity_halt or vpin >= 0.70:
             return {
                 "tape_condition": "BEARISH_ABSORPTION" if norm_ofi < 0 else "SPOOF_SUSPECTED",
                 "absorption_side": "ASK" if norm_ofi < 0 else "BID",
                 "confidence": 0.95,
-                "headline": "Quantitative Fast-Path: High flow toxicity / adverse Kyle lambda detected.",
+                "headline": "Quantitative Fast-Path: High flow toxicity detected.",
                 "execution_veto": "BLOCK_LONGS",
                 "deterministic": True,
                 "updated_at": datetime.now(timezone.utc).isoformat()

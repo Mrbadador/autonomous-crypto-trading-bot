@@ -320,8 +320,7 @@ class SymbolOFIState:
         self.latest_toxicity_halt = bool(
             (vpin_val >= 0.68) or
             (self.latest_hawkes_rho >= rho_cut) or
-            (self.latest_hawkes_spoof >= spoof_cut) or
-            (self.latest_kyle_pctile >= 0.90)
+            (self.latest_hawkes_spoof >= spoof_cut)
         )
 
         # Streaming VPIN update
