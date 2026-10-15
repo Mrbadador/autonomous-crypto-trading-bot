@@ -1208,6 +1208,8 @@ async def analyze_order_flow_tape(ofi_packet: dict, timeout_sec: float = 8.0) ->
     """
     Feature 2: High-Speed AI Order Flow Tape & Iceberg Absorption Interpreter.
     Dispatched via deterministic quantitative fast-path if enabled, or Groq Cloud 3-key rotation pool (<300ms).
+    Note: 'execution_veto' published in this packet is display-only/advisory telemetry consumed
+    primarily by dashboard diagnostics and MicrostructureGuard monitoring; it does not block hard live orders.
     """
     if getattr(config, "USE_DETERMINISTIC_MICROSTRUCTURE", True):
         # Deterministic sub-millisecond quantitative evaluation

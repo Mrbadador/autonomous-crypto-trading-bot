@@ -685,24 +685,14 @@ class SuperBotTrader:
                             log.warning(f"[GRID-VETO] 🛑 Markov Tradability Screen Veto for {symbol}: {tradable_rsn}. Blocking entry to prevent fee churn.")
                             continue
 
-                    # Avellaneda-Stoikov Reservation Price & LVR-Compensated Geometry
-                    # r(s, q) = s_micro * (1 - q * gamma * sigma^2)
-                    gamma = float(getattr(config, "AS_GAMMA_RISK_AVERSION", 1.5))
-                    atr_pct = float(ind.get("atr", 0.0) / curr_price) if curr_price > 0 else 0.015
-                    vol_sq = atr_pct ** 2
-                    q_inventory = len(self.active_positions)
-                    res_price = micro_p * (1.0 - (q_inventory * gamma * vol_sq * 0.1))
-                    maker_entry_price = min(curr_price, res_price)
+                    # Maker entry pricing: align with micro-price (or current price if lower)
+                    maker_entry_price = min(curr_price, micro_p)
 
-                    # Dynamic LVR-Compensated TP
-                    lvr_pct = (lvr_bps / 10000.0)
-                    target_tp_pct = max(self.grid_tp_pct, self.grid_tp_pct + lvr_pct)
-
-                    log.info(f"[GRID-OPPORTUNITY] [SIGNAL] {symbol} Oversold Dip! Price: ${curr_price:,.4f} | ResPrice: ${maker_entry_price:,.4f} | LVR Tax: {lvr_bps:.1f} bps")
+                    log.info(f"[GRID-OPPORTUNITY] [SIGNAL] {symbol} Oversold Dip! Price: ${curr_price:,.4f} | MicroPrice: ${micro_p:,.4f}")
                     
                     conv_score = 0.75
-                    rationale = f"AS-Maker Grid dip: RSI {rsi:.1f}, MicroPrice ${micro_p:,.4f}, AS-ResPrice ${maker_entry_price:,.4f}, LVR TP +{target_tp_pct*100:.2f}%"
-                    log.info(f"[GRID-APPROVED] ⚡ {symbol} Approved via AS-Maker Engine (Score: {conv_score:.2f} | {rationale})")
+                    rationale = f"Maker Grid dip: RSI {rsi:.1f}, MicroPrice ${micro_p:,.4f}, Entry ${maker_entry_price:,.4f}, TP +{self.grid_tp_pct*100:.2f}%"
+                    log.info(f"[GRID-APPROVED] ⚡ {symbol} Approved via Maker Engine (Score: {conv_score:.2f} | {rationale})")
                         
                     # Execute Post-Only Maker Order
                     await self._execute_grid_maker_entry(

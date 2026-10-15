@@ -165,6 +165,8 @@ class FundingArbitrageur:
         Ranks arrays of funding rates and returns precise delta-neutral allocations.
         Funding rates occur every 8 hours (3 times/day).
         Enforces Markov-gated carry persistence: E[D_carry] >= 2 * k_breakeven.
+        Note: The yield hunter path is advisory/display-only; opportunities are logged for
+        analytical intelligence and dashboard telemetry, not executed as live orders.
         """
         valid_opps = []
         fee_drag_pct = (self.est_roundtrip_fee_bps / 10000.0) # e.g. 24 bps = 0.0024
