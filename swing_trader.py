@@ -1042,10 +1042,16 @@ class SwingArchitectTrader:
             return
 
         # P0-5 DEFENSE: Check Pre-Trade Microstructure Guard (VPIN Toxicity & Hawkes Spoof Veto)
+        ms_is_degraded = False
         try:
             from microstructure_guard import MicrostructureStateCache
             clean_s = symbol.replace("/", "").upper()
             ms_state = MicrostructureStateCache.get_state(clean_s)
+            if not ms_state:
+                # P0-4: Microstructure telemetry is missing or stale (>60s). Flag for 50% sizing haircut.
+                ms_is_degraded = True
+                log.info(f"[SWING-MS-DEGRADED] Microstructure state for {clean_s} is missing or stale (>60s). Scaling margin 50% for defense.")
+
             vpin_val = float(ms_state.get("vpin", 0.0) or 0.0)
             h_spoof = float(ms_state.get("hawkes_spoof_index", 0.0) or 0.0)
             h_rho = float(ms_state.get("hawkes_rho", 0.0) or 0.0)
@@ -1256,6 +1262,19 @@ class SwingArchitectTrader:
             prev_margin = margin_collateral
             margin_collateral = scaled_margin
             log.warning(f"[SENTINEL-SIZE-DOWN] {symbol} WARNING tier active -> scaling margin ${prev_margin:.2f} -> ${margin_collateral:.2f} ({news_mult:.2f}x)")
+
+        # P0-4 DEFENSE: Apply 50% margin haircut if microstructure telemetry is missing or stale (>60s)
+        if ms_is_degraded:
+            scaled_margin = round(margin_collateral * 0.50, 2)
+            if scaled_margin < 6.0:
+                log.warning(
+                    f"[SWING-MS-DEGRADED-VETO] 🛑 Microstructure-downscaled margin (${scaled_margin:.2f}) falls below $6.00 minimum. "
+                    f"Vetoing {symbol} entry to maintain capital safety."
+                )
+                return
+            prev_margin = margin_collateral
+            margin_collateral = scaled_margin
+            log.warning(f"[SWING-MS-DEGRADED-SIZING] {symbol} Microstructure degraded -> scaling margin ${prev_margin:.2f} -> ${margin_collateral:.2f} (0.50x)")
 
         target_notional = margin_collateral * assigned_leverage
         qty = target_notional / entry_price

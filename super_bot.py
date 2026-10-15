@@ -714,7 +714,8 @@ class SuperBotTrader:
                         current_price=maker_entry_price,
                         rsi=rsi,
                         conv_score=conv_score,
-                        rationale=rationale
+                        rationale=rationale,
+                        ms_is_degraded=ms_is_degraded
                     )
                     break  # One entry per cycle
                     
@@ -728,7 +729,8 @@ class SuperBotTrader:
         rsi: float = 0.0,
         conv_score: float = 0.0,
         rationale: str = "",
-        side: str = "long"
+        side: str = "long",
+        ms_is_degraded: bool = False
     ):
         """Places a post-only limit buy or sell order on Bitget UTA using dynamic 70% wallet allocation."""
         try:
@@ -864,6 +866,12 @@ class SuperBotTrader:
                 prev_margin = margin
                 margin = max(6.0, round(margin * news_mult, 2))
                 log.warning(f"[{engine_tag}-NEWS-SIZE-DOWN] {symbol} WARNING tier active -> scaling margin ${prev_margin:.2f} -> ${margin:.2f} ({news_mult:.2f}x)")
+
+            # P0-4 DEFENSE: Apply 50% margin haircut if microstructure state is missing or stale
+            if ms_is_degraded:
+                prev_margin = margin
+                margin = max(6.0, round(margin * 0.50, 2))
+                log.warning(f"[{engine_tag}-MS-DEGRADED-SIZING] {symbol} Microstructure degraded -> scaling margin ${prev_margin:.2f} -> ${margin:.2f} (0.50x)")
 
             notional = margin * self.grid_leverage
             qty = self.uta_client.format_qty_precision(symbol, notional / current_price)
@@ -1317,15 +1325,17 @@ class SuperBotTrader:
                     continue
 
                 # Microstructure Guard & VPIN
+                ms_is_degraded = False
                 try:
                     clean_sym = symbol.replace("/", "").replace("-", "").upper()
                     ms_state = MicrostructureStateCache.get_state(clean_sym)
+                    ms_is_degraded = (not ms_state)
                     vpin_score = float(ms_state.get("vpin", 0.0) or 0.0)
                     if vpin_score >= 0.75:
                         log.info(f"[SCALP-SHORT-VPIN-VETO] [VETO] {symbol} VPIN={vpin_score:.2f} >= 0.75. Toxic flow squeeze risk. Skipping.")
                         continue
                 except Exception:
-                    pass
+                    ms_is_degraded = True
 
                 log.info(f"[SCALP-SHORT-OPPORTUNITY] 🎯 {symbol} Quick Scalp Short Signal! {trigger_reason} | RSI: {rsi:.1f} | Wick: {upper_wick_ratio:.1%}")
 
@@ -1337,7 +1347,8 @@ class SuperBotTrader:
                     rsi=rsi,
                     conv_score=conv_score,
                     rationale=trigger_reason,
-                    side="short"
+                    side="short",
+                    ms_is_degraded=ms_is_degraded
                 )
                 break  # One entry per cycle
             except Exception as e:
