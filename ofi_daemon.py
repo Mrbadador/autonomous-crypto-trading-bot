@@ -334,13 +334,15 @@ class SymbolOFIState:
             import config as _cfg
             rho_cut = float(getattr(_cfg, "HAWKES_CASCADE_RHO_THRESHOLD", 1.05))
             spoof_cut = float(getattr(_cfg, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
+            vpin_cut = float(getattr(_cfg, "MICROSTRUCTURE_VPIN_VETO_THRESHOLD", 0.70))
         except Exception:
             rho_cut = 1.05
             spoof_cut = 0.78
+            vpin_cut = 0.70
 
         # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314); removed rho comparison from toxicity halt
         self.latest_toxicity_halt = bool(
-            (vpin_val >= 0.68) or
+            (vpin_val >= vpin_cut) or
             (self.latest_hawkes_spoof >= spoof_cut)
         )
 
