@@ -392,17 +392,17 @@ class SwingArchitectTrader:
             return False
 
     def _release_lock_sync(self, symbol: str):
-        """Releases exclusive asset lock owned by swing_architect."""
+        """Releases exclusive asset lock for symbol across all unified Super Bot engines."""
         try:
             with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = 'swing_architect'", (symbol,))
+                conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (symbol,))
                 conn.commit()
             log.info(f"[LOCK-RELEASED] Exclusive Mutex Lock freed for {symbol}. Intraday bots unblocked.")
         except Exception as e:
             log.error(f"[LOCK-ERROR] Failed to release lock for {symbol}: {e}")
 
     def _refresh_heartbeats_sync(self):
-        """Refreshes heartbeat for all actively locked swing assets and prunes only orphaned swing_architect locks."""
+        """Refreshes heartbeat for all actively locked assets and prunes orphaned Super Bot locks."""
         now_iso = datetime.now(UTC).isoformat()
         try:
             with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
@@ -410,17 +410,21 @@ class SwingArchitectTrader:
                 for sym in active_symbols:
                     conn.execute("""
                         UPDATE asset_locks SET heartbeat = ?
-                        WHERE symbol = ? AND locked_by = 'swing_architect'
+                        WHERE symbol = ?
                     """, (now_iso, sym))
-                # Prune only swing_architect locks whose positions are no longer active
+                # Prune orphaned locks whose positions are no longer active
                 if active_symbols:
                     placeholders = ",".join("?" for _ in active_symbols)
                     conn.execute(f"""
                         DELETE FROM asset_locks
-                        WHERE locked_by = 'swing_architect' AND symbol NOT IN ({placeholders})
+                        WHERE locked_by IN ('swing_architect', 'super_bot_grid', 'super_bot_scalp_short')
+                          AND symbol NOT IN ({placeholders})
                     """, active_symbols)
                 else:
-                    conn.execute("DELETE FROM asset_locks WHERE locked_by = 'swing_architect'")
+                    conn.execute("""
+                        DELETE FROM asset_locks
+                        WHERE locked_by IN ('swing_architect', 'super_bot_grid', 'super_bot_scalp_short')
+                    """)
                 conn.commit()
         except Exception as e:
             log.debug(f"[HEARTBEAT-NOTE] Lock heartbeat refresh error: {e}")

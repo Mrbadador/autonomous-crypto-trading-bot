@@ -374,6 +374,18 @@ class SuperBotTrader:
                 self.active_positions = active
                 # Mirror ALL active positions to swing engine so manage_active_positions tracks them with ratchets
                 self.swing_engine.active_positions = dict(active)
+
+                # Prune orphaned asset_locks that have no active position
+                active_syms = list(active.keys())
+                if active_syms:
+                    placeholders = ",".join("?" for _ in active_syms)
+                    conn.execute(
+                        f"DELETE FROM asset_locks WHERE symbol NOT IN ({placeholders})",
+                        active_syms,
+                    )
+                else:
+                    conn.execute("DELETE FROM asset_locks")
+                conn.commit()
                 
         except Exception as e:
             log.error(f"[SYNC-ERR] Error adopting positions: {e}")

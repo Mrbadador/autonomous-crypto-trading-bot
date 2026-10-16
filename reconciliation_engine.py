@@ -540,6 +540,7 @@ async def audit_live_exchange_positions():
                                 # (already recorded by the engine, or our insert reported exactly 1 row).
                                 if ledger_write_ok:
                                     conn.execute(f"DELETE FROM {tbl} WHERE symbol = ? AND side = ?", (s_sym, row_dict.get("side", norm_side)))
+                                    conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (s_sym,))
                                     pruned_count += 1
                                 else:
                                     log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{s_sym} — closed-trade row not written; will retry next pass")
