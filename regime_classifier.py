@@ -179,8 +179,15 @@ class RegimeClassifier:
         The returned frame is normalised by `_normalize_bars`: closed bars only, sorted
         and de-duplicated by `open_time`.
         """
+        gran_map = {
+            "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+            "1h": "1H", "1H": "1H", "2h": "2H", "2H": "2H", "4h": "4H", "4H": "4H",
+            "6h": "6H", "6H": "6H", "12h": "12H", "12H": "12H",
+            "1d": "1D", "1D": "1D", "1w": "1W", "1W": "1W"
+        }
+        api_gran = gran_map.get(interval, interval)
         clean_sym = symbol.replace("/", "").replace("-", "").upper()
-        url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={clean_sym}&granularity={interval}&limit={limit}&productType=USDT-FUTURES"
+        url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={clean_sym}&granularity={api_gran}&limit={limit}&productType=USDT-FUTURES"
         try:
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
@@ -192,6 +199,9 @@ class RegimeClassifier:
                     for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = df[col].astype(float)
                     return self._normalize_bars(df, interval, symbol=clean_sym)
+            else:
+                log.error(f"Bitget candles API returned HTTP {response.status_code} for {clean_sym} ({api_gran}): {response.text[:200]}")
+                return None
         except Exception as e:
             log.error(f"Failed to fetch Bitget historical bars: {e}")
             return None
