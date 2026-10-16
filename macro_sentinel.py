@@ -383,20 +383,20 @@ def _raw_fetch_macro():
         etf_macro_metrics = {}
         etf_gate_eval = {}
         try:
-            hyg = yf.Ticker("HYG").history(period="15d", interval="1d", timeout=6.0)
-            lqd = yf.Ticker("LQD").history(period="15d", interval="1d", timeout=6.0)
-            ibit = yf.Ticker("IBIT").history(period="15d", interval="1d", timeout=6.0)
+            hyg = yf.Ticker("HYG").history(period="60d", interval="1d", timeout=6.0)
+            lqd = yf.Ticker("LQD").history(period="60d", interval="1d", timeout=6.0)
+            ibit = yf.Ticker("IBIT").history(period="60d", interval="1d", timeout=6.0)
             
-            if len(hyg) >= 5 and len(lqd) >= 5:
+            if len(hyg) >= 20 and len(lqd) >= 20:
                 from etf_macro_engine import MarketHoursAwareMacroGate
                 gate = MarketHoursAwareMacroGate()
                 # Compute stationary z-scores using daily history + 1h series
                 spy_daily = yf.Ticker("SPY").history(period="60d", interval="1d", timeout=6.0)
-                uup_daily = yf.Ticker("UUP").history(period="30d", interval="1d", timeout=6.0)
+                uup_daily = yf.Ticker("UUP").history(period="60d", interval="1d", timeout=6.0)
                 
                 if len(spy_daily) >= 20 and len(uup_daily) >= 5:
                     now_utc = datetime.now(timezone.utc)
-                    gate.update_market_feed(spy_daily['Close'], uup_daily['Close'], hyg['Close'], lqd['Close'], now_utc)
+                    gate.update_market_feed(spy_daily['Close'].dropna(), uup_daily['Close'].dropna(), hyg['Close'].dropna(), lqd['Close'].dropna(), now_utc)
                     etf_gate_eval = gate.evaluate_gate(now_utc)
                     etf_macro_metrics = etf_gate_eval.get("metrics", {})
         except Exception as etf_err:

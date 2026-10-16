@@ -187,21 +187,22 @@ class MarketHoursAwareMacroGate:
         uup_mom_z = float((log_ret_uup - uup_mean) / uup_std)
 
         # 3. Credit Stress Z-Score: ln(HYG / LQD)
-        hyg_close = hyg_series.to_numpy(dtype=np.float64)
-        lqd_close = lqd_series.to_numpy(dtype=np.float64)
+        hyg_close = hyg_series.dropna().to_numpy(dtype=np.float64)
+        lqd_close = lqd_series.dropna().to_numpy(dtype=np.float64)
         min_len = min(len(hyg_close), len(lqd_close))
         if min_len < 5:
             raise ValueError("Insufficient HYG/LQD history.")
         credit_ratio = np.log(hyg_close[-min_len:] / lqd_close[-min_len:])
-        ema_span = min(20, len(credit_ratio))
+        ema_span = min(60, len(credit_ratio))
         ema_credit = float(pd.Series(credit_ratio).ewm(span=ema_span).mean().iloc[-1])
-        std_credit = float(np.std(credit_ratio[-ema_span:])) + 1e-8
+        # Enforce a 100 bps (0.0100) minimum dispersion floor so quiet rate drift does not trigger false credit blowouts
+        std_credit = max(float(np.std(credit_ratio[-ema_span:])), 0.0100) + 1e-8
         credit_z = float((credit_ratio[-1] - ema_credit) / std_credit)
 
         return {
-            "spy_trend_z": round(spy_trend_z, 4),
-            "uup_mom_z": round(uup_mom_z, 4),
-            "credit_spread_z": round(credit_z, 4),
+            "spy_trend_z": 0.0 if math.isnan(spy_trend_z) else round(spy_trend_z, 4),
+            "uup_mom_z": 0.0 if math.isnan(uup_mom_z) else round(uup_mom_z, 4),
+            "credit_spread_z": 0.0 if math.isnan(credit_z) else round(credit_z, 4),
         }
 
     def update_market_feed(
