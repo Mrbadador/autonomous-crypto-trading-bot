@@ -51,24 +51,48 @@ st.set_page_config(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADING_DATA_DB = os.path.join(BASE_DIR, "trading_data.db")
 TRADING_LEDGER_DB = os.path.join(BASE_DIR, "trading_ledger.db")
+MICROSTRUCTURE_STATE_FILE = os.path.join(BASE_DIR, "microstructure_state.json")
 
-def connect_readonly(db_path: str, timeout: float = 10.0) -> sqlite3.Connection:
+def connect_readonly(db_path: str, timeout: float = 30.0) -> sqlite3.Connection:
     """Connects to SQLite in WAL Read-Only mode to eliminate lock contention."""
     db_uri = f"file:{os.path.abspath(db_path).replace(os.sep, '/')}?mode=ro"
     conn = sqlite3.connect(db_uri, timeout=timeout, check_same_thread=False, uri=True)
     return conn
 
+# Feed failures captured during the current script run; surfaced as a banner next rerun.
+FEED_FAILURES: dict = {}
+
+
+def _feed_key(db_path: str, query: str) -> str:
+    parts = query.split()
+    table = "?"
+    upper_parts = [p.upper() for p in parts]
+    if "FROM" in upper_parts:
+        nxt = upper_parts.index("FROM") + 1
+        if nxt < len(parts):
+            table = parts[nxt].strip("(").split(".")[-1]
+    return f"{os.path.basename(db_path)} \u2192 {table}"
+
+
 @st.cache_data(ttl=4, show_spinner=False)
 def query_db(db_path: str, query: str, params: tuple = ()) -> pd.DataFrame:
-    """Safely executes a query and returns a pandas DataFrame."""
+    """Safely executes a read-only query and returns a pandas DataFrame.
+
+    Never raises: an unavailable feed returns an empty frame and is recorded in
+    FEED_FAILURES so the UI can report the outage instead of silently showing zero.
+    """
     if not os.path.exists(db_path):
+        FEED_FAILURES[_feed_key(db_path, query)] = "database file missing"
         return pd.DataFrame()
     try:
         conn = connect_readonly(db_path)
-        df = pd.read_sql_query(query, conn, params=params)
-        conn.close()
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        finally:
+            conn.close()
         return df
-    except Exception:
+    except Exception as q_err:
+        FEED_FAILURES[_feed_key(db_path, query)] = f"{type(q_err).__name__}: {str(q_err)[:120]}"
         return pd.DataFrame()
 
 @st.cache_data(ttl=4, show_spinner=False)
@@ -79,15 +103,81 @@ def query_system_state(key: str, default: str = "") -> str:
         return str(df.iloc[0]["value"])
     return default
 
+_JUNK_TOKENS = ("", "none", "null", "nan", "n/a", "na", "syncing...", "--")
+
+
+def num(val, default: float = 0.0):
+    """Coerce telemetry or DB values to float without ever raising.
+
+    NULL, empty strings, placeholder text and unparseable junk all return `default`,
+    so one bad daemon write cannot take down the whole monitoring page.
+    """
+    try:
+        if val is None:
+            return default
+        if isinstance(val, str):
+            if val.strip().lower() in _JUNK_TOKENS:
+                return default
+            val = float(val.replace(",", "").replace("$", "").strip())
+        else:
+            val = float(val)
+        if val != val:  # NaN
+            return default
+        return val
+    except (TypeError, ValueError):
+        return default
+
+
+def state_num(key: str, default: float = 0.0) -> float:
+    """Read a numeric system_state value without ever raising."""
+    return num(query_system_state(key, ""), default)
+
+
+def state_flag(key: str, default: str = "0") -> bool:
+    """Parse a 0/1-style operator or daemon halt flag, case and whitespace insensitive.
+
+    A control the fleet honours but the HUD misreads as OFF is worse than no HUD at all.
+    """
+    return str(query_system_state(key, default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+def read_state_now(key: str):
+    """Uncached single read of system_state, used to verify operator writes landed."""
+    try:
+        conn = connect_readonly(TRADING_DATA_DB)
+        try:
+            row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def state_flag_now(key: str) -> bool:
+    """Parse a halt flag straight from disk, bypassing the 4s telemetry cache.
+
+    Operator controls must compare against on-disk truth: a cached read here makes the
+    widget disagree with the database and re-issue the same write on every rerun.
+    """
+    val = read_state_now(key)
+    return str(val if val is not None else "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def execute_safe_write(db_path: str, query: str, params: tuple = ()) -> bool:
     """Executes a non-blocking parameterized write to SQLite with timeout."""
+    conn = None
     try:
-        with sqlite3.connect(db_path, timeout=5.0) as conn:
-            conn.execute(query, params)
-            conn.commit()
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn.execute(query, params)
+        conn.commit()
         return True
-    except Exception:
+    except Exception as w_err:
+        FEED_FAILURES[f"write \u2192 {os.path.basename(db_path)}"] = f"{type(w_err).__name__}: {str(w_err)[:120]}"
         return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 def utc_to_sast(dt_val) -> str:
     """Converts a UTC datetime string/object to South Africa Standard Time (SAST / UTC+2)."""
@@ -163,7 +253,7 @@ def fetch_live_market_prices() -> dict:
     """Fetches real-time market prices across assets with local JSON cache fallback."""
     prices = {}
     # 1. Check local sub-millisecond microstructure state
-    state_file = os.path.join(BASE_DIR, "microstructure_state.json")
+    state_file = MICROSTRUCTURE_STATE_FILE
     if os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
@@ -465,7 +555,7 @@ def build_position_candlestick_chart(
         )
 
     # 9. Overlays: Current Mark Price
-    mark_price = curr_p if curr_p > 0 else (float(df["close"].iloc[-1]) if not df.empty else 0.0)
+    mark_price = curr_p if curr_p > 0 else (num(df["close"].iloc[-1], 0.0) if not df.empty else 0.0)
     if mark_price > 0:
         curr_is_profit = ((side == "long" and mark_price >= entry_p) or (side == "short" and mark_price <= entry_p)) if entry_p > 0 else True
         curr_color = "#00ff66" if curr_is_profit else "#ff003c"
@@ -529,7 +619,7 @@ def fetch_fleet_quant_alpha_matrix(symbols: tuple, timeframe: str = "4h") -> Lis
             df_calc = df.copy()
             df_calc["volume"] = df_calc["base_vol"]
             
-            curr_p = float(df_calc["close"].iloc[-1])
+            curr_p = num(df_calc["close"].iloc[-1], 0.0)
             div_info = detect_momentum_divergence(df_calc, lookback=24)
             vp_info = compute_volume_profile(df_calc, lookback=min(len(df_calc), 48), value_area_pct=0.70)
             td_info = compute_td_sequential(df_calc)
@@ -600,23 +690,98 @@ def fetch_fleet_quant_alpha_matrix(symbols: tuple, timeframe: str = "4h") -> Lis
             pass
     return matrix
 
+_LOG_TALLY_KEYS = ("gemini_calls", "macro_calls", "boardroom_calls", "groq_calls", "groq_429s",
+                   "scout_radar_calls", "ranking_calls", "post_mortem_calls",
+                   "tape_whisperer_calls", "arbiter_calls", "trap_gate_calls")
+
+
+@st.cache_resource
+def _log_scan_checkpoint() -> dict:
+    """Byte offsets + per-day tallies so the AI-usage counters grow incrementally
+    instead of re-reading every log file (~200 MB, ~4s) on each refresh."""
+    return {"date": "", "files": {}}
+
+
+def _tally_log_line(line: str, counts: dict) -> None:
+    if "[AI-MACRO] Synthesis Complete" in line:
+        counts["macro_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[AI-ENGINE] Processed opportunity via Primary Google Gemini" in line:
+        counts["boardroom_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[AI-REGIME-ARBITER] Primary Gemini synthesis" in line:
+        counts["arbiter_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[BREAKOUT-TRAP-GATE]" in line and "CONFIRMED" in line:
+        counts["trap_gate_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[AI-RADAR] AI Scan Complete" in line or "[MTF-CONFLUENCE] Scan Complete" in line:
+        counts["scout_radar_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[HEDGING-ORACLE]" in line and "Shield=" in line:
+        counts["gemini_calls"] += 1
+    elif "[CHIEF-STRATEGIST]" in line and "Asset Hierarchy Updated" in line:
+        counts["ranking_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[RELATIVE-STRENGTH] Fleet Alpha Leaders" in line:
+        counts["ranking_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[POST-MORTEM-RULE]" in line or "[INSTANT-AUTOPSY]" in line:
+        counts["post_mortem_calls"] += 1
+        counts["gemini_calls"] += 1
+    elif "[TAPE-WHISPERER]" in line:
+        counts["tape_whisperer_calls"] += 1
+        counts["groq_calls"] += 1
+    elif "[GHOST-WALL]" in line or "[RUNNER-ARCHITECT]" in line:
+        counts["groq_calls"] += 1
+    elif "Processed opportunity via Groq Failover" in line:
+        counts["groq_calls"] += 1
+    elif "[SRE-ROTATION] Groq 429 Hit" in line:
+        counts["groq_429s"] += 1
+
+
+def _scan_log_file(lp: str, today_str: str) -> dict:
+    """Tally only the bytes appended since this file's checkpoint. Returns new counts."""
+    state = _log_scan_checkpoint()
+    if state["date"] != today_str:
+        state["date"] = today_str
+        state["files"] = {}
+    entry = state["files"].setdefault(lp, {"pos": 0, "counts": dict.fromkeys(_LOG_TALLY_KEYS, 0)})
+    try:
+        if os.path.getsize(lp) < entry["pos"]:
+            entry["pos"] = 0
+            entry["counts"] = dict.fromkeys(_LOG_TALLY_KEYS, 0)
+    except OSError:
+        return {}
+    fresh = dict.fromkeys(_LOG_TALLY_KEYS, 0)
+    today_b = today_str.encode("utf-8")
+    tail = b""
+    try:
+        with open(lp, "rb") as f:
+            f.seek(entry["pos"])
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                segments = (tail + chunk).split(b"\n")
+                tail = segments.pop()
+                for raw in segments:
+                    entry["pos"] += len(raw) + 1
+                    if today_b in raw:
+                        _tally_log_line(raw.decode("utf-8", "replace"), fresh)
+    except OSError:
+        return fresh
+    for key, val in fresh.items():
+        entry["counts"][key] += val
+    return fresh
+
+
 @st.cache_data(ttl=15)
 def fetch_ai_usage_stats() -> dict:
     """Computes daily AI credit, call count, and token usage telemetry across Gemini & Groq."""
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    gemini_calls = 0
-    macro_calls = 0
-    boardroom_calls = 0
-    groq_calls = 0
-    groq_429s = 0
-    scout_radar_calls = 0
-    ranking_calls = 0
-    post_mortem_calls = 0
-    tape_whisperer_calls = 0
-    arbiter_calls = 0
-    trap_gate_calls = 0
-
-    log_files = [
+    counts = dict.fromkeys(_LOG_TALLY_KEYS, 0)
+    for lp in [
         os.path.join(BASE_DIR, "logs", "live_trader.log"),
         os.path.join(BASE_DIR, "logs", "macro_sentinel.log"),
         os.path.join(BASE_DIR, "logs", "main.log"),
@@ -626,53 +791,22 @@ def fetch_ai_usage_stats() -> dict:
         os.path.join(BASE_DIR, "logs", "regime_classifier.log"),
         os.path.join(BASE_DIR, "logs", "swing_trader.log"),
         os.path.join(BASE_DIR, "logs", "start_system.log"),
-    ]
-
-    for lp in log_files:
+    ]:
         if not os.path.exists(lp):
             continue
-        try:
-            with open(lp, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if today_str not in line:
-                        continue
-                    if "[AI-MACRO] Synthesis Complete" in line:
-                        macro_calls += 1
-                        gemini_calls += 1
-                    elif "[AI-ENGINE] Processed opportunity via Primary Google Gemini" in line:
-                        boardroom_calls += 1
-                        gemini_calls += 1
-                    elif "[AI-REGIME-ARBITER] Primary Gemini synthesis" in line:
-                        arbiter_calls += 1
-                        gemini_calls += 1
-                    elif "[BREAKOUT-TRAP-GATE]" in line and "CONFIRMED" in line:
-                        trap_gate_calls += 1
-                        gemini_calls += 1
-                    elif "[AI-RADAR] AI Scan Complete" in line or "[MTF-CONFLUENCE] Scan Complete" in line:
-                        scout_radar_calls += 1
-                        gemini_calls += 1
-                    elif "[HEDGING-ORACLE]" in line and "Shield=" in line:
-                        gemini_calls += 1
-                    elif "[CHIEF-STRATEGIST]" in line and "Asset Hierarchy Updated" in line:
-                        ranking_calls += 1
-                        gemini_calls += 1
-                    elif "[RELATIVE-STRENGTH] Fleet Alpha Leaders" in line:
-                        ranking_calls += 1
-                        gemini_calls += 1
-                    elif "[POST-MORTEM-RULE]" in line or "[INSTANT-AUTOPSY]" in line:
-                        post_mortem_calls += 1
-                        gemini_calls += 1
-                    elif "[TAPE-WHISPERER]" in line:
-                        tape_whisperer_calls += 1
-                        groq_calls += 1
-                    elif "[GHOST-WALL]" in line or "[RUNNER-ARCHITECT]" in line:
-                        groq_calls += 1
-                    elif "Processed opportunity via Groq Failover" in line:
-                        groq_calls += 1
-                    elif "[SRE-ROTATION] Groq 429 Hit" in line:
-                        groq_429s += 1
-        except Exception:
-            pass
+        for key, val in _scan_log_file(lp, today_str).items():
+            counts[key] += val
+    gemini_calls = counts["gemini_calls"]
+    macro_calls = counts["macro_calls"]
+    boardroom_calls = counts["boardroom_calls"]
+    groq_calls = counts["groq_calls"]
+    groq_429s = counts["groq_429s"]
+    scout_radar_calls = counts["scout_radar_calls"]
+    ranking_calls = counts["ranking_calls"]
+    post_mortem_calls = counts["post_mortem_calls"]
+    tape_whisperer_calls = counts["tape_whisperer_calls"]
+    arbiter_calls = counts["arbiter_calls"]
+    trap_gate_calls = counts["trap_gate_calls"]
 
     # Token calculations across all engines
     est_input_tokens = (macro_calls * 500) + (boardroom_calls * 800) + (arbiter_calls * 450) + (trap_gate_calls * 400) + (scout_radar_calls * 650) + (ranking_calls * 450) + (post_mortem_calls * 350) + (tape_whisperer_calls * 250)
@@ -782,6 +916,22 @@ button[data-baseweb="tab"][aria-selected="true"] {
 </style>
 """, unsafe_allow_html=True)
 
+# ── Data Feed Health Banner ──────────────────────────────────────────────────
+# Failures recorded by query_db/execute_safe_write during the *previous* pass.
+# A monitoring page that silently renders zeros is worse than one that admits it is blind.
+_carried_feed_failures = st.session_state.pop("_carried_feed_failures", {})
+if _carried_feed_failures:
+    _ff_body = "\n".join(
+        f"- `{feed}` — {err}" for feed, err in list(_carried_feed_failures.items())[:12]
+    )
+    _ff_extra = "" if len(_carried_feed_failures) <= 12 else f"\n- …{len(_carried_feed_failures) - 12} more"
+    st.warning(
+        f"⚠️ **{len(_carried_feed_failures)} data feed(s) failed on the last refresh.** "
+        f"Affected sections fall back to empty/placeholder values — treat them as unknown, not as zero.\n\n"
+        f"{_ff_body}{_ff_extra}",
+        icon="📡"
+    )
+
 # ── Sidebar Controls & Configuration ─────────────────────────────────────────
 with st.sidebar:
     st.image("https://cryptologos.cc/logos/bitcoin-btc-logo.png", width=40)
@@ -800,8 +950,8 @@ with st.sidebar:
     # P1: Operator Safe Controls Drawer
     with st.expander("🛠️ Fleet Operator Controls", expanded=False):
         st.markdown("##### ⚙️ Operational Overrides")
-        curr_op_halt = query_system_state("OPERATOR_HALT", "0") in ("1", "true", "TRUE")
-        curr_auto_halt = query_system_state("RISK_HALT", "0") in ("1", "true", "TRUE")
+        curr_op_halt = state_flag_now("OPERATOR_HALT")
+        curr_auto_halt = state_flag("RISK_HALT")
         pause_entries = st.toggle(
             "⏸️ Pause Entries (Close-Only)",
             value=curr_op_halt,
@@ -811,14 +961,28 @@ with st.sidebar:
             st.caption("⚠️ *Auto Risk Cap Halt is currently active (margin/slot ceiling).*")
         if pause_entries != curr_op_halt:
             new_val = "1" if pause_entries else "0"
-            if execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('OPERATOR_HALT', ?, datetime('now'))", (new_val,)):
-                st.toast(f"Fleet State Updated: {'Entries Paused (Close-Only)' if pause_entries else 'Manual Pause Cleared'}")
+            wrote = execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('OPERATOR_HALT', ?, datetime('now'))", (new_val,))
+            persisted = read_state_now("OPERATOR_HALT")
+            if wrote and str(persisted) == new_val:
+                st.toast(f"Fleet State Updated (verified): {'Entries Paused (Close-Only)' if pause_entries else 'Manual Pause Cleared'}")
                 st.rerun()
+            else:
+                st.warning(
+                    f"⚠️ PAUSE COMMAND DID NOT LAND — write {'succeeded' if wrote else 'FAILED'}, "
+                    f"ledger read-back is {persisted!r} instead of {new_val!r}. The fleet is still in its "
+                    f"previous entry state; do not rely on this toggle until it re-reads as intended."
+                )
 
         st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
         if st.button("🔄 Force Exchange Re-Sync", width="stretch", help="Dispatches an immediate re-sync signal to the Reconciliation Engine."):
-            if execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('force_resync', '1', datetime('now'))", ()):
+            wrote = execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('force_resync', '1', datetime('now'))", ())
+            persisted = str(read_state_now("force_resync"))
+            if wrote and persisted == "1":
                 st.toast("✅ Force Re-Sync signal dispatched to Reconciliation Engine!")
+            elif wrote:
+                st.toast(f"✅ Force Re-Sync committed; the engine has already moved the flag to {persisted!r}")
+            else:
+                st.warning("⚠️ Force Re-Sync signal was NOT persisted to trading_data.db — the Reconciliation Engine will not see it.")
 
         st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
         if st.button("📧 Send 1h Rollup Email", width="stretch", help="Immediately synthesizes the last 60 minutes of 5-minute briefings and sends the 1-Hour Executive Briefing email via Gmail SMTP."):
@@ -837,12 +1001,12 @@ with st.sidebar:
                 st.error(f"Failed to dispatch email: {em_ui_err}")
 
     st.markdown("---")
-    bal_str = query_system_state("balance", None)
-    live_bal_val = float(bal_str) if bal_str and bal_str != "None" else None
-    total_deposited = float(query_system_state("user_total_deposit", os.getenv("INITIAL_BALANCE", "250.00")))
-    deposit_t1 = float(query_system_state("initial_deposit_tranche_1", "55.00"))
-    deposit_t2 = float(query_system_state("topup_deposit_tranche_2", "82.00"))
-    deposit_t3 = float(query_system_state("topup_deposit_tranche_3", "113.00"))
+    live_bal_val = num(query_system_state("balance", ""), None)
+    total_deposited = state_num("user_total_deposit", num(os.getenv("INITIAL_BALANCE"), 250.0))
+    deposit_t1 = state_num("initial_deposit_tranche_1", 55.00)
+    deposit_t2 = state_num("topup_deposit_tranche_2", 82.00)
+    deposit_t3 = state_num("topup_deposit_tranche_3", 113.00)
+    bal_display = f"${live_bal_val:,.2f}" if live_bal_val is not None else "Syncing..."
 
     st.write(f"**Connected Exchange:** Bitget UTA (Live)")
     if live_bal_val is not None:
@@ -889,7 +1053,7 @@ macro_trend = query_system_state("btc_macro_trend", "BULLISH").upper()
 risk_halt = query_system_state("RISK_HALT", "0")
 rec_lev = query_system_state("recommended_leverage", "3")
 fg_val = query_system_state("fear_greed_index", "50.0")
-news_active = query_system_state("news_event_active", "0")
+news_active = "1" if state_flag("news_event_active") else "0"
 news_reason = query_system_state("news_event_reason", "No active events")
 
 if macro_trend == "BULLISH":
@@ -926,7 +1090,7 @@ st.markdown(f"""
             {banner_icon} {regime_text}
         </span>
         <span style="color: #94a3b8; font-size: 0.8rem; margin-left: 15px;">
-            ⚡ Lev: <b style="color: #00e5ff;">{rec_lev}x Dynamic</b> | 🧠 F&G: <b style="color: #e2e8f0;">{float(fg_val):.0f}/100</b> | 📰 Event Gate: <b style="color: {'#ff003c' if news_active=='1' else '#00ff66'};">{'EVENT VETO' if news_active=='1' else 'CLEAR'}</b>
+            ⚡ Lev: <b style="color: #00e5ff;">{rec_lev}x Dynamic</b> | 🧠 F&G: <b style="color: #e2e8f0;">{num(fg_val, 50.0):.0f}/100</b> | 📰 Event Gate: <b style="color: {'#ff003c' if news_active=='1' else '#00ff66'};">{'EVENT VETO' if news_active=='1' else 'CLEAR'}</b>
         </span>
     </div>
     <div>
@@ -1008,6 +1172,13 @@ if not df_all_trades.empty and 'timestamp' in df_all_trades.columns:
     df_all_trades['dt_sort'] = pd.to_datetime(df_all_trades['timestamp'], utc=True, errors='coerce')
     df_all_trades = df_all_trades.sort_values(by='dt_sort', ascending=False).reset_index(drop=True)
 
+# Ledger columns are REAL-affinity, but daemons can persist text ('N/A', '') that breaks
+# numeric comparison and mixed-type sorting on this shared frame.
+if not df_all_trades.empty:
+    for _numcol in ("pnl", "entry_price", "exit_price", "qty", "duration_mins"):
+        if _numcol in df_all_trades.columns:
+            df_all_trades[_numcol] = pd.to_numeric(df_all_trades[_numcol], errors="coerce")
+
 total_closed_count = len(df_all_trades)
 if not df_all_trades.empty:
     wins_df = df_all_trades[df_all_trades['pnl'].astype(float) > 0]
@@ -1048,10 +1219,10 @@ if not df_open.empty:
     for _, row in df_open.iterrows():
         s = str(row['symbol']).upper().replace("/", "").replace("-", "")
         active_coins_set.add(s)
-        qty = float(row.get('qty') or 0.0)
-        ep = float(row.get('entry_price') or 0.0)
-        lev = float(row.get('leverage') or (10.0 if "BTC" in s else 5.0))
-        curr_p = float(live_prices.get(s, ep) or ep)
+        qty = num(row.get('qty'))
+        ep = num(row.get('entry_price'))
+        lev = num(row.get('leverage'), 10.0 if "BTC" in s else 5.0)
+        curr_p = num(live_prices.get(s, ep), ep)
         side = str(row.get('side') or 'long').lower()
         
         pos_margin = (qty * ep) / lev if lev > 0 else (qty * ep)
@@ -1060,10 +1231,10 @@ if not df_open.empty:
         total_unrealized_pnl += pos_unr
 
         f_info = funding_telemetry_map.get(s, {}) or funding_telemetry_map.get(str(row['symbol']), {})
-        total_live_funding += float(f_info.get("total_funding", 0.0) or 0.0)
+        total_live_funding += num(f_info.get("total_funding"), 0.0)
 
-max_coin_slots = int(query_system_state("GLOBAL_MAX_POSITIONS", "5"))
-margin_limit_pct = float(query_system_state("GLOBAL_MARGIN_LIMIT", "70.0"))
+max_coin_slots = int(num(query_system_state("GLOBAL_MAX_POSITIONS", "5"), 5.0))
+margin_limit_pct = state_num("GLOBAL_MARGIN_LIMIT", 70.0)
 bal_for_calc = live_bal_val if live_bal_val is not None else 0.0
 free_cash_buffer = max(0.0, bal_for_calc - total_margin_locked)
 
@@ -1161,7 +1332,7 @@ with tab_briefing:
         pass
 
     now_ts = time.time()
-    last_gen_ts = float(briefing_data.get("generated_at_timestamp") or 0.0)
+    last_gen_ts = num(briefing_data.get("generated_at_timestamp"), 0.0)
     age_seconds = now_ts - last_gen_ts if last_gen_ts > 0 else 999999
 
     # Top Control Bar
@@ -1218,11 +1389,11 @@ with tab_briefing:
     st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
 
     # 4 Executive KPI Metric Cards
-    b_eq = float(briefing_data.get("equity") or live_bal_val)
-    b_margin = float(briefing_data.get("margin_locked") or total_margin_locked)
-    b_util_pct = float(briefing_data.get("margin_util_pct") or 0.0)
-    b_slots = int(briefing_data.get("slots_occupied") or len(df_open))
-    b_rules = int(briefing_data.get("rules_count") or 108)
+    b_eq = num(briefing_data.get("equity"), bal_for_calc)
+    b_margin = num(briefing_data.get("margin_locked"), total_margin_locked)
+    b_util_pct = num(briefing_data.get("margin_util_pct"))
+    b_slots = int(num(briefing_data.get("slots_occupied"), len(df_open)))
+    b_rules = int(num(briefing_data.get("rules_count"), 108))
     max_slots_calc = max(4, max_coin_slots)
 
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -1337,7 +1508,7 @@ with tab_briefing:
         )
         if not hist_rows.empty:
             cycle_options = [
-                f"Cycle #{r['cycle_num']} — {r['generated_at']} | Equity: ${r['equity']:.2f} | Slots: {r['slots_occupied']} | {r['regime']}"
+                f"Cycle #{r['cycle_num']} — {r['generated_at']} | Equity: ${num(r['equity']):,.2f} | Slots: {r['slots_occupied']} | {r['regime']}"
                 for _, r in hist_rows.iterrows()
             ]
             selected_cycle_label = st.selectbox("Select Past Briefing Cycle to Review:", cycle_options, index=0)
@@ -1386,14 +1557,14 @@ with tab_live:
             sym = str(row['symbol'])
             sym_clean = sym.upper().replace("/", "").replace("-", "")
             side = str(row.get('side') or 'long').lower()
-            qty = float(row.get('qty') or 0.0)
-            entry_p = float(row.get('entry_price') or 0.0)
-            sl = float(row.get('stop_loss') or 0.0)
-            tp = float(row.get('take_profit') or 0.0)
-            hard_sl = float(row.get('hard_sl') or 0.0)
-            lev = float(row.get('leverage') or (10.0 if "BTC" in sym_clean else 5.0))
+            qty = num(row.get('qty'))
+            entry_p = num(row.get('entry_price'))
+            sl = num(row.get('stop_loss'))
+            tp = num(row.get('take_profit'))
+            hard_sl = num(row.get('hard_sl'))
+            lev = num(row.get('leverage'), 10.0 if "BTC" in sym_clean else 5.0)
             margin = (qty * entry_p) / lev if lev > 0 else (qty * entry_p)
-            curr_p = float(live_prices.get(sym_clean, entry_p) or entry_p)
+            curr_p = num(live_prices.get(sym_clean, entry_p) or entry_p)
             entry_time_raw = row.get('entry_time')
             pos_age = compute_position_age(entry_time_raw)
             sl_breach_raw = row.get('sl_breach_time')
@@ -1413,7 +1584,7 @@ with tab_live:
 
             # Live Position Funding Telemetry
             f_info = funding_telemetry_map.get(sym_clean, {}) or funding_telemetry_map.get(sym, {})
-            pos_funding = float(f_info.get("total_funding", 0.0) or 0.0)
+            pos_funding = num(f_info.get("total_funding"), 0.0)
             if pos_funding < 0:
                 pos_funding_str = f"-${abs(pos_funding):.4f} (Paid)"
                 pos_funding_badge = f"<b style='color: #ffaa00;'>-${abs(pos_funding):.4f} USDT</b> <span style='color: #ffaa00; font-size: 0.72rem;'>(Paid)</span>"
@@ -1432,14 +1603,14 @@ with tab_live:
             
             # Target Distances
             if side == "long":
-                dist_tp_pct = ((tp - curr_p) / curr_p * 100.0) if tp > 0 else 0.0
-                dist_sl_pct = ((curr_p - sl) / curr_p * 100.0) if sl > 0 else 0.0
+                dist_tp_pct = ((tp - curr_p) / curr_p * 100.0) if tp > 0 and curr_p > 0 else 0.0
+                dist_sl_pct = ((curr_p - sl) / curr_p * 100.0) if sl > 0 and curr_p > 0 else 0.0
                 tp_str = f"+{dist_tp_pct:.2f}% to TP" if tp > 0 else "Active Trail"
                 sl_str = f"{dist_sl_pct:.2f}% above SL" if sl > 0 else "Active Trail"
                 is_risk_free = (sl >= entry_p)
             else:
-                dist_tp_pct = ((curr_p - tp) / curr_p * 100.0) if tp > 0 else 0.0
-                dist_sl_pct = ((sl - curr_p) / curr_p * 100.0) if sl > 0 else 0.0
+                dist_tp_pct = ((curr_p - tp) / curr_p * 100.0) if tp > 0 and curr_p > 0 else 0.0
+                dist_sl_pct = ((sl - curr_p) / curr_p * 100.0) if sl > 0 and curr_p > 0 else 0.0
                 tp_str = f"-{dist_tp_pct:.2f}% to TP" if tp > 0 else "Active Trail"
                 sl_str = f"{dist_sl_pct:.2f}% below SL" if sl > 0 else "Active Trail"
                 is_risk_free = (sl <= entry_p and sl > 0)
@@ -1581,15 +1752,15 @@ with tab_live:
             s_name = str(row['symbol'])
             s_clean = s_name.upper().replace("/", "").replace("-", "").split(":")[0]
             s_side = str(row.get('side') or 'long').upper()
-            s_entry = float(row.get('entry_price') or 0.0)
-            s_sl = float(row.get('stop_loss') or 0.0)
-            s_tp = float(row.get('take_profit') or 0.0)
-            s_hard_sl = float(row.get('hard_sl') or 0.0)
+            s_entry = num(row.get('entry_price'))
+            s_sl = num(row.get('stop_loss'))
+            s_tp = num(row.get('take_profit'))
+            s_hard_sl = num(row.get('hard_sl'))
             if s_hard_sl <= 0.0 and s_entry > 0:
                 s_hard_sl = s_entry * (1.0 - 0.035) if s_side == 'LONG' else s_entry * (1.0 + 0.035)
-            s_curr = float(live_prices.get(s_clean, s_entry) or s_entry)
-            s_lev = float(row.get('leverage') or (10.0 if "BTC" in s_clean else 5.0))
-            s_qty = float(row.get('qty') or 0.0)
+            s_curr = num(live_prices.get(s_clean, s_entry) or s_entry)
+            s_lev = num(row.get('leverage'), 10.0 if "BTC" in s_clean else 5.0)
+            s_qty = num(row.get('qty'))
             s_margin = (s_qty * s_entry) / s_lev if s_lev > 0 else (s_qty * s_entry)
             s_unr = (s_curr - s_entry) * s_qty if s_side == 'LONG' else (s_entry - s_curr) * s_qty
             s_roi = (s_unr / s_margin * 100.0) if s_margin > 0 else 0.0
@@ -1705,8 +1876,8 @@ with tab_live:
                     is_run = s_data.get("runner_mode", False)
                     v_color = "#00e5ff" if is_run else ("#00ff66" if v_val == "HOLDING_NORMAL" else ("#ff9900" if "STALL" in v_val else "#ff003c"))
                     v_icon = "🏃" if is_run else ("🛡️" if v_val == "HOLDING_NORMAL" else "⚠️")
-                    r_mult = float(s_data.get("r_multiple", 0.0))
-                    tgt_r = float(s_data.get("target_r", 2.5))
+                    r_mult = num(s_data.get("r_multiple"), 0.0)
+                    tgt_r = num(s_data.get("target_r"), 2.5)
                     tape = s_data.get("tape_condition", "BALANCED")
                     diag = s_data.get("diagnosis", "Position monitored.")
                     sl_sugg = s_data.get("suggested_sl")
@@ -1744,7 +1915,7 @@ with tab_live:
                         🛡️ 100% CAPITAL PRESERVED — ZERO NAKED RISK
                     </span>
                     <span style="color: #94a3b8; font-size: 0.82rem; margin-left: 12px;">
-                        Liquid Buffer: <b style="color: #38bdf8;">${live_bal_val:.2f} USDT</b> | Margin Utilized: <b style="color: #00ff66;">0.0%</b> (70% Max Ceiling)
+                        Liquid Buffer: <b style="color: #38bdf8;">{bal_display} USDT</b> | Margin Utilized: <b style="color: #00ff66;">0.0%</b> (70% Max Ceiling)
                     </span>
                 </div>
                 <div>
@@ -1813,12 +1984,12 @@ with tab_live:
             r_show_vp = st.checkbox("Show Volume Profile (POC/VAH/VAL)", value=True, key="radar_show_vp")
 
         radar_clean = radar_sym.replace("/", "").replace("-", "")
-        r_live_p = float(live_prices.get(radar_clean, 0.0) or 0.0)
+        r_live_p = num(live_prices.get(radar_clean), 0.0)
 
         # 🔬 Live Microstructure & Alpha Telemetry Banner for Selected Asset
         try:
-            if os.path.exists("microstructure_state.json"):
-                with open("microstructure_state.json", "r", encoding="utf-8") as f_radar_ms:
+            if os.path.exists(MICROSTRUCTURE_STATE_FILE):
+                with open(MICROSTRUCTURE_STATE_FILE, "r", encoding="utf-8") as f_radar_ms:
                     r_ms_data = json.load(f_radar_ms)
                 r_sym_code = radar_sym.replace("/", "").replace("-", "").upper()
                 r_sym_info = r_ms_data.get("symbols", {}).get(r_sym_code, {})
@@ -1882,15 +2053,14 @@ with tab_live:
     
     # Fetch BTC Anchor Telemetry
     btc_anchor_state = query_system_state("btc_anchor_state", "HEALTHY_EXPANSION")
-    alt_long_pause_raw = query_system_state("ALT_LONG_PAUSE", "0")
-    is_alt_paused = alt_long_pause_raw in ("1", "true", "True")
+    is_alt_paused = state_flag("ALT_LONG_PAUSE")
     try:
-        btc_risk_score = float(query_system_state("btc_contagion_risk_score", "20"))
+        btc_risk_score = state_num("btc_contagion_risk_score", 20.0)
     except Exception:
         btc_risk_score = 20.0
     btc_directive = query_system_state("btc_anchor_directive", "Bitcoin in healthy posture; normal fleet operations active.")
     try:
-        btc_pivot = float(query_system_state("btc_key_pivot", "84500"))
+        btc_pivot = state_num("btc_key_pivot", 84500.0)
         btc_pivot_str = f"${btc_pivot:,.0f}"
     except Exception:
         btc_pivot_str = "$84,500"
@@ -2021,7 +2191,7 @@ with tab_ledger:
             </div>
             <div>
                 <span style="color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;">Current Portfolio Value</span><br>
-                <span style="color: #38bdf8; font-size: 1.15rem; font-weight: 700; font-family: 'JetBrains Mono', monospace;">${live_bal_val:.2f} USDT</span>
+                <span style="color: #38bdf8; font-size: 1.15rem; font-weight: 700; font-family: 'JetBrains Mono', monospace;">{bal_display} USDT</span>
             </div>
             <div>
                 <span style="color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;">Real Net Profit</span><br>
@@ -2074,10 +2244,10 @@ with tab_ledger:
         # Format ledger for display
         df_ledger_display = df_filtered.copy()
         df_ledger_display['Timestamp (SAST)'] = df_ledger_display['timestamp'].apply(utc_to_sast)
-        df_ledger_display['PnL ($)'] = df_ledger_display['pnl'].apply(lambda x: f"{'+$' if float(x)>=0 else '-$'}{abs(float(x)):.4f}")
-        df_ledger_display['Result'] = df_ledger_display['pnl'].apply(lambda x: "🟢 WIN" if float(x)>0 else "🔴 LOSS")
-        df_ledger_display['Entry Price'] = df_ledger_display['entry_price'].apply(lambda x: f"${float(x):,.4f}" if x else "$0.00")
-        df_ledger_display['Exit Price'] = df_ledger_display['exit_price'].apply(lambda x: f"${float(x):,.4f}" if x else "$0.00")
+        df_ledger_display['PnL ($)'] = df_ledger_display['pnl'].apply(lambda x: f"{'+$' if num(x)>=0 else '-$'}{abs(num(x)):.4f}")
+        df_ledger_display['Result'] = df_ledger_display['pnl'].apply(lambda x: "🟢 WIN" if num(x)>0 else "🔴 LOSS")
+        df_ledger_display['Entry Price'] = df_ledger_display['entry_price'].apply(lambda x: f"${num(x):,.4f}" if num(x) else "$0.00")
+        df_ledger_display['Exit Price'] = df_ledger_display['exit_price'].apply(lambda x: f"${num(x):,.4f}" if num(x) else "$0.00")
         df_ledger_display['Notes'] = df_ledger_display['notes'].fillna("Completed")
         
         cols_to_show = ['Timestamp (SAST)', 'symbol', 'side', 'Entry Price', 'Exit Price', 'qty', 'PnL ($)', 'Result', 'Notes']
@@ -2193,9 +2363,9 @@ with tab_ledger:
         with c_col2:
             st.markdown("#### 🏆 Asset Leaderboard")
             show_coin_df = coin_grp.copy()
-            show_coin_df['Win Rate (%)'] = show_coin_df['win_rate'].apply(lambda x: f"{x:.1f}%")
-            show_coin_df['Net PnL ($)'] = show_coin_df['net_pnl'].apply(lambda x: f"{'+$' if x>=0 else '-$'}{abs(x):.2f}")
-            show_coin_df['Avg / Trade'] = show_coin_df['avg_pnl'].apply(lambda x: f"{'+$' if x>=0 else '-$'}{abs(x):.2f}")
+            show_coin_df['Win Rate (%)'] = show_coin_df['win_rate'].apply(lambda x: f"{num(x):.1f}%")
+            show_coin_df['Net PnL ($)'] = show_coin_df['net_pnl'].apply(lambda x: f"{'+$' if num(x)>=0 else '-$'}{abs(num(x)):.2f}")
+            show_coin_df['Avg / Trade'] = show_coin_df['avg_pnl'].apply(lambda x: f"{'+$' if num(x)>=0 else '-$'}{abs(num(x)):.2f}")
             show_coin_df = show_coin_df[['symbol', 'trades', 'Win Rate (%)', 'Net PnL ($)', 'Avg / Trade']].rename(columns={'symbol': 'Asset', 'trades': 'Trades'})
             st.dataframe(show_coin_df, width="stretch", hide_index=True)
 
@@ -2203,13 +2373,18 @@ with tab_ledger:
         st.markdown("---")
         st.subheader("⏱️ Trade Duration & Holding Time Analysis")
         
-        valid_dur = df_all_trades[df_all_trades['duration_mins'].notnull() & (df_all_trades['duration_mins'] > 0)] if 'duration_mins' in df_all_trades.columns else pd.DataFrame()
+        if 'duration_mins' in df_all_trades.columns:
+            dur_col = pd.to_numeric(df_all_trades['duration_mins'], errors="coerce")
+            pnl_col = pd.to_numeric(df_all_trades['pnl'], errors="coerce") if 'pnl' in df_all_trades.columns else pd.Series(0.0, index=df_all_trades.index)
+            valid_dur = df_all_trades[dur_col.notnull() & (dur_col > 0)].copy()
+            valid_dur["_dur_m"] = dur_col[valid_dur.index]
+            valid_dur["_pnl_n"] = pnl_col[valid_dur.index]
+        else:
+            valid_dur = pd.DataFrame()
         if not valid_dur.empty:
-            avg_all_m = float(valid_dur['duration_mins'].mean())
-            win_dur = valid_dur[valid_dur['pnl'].astype(float) > 0]
-            loss_dur = valid_dur[valid_dur['pnl'].astype(float) <= 0]
-            avg_win_m = float(win_dur['duration_mins'].mean()) if not win_dur.empty else avg_all_m
-            avg_loss_m = float(loss_dur['duration_mins'].mean()) if not loss_dur.empty else avg_all_m
+            avg_all_m = num(valid_dur["_dur_m"].mean())
+            avg_win_m = num(valid_dur.loc[valid_dur["_pnl_n"] > 0, "_dur_m"].mean(), avg_all_m)
+            avg_loss_m = num(valid_dur.loc[valid_dur["_pnl_n"] <= 0, "_dur_m"].mean(), avg_all_m)
             hold_ratio = (avg_win_m / avg_loss_m) if avg_loss_m > 0 else 1.0
             
             def _fmt_mins(m):
@@ -2303,7 +2478,7 @@ with tab_ai:
             bp_session = bp_obj.get("session_name", "Global Macro Session")
             bp_bias = bp_obj.get("macro_bias", "DEFENSIVE_CHOP")
             bp_narrative = bp_obj.get("daily_narrative", "Session macro posture active.")
-            bp_conf = float(bp_obj.get("confidence", 0.85)) * 100.0
+            bp_conf = num(bp_obj.get("confidence"), 0.85) * 100.0
             bp_updated = utc_to_sast(bp_obj.get("updated_at"))
 
             # Calculate remaining minutes in current 6h session block
@@ -2349,9 +2524,9 @@ with tab_ai:
                         bp_rows.append({
                             "Asset": a_sym,
                             "Bias": a_data.get("bias", "RANGE"),
-                            "Key Support": f"${float(a_data.get('key_support', 0.0)):,.2f}" if float(a_data.get('key_support', 0.0)) > 0 else "---",
-                            "Key Resistance": f"${float(a_data.get('key_resistance', 0.0)):,.2f}" if float(a_data.get('key_resistance', 0.0)) > 0 else "---",
-                            "Invalidation": f"${float(a_data.get('invalidation_level', 0.0)):,.2f}" if float(a_data.get('invalidation_level', 0.0)) > 0 else "---",
+                            "Key Support": f"${num(a_data.get('key_support'), 0.0):,.2f}" if num(a_data.get('key_support'), 0.0) > 0 else "---",
+                            "Key Resistance": f"${num(a_data.get('key_resistance'), 0.0):,.2f}" if num(a_data.get('key_resistance'), 0.0) > 0 else "---",
+                            "Invalidation": f"${num(a_data.get('invalidation_level'), 0.0):,.2f}" if num(a_data.get('invalidation_level'), 0.0) > 0 else "---",
                             "Tactical Playbook": a_data.get("tactical_plan", "Standard risk limits active.")
                         })
                 if bp_rows:
@@ -2371,7 +2546,7 @@ with tab_ai:
             d_sym = d_obj.get("symbol", "BTC/USDT")
             d_side = d_obj.get("side", "SHORT")
             d_exec = d_obj.get("execute", False)
-            d_score = float(d_obj.get("conviction_score", 0.0)) * 100.0
+            d_score = num(d_obj.get("conviction_score"), 0.0) * 100.0
             d_red = d_obj.get("red_team_objection", "No active objections recorded.")
             d_blue = d_obj.get("alpha_thesis", "Momentum continuation confirmed.")
             d_rat = d_obj.get("final_rationale", "Adversarial deliberation rendered.")
@@ -2517,27 +2692,20 @@ with tab_ai:
     st.markdown("---")
     st.subheader("📜 Dynamic Rule Enforcement Ledger (Closed-Loop Forensic Safeguards)")
     st.caption("The Boardroom & Red Team cross-examine every trade against these dynamically distilled institutional rules from trading_ledger.db:")
-    try:
-        with sqlite3.connect("trading_ledger.db", timeout=3.0) as l_conn:
-            df_rules = pd.read_sql_query(
-                "SELECT rule_id, category, rule_text, confidence, created_at FROM learned_rules WHERE confidence >= 0.70 ORDER BY confidence DESC, rule_id DESC LIMIT 15",
-                l_conn
-            )
-            if not df_rules.empty:
-                df_rules["confidence"] = df_rules["confidence"].apply(lambda x: f"{float(x):.0%}")
-                df_rules["created_at"] = df_rules["created_at"].apply(utc_to_sast)
-                df_rules.rename(columns={
-                    "rule_id": "Rule ID",
-                    "category": "Category",
-                    "rule_text": "Enforced Principle / Forensic Directive",
-                    "confidence": "Weight",
-                    "created_at": "Learned Date"
-                }, inplace=True)
-                st.dataframe(df_rules, width="stretch", hide_index=True)
-            else:
-                st.info("No learned rules found in trading ledger.")
-    except Exception as rule_ui_err:
-        st.info(f"Learned rules ledger synchronizing: {rule_ui_err}")
+    df_rules = query_db(TRADING_LEDGER_DB, "SELECT rule_id, category, rule_text, confidence, created_at FROM learned_rules WHERE confidence >= 0.70 ORDER BY confidence DESC, rule_id DESC LIMIT 15")
+    if not df_rules.empty:
+        df_rules["confidence"] = df_rules["confidence"].apply(lambda x: f"{num(x):.0%}")
+        df_rules["created_at"] = df_rules["created_at"].apply(utc_to_sast)
+        df_rules.rename(columns={
+            "rule_id": "Rule ID",
+            "category": "Category",
+            "rule_text": "Enforced Principle / Forensic Directive",
+            "confidence": "Weight",
+            "created_at": "Learned Date"
+        }, inplace=True)
+        st.dataframe(df_rules, width="stretch", hide_index=True)
+    else:
+        st.info("No learned rules at/above 0.70 confidence in the trading ledger.")
 
     # ── Real-Time Active Position AI Health Radar ─────────────────────────────
     st.markdown("---")
@@ -2557,9 +2725,9 @@ with tab_ai:
                         "Side": str(pos_r.get("side", "LONG")).upper(),
                         "Health Grade": h_data.get("health_grade", "PRISTINE"),
                         "AI Verdict": h_data.get("verdict", "HOLD"),
-                        "Confidence": f"{float(h_data.get('confidence', 0.5))*100:.0f}%",
+                        "Confidence": f"{num(h_data.get('confidence'), 0.5)*100:.0f}%",
                         "Diagnosis": h_data.get("diagnosis", "Normal"),
-                        "Suggested SL": f"${float(h_data['suggested_sl']):,.4f}" if h_data.get("suggested_sl") else "---",
+                        "Suggested SL": f"${num(h_data.get('suggested_sl')):,.4f}" if num(h_data.get('suggested_sl')) else "---",
                         "Last Evaluated": utc_to_sast(h_data.get("checked_at"))
                     })
                 except Exception:
@@ -2575,34 +2743,31 @@ with tab_ai:
     st.markdown("---")
     st.subheader("🦅 In-Flight AI Shepherd & Runner History (Trading Ledger)")
     try:
-        with sqlite3.connect("trading_ledger.db", timeout=3.0) as s_conn:
-            df_shep = pd.read_sql_query(
-                "SELECT timestamp, symbol, side, entry_price, current_price, unrealized_roe_pct, r_multiple, holding_mins, verdict, tape_condition, suggested_sl, sl_ratcheted, diagnosis FROM inflight_shepherd_logs ORDER BY id DESC LIMIT 15",
-                s_conn
-            )
-            if not df_shep.empty:
-                df_shep["timestamp"] = df_shep["timestamp"].apply(utc_to_sast)
-                df_shep["ROE %"] = df_shep["unrealized_roe_pct"].apply(lambda x: f"{x:+.2f}%")
-                df_shep["R-Mult"] = df_shep["r_multiple"].apply(lambda x: f"{x:+.2f}R")
-                df_shep["Ratcheted"] = df_shep["sl_ratcheted"].apply(lambda x: "✅ YES" if x else "❌ NO")
-                df_shep.rename(columns={
-                    "timestamp": "Evaluated At",
-                    "symbol": "Asset",
-                    "side": "Side",
-                    "entry_price": "Entry",
-                    "current_price": "Mark Price",
-                    "holding_mins": "Hold (m)",
-                    "verdict": "Verdict",
-                    "tape_condition": "L2 Tape",
-                    "suggested_sl": "Suggested SL",
-                    "diagnosis": "AI Diagnosis"
-                }, inplace=True)
-                cols_order = ["Evaluated At", "Asset", "Side", "Entry", "Mark Price", "ROE %", "R-Mult", "Hold (m)", "Verdict", "L2 Tape", "Suggested SL", "Ratcheted", "AI Diagnosis"]
-                st.dataframe(df_shep[[c for c in cols_order if c in df_shep.columns]], width="stretch", hide_index=True)
-            else:
-                st.info("In-flight AI shepherd logs will appear here once an open position is evaluated.")
+        df_shep = query_db(TRADING_LEDGER_DB,
+            "SELECT timestamp, symbol, side, entry_price, current_price, unrealized_roe_pct, r_multiple, holding_mins, verdict, tape_condition, suggested_sl, sl_ratcheted, diagnosis FROM inflight_shepherd_logs ORDER BY id DESC LIMIT 15")
+        if not df_shep.empty:
+            df_shep["timestamp"] = df_shep["timestamp"].apply(utc_to_sast)
+            df_shep["ROE %"] = df_shep["unrealized_roe_pct"].apply(lambda x: f"{num(x):+.2f}%")
+            df_shep["R-Mult"] = df_shep["r_multiple"].apply(lambda x: f"{num(x):+.2f}R")
+            df_shep["Ratcheted"] = df_shep["sl_ratcheted"].apply(lambda x: "YES" if x else "NO")
+            df_shep.rename(columns={
+                "timestamp": "Evaluated At",
+                "symbol": "Asset",
+                "side": "Side",
+                "entry_price": "Entry",
+                "current_price": "Mark Price",
+                "holding_mins": "Hold (m)",
+                "verdict": "Verdict",
+                "tape_condition": "L2 Tape",
+                "suggested_sl": "Suggested SL",
+                "diagnosis": "AI Diagnosis"
+            }, inplace=True)
+            cols_order = ["Evaluated At", "Asset", "Side", "Entry", "Mark Price", "ROE %", "R-Mult", "Hold (m)", "Verdict", "L2 Tape", "Suggested SL", "Ratcheted", "AI Diagnosis"]
+            st.dataframe(df_shep[[c for c in cols_order if c in df_shep.columns]], width="stretch", hide_index=True)
+        else:
+            st.info("In-flight AI shepherd logs will appear here once an open position is evaluated.")
     except Exception as e:
-        st.info("In-flight shepherd ledger active.")
+        st.info(f"In-flight shepherd ledger rendering deferred: {type(e).__name__}")
 
     # ── 3.1c Multi-Asset Relative Strength & Fleet Hierarchy Matrix ───────────
     st.markdown("---")
@@ -2657,7 +2822,7 @@ with tab_ai:
             btc_a_data = json.loads(raw_btc_anchor)
             b_state = btc_a_data.get("btc_anchor_state", "HEALTHY_EXPANSION")
             b_pause = bool(btc_a_data.get("alt_long_pause", False))
-            b_risk = float(btc_a_data.get("contagion_risk_score", 20))
+            b_risk = num(btc_a_data.get("contagion_risk_score"), 20)
             b_dir = btc_a_data.get("anchor_directive", "Normal operations.")
             b_pivot = btc_a_data.get("key_btc_pivot", 84500.0)
             b_time = utc_to_sast(btc_a_data.get("updated_at"))
@@ -2679,7 +2844,7 @@ with tab_ai:
                     </div>
                 </div>
                 <div style="font-size: 0.82rem; color: #94a3b8; line-height: 1.6; margin-bottom: 8px;">
-                    Contagion Risk Meter: <b style="color: {'#00ff66' if b_risk < 40 else ('#ff9900' if b_risk < 70 else '#ff003c')};">{b_risk:.0f} / 100</b> | Key Pivot Reference: <b style="color: #e2e8f0;">${float(b_pivot):,.0f}</b>
+                    Contagion Risk Meter: <b style="color: {'#00ff66' if b_risk < 40 else ('#ff9900' if b_risk < 70 else '#ff003c')};">{b_risk:.0f} / 100</b> | Key Pivot Reference: <b style="color: #e2e8f0;">${num(b_pivot, 0.0):,.0f}</b>
                 </div>
                 <div style="font-size: 0.8rem; color: #cbd5e1; background: rgba(255,255,255,0.02); padding: 10px 14px; border-radius: 4px; border-left: 2px solid rgba(255,255,255,0.1);">
                     <i>"{b_dir}"</i>
@@ -2723,7 +2888,7 @@ with tab_ai:
                     "Bias": dir_badge,
                     "TF": p.get("timeframe", "15m"),
                     "Quality": f"{p.get('quality_score', 80)}%",
-                    "Key Level": f"${float(p.get('key_level', 0.0)):,.2f}" if p.get("key_level") else "---",
+                    "Key Level": f"${num(p.get('key_level'), 0.0):,.2f}" if p.get("key_level") else "---",
                     "Institutional Thesis": p.get("structural_thesis", "")
                 })
             df_pat = pd.DataFrame(rows_pat)
@@ -3039,7 +3204,7 @@ with tab_ai:
         if not df_debates.empty:
             df_debates['Time (SAST)'] = df_debates['timestamp'].apply(utc_to_sast)
             df_debates['Verdict'] = df_debates['execute'].apply(lambda x: "🟢 APPROVED" if x in (1, "1", True) else "🔴 VETOED")
-            df_debates['Conviction'] = df_debates['conviction_score'].apply(lambda x: f"{float(x or 0)*100:.0f}%")
+            df_debates['Conviction'] = df_debates['conviction_score'].apply(lambda x: f"{num(x)*100:.0f}%")
             df_debates['Objection / Thesis'] = df_debates.apply(
                 lambda r: str(r.get('red_team_objection') or r.get('final_rationale') or '')[:70] + "...",
                 axis=1
@@ -3058,7 +3223,7 @@ with tab_ai:
             for _, r in df_rules.iterrows():
                 st.markdown(f"""
                 <div style='background: #0d121f; border-left: 3px solid #00e5ff; padding: 8px 12px; margin-bottom: 8px; border-radius: 4px; font-size: 0.85rem;'>
-                    <b style='color: #00e5ff;'>[{r['category']}] ({float(r['confidence'])*100:.0f}% Conf)</b><br>
+                    <b style='color: #00e5ff;'>[{r['category']}] ({num(r['confidence'])*100:.0f}% Conf)</b><br>
                     <span style='color: #e2e8f0;'>{r['rule_text']}</span>
                 </div>
                 """, unsafe_allow_html=True)
@@ -3102,7 +3267,7 @@ with tab_ai:
     df_lessons = query_db(TRADING_LEDGER_DB, "SELECT symbol, pnl, lesson, timestamp FROM trade_lessons ORDER BY id DESC LIMIT 5")
     if not df_lessons.empty:
         for _, l in df_lessons.iterrows():
-            pnl_v = float(l['pnl'] or 0)
+            pnl_v = num(l['pnl'])
             color = "#00ff66" if pnl_v > 0 else "#ff003c"
             st.markdown(f"""
             <div style='background: #0d121f; border: 1px solid #1e293b; padding: 10px 14px; margin-bottom: 8px; border-radius: 6px;'>
@@ -3131,9 +3296,9 @@ with tab_risk:
         st.markdown("#### 🌊 Macro & News Event Gating")
         df_macro = query_db(TRADING_LEDGER_DB, "SELECT * FROM macro_market_context ORDER BY id DESC LIMIT 1")
         if not df_macro.empty:
-            spy_p = float(df_macro.iloc[0].get('spy_price', 0.0) or 0.0)
-            uup_p = float(df_macro.iloc[0].get('uup_price', 0.0) or 0.0)
-            dxy_p = float(df_macro.iloc[0].get('dxy_price', 0.0) or 0.0)
+            spy_p = num(df_macro.iloc[0].get('spy_price'), 0.0)
+            uup_p = num(df_macro.iloc[0].get('uup_price'), 0.0)
+            dxy_p = num(df_macro.iloc[0].get('dxy_price'), 0.0)
             st.write(f"• **S&P 500 (SPY):** ${spy_p:,.2f}")
             st.write(f"• **USD Index (DXY):** {dxy_p:.2f}")
             st.write(f"• **Invesco DB US Dollar (UUP):** ${uup_p:.2f}")
@@ -3166,9 +3331,9 @@ with tab_risk:
     ask_wall = 0.0
     micro_sym = "BTC/USDT"
     if not df_micro.empty:
-        imb = float(df_micro.iloc[0].get('liquidity_imbalance', 0.0) or 0.0)
-        bid_wall = float(df_micro.iloc[0].get('bid_wall_price', 0.0) or 0.0)
-        ask_wall = float(df_micro.iloc[0].get('ask_wall_price', 0.0) or 0.0)
+        imb = num(df_micro.iloc[0].get('liquidity_imbalance'), 0.0)
+        bid_wall = num(df_micro.iloc[0].get('bid_wall_price'), 0.0)
+        ask_wall = num(df_micro.iloc[0].get('ask_wall_price'), 0.0)
         micro_sym = str(df_micro.iloc[0].get('symbol', 'BTC/USDT'))
 
     # Visual bipolar OFI bar calculation (-1.0 to +1.0 mapped to 0% to 100%)
@@ -3209,8 +3374,8 @@ with tab_risk:
     lvr_tax_bps_val = 0.0
     tox_halt_val = False
     try:
-        if os.path.exists("microstructure_state.json"):
-            with open("microstructure_state.json", "r", encoding="utf-8") as f_ms:
+        if os.path.exists(MICROSTRUCTURE_STATE_FILE):
+            with open(MICROSTRUCTURE_STATE_FILE, "r", encoding="utf-8") as f_ms:
                 ms_json = json.load(f_ms)
                 mlofi_val = float(ms_json.get("mlofi", 0.0) or 0.0)
                 micro_p = float(ms_json.get("micro_price", 0.0) or 0.0)
@@ -3336,7 +3501,7 @@ with tab_risk:
                 "breakdown_risk_4step": fc_fb.get("breakdown_risk", 0.35),
                 "transition_matrix": default_P.tolist(),
                 "forecast_probabilities": fc_fb.get("forecast_probabilities", {"CHOP": 0.50, "BULL_EXPANSION": 0.30, "BEAR_CASCADE": 0.20}),
-                "stationary_distribution": {"CHOP": float(stat_fb[0]), "BULL_EXPANSION": float(stat_fb[1]), "BEAR_CASCADE": float(stat_fb[2])}
+                "stationary_distribution": {"CHOP": num(stat_fb[0]), "BULL_EXPANSION": num(stat_fb[1]), "BEAR_CASCADE": num(stat_fb[2])}
             }
         except Exception:
             m_tel = {
@@ -3372,9 +3537,9 @@ with tab_risk:
         st_bull = float(raw_stat.get("BULL_EXPANSION", 0.333) or 0.333)
         st_bear = float(raw_stat.get("BEAR_CASCADE", 0.333) or 0.333)
     elif isinstance(raw_stat, (list, tuple, np.ndarray)) and len(raw_stat) >= 3:
-        st_chop = float(raw_stat[0])
-        st_bull = float(raw_stat[1])
-        st_bear = float(raw_stat[2])
+        st_chop = num(raw_stat[0])
+        st_bull = num(raw_stat[1])
+        st_bear = num(raw_stat[2])
 
     # Normalize 4-step forecast probabilities (dict or list, check forecast_4step or forecast_probabilities)
     fc_chop, fc_bull, fc_bear = p_chop, p_bull, p_bear
@@ -3384,9 +3549,9 @@ with tab_risk:
         fc_bull = float(raw_fc.get("BULL_EXPANSION", p_bull) or 0.0)
         fc_bear = float(raw_fc.get("BEAR_CASCADE", p_bear) or 0.0)
     elif isinstance(raw_fc, (list, tuple, np.ndarray)) and len(raw_fc) >= 3:
-        fc_chop = float(raw_fc[0])
-        fc_bull = float(raw_fc[1])
-        fc_bear = float(raw_fc[2])
+        fc_chop = num(raw_fc[0])
+        fc_bull = num(raw_fc[1])
+        fc_bear = num(raw_fc[2])
 
     # Extract new Deep Research Playbook metrics
     is_tradable = bool(m_tel.get("is_tradable", True))
@@ -3511,7 +3676,7 @@ with tab_risk:
             margin=dict(l=40, r=20, t=40, b=30),
             yaxis=dict(autorange="reversed")
         )
-        st.plotly_chart(fig_hm, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_hm, width="stretch", config={"displayModeBar": False})
 
     with col_bars:
         # Comparison: Current Belief π_t vs. 4-step Forecast π_{t+4} vs. Stationary π*
@@ -3561,15 +3726,15 @@ with tab_risk:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
             yaxis=dict(range=[0, 1.0], gridcolor="#1e293b")
         )
-        st.plotly_chart(fig_bars, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_bars, width="stretch", config={"displayModeBar": False})
 
     st.markdown("<div style='margin-bottom: 16px;'></div>", unsafe_allow_html=True)
 
 
     # ── Multi-Asset Fleet Microstructure & Toxicity Matrix ─────────────────────
-    if os.path.exists("microstructure_state.json"):
+    if os.path.exists(MICROSTRUCTURE_STATE_FILE):
         try:
-            with open("microstructure_state.json", "r", encoding="utf-8") as f_ms_all:
+            with open(MICROSTRUCTURE_STATE_FILE, "r", encoding="utf-8") as f_ms_all:
                 ms_all_json = json.load(f_ms_all)
             symbols_map = ms_all_json.get("symbols", {})
             if symbols_map:
@@ -3613,7 +3778,7 @@ with tab_risk:
                     })
                 
                 df_fleet_micro = pd.DataFrame(fleet_rows)
-                st.dataframe(df_fleet_micro, use_container_width=True, hide_index=True)
+                st.dataframe(df_fleet_micro, width="stretch", hide_index=True)
         except Exception:
             pass
 
@@ -3632,7 +3797,7 @@ with tab_risk:
         t_cond = tape_data.get("tape_condition", "NORMAL_FLOW")
         t_side = tape_data.get("absorption_side", "NONE")
         t_veto = tape_data.get("execution_veto", "CLEAR")
-        t_conf = float(tape_data.get("confidence", 0.80)) * 100.0
+        t_conf = num(tape_data.get("confidence"), 0.80) * 100.0
         t_head = tape_data.get("headline", "Order flow tape analyzed.")
         t_time = utc_to_sast(tape_data.get("updated_at"))
 
@@ -3722,13 +3887,13 @@ with tab_risk:
     df_regime = query_db(TRADING_DATA_DB, "SELECT * FROM market_regime ORDER BY id DESC LIMIT 1")
     df_oracle = query_db(TRADING_LEDGER_DB, "SELECT * FROM oracle_state ORDER BY id DESC LIMIT 1")
 
-    adx_val = float(df_regime.iloc[0].get('adx', 28.5) if not df_regime.empty else 28.5)
-    hurst_val = float(df_regime.iloc[0].get('hurst', 0.62) if not df_regime.empty else 0.62)
-    vol_state = float(df_oracle.iloc[0].get('volatility', 0.55) if not df_oracle.empty else 0.55)
-    trend_pwr = float(df_oracle.iloc[0].get('trend_strength', 0.40) if not df_oracle.empty else 0.40)
+    adx_val = num(df_regime.iloc[0].get('adx'), 28.5) if not df_regime.empty else 28.5
+    hurst_val = num(df_regime.iloc[0].get('hurst'), 0.62) if not df_regime.empty else 0.62
+    vol_state = num(df_oracle.iloc[0].get('volatility'), 0.55) if not df_oracle.empty else 0.55
+    trend_pwr = num(df_oracle.iloc[0].get('trend_strength'), 0.40) if not df_oracle.empty else 0.40
 
-    plus_di = float(df_regime.iloc[0].get('plus_di', 0.0) if not df_regime.empty and 'plus_di' in df_regime.columns else 0.0)
-    minus_di = float(df_regime.iloc[0].get('minus_di', 0.0) if not df_regime.empty and 'minus_di' in df_regime.columns else 0.0)
+    plus_di = num(df_regime.iloc[0].get('plus_di'), 0.0) if not df_regime.empty and 'plus_di' in df_regime.columns else 0.0
+    minus_di = num(df_regime.iloc[0].get('minus_di'), 0.0) if not df_regime.empty and 'minus_di' in df_regime.columns else 0.0
     spread_di = plus_di - minus_di
 
     gcol1, gcol2, gcol3, gcol4, gcol5 = st.columns(5)
@@ -3848,15 +4013,15 @@ with tab_risk:
                 turb_data = json.loads(turb_raw) if isinstance(turb_raw, str) else turb_raw
             except Exception:
                 turb_data = {}
-        t_idx = float(turb_data.get("turbulence_index", 0.0))
-        t_tau90 = float(turb_data.get("turbulence_tau90", 30.0))
-        t_tau99 = float(turb_data.get("turbulence_tau99", 230.0))
-        t_active = float(turb_data.get("active_threshold", 230.0))
+        t_idx = num(turb_data.get("turbulence_index"), 0.0)
+        t_tau90 = num(turb_data.get("turbulence_tau90"), 30.0)
+        t_tau99 = num(turb_data.get("turbulence_tau99"), 230.0)
+        t_active = num(turb_data.get("active_threshold"), 230.0)
         t_state = str(turb_data.get("turbulence_state", "CALM_NORMAL"))
-        t_pct = float(turb_data.get("percentile_rank", 20.0))
+        t_pct = num(turb_data.get("percentile_rank"), 20.0)
         t_color = "#10b981" if t_state == "CALM_NORMAL" else ("#f59e0b" if t_state == "ELEVATED_STRESS" else "#ef4444")
         ens_winner = str(ens_map.get("ensemble_winner", "SWING_4H"))
-        ens_w_sharpe = float(ens_map.get("winner_sharpe", 2.0))
+        ens_w_sharpe = num(ens_map.get("winner_sharpe"), 2.0)
 
         ft_c1, ft_c2 = st.columns(2)
         with ft_c1:
@@ -3905,14 +4070,14 @@ with tab_risk:
         for idx_s, (s_key, s_label, s_color) in enumerate(strat_meta):
             s_info = boot_map.get(s_key, {})
             w_info = ens_weights.get(s_key, {})
-            p_val = float(s_info.get("p_value", 0.5))
-            z_val = float(s_info.get("z_score", 0.0))
-            obs_roe = float(s_info.get("observed_expectancy_roe_pct", 0.0))
-            rand_roe = float(s_info.get("random_baseline_roe_pct", 0.0))
-            k_cnt = int(s_info.get("Sampled Signals (K)", 0))
-            surv_pct = float(s_info.get("ratchet_survival_rate_pct", 0.0))
-            r_sharpe = float(s_info.get("rolling_sharpe", w_info.get("rolling_sharpe", 0.0)))
-            w_mult = float(w_info.get("allocation_weight_mult", 1.0))
+            p_val = num(s_info.get("p_value"), 0.5)
+            z_val = num(s_info.get("z_score"), 0.0)
+            obs_roe = num(s_info.get("observed_expectancy_roe_pct"), 0.0)
+            rand_roe = num(s_info.get("random_baseline_roe_pct"), 0.0)
+            k_cnt = int(num(s_info.get("Sampled Signals (K)"), 0.0))
+            surv_pct = num(s_info.get("ratchet_survival_rate_pct"), 0.0)
+            r_sharpe = num(s_info.get("rolling_sharpe"), w_info.get("rolling_sharpe", 0.0))
+            w_mult = num(w_info.get("allocation_weight_mult"), 1.0)
             w_posture = str(w_info.get("posture", "STANDARD"))
             is_sig = bool(s_info.get("significant_edge", p_val < 0.05))
             badge_bg = "rgba(16,185,129,0.18)" if is_sig else "rgba(245,158,11,0.18)"
@@ -4061,3 +4226,10 @@ with tab_system:
     
     st_df_daemons = pd.DataFrame(daemon_list, columns=["Subsystem Component", "Core Script", "Operational SLA"])
     st.dataframe(st_df_daemons, width="stretch", hide_index=True)
+
+# ── End-of-run data feed health handoff ──────────────────────────────────────
+# Stash this pass's failures so the next render can surface them in the top banner.
+if FEED_FAILURES:
+    st.session_state["_carried_feed_failures"] = dict(FEED_FAILURES)
+else:
+    st.session_state.pop("_carried_feed_failures", None)
