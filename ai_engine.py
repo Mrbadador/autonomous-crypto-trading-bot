@@ -170,7 +170,7 @@ def _get_groq_model_pool(requested_model: str | None = None) -> list[str]:
     ordered = [primary] + [m for m in pool if m != primary]
     return list(dict.fromkeys(ordered))
 
-async def _query_gemini_cloud(session: aiohttp.ClientSession, prompt: str, timeout_sec: float = 15.0) -> dict | None:
+async def _query_gemini_cloud(session: aiohttp.ClientSession | None, prompt: str, timeout_sec: float = 15.0) -> dict | None:
     """
     Primary cloud AI dispatcher using Google Gemini Multi-Model Pool with automatic model rotation.
     Rotates across GEMINI_MODEL_POOL whenever a model hits its 500 RPD quota (429) or 503 spike.
@@ -193,45 +193,64 @@ async def _query_gemini_cloud(session: aiohttp.ClientSession, prompt: str, timeo
     cooldowns = _sync_model_cooldowns().get("gemini", {})
     now = time.time()
 
-    for model_name in model_pool:
-        if cooldowns.get(model_name, 0.0) > now:
-            continue
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-        headers = {"x-goog-api-key": gemini_key.strip()}
+    own_session = False
+    active_sess = session
+    if active_sess is None or active_sess.closed:
+        active_sess = _ipv4_session()
+        own_session = True
+    else:
         try:
-            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                    return {
-                        "model_used": model_name,
-                        "choices": [{
-                            "message": {
-                                "content": text
-                            }
-                        }]
-                    }
-                elif resp.status == 404:
-                    _set_model_cooldown("gemini", model_name, 86400.0, reason="HTTP 404 model unavailable")
-                    continue
-                elif resp.status in (429, 503):
-                    err_txt = await resp.text()
-                    is_daily = ("free_tier_requests" in err_txt or "Quota exceeded" in err_txt or "per day" in err_txt.lower())
-                    cd_sec = 1800.0 if is_daily else 60.0
-                    _set_model_cooldown("gemini", model_name, cd_sec, reason=f"HTTP {resp.status} {'Daily Quota' if is_daily else 'Rate/Demand Limit'}")
-                    continue
-                else:
-                    err_txt = await resp.text()
-                    log.warning(f"[GEMINI-AI] Status {resp.status} on {model_name}: {err_txt[:100]}")
-                    continue
-        except Exception as e:
-            log.warning(f"[GEMINI-AI] Request error ({type(e).__name__}) on {model_name}: {e or type(e).__name__}")
-            continue
+            loop = asyncio.get_running_loop()
+            sess_loop = getattr(active_sess, "_loop", None)
+            if sess_loop is not loop or (hasattr(sess_loop, "is_closed") and sess_loop.is_closed()):
+                active_sess = _ipv4_session()
+                own_session = True
+        except RuntimeError:
+            active_sess = _ipv4_session()
+            own_session = True
 
-    return None
+    try:
+        for model_name in model_pool:
+            if cooldowns.get(model_name, 0.0) > now:
+                continue
 
-async def _query_groq_cloud_with_rotation(session: aiohttp.ClientSession, payload: dict, timeout_sec: float = 30.0) -> dict | None:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            headers = {"x-goog-api-key": gemini_key.strip()}
+            try:
+                async with active_sess.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                        return {
+                            "model_used": model_name,
+                            "choices": [{
+                                "message": {
+                                    "content": text
+                                }
+                            }]
+                        }
+                    elif resp.status == 404:
+                        _set_model_cooldown("gemini", model_name, 86400.0, reason="HTTP 404 model unavailable")
+                        continue
+                    elif resp.status in (429, 503):
+                        err_txt = await resp.text()
+                        is_daily = ("free_tier_requests" in err_txt or "Quota exceeded" in err_txt or "per day" in err_txt.lower())
+                        cd_sec = 1800.0 if is_daily else 60.0
+                        _set_model_cooldown("gemini", model_name, cd_sec, reason=f"HTTP {resp.status} {'Daily Quota' if is_daily else 'Rate/Demand Limit'}")
+                        continue
+                    else:
+                        err_txt = await resp.text()
+                        log.warning(f"[GEMINI-AI] Status {resp.status} on {model_name}: {err_txt[:100]}")
+                        continue
+            except Exception as e:
+                log.warning(f"[GEMINI-AI] Request error ({type(e).__name__}) on {model_name}: {e or type(e).__name__}")
+                continue
+        return None
+    finally:
+        if own_session and active_sess and not active_sess.closed:
+            await active_sess.close()
+
+async def _query_groq_cloud_with_rotation(session: aiohttp.ClientSession | None, payload: dict, timeout_sec: float = 30.0) -> dict | None:
     """
     Centralized asynchronous dispatcher that manages instant API key rotation AND automatic
     multi-model rotation (GROQ_MODEL_POOL) when a model hits its 200k TPD or 8k TPM limit.
@@ -245,146 +264,166 @@ async def _query_groq_cloud_with_rotation(session: aiohttp.ClientSession, payloa
         log.critical("Groq API Key Pool is empty. Setup GROQ_API_KEY_* in environment variables.")
         return None
 
+    own_session = False
+    active_sess = session
+    if active_sess is None or active_sess.closed:
+        active_sess = _ipv4_session()
+        own_session = True
+    else:
+        try:
+            loop = asyncio.get_running_loop()
+            sess_loop = getattr(active_sess, "_loop", None)
+            if sess_loop is not loop or (hasattr(sess_loop, "is_closed") and sess_loop.is_closed()):
+                active_sess = _ipv4_session()
+                own_session = True
+        except RuntimeError:
+            active_sess = _ipv4_session()
+            own_session = True
+
     requested_model = payload.get("model") or getattr(config, "GROQ_MODEL", "openai/gpt-oss-20b")
     model_pool = _get_groq_model_pool(requested_model)
     max_attempts = max(len(keys) + len(model_pool), 4)
     backoff = 0.4
 
-    for attempt in range(max_attempts):
-        # Select first non-cooled-down Groq model from pool
-        cooldowns = _sync_model_cooldowns().get("groq", {})
-        now = time.time()
-        active_model = None
-        for m in model_pool:
-            if cooldowns.get(m, 0.0) <= now:
-                active_model = m
-                break
-        if not active_model:
-            # All Groq models in pool are currently on cooldown
-            return None
-
-        req_payload = dict(payload)
-        req_payload["model"] = active_model
-
-        # Protect key reading from race conditions due to concurrent key amputation
-        async with _get_key_lock():
-            keys = _ensure_groq_keys()
-            if not keys:
-                log.fatal("[FATAL] ALL API KEYS EXHAUSTED OR DEAD.")
-                return {
-                    "choices": [{
-                        "message": {
-                            "content": json.dumps({
-                                "execute": False,
-                                "sl_mult": 2.0,
-                                "tp_mult": 3.0,
-                                "size_mult": 1.0,
-                                "conviction": 0.0,
-                                "sl_profile": "NORMAL",
-                                "tp_profile": "SWING",
-                                "notes": "[SRE FALLBACK] All API keys dead/exhausted. Calibration scaled to neutral 0.50 fallback."
-                            })
-                        }
-                    }]
-                }
-            current_key = keys[_key_index % len(keys)]
-        
-        headers = {
-            "Authorization": f"Bearer {current_key}",
-            "Content-Type": "application/json"
-        }
-        
-        try:
-            timeout = aiohttp.ClientTimeout(total=timeout_sec)
-            status = None
-            text = ""
-            resp_json = None
-            
-            async with _get_groq_semaphore():
-                async with session.post(config.GROQ_URL, headers=headers, json=req_payload, timeout=timeout) as resp:
-                    status = resp.status
-                    if status == 200:
-                        resp_json = await resp.json()
-                    else:
-                        text = await resp.text()
-            
-            if status == 200:
-                # FIX 2 (provenance, read-only): tag which pool model answered
-                if isinstance(resp_json, dict):
-                    resp_json.setdefault("model_used", resp_json.get("model") or active_model)
-                return resp_json
-            
-            # V28.9 Self-Healing: Amputate invalid/dead API key on 401/403 Unauthorized responses
-            if status in (401, 403):
-                async with _get_key_lock():
-                    keys = _ensure_groq_keys()
-                    if current_key in keys:
-                        idx = keys.index(current_key)
-                        keys.pop(idx)
-                        log.critical(f"[SRE-CRITICAL] API Key at index {idx} is DEAD/INVALID. Amputating from active pool.")
-                        
-                        if len(keys) == 0:
-                            log.fatal("[FATAL] ALL API KEYS EXHAUSTED OR DEAD.")
-                            return {
-                                "choices": [{
-                                    "message": {
-                                        "content": json.dumps({
-                                            "execute": False,
-                                            "sl_mult": 2.0,
-                                            "tp_mult": 3.0,
-                                            "size_mult": 1.0,
-                                            "conviction": 0.0,
-                                            "sl_profile": "NORMAL",
-                                            "tp_profile": "SWING",
-                                            "notes": "[SRE FALLBACK] All API keys dead/exhausted. Calibration scaled to neutral 0.50 fallback."
-                                        })
-                                    }
-                                }]
-                            }
-                        
-                        # Realign active pointer to avoid skipping elements or overflow
-                        if idx < _key_index:
-                            _key_index -= 1
-                        _key_index = _key_index % len(keys)
-                continue  # Instantly retry query with the next available, healthy key
-            
-            if status in (429, 503):
-                is_daily_tpd = ("tokens per day" in text.lower() or "(tpd)" in text.lower() or "requests per day" in text.lower() or "(rpd)" in text.lower())
-                if is_daily_tpd:
-                    # Organization-wide daily limit on this specific model: cool down model for 30m and switch model immediately!
-                    _set_model_cooldown("groq", active_model, 1800.0, reason="Daily TPD/RPD limit reached")
-                    continue
-                else:
-                    # Per-minute TPM/RPM burst or 503: cool down model briefly (45s) so next attempt uses sibling model AND rotate key
-                    _set_model_cooldown("groq", active_model, 45.0, reason=f"HTTP {status} burst limit")
-                    await rotate_groq_key(current_key)
-                    await asyncio.sleep(min(backoff, 1.5))
-                    backoff = min(backoff * 1.5, 4.0)
-                    continue
-            else:
-                log.error(f"Groq API ({active_model}) failed with status {status}: {text[:160]}")
-                if status in (400, 404):
-                    _set_model_cooldown("groq", active_model, 3600.0, reason=f"HTTP {status}")
-                    continue
-                if status >= 500:
-                    await rotate_groq_key(current_key)
-                    await asyncio.sleep(0.5)
-                    continue
+    try:
+        for attempt in range(max_attempts):
+            # Select first non-cooled-down Groq model from pool
+            cooldowns = _sync_model_cooldowns().get("groq", {})
+            now = time.time()
+            active_model = None
+            for m in model_pool:
+                if cooldowns.get(m, 0.0) <= now:
+                    active_model = m
+                    break
+            if not active_model:
+                # All Groq models in pool are currently on cooldown
                 return None
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+
+            req_payload = dict(payload)
+            req_payload["model"] = active_model
+
+            # Protect key reading from race conditions due to concurrent key amputation
             async with _get_key_lock():
                 keys = _ensure_groq_keys()
-                safe_idx = _key_index % len(keys) if keys else 0
-            log.warning(f"Network error on key index {safe_idx} ({active_model}): {e}")
-            await rotate_groq_key(current_key)
-            sleep_sec = min(backoff * (attempt + 1), 3.0)
-            await asyncio.sleep(sleep_sec)
-            backoff = min(backoff * 1.5, 6.0)
-            continue
+                if not keys:
+                    log.fatal("[FATAL] ALL API KEYS EXHAUSTED OR DEAD.")
+                    return {
+                        "choices": [{
+                            "message": {
+                                "content": json.dumps({
+                                    "execute": False,
+                                    "sl_mult": 2.0,
+                                    "tp_mult": 3.0,
+                                    "size_mult": 1.0,
+                                    "conviction": 0.0,
+                                    "sl_profile": "NORMAL",
+                                    "tp_profile": "SWING",
+                                    "notes": "[SRE FALLBACK] All API keys dead/exhausted. Calibration scaled to neutral 0.50 fallback."
+                                })
+                            }
+                        }]
+                    }
+                current_key = keys[_key_index % len(keys)]
+            
+            headers = {
+                "Authorization": f"Bearer {current_key}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                timeout = aiohttp.ClientTimeout(total=timeout_sec)
+                status = None
+                text = ""
+                resp_json = None
+                
+                async with _get_groq_semaphore():
+                    async with active_sess.post(config.GROQ_URL, headers=headers, json=req_payload, timeout=timeout) as resp:
+                        status = resp.status
+                        if status == 200:
+                            resp_json = await resp.json()
+                        else:
+                            text = await resp.text()
+                
+                if status == 200:
+                    # FIX 2 (provenance, read-only): tag which pool model answered
+                    if isinstance(resp_json, dict):
+                        resp_json.setdefault("model_used", resp_json.get("model") or active_model)
+                    return resp_json
+                
+                # V28.9 Self-Healing: Amputate invalid/dead API key on 401/403 Unauthorized responses
+                if status in (401, 403):
+                    async with _get_key_lock():
+                        keys = _ensure_groq_keys()
+                        if current_key in keys:
+                            idx = keys.index(current_key)
+                            keys.pop(idx)
+                            log.critical(f"[SRE-CRITICAL] API Key at index {idx} is DEAD/INVALID. Amputating from active pool.")
+                            
+                            if len(keys) == 0:
+                                log.fatal("[FATAL] ALL API KEYS EXHAUSTED OR DEAD.")
+                                return {
+                                    "choices": [{
+                                        "message": {
+                                            "content": json.dumps({
+                                                "execute": False,
+                                                "sl_mult": 2.0,
+                                                "tp_mult": 3.0,
+                                                "size_mult": 1.0,
+                                                "conviction": 0.0,
+                                                "sl_profile": "NORMAL",
+                                                "tp_profile": "SWING",
+                                                "notes": "[SRE FALLBACK] All API keys dead/exhausted. Calibration scaled to neutral 0.50 fallback."
+                                            })
+                                        }
+                                    }]
+                                }
+                            
+                            # Realign active pointer to avoid skipping elements or overflow
+                            if idx < _key_index:
+                                _key_index -= 1
+                            _key_index = _key_index % len(keys)
+                    continue  # Instantly retry query with the next available, healthy key
+                
+                if status in (429, 503):
+                    is_daily_tpd = ("tokens per day" in text.lower() or "(tpd)" in text.lower() or "requests per day" in text.lower() or "(rpd)" in text.lower())
+                    if is_daily_tpd:
+                        # Organization-wide daily limit on this specific model: cool down model for 30m and switch model immediately!
+                        _set_model_cooldown("groq", active_model, 1800.0, reason="Daily TPD/RPD limit reached")
+                        continue
+                    else:
+                        # Per-minute TPM/RPM burst or 503: cool down model briefly (45s) so next attempt uses sibling model AND rotate key
+                        _set_model_cooldown("groq", active_model, 45.0, reason=f"HTTP {status} burst limit")
+                        await rotate_groq_key(current_key)
+                        await asyncio.sleep(min(backoff, 1.5))
+                        backoff = min(backoff * 1.5, 4.0)
+                        continue
+                else:
+                    log.error(f"Groq API ({active_model}) failed with status {status}: {text[:160]}")
+                    if status in (400, 404):
+                        _set_model_cooldown("groq", active_model, 3600.0, reason=f"HTTP {status}")
+                        continue
+                    if status >= 500:
+                        await rotate_groq_key(current_key)
+                        await asyncio.sleep(0.5)
+                        continue
+                    return None
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                async with _get_key_lock():
+                    keys = _ensure_groq_keys()
+                    safe_idx = _key_index % len(keys) if keys else 0
+                log.warning(f"Network error on key index {safe_idx} ({active_model}): {e}")
+                await rotate_groq_key(current_key)
+                sleep_sec = min(backoff * (attempt + 1), 3.0)
+                await asyncio.sleep(sleep_sec)
+                backoff = min(backoff * 1.5, 6.0)
+                continue
 
-    _groq_cooldown_until = time.time() + 30.0
-    log.critical("[CRITICAL] All Groq API keys & models in pool temporarily busy. Cooling off for 30s...")
-    return None
+        _groq_cooldown_until = time.time() + 30.0
+        log.critical("[CRITICAL] All Groq API keys & models in pool temporarily busy. Cooling off for 30s...")
+        return None
+    finally:
+        if own_session and active_sess and not active_sess.closed:
+            await active_sess.close()
 
 # ---------------------------------------------------------------------------
 # LLM Response Cache (Persistent)
@@ -395,23 +434,24 @@ def _ipv4_session() -> aiohttp.ClientSession:
     connector = aiohttp.TCPConnector(family=socket.AF_INET, resolver=aiohttp.ThreadedResolver())
     return aiohttp.ClientSession(connector=connector)
 
-def _ensure_active_session(target) -> aiohttp.ClientSession:
-    """Ensures client or self has an active aiohttp session bound to the current running event loop."""
+def _ensure_active_session(target) -> aiohttp.ClientSession | None:
+    """
+    Returns an existing open aiohttp session bound to the current running event loop,
+    or None so the cloud query helpers create and deterministically close a scoped session.
+    """
     sess = getattr(target, "session", None)
-    need_new = False
     if sess is None or sess.closed:
-        need_new = True
-    else:
-        try:
-            loop = asyncio.get_running_loop()
-            sess_loop = getattr(sess, "_loop", None)
-            if sess_loop is not loop or (hasattr(sess_loop, "is_closed") and sess_loop.is_closed()):
-                need_new = True
-        except RuntimeError:
-            need_new = True
-    if need_new:
-        target.session = _ipv4_session()
-    return target.session
+        target.session = None
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+        sess_loop = getattr(sess, "_loop", None)
+        if sess_loop is loop and not (hasattr(sess_loop, "is_closed") and sess_loop.is_closed()):
+            return sess
+    except RuntimeError:
+        pass
+    target.session = None
+    return None
 
 def _cache_key(ctx: dict) -> str:
     """Stable cache key from coarse market signals — now includes ema_stack and patterns."""
