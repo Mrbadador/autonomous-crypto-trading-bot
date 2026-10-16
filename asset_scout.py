@@ -445,8 +445,10 @@ def run_scout():
                                 except Exception:
                                     pass
                         
-                        # BIS Crash-Risk Contagion Shield: Funding > +0.045% while 4H ROC <= 0
-                        high_funding = any(float(r) >= 0.00045 for r in funding_rates.values())
+                        # BIS Crash-Risk Contagion Shield: Funding > +0.045% across active fleet while 4H ROC <= 0
+                        fleet_clean = {s.upper().replace("/", "").replace("-", "") for s in getattr(config, "SYMBOLS", [])}
+                        fleet_funding_rates = {k: v for k, v in funding_rates.items() if k.upper().replace("/", "").replace("-", "") in fleet_clean} if fleet_clean else funding_rates
+                        high_funding = any(float(r) >= 0.00045 for r in fleet_funding_rates.values())
                         btc_df_4h = fetch_futures_ohlcv("BTCUSDT", interval="4h", limit=10)
                         btc_roc_negative = False
                         if btc_df_4h is not None and len(btc_df_4h) >= 2:
