@@ -83,8 +83,11 @@ class RegimeClassifier:
 
     def _init_db(self):
         """Ensures the market_regime history table exists in trading_data.db with AI columns."""
+        conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=60.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
             with conn:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS market_regime (
@@ -110,10 +113,15 @@ class RegimeClassifier:
                         conn.execute(f"ALTER TABLE market_regime ADD COLUMN {col} {col_type}")
                     except sqlite3.OperationalError:
                         pass
-            conn.close()
         except Exception as e:
             log.critical(f"Failed to initialize database table: {e}")
             raise
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def _interval_seconds(interval):
@@ -652,7 +660,7 @@ class RegimeClassifier:
                                 return validated
                             continue
                     else:
-                        log.debug(f"[AI-REGIME-ARBITER] Gemini ({model}) HTTP {res.status_code}")
+                        log.warning(f"[AI-REGIME-ARBITER] Gemini ({model}) HTTP {res.status_code}")
                 except Exception as ge:
                     log.debug(f"[AI-REGIME-ARBITER] Gemini ({model}) error: {ge}")
 
@@ -690,7 +698,7 @@ class RegimeClassifier:
                                 return validated_g
                             continue
                     else:
-                        log.debug(f"[AI-REGIME-ARBITER] Groq ({g_model}) HTTP {res_g.status_code}")
+                        log.warning(f"[AI-REGIME-ARBITER] Groq ({g_model}) HTTP {res_g.status_code}")
                 except Exception as gr_err:
                     log.debug(f"[AI-REGIME-ARBITER] Groq ({g_model}) error: {gr_err}")
 
@@ -737,8 +745,10 @@ class RegimeClassifier:
         # flip masked by a persistent override looks like no change at all.
         prior_regime = "NEUTRAL"
         prior_math_regime = "NEUTRAL"
+        conn_prev = None
         try:
-            conn_prev = sqlite3.connect(self.db_path)
+            db_ro_uri = f"file:{os.path.abspath(self.db_path).replace(os.sep, '/')}?mode=ro"
+            conn_prev = sqlite3.connect(db_ro_uri, timeout=10.0, uri=True)
             try:
                 r_prev = conn_prev.execute(
                     "SELECT regime, math_regime FROM market_regime ORDER BY id DESC LIMIT 1"
@@ -748,12 +758,17 @@ class RegimeClassifier:
                 r_prev = list(conn_prev.execute(
                     "SELECT regime FROM market_regime ORDER BY id DESC LIMIT 1"
                 ).fetchone() or ()) + [None]
-            conn_prev.close()
             if r_prev and r_prev[0]:
                 prior_regime = str(r_prev[0])
                 prior_math_regime = str(r_prev[1]) if len(r_prev) > 1 and r_prev[1] else str(r_prev[0])
-        except Exception:
-            pass
+        except Exception as prev_err:
+            log.debug(f"[REGIME-PRIOR-NOTE] Could not read prior regime: {prev_err}")
+        finally:
+            if conn_prev:
+                try:
+                    conn_prev.close()
+                except Exception:
+                    pass
 
         # Directional Polarity & Schmitt Trigger Decision Matrix
         # The 20-25 ADX dead zone carries the previous *mathematical* trend forward. Using
@@ -929,8 +944,11 @@ class RegimeClassifier:
 
         timestamp = datetime.now(UTC).isoformat()
         source_close_ts = self._bar_close_ts(df, "15m")
+        conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=60.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
             with conn:
                 # Append-only history: every classification is a new row. Readers that want the
                 # current gate use ORDER BY id/rowid DESC LIMIT 1, which is unchanged by this.
@@ -1010,7 +1028,6 @@ class RegimeClassifier:
                         INSERT OR REPLACE INTO system_state (key, value, updated_at)
                         VALUES ('markov_regime_telemetry', ?, ?)
                     """, (json.dumps(markov_telemetry), timestamp))
-            conn.close()
             
             log.info(
                 f"[REGIME] Final Regime: {regime} (Math: {math_regime}, AI Bias: {ai_bias}, Trap Risk: {trap_risk:.2f}). "
@@ -1020,6 +1037,12 @@ class RegimeClassifier:
         except Exception as e:
             log.error(f"Failed to commit regime to database: {e}")
             return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     import time
