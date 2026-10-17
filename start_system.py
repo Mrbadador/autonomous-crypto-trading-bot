@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # ENV CUSTODIAN: Load .env before spawning any subprocesses.
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
 def _get_script_identity(cmd):
     py_file = None
