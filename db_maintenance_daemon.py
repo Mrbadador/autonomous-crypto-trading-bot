@@ -7,7 +7,8 @@ Key Capabilities:
 3. Strict Ledger Preservation: Never deletes closed trades (trades, berserker_trades, marl_live_trades, mean_reversion_trades).
 4. SQLite Query Plan Optimization: Runs `PRAGMA optimize` to rebuild indexes and maintain sub-millisecond query execution.
 5. Temp file cleanup: Removes stale temporary process files (*.tmp, *.npy) from the root workspace.
-6. Publishes health and storage metrics to system_state for live Streamlit visibility.
+6. Publishes health, per-database integrity verdicts (db_integrity_<name>) and storage
+   metrics to system_state for live Streamlit visibility and downstream fail-closed gating.
 """
 
 import os
@@ -17,6 +18,7 @@ import json
 import glob
 import sqlite3
 import logging
+import contextlib
 from datetime import datetime, UTC, timedelta
 from dotenv import load_dotenv
 
@@ -39,6 +41,25 @@ DATABASES = [
 CHECKPOINT_INTERVAL_SECS = 300  # Run maintenance every 5 minutes
 RETENTION_DAYS = 7              # Retain ephemeral telemetry for 7 days
 
+_WAL_MODE_WARNED = set()
+
+def _ensure_wal(conn, db_name: str, busy_timeout_ms: int) -> str:
+    """Set busy_timeout first, then attempt WAL, and report the mode actually granted.
+
+    PRAGMA journal_mode does not raise when conversion fails (locked DB or network
+    share) - it returns the mode still in effect, so the result has to be inspected.
+    """
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms};")
+    row = conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+    actual = str(row[0]).lower() if row and row[0] is not None else "unknown"
+    if actual != "wal" and db_name not in _WAL_MODE_WARNED:
+        _WAL_MODE_WARNED.add(db_name)
+        log.warning(
+            f"[{db_name}] journal_mode is '{actual}', not 'wal' - WAL conversion failed. "
+            "Readers will contend with writers."
+        )
+    return actual
+
 EPHEMERAL_TABLES = [
     {"db": "trading_ledger.db", "table": "market_metrics", "time_col": "timestamp"},
     {"db": "trading_ledger.db", "table": "oracle_microstructure", "time_col": "timestamp"},
@@ -51,40 +72,75 @@ def update_system_state(key: str, value: str):
     """Safely writes a key-value record to the system_state table."""
     try:
         data_db = os.path.join(BASE_DIR, "trading_data.db")
-        with sqlite3.connect(data_db, timeout=10.0) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA busy_timeout=10000;")
-            conn.execute(
-                "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now')) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                (key, value)
-            )
+        with contextlib.closing(sqlite3.connect(data_db, timeout=10.0)) as conn:
+            with conn:
+                _ensure_wal(conn, "trading_data.db", 10000)
+                conn.execute(
+                    "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now')) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (key, value)
+                )
     except Exception as e:
-        log.debug(f"Failed to update system_state ({key}): {e}")
+        # A silently dropped health write is itself a fault: downstream guards gate on
+        # freshness of these keys, so callers must be able to see the publish failure.
+        log.warning(f"Failed to update system_state ({key}): {e}")
 
 def run_wal_checkpoints():
-    """Runs non-blocking WAL checkpoints and PRAGMA quick_check across all databases."""
+    """Runs non-blocking WAL checkpoints and PRAGMA quick_check across all databases.
+
+    Returns (results, statuses). Integrity verdicts are published to system_state as
+    db_integrity_<dbname> so engines and the HUD can fail closed instead of relying on
+    a human reading logs.
+    """
     results = {}
+    statuses = {}
     for db_path in DATABASES:
         if not os.path.exists(db_path):
             continue
         db_name = os.path.basename(db_path)
         try:
-            with sqlite3.connect(db_path, timeout=30.0) as conn:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA busy_timeout=30000;")
+            with contextlib.closing(sqlite3.connect(db_path, timeout=30.0)) as conn:
+                _ensure_wal(conn, db_name, 30000)
                 qc = conn.execute("PRAGMA quick_check(1);").fetchone()
                 qc_status = str(qc[0]) if qc else "unknown"
-                if qc_status.lower() != "ok":
-                    log.critical(f"[{db_name}] 🚨 DATABASE INTEGRITY QUICK_CHECK FAILED: {qc_status}")
+                integrity_ok = qc_status.lower() == "ok"
                 res = conn.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
                 conn.execute("PRAGMA optimize;")
-                results[db_name] = f"WAL Checkpoint OK (busy={res[0]}, log={res[1]}, checkpointed={res[2]}, integrity={qc_status})"
-                log.info(f"[{db_name}] {results[db_name]}")
+
+            if not integrity_ok:
+                log.critical(f"[{db_name}] 🚨 DATABASE INTEGRITY QUICK_CHECK FAILED: {qc_status}")
+            update_system_state(f"db_integrity_{db_name}", "OK" if integrity_ok else "CRITICAL")
+
+            busy = int(res[0]) if res and res[0] is not None else -1
+            log_frames = int(res[1]) if res and res[1] is not None else -1
+            checkpointed = int(res[2]) if res and res[2] is not None else -1
+            # quick_check returns a multi-line dump on failure; keep the published string
+            # single-line so it stays readable inside the system_state JSON blob.
+            qc_brief = " ".join(qc_status.split())[:120]
+
+            if not integrity_ok:
+                status = "CORRUPT"
+            elif busy == 1:
+                # PASSIVE checkpoint returned busy: WAL was not drained this pass.
+                status = "BUSY"
+            elif log_frames != checkpointed:
+                status = "DEGRADED"
+            else:
+                status = "OK"
+            statuses[db_name] = status
+            results[db_name] = (
+                f"WAL Checkpoint {status} (busy={busy}, log={log_frames}, "
+                f"checkpointed={checkpointed}, integrity={qc_brief})"
+            )
+            log.info(f"[{db_name}] {results[db_name]}")
         except Exception as e:
-            results[db_name] = f"Checkpoint Error: {e}"
-            log.warning(f"[{db_name}] Checkpoint failed: {e}")
-    return results
+            # An exception in this path is worse than a failed result: the DB was not
+            # verified at all. Route it to the same machine-readable CRITICAL signal.
+            statuses[db_name] = "ERROR"
+            results[db_name] = f"WAL Checkpoint ERROR (integrity unverified): {e}"
+            log.error(f"[{db_name}] 🚨 Checkpoint/integrity pass raised before verification: {e}")
+            update_system_state(f"db_integrity_{db_name}", "ERROR")
+    return results, statuses
 
 def prune_ephemeral_records():
     """Prunes high-frequency market tick logs and telemetry older than RETENTION_DAYS."""
@@ -102,7 +158,8 @@ def prune_ephemeral_records():
             continue
             
         try:
-            with sqlite3.connect(db_path, timeout=10.0) as conn:
+            with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                _ensure_wal(conn, item["db"], 10000)
                 # Check if table exists
                 cursor = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -111,16 +168,17 @@ def prune_ephemeral_records():
                     continue
                     
                 # Delete rows older than cutoff (handling both standard space and ISO-T string formats)
-                res = conn.execute(
-                    f"DELETE FROM {table} WHERE {time_col} < ? OR ({time_col} LIKE '%T%' AND {time_col} < ?)",
-                    (cutoff_space, cutoff_iso)
-                )
-                deleted = res.rowcount
+                with conn:
+                    res = conn.execute(
+                        f"DELETE FROM {table} WHERE {time_col} < ? OR ({time_col} LIKE '%T%' AND {time_col} < ?)",
+                        (cutoff_space, cutoff_iso)
+                    )
+                    deleted = res.rowcount
                 if deleted > 0:
                     pruned_summary[f"{item['db']}.{table}"] = deleted
                     log.info(f"[{item['db']}] Pruned {deleted} rows older than {RETENTION_DAYS}d from {table}")
         except Exception as e:
-            log.debug(f"Prune skip for {table}: {e}")
+            log.warning(f"Prune skip for {item['db']}.{table}: {e}")
             
     return pruned_summary
 
@@ -186,7 +244,7 @@ def main():
             log.info("Starting scheduled database maintenance pass...")
             
             # 1. Non-blocking WAL Checkpoints
-            cp_res = run_wal_checkpoints()
+            cp_res, cp_status = run_wal_checkpoints()
             
             # 2. Prune old records
             prune_res = prune_ephemeral_records()
@@ -197,17 +255,25 @@ def main():
             # 4. Storage sizes
             storage_stats = get_storage_stats()
             
-            # 5. Emit health metrics
+            # 5. Emit health metrics (status reflects the worst per-DB verdict, never a
+            # hardcoded healthy)
+            if any(s in ("CORRUPT", "ERROR") for s in cp_status.values()):
+                overall_status = "CRITICAL"
+            elif any(s in ("BUSY", "DEGRADED") for s in cp_status.values()):
+                overall_status = "DEGRADED"
+            else:
+                overall_status = "HEALTHY"
             telemetry = {
                 "last_run": datetime.now(UTC).isoformat(),
-                "status": "HEALTHY",
+                "status": overall_status,
                 "storage": storage_stats,
                 "checkpoints": cp_res,
+                "integrity": cp_status,
                 "pruned_tables": prune_res,
                 "temp_files_cleaned": cleaned_temp
             }
             update_system_state("db_maintenance_stats", json.dumps(telemetry))
-            log.info(f"Maintenance pass complete. Storage: {storage_stats['total_storage']}. Sleeping {CHECKPOINT_INTERVAL_SECS}s.")
+            log.info(f"Maintenance pass complete. Status: {overall_status}. Storage: {storage_stats['total_storage']}. Sleeping {CHECKPOINT_INTERVAL_SECS}s.")
             
         except Exception as e:
             log.error(f"Maintenance pass error: {e}")
