@@ -649,6 +649,8 @@ async def audit_live_exchange_positions():
                                     try:
                                         # BUG-09 FIX: Use async email dispatch to avoid blocking the reconciler event loop
                                         from email_dispatcher import send_trade_log_async
+                                        close_price_str = f" at ${exit_p:,.4f}" if exit_p is not None else " (unverified exit price)"
+                                        pnl_display = f"${net_pnl:+.4f}" if net_pnl is not None else "N/A"
                                         t_close = asyncio.create_task(send_trade_log_async(
                                             symbol=s_sym,
                                             side=norm_side.upper(),
@@ -662,13 +664,13 @@ async def audit_live_exchange_positions():
                                                 "entry_price": entry_p,
                                                 "engine": f"{bot_name} (Exchange Auto-Close)",
                                                 "close_trigger": "BITGET ON-EXCHANGE MATCH",
-                                                "close_reason": f"Position was executed and settled directly on Bitget USDT-M matching engine ({close_type.upper()}) at ${exit_p:,.4f}.",
+                                                "close_reason": f"Position was executed and settled directly on Bitget USDT-M matching engine ({close_type.upper()}){close_price_str}.",
                                                 "notes": f"Executed directly on Bitget Matching Engine ({close_type.upper()})"
                                             }
                                         ))
                                         _background_tasks.add(t_close)
                                         t_close.add_done_callback(_background_tasks.discard)
-                                        log.info(f"[RECONCILER] Dispatched trade closure email for {s_sym} (PnL: ${net_pnl:+.4f})")
+                                        log.info(f"[RECONCILER] Dispatched trade closure email for {s_sym} (PnL: {pnl_display})")
                                     except Exception as mail_e:
                                         log.warning(f"[RECONCILER] Failed to send email for {s_sym}: {mail_e}")
                     except Exception as fleet_e:
@@ -838,12 +840,44 @@ async def audit_live_exchange_positions():
                         for row in rows:
                             row_dict = dict(zip(col_names, row))
                             sym = row_dict.get("symbol", "")
+                            side = str(row_dict.get("side", "long")).lower()
+                            is_long = "long" in side
+                            
+                            # 1. Grace period check: if position was created < 60s ago, give it time to settle
+                            created_ts = row_dict.get("opened_at") or row_dict.get("entry_time") or row_dict.get("timestamp")
+                            if created_ts:
+                                try:
+                                    c_clean = str(created_ts).replace("Z", "+00:00")
+                                    if "T" not in c_clean and " " in c_clean:
+                                        c_clean = c_clean.replace(" ", "T")
+                                    if "+" not in c_clean and not c_clean.endswith("Z"):
+                                        c_clean += "+00:00"
+                                    c_dt = datetime.fromisoformat(c_clean)
+                                    now_dt = datetime.now(UTC) if c_dt.tzinfo else datetime.utcnow()
+                                    if (now_dt - c_dt).total_seconds() < 60.0:
+                                        continue
+                                except Exception:
+                                    pass
+
                             if sym not in live_symbols and sym.replace("/", "") not in live_symbols:
+                                # 2. P0 SAFEGUARD: Double-check with a targeted single-symbol fetch to prevent false closure on partial batch drops
+                                try:
+                                    targeted_chk = await uta.fetch_positions(symbol=sym)
+                                    matching_live = [
+                                        p for p in (targeted_chk or [])
+                                        if float(p.get("total", 0.0) or p.get("contracts", 0.0) or 0.0) > 0
+                                        and str(p.get("posSide", "long")).lower() == side
+                                    ]
+                                    if matching_live:
+                                        log.warning(f"[RECONCILER-SHIELD-STEP4] 🛡️ Partial API drop prevented in Step 4! Global list missed {sym} {side.upper()}, but targeted query confirmed active position. Preserving local record.")
+                                        continue
+                                except Exception as target_err:
+                                    log.warning(f"[RECONCILER-SHIELD-STEP4] Targeted verification for {sym} returned error ({target_err}). Skipping pruning this cycle to prevent accidental deletion.")
+                                    continue
+
                                 log.warning(f"[RECONCILER] Detected on-exchange closure for {sym} in {tbl}. Finalizing trade & dispatching alert.")
                                 entry_p = float(row_dict.get("entry_price", 0.0) or 0.0)
                                 qty = float(row_dict.get("qty", 0.0) or row_dict.get("size", 0.0) or 0.0)
-                                side = str(row_dict.get("side", "long")).lower()
-                                is_long = "long" in side
                                 sl = float(row_dict.get("stop_loss", 0.0) or 0.0)
                                 tp = float(row_dict.get("take_profit", 0.0) or 0.0)
                                 lev = float(row_dict.get("leverage", 5.0) or 5.0)
@@ -855,7 +889,11 @@ async def audit_live_exchange_positions():
                                 try:
                                     recent_fills = await uta.get_recent_fills(symbol=sym, lookback_mins=30)
                                     target_close_side = "close_long" if is_long else "close_short"
-                                    matching_fills = [f for f in recent_fills if f.get("tradeSide") == target_close_side]
+                                    matching_fills = [
+                                        f for f in recent_fills
+                                        if f.get("tradeSide") == target_close_side
+                                        and uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(sym)
+                                    ]
                                     if matching_fills:
                                         tot_qty = sum(float(f.get("execQty", 0.0) or 0.0) for f in matching_fills)
                                         tot_val = sum(float(f.get("execValue", 0.0) or (float(f.get("execQty", 0.0) or 0.0) * float(f.get("execPrice", 0.0) or 0.0))) for f in matching_fills)
@@ -872,16 +910,34 @@ async def audit_live_exchange_positions():
                                 except Exception as fill_err2:
                                     log.debug(f"[RECONCILER-FILLS-NOTE] {fill_err2}")
 
+                                # Plausibility guard
+                                if exit_p is not None and not validate_exit_price_plausibility(sym, side, entry_p, exit_p, qty, actual_pnl):
+                                    log.error(f"[RECONCILER-CORRUPT-EXIT-STEP4] Exit price ${exit_p} for {sym} failed plausibility check vs entry ${entry_p}. Setting exit_p=None (UNRECONCILED).")
+                                    exit_p = None
+
+                                is_unreconciled = False
                                 if exit_p is None or exit_p <= 0:
-                                    exit_p = fetch_live_price(sym) or (sl if sl > 0 else entry_p)
-                                gross_pnl = (exit_p - entry_p) * qty if is_long else (entry_p - exit_p) * qty
-                                funding_val = float(row_dict.get("total_funding", 0.0) or 0.0)
-                                est_fee = actual_fee if actual_fee is not None else ((entry_p * qty * 0.0006) + (exit_p * qty * 0.0006))
-                                net_pnl = actual_pnl if actual_pnl is not None else (gross_pnl + funding_val - est_fee)
+                                    is_unreconciled = True
+                                    exit_p = None
+                                    gross_pnl = None
+                                    est_fee = None
+                                    net_pnl = None
+                                    roe_val = None
+                                    close_type = "UNRECONCILED_CLOSE"
+                                    notes_str = "UNRECONCILED: Position closed on Bitget but fill history unavailable. No fabricated prices."
+                                    log.warning(f"[RECONCILER-UNRECONCILED-STEP4] No ground-truth fills found for {sym}. Recording status='UNRECONCILED' with NULL exit_price/pnl.")
+                                else:
+                                    gross_pnl = (exit_p - entry_p) * qty if is_long else (entry_p - exit_p) * qty
+                                    funding_val = float(row_dict.get("total_funding", 0.0) or 0.0)
+                                    est_fee = actual_fee if actual_fee is not None else ((entry_p * qty * 0.0006) + (exit_p * qty * 0.0006))
+                                    net_pnl = actual_pnl if actual_pnl is not None else (gross_pnl + funding_val - est_fee)
+                                    roe_val = (
+                                        ((exit_p - entry_p) / entry_p * lev * 100.0) if (is_long and entry_p > 0)
+                                        else (((entry_p - exit_p) / entry_p * lev * 100.0) if entry_p > 0 else 0.0)
+                                    )
 
                                 # Calculate Real Holding Time
                                 holding_hours = 1.0
-                                created_ts = row_dict.get("opened_at") or row_dict.get("entry_time") or row_dict.get("timestamp")
                                 if created_ts:
                                     try:
                                         c_clean = str(created_ts).replace("Z", "+00:00")
@@ -895,36 +951,36 @@ async def audit_live_exchange_positions():
                                     except Exception:
                                         pass
 
-                                is_tp_price = (tp > 0 and ((is_long and exit_p >= tp * 0.998) or (not is_long and exit_p <= tp * 1.002)))
-                                is_breakeven_price = (sl > 0 and ((is_long and abs(exit_p - entry_p * 1.0018) / entry_p < 0.003) or (not is_long and abs(exit_p - entry_p * 0.9982) / entry_p < 0.003)))
+                                if not is_unreconciled:
+                                    is_tp_price = (tp > 0 and ((is_long and exit_p >= tp * 0.998) or (not is_long and exit_p <= tp * 1.002)))
+                                    is_breakeven_price = (sl > 0 and ((is_long and abs(exit_p - entry_p * 1.0018) / entry_p < 0.003) or (not is_long and abs(exit_p - entry_p * 0.9982) / entry_p < 0.003)))
 
-                                if is_tp_price:
-                                    close_type = "tp_hit"
-                                elif is_breakeven_price or (abs(net_pnl) < (entry_p * qty * 0.003)):
-                                    close_type = "breakeven_hit"
-                                else:
-                                    close_type = "sl_hit"
+                                    if is_tp_price:
+                                        close_type = "tp_hit"
+                                    elif is_breakeven_price or (net_pnl is not None and abs(net_pnl) < (entry_p * qty * 0.003)):
+                                        close_type = "breakeven_hit"
+                                    else:
+                                        close_type = "sl_hit"
 
-                                notes_str = f"On-exchange {close_type.upper()} on Bitget UTA (Net: ${net_pnl:+.2f}, Fee: -${est_fee:.3f})"
-                                
+                                    pnl_str = f"${net_pnl:+.2f}" if net_pnl is not None else "N/A"
+                                    fee_str = f"-${est_fee:.3f}" if est_fee is not None else "N/A"
+                                    notes_str = f"On-exchange {close_type.upper()} on Bitget UTA (Net: {pnl_str}, Fee: {fee_str})"
+
                                 # Check if engine already closed & recorded this trade in closed_tbl recently (last 15 minutes)
                                 recent_close = conn.execute(
                                     f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') ORDER BY rowid DESC LIMIT 1",
                                     (sym, sym.replace('/', ''), entry_p, entry_p)
                                 ).fetchone()
-                                
+
                                 # 1. Log to closed trades table (only if not already recorded)
                                 ledger_write_ok = True
                                 if not recent_close:
                                     try:
-                                        roe_val = (
-                                            ((exit_p - entry_p) / entry_p * lev * 100.0) if (is_long and entry_p > 0)
-                                            else (((entry_p - exit_p) / entry_p * lev * 100.0) if entry_p > 0 else 0.0)
-                                        )
                                         intended_entry_val = row_dict.get("intended_entry_price") or entry_p
                                         actual_fill_entry_val = row_dict.get("actual_fill_price") or entry_p
                                         slippage_bps_val = row_dict.get("slippage_bps") or 0.0
                                         gates_snap_val = row_dict.get("gates_snapshot")
+                                        rec_status = "UNRECONCILED" if is_unreconciled else "CLOSED"
 
                                         if closed_tbl == "swing_trades":
                                             cur_ins = conn.execute(
@@ -938,24 +994,24 @@ async def audit_live_exchange_positions():
                                                 (
                                                     sym, side, entry_p, exit_p, qty, net_pnl, roe_val,
                                                     holding_hours, close_type, notes_str, intended_entry_val, actual_fill_entry_val,
-                                                    slippage_bps_val, est_fee, 0.0, est_fee, funding_val,
-                                                    "reconciler", gates_snap_val, "CLOSED"
+                                                    slippage_bps_val, est_fee, 0.0, est_fee, funding_val if not is_unreconciled else 0.0,
+                                                    "reconciler", gates_snap_val, rec_status
                                                 )
                                             )
                                         else:
                                             cur_ins = conn.execute(
                                                 f"INSERT INTO {closed_tbl} (timestamp, symbol, side, type, entry_price, exit_price, qty, pnl, balance, notes, status, action) "
-                                                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?)",
-                                                (sym, side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, side)
+                                                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                                (sym, side, close_type, entry_p, exit_p, qty, net_pnl, bal, notes_str, rec_status, side)
                                             )
                                         ledger_write_ok = cur_ins.rowcount == 1
                                     except Exception as ins_e:
                                         ledger_write_ok = False
                                         log.error(f"[RECONCILER] Ledger INSERT FAILED into {closed_tbl} for {sym} — retaining open-position row for retry: {ins_e}")
-                                
+
                                 # 2. Delete from open positions and commit immediately — only when the ledger row is confirmed
                                 if ledger_write_ok:
-                                    conn.execute(f"DELETE FROM {tbl} WHERE symbol = ?", (sym,))
+                                    conn.execute(f"DELETE FROM {tbl} WHERE symbol = ? AND side = ?", (sym, row_dict.get("side", side)))
                                     conn.execute("""
                                         DELETE FROM asset_locks
                                         WHERE symbol = ?
@@ -965,7 +1021,7 @@ async def audit_live_exchange_positions():
                                     pruned_count += 1
                                 else:
                                     log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{sym} — closed-trade row not written; will retry next pass")
-                                if close_type == "sl_hit" or net_pnl < 0:
+                                if (not is_unreconciled) and (close_type == "sl_hit" or (net_pnl is not None and net_pnl < 0)):
                                     try:
                                         from datetime import timedelta, timezone
                                         cd_hours = 6.0
@@ -979,7 +1035,7 @@ async def audit_live_exchange_positions():
                                     except Exception as cd_err:
                                         log.debug(f"[RECONCILER-COOLDOWN-NOTE] {cd_err}")
                                 conn.commit()
-                                
+
                                 # 3. Dispatch Email Alert (Deduplicated with 15-minute cooldown and engine close check)
                                 import time as _tm
                                 now_epoch = _tm.time()
@@ -991,25 +1047,25 @@ async def audit_live_exchange_positions():
                                 else:
                                     _recently_alerted_closures[sym] = now_epoch
                                     try:
-                                        from email_dispatcher import send_trade_log
-                                        send_trade_log(
+                                        from email_dispatcher import send_trade_log_async
+                                        t_close = asyncio.create_task(send_trade_log_async(
                                             symbol=sym,
                                             side=side.upper(),
                                             price=exit_p,
-                                            pnl=gross_pnl,
-                                            status="CLOSED",
+                                            pnl=net_pnl,
+                                            status="UNRECONCILED" if is_unreconciled else "CLOSED",
                                             trade_context={
                                                 "qty": qty,
-                                                "pnl": gross_pnl,
+                                                "pnl": net_pnl,
                                                 "leverage": lev,
                                                 "entry_price": entry_p,
                                                 "engine": f"{bot_name} (Exchange Auto-Close)",
                                                 "close_trigger": "BITGET ON-EXCHANGE MATCH",
-                                                "close_reason": f"Position was executed and settled directly on Bitget USDT-M matching engine ({close_type.upper()}) at ${exit_p:,.4f}.",
-                                                "notes": f"Executed directly on Bitget Matching Engine ({close_type.upper()})"
+                                                "close_reason": f"Position was executed and settled directly on Bitget USDT-M matching engine ({close_type.upper()}).",
+                                                "notes": notes_str
                                             }
-                                        )
-                                        log.info(f"[RECONCILER] Dispatched trade closure email for {sym} (PnL: ${gross_pnl:+.4f})")
+                                        ))
+                                        log.info(f"[RECONCILER] Dispatched trade closure email task for {sym} (PnL: {net_pnl})")
                                     except Exception as mail_e:
                                         log.warning(f"[RECONCILER] Failed to send email for {sym}: {mail_e}")
                     except Exception as fleet_e:

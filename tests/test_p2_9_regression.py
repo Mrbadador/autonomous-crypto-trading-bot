@@ -4,6 +4,7 @@ Regression tests for P2-9 (D-1 through D-12).
 
 import ast
 import asyncio
+from datetime import datetime, timezone, timedelta
 import importlib
 import os
 import sqlite3
@@ -697,8 +698,271 @@ class TestP29D4ExitPriceGuard(unittest.TestCase):
 
 
 
+class TestP29D5ReconcilerStep4Safeguards(unittest.TestCase):
+    """D-5: Verify Reconciler Step 4 safeguards (grace period, targeted fetch retry, symbol fills filtering, plausibility guard, NULL/UNRECONCILED fallback)."""
+
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.db_path = self.temp_db.name
+        self.temp_db.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE swing_open_positions (
+                symbol TEXT PRIMARY KEY,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                size REAL NOT NULL,
+                stop_loss REAL NOT NULL,
+                take_profit REAL NOT NULL,
+                trailing_stop REAL,
+                peak_price REAL,
+                leverage REAL DEFAULT 3.0,
+                opened_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT DEFAULT 'ACTIVE',
+                r_multiple REAL DEFAULT 0.0,
+                initial_risk_usd REAL,
+                notes TEXT,
+                intended_entry_price REAL,
+                actual_fill_price REAL,
+                slippage_bps REAL,
+                fee_entry_usd REAL,
+                execution_type TEXT,
+                gates_snapshot TEXT
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE swing_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL,
+                size REAL NOT NULL,
+                pnl REAL,
+                roe_pct REAL,
+                holding_hours REAL,
+                exit_reason TEXT,
+                notes TEXT,
+                intended_entry_price REAL,
+                actual_fill_price REAL,
+                slippage_bps REAL,
+                fee_paid_usd REAL,
+                fee_maker_usd REAL,
+                fee_taker_usd REAL,
+                funding_usd REAL,
+                funding_source TEXT,
+                gates_snapshot TEXT,
+                status TEXT
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE asset_locks (
+                symbol TEXT PRIMARY KEY,
+                locked_by TEXT NOT NULL,
+                locked_at TEXT NOT NULL,
+                reason TEXT,
+                heartbeat TEXT NOT NULL
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE system_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE swing_cooldowns (
+                symbol TEXT PRIMARY KEY,
+                cooldown_until TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+        """)
+        conn.execute("CREATE TABLE open_positions (symbol TEXT PRIMARY KEY, side TEXT, entry_price REAL, qty REAL, stop_loss REAL, take_profit REAL);")
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, timestamp TEXT, symbol TEXT, side TEXT, type TEXT, entry_price REAL, exit_price REAL, qty REAL, pnl REAL, balance REAL, notes TEXT, status TEXT, action TEXT);")
+        conn.execute("CREATE TABLE berserker_open_positions (symbol TEXT PRIMARY KEY, side TEXT, entry_price REAL, qty REAL, stop_loss REAL, take_profit REAL);")
+        conn.execute("CREATE TABLE berserker_trades (id INTEGER PRIMARY KEY, timestamp TEXT, symbol TEXT, side TEXT, type TEXT, entry_price REAL, exit_price REAL, qty REAL, pnl REAL, balance REAL, notes TEXT, status TEXT, action TEXT);")
+        conn.execute("CREATE TABLE marl_live_open_positions (symbol TEXT PRIMARY KEY, side TEXT, entry_price REAL, qty REAL, stop_loss REAL, take_profit REAL);")
+        conn.execute("CREATE TABLE marl_live_trades (id INTEGER PRIMARY KEY, timestamp TEXT, symbol TEXT, side TEXT, type TEXT, entry_price REAL, exit_price REAL, qty REAL, pnl REAL, balance REAL, notes TEXT, status TEXT, action TEXT);")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        try:
+            if os.path.exists(self.db_path):
+                os.remove(self.db_path)
+        except OSError:
+            pass
+
+    def test_d5_step4_grace_period(self):
+        import reconciliation_engine
+        from unittest.mock import patch
+
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT INTO swing_open_positions (symbol, side, entry_price, size, stop_loss, take_profit, opened_at, updated_at)
+            VALUES ('BTC/USDT', 'LONG', 80000.0, 0.001, 78000.0, 85000.0, ?, ?)
+        """, (now_str, now_str))
+        conn.commit()
+        conn.close()
+
+        mock_uta = MagicMock()
+        mock_uta.fetch_balance = AsyncMock(return_value=500.0)
+        mock_uta.fetch_positions = AsyncMock(return_value=[])
+        mock_uta._normalize_symbol = lambda s: str(s).replace('/', '').upper()
+        mock_uta.exchange = MagicMock()
+        mock_uta.exchange.private_uta_get_v3_trade_unfilled_orders = AsyncMock(return_value={"data": {"list": []}})
+
+        with patch("reconciliation_engine.DATA_DB", self.db_path), \
+             patch("reconciliation_engine.config.MODE", "live"), \
+             patch("reconciliation_engine.config.PAPER_TRADE", False), \
+             patch("reconciliation_engine.config.EXCHANGE_ID", "bitget"), \
+             patch("bitget_uta_client.BitgetUTAClient", return_value=mock_uta):
+
+            asyncio.run(reconciliation_engine.audit_live_exchange_positions())
+
+        chk_conn = sqlite3.connect(self.db_path)
+        open_cnt = chk_conn.execute("SELECT count(*) FROM swing_open_positions").fetchone()[0]
+        closed_cnt = chk_conn.execute("SELECT count(*) FROM swing_trades").fetchone()[0]
+        chk_conn.close()
+
+        self.assertEqual(open_cnt, 1, "Grace period (<60s) must protect open position from being pruned!")
+        self.assertEqual(closed_cnt, 0, "No closed trade row should be recorded for a position in grace period!")
+
+    def test_d5_step4_targeted_fetch_shield(self):
+        import reconciliation_engine
+        from unittest.mock import patch
+
+        old_str = (datetime.now(timezone.utc) - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT INTO swing_open_positions (symbol, side, entry_price, size, stop_loss, take_profit, opened_at, updated_at)
+            VALUES ('BTC/USDT', 'LONG', 80000.0, 0.001, 78000.0, 85000.0, ?, ?)
+        """, (old_str, old_str))
+        conn.commit()
+        conn.close()
+
+        mock_uta = MagicMock()
+        mock_uta.fetch_balance = AsyncMock(return_value=500.0)
+        # Global query returns empty, but targeted query confirms position is active
+        mock_uta.fetch_positions = AsyncMock(side_effect=lambda symbol=None: [] if symbol is None else [{"symbol": "BTCUSDT", "posSide": "long", "total": 0.001}])
+        mock_uta._normalize_symbol = lambda s: str(s).replace('/', '').upper()
+        mock_uta.exchange = MagicMock()
+        mock_uta.exchange.private_uta_get_v3_trade_unfilled_orders = AsyncMock(return_value={"data": {"list": []}})
+
+        with patch("reconciliation_engine.DATA_DB", self.db_path), \
+             patch("reconciliation_engine.config.MODE", "live"), \
+             patch("reconciliation_engine.config.PAPER_TRADE", False), \
+             patch("reconciliation_engine.config.EXCHANGE_ID", "bitget"), \
+             patch("bitget_uta_client.BitgetUTAClient", return_value=mock_uta):
+
+            asyncio.run(reconciliation_engine.audit_live_exchange_positions())
+
+        chk_conn = sqlite3.connect(self.db_path)
+        open_cnt = chk_conn.execute("SELECT count(*) FROM swing_open_positions").fetchone()[0]
+        chk_conn.close()
+
+        self.assertEqual(open_cnt, 1, "Targeted single-symbol query must shield active position from transient API drop!")
+
+    def test_d5_step4_unreconciled_fallback_when_fills_missing(self):
+        import reconciliation_engine
+        from unittest.mock import patch
+
+        old_str = (datetime.now(timezone.utc) - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT INTO swing_open_positions (symbol, side, entry_price, size, stop_loss, take_profit, opened_at, updated_at)
+            VALUES ('BTC/USDT', 'LONG', 80000.0, 0.001, 78000.0, 85000.0, ?, ?)
+        """, (old_str, old_str))
+        conn.commit()
+        conn.close()
+
+        mock_uta = MagicMock()
+        mock_uta.fetch_balance = AsyncMock(return_value=500.0)
+        mock_uta.fetch_positions = AsyncMock(return_value=[])  # Truly gone
+        mock_uta.get_recent_fills = AsyncMock(return_value=[])  # No fills available
+        mock_uta._normalize_symbol = lambda s: str(s).replace('/', '').upper()
+        mock_uta.exchange = MagicMock()
+        mock_uta.exchange.private_uta_get_v3_trade_unfilled_orders = AsyncMock(return_value={"data": {"list": []}})
+
+        with patch("reconciliation_engine.DATA_DB", self.db_path), \
+             patch("reconciliation_engine.config.MODE", "live"), \
+             patch("reconciliation_engine.config.PAPER_TRADE", False), \
+             patch("reconciliation_engine.config.EXCHANGE_ID", "bitget"), \
+             patch("bitget_uta_client.BitgetUTAClient", return_value=mock_uta):
+
+            asyncio.run(reconciliation_engine.audit_live_exchange_positions())
+
+        chk_conn = sqlite3.connect(self.db_path)
+        open_cnt = chk_conn.execute("SELECT count(*) FROM swing_open_positions").fetchone()[0]
+        self.assertEqual(open_cnt, 0, "Position must be pruned when confirmed closed.")
+
+        rec_row = chk_conn.execute("SELECT status, exit_price, pnl, exit_reason, notes FROM swing_trades WHERE symbol = 'BTC/USDT'").fetchone()
+        chk_conn.close()
+
+        self.assertIsNotNone(rec_row, "Closed trade record must exist!")
+        self.assertEqual(rec_row[0], "UNRECONCILED", "Status must be UNRECONCILED when fills cannot be verified!")
+        self.assertIsNone(rec_row[1], "Exit price must be NULL (no fabricated prices allowed)!")
+        self.assertIsNone(rec_row[2], "PnL must be NULL when exit price is unknown!")
+        self.assertEqual(rec_row[3], "UNRECONCILED_CLOSE")
+        self.assertIn("UNRECONCILED", rec_row[4])
+
+    def test_d5_step4_implausible_fill_rejected_to_unreconciled(self):
+        import reconciliation_engine
+        from unittest.mock import patch
+
+        old_str = (datetime.now(timezone.utc) - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT INTO swing_open_positions (symbol, side, entry_price, size, stop_loss, take_profit, opened_at, updated_at)
+            VALUES ('BNB/USDT', 'LONG', 750.0, 0.1, 730.0, 800.0, ?, ?)
+        """, (old_str, old_str))
+        conn.commit()
+        conn.close()
+
+        mock_uta = MagicMock()
+        mock_uta.fetch_balance = AsyncMock(return_value=500.0)
+        mock_uta.fetch_positions = AsyncMock(return_value=[])  # Truly gone
+        # Returns corrupt fill with price $11.60
+        mock_uta.get_recent_fills = AsyncMock(return_value=[{
+            "symbol": "BNBUSDT",
+            "tradeSide": "close_long",
+            "execQty": "0.1",
+            "execPrice": "11.60",
+            "execValue": "1.16",
+            "fee": "0.01",
+        }])
+        mock_uta._normalize_symbol = lambda s: str(s).replace('/', '').upper()
+        mock_uta.exchange = MagicMock()
+        mock_uta.exchange.private_uta_get_v3_trade_unfilled_orders = AsyncMock(return_value={"data": {"list": []}})
+
+        with patch("reconciliation_engine.DATA_DB", self.db_path), \
+             patch("reconciliation_engine.config.MODE", "live"), \
+             patch("reconciliation_engine.config.PAPER_TRADE", False), \
+             patch("reconciliation_engine.config.EXCHANGE_ID", "bitget"), \
+             patch("bitget_uta_client.BitgetUTAClient", return_value=mock_uta):
+
+            asyncio.run(reconciliation_engine.audit_live_exchange_positions())
+
+        chk_conn = sqlite3.connect(self.db_path)
+        rec_row = chk_conn.execute("SELECT status, exit_price, pnl FROM swing_trades WHERE symbol = 'BNB/USDT'").fetchone()
+        chk_conn.close()
+
+        self.assertIsNotNone(rec_row, "Closed trade record must exist!")
+        self.assertEqual(rec_row[0], "UNRECONCILED", "Implausible exit price must force UNRECONCILED status!")
+        self.assertIsNone(rec_row[1], "Exit price must be NULL to prevent corrupting ledger with $11.60!")
+        self.assertIsNone(rec_row[2], "PnL must be NULL!")
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
