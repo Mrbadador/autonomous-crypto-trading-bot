@@ -1388,12 +1388,24 @@ class SwingArchitectTrader:
             log.warning(f"[ABORT] Cannot open {symbol} swing trade: Lock acquisition failed.")
             return
 
-        # Explicitly set exchange leverage before placing entry order
+        # Explicitly set exchange leverage before placing entry order; veto entry if unconfirmed (D-1)
         try:
             if hasattr(self.uta_client, "set_leverage"):
-                await self.uta_client.set_leverage(symbol, int(assigned_leverage))
+                lev_ok = await self.uta_client.set_leverage(leverage=int(assigned_leverage), symbol=symbol)
+                if not lev_ok:
+                    log.error(
+                        f"[SWING-LEVERAGE-VETO] Failed to confirm {int(assigned_leverage)}x leverage on {symbol}. "
+                        f"Releasing lock and vetoing entry to prevent unanchored leverage execution."
+                    )
+                    await asyncio.to_thread(self._release_lock_sync, symbol)
+                    return
         except Exception as lev_err:
-            log.debug(f"[SWING-LEVERAGE-NOTE] {symbol}: {lev_err}")
+            log.error(
+                f"[SWING-LEVERAGE-VETO] Exception setting {int(assigned_leverage)}x leverage on {symbol}: {lev_err}. "
+                f"Releasing lock and vetoing entry."
+            )
+            await asyncio.to_thread(self._release_lock_sync, symbol)
+            return
 
         tp_dist_pct = abs(take_profit - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
         log.info("=" * 60)

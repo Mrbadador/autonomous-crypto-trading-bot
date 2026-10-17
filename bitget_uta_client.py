@@ -37,6 +37,8 @@ class BitgetUTAClient:
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Converts symbol like 'BTC/USDT' or 'BTC/USDT:USDT' to Bitget format 'BTCUSDT'."""
+        if not isinstance(symbol, str) or not symbol.strip() or symbol.strip().isdigit():
+            raise TypeError(f"Expected valid symbol string in _normalize_symbol, got {type(symbol).__name__}: {symbol!r}")
         clean = symbol.split(":")[0].replace("/", "").upper()
         return clean
 
@@ -196,15 +198,18 @@ class BitgetUTAClient:
     async def set_leverage(self, leverage: int = None, symbol: str = "BTCUSDT", margin_mode: str = None) -> bool:
         """Sets leverage for positions on Bitget Unified Account (V3)."""
         import config
-        clean_sym = self._normalize_symbol(symbol)
-        if leverage is None:
-            leverage = config.get_asset_leverage(clean_sym) if hasattr(config, "get_asset_leverage") else getattr(config, "LEVERAGE", 5)
-        lev = str(leverage)
-        if margin_mode is None:
-            margin_mode = getattr(config, "MARGIN_MODE", "isolated").lower()
-        else:
-            margin_mode = margin_mode.lower()
         try:
+            clean_sym = self._normalize_symbol(symbol)
+            if leverage is None:
+                leverage = config.get_asset_leverage(clean_sym) if hasattr(config, "get_asset_leverage") else getattr(config, "LEVERAGE", 5)
+            lev_int = int(leverage)
+            if lev_int <= 0:
+                raise ValueError(f"Invalid non-positive leverage: {leverage!r}")
+            lev = str(lev_int)
+            if margin_mode is None:
+                margin_mode = getattr(config, "MARGIN_MODE", "isolated").lower()
+            else:
+                margin_mode = str(margin_mode).lower()
             params = {
                 "category": "USDT-FUTURES",
                 "symbol": clean_sym,
