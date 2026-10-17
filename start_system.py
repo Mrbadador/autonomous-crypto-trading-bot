@@ -416,7 +416,12 @@ def main():
         log.info("[FLEET-ROUTER] 📡 books15 depth recorder disabled via DEPTH_RECORDER_ENABLED=false.")
     if getattr(config, "BASIS_TRADER_ENABLED", False):
         subprocess_configs.append([sys.executable, "basis_trader.py"])
-    subprocess_configs.append([sys.executable, "-m", "streamlit", "run", "dashboard.py", "--server.port", "8501"])
+    subprocess_configs.append([
+        sys.executable, "-m", "streamlit", "run", "dashboard.py",
+        "--server.port", "8501",
+        "--server.address", "127.0.0.1",
+        "--server.headless", "true"
+    ])
 
     global managed
     managed = [ManagedProcess(cmd) for cmd in subprocess_configs]

@@ -324,6 +324,7 @@ def collect_metrics(data_db_path, ledger_db_path):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Prometheus Exporter for Llama Trading Bot")
+    parser.add_argument('--host', type=str, default='127.0.0.1', help='Interface to bind metrics server')
     parser.add_argument('--port', type=int, default=8000, help='Port to expose metrics')
     parser.add_argument('--data-db', type=str, default='trading_data.db', help='Path to trading_data.db')
     parser.add_argument('--ledger-db', type=str, default='trading_ledger.db', help='Path to trading_ledger.db')
@@ -335,8 +336,8 @@ if __name__ == "__main__":
     data_path = os.path.join(base_dir, args.data_db)
     ledger_path = os.path.join(base_dir, args.ledger_db)
     
-    start_http_server(args.port)
-    log.info(f"Prometheus Exporter started on port {args.port}")
+    start_http_server(args.port, addr=args.host)
+    log.info(f"Prometheus Exporter started on {args.host}:{args.port}")
     log.info(f"Monitoring: {data_path} & {ledger_path}")
     
     try:

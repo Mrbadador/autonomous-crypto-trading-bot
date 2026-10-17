@@ -960,8 +960,55 @@ class TestP29D5ReconcilerStep4Safeguards(unittest.TestCase):
 
 
 
+class TestP29D6NetworkInterfaceBinding(unittest.TestCase):
+    """D-6: Verify explicit localhost binding for Streamlit HUD and Prometheus Exporter."""
+
+    def test_d6_start_system_binds_streamlit_to_localhost_statically(self):
+        # NOTE: start_system.py MUST NOT be imported (0.3 Fleet-Kill Trap).
+        # We verify AST statically.
+        with open("start_system.py", "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        found_streamlit = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.List):
+                el_vals = []
+                for elt in node.elts:
+                    if isinstance(elt, ast.Constant):
+                        el_vals.append(elt.value)
+                if "streamlit" in el_vals and "run" in el_vals:
+                    found_streamlit = True
+                    self.assertIn("--server.address", el_vals, "Streamlit must specify --server.address!")
+                    addr_idx = el_vals.index("--server.address")
+                    self.assertEqual(el_vals[addr_idx + 1], "127.0.0.1", "--server.address must be 127.0.0.1!")
+                    self.assertIn("--server.headless", el_vals, "Streamlit must specify --server.headless!")
+                    headless_idx = el_vals.index("--server.headless")
+                    self.assertEqual(el_vals[headless_idx + 1], "true", "--server.headless must be true!")
+
+        self.assertTrue(found_streamlit, "Streamlit launch config not found in start_system.py!")
+
+    def test_d6_prometheus_exporter_binds_to_localhost_statically(self):
+        with open("prometheus_exporter.py", "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        found_start_http = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func_name = ""
+                if isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                if func_name == "start_http_server":
+                    found_start_http = True
+                    # Check keyword argument addr is passed
+                    addr_kw = [kw for kw in node.keywords if kw.arg == "addr"]
+                    self.assertTrue(len(addr_kw) > 0, "start_http_server must specify addr keyword argument!")
+
+        self.assertTrue(found_start_http, "start_http_server call not found in prometheus_exporter.py!")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
