@@ -1523,6 +1523,7 @@ class SwingArchitectTrader:
                         poll_interval = 2.0
                         start_time = time.time()
                         is_filled = False
+                        filled_amount = 0.0
                         
                         while (time.time() - start_time) < sniper_timeout:
                             await asyncio.sleep(poll_interval)
@@ -1556,7 +1557,9 @@ class SwingArchitectTrader:
                                 final_o = await self.uta_client.fetch_order(symbol, po_order_id)
                                 final_st = str(final_o.get("order_status") or final_o.get("status") or "").lower()
                                 final_fill = float(final_o.get("filled_qty") or final_o.get("cumExecQty") or 0.0)
-                                if final_st in ("filled", "closed") or (qty > 0 and final_fill >= qty * 0.95):
+                                if final_fill > filled_amount:
+                                    filled_amount = final_fill
+                                if final_st in ("filled", "closed") or (qty > 0 and filled_amount >= qty * 0.95):
                                     is_filled = True
                                     deal_p = float(final_o.get("deal_avg_price") or final_o.get("avgPrice") or 0.0)
                                     if deal_p > 0:
@@ -1564,6 +1567,16 @@ class SwingArchitectTrader:
                                     log.info(f"[ENTRY-SNIPER-FILLED] Order {po_order_id} filled right at cancel boundary!")
                             except Exception:
                                 pass
+
+                            # D-7 FIX: Partial fill handling — if order partially filled (0 < filled_amount < qty * 0.95),
+                            # adopt the partial fill, attach native SL to partial qty, and book position into swing_open_positions.
+                            if not is_filled and filled_amount > 0.0:
+                                is_filled = True
+                                log.warning(
+                                    f"[ENTRY-SNIPER-PARTIAL-FILL] Order {po_order_id} on {symbol} partially filled: "
+                                    f"{filled_amount}/{qty} ({(filled_amount/qty)*100.0:.1f}%). Adopting partial fill, "
+                                    f"attaching native SL to {filled_amount} units, and booking position."
+                                )
                         
                         if is_filled:
                             order_success = True

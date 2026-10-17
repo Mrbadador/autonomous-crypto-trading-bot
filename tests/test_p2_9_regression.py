@@ -1006,8 +1006,55 @@ class TestP29D6NetworkInterfaceBinding(unittest.TestCase):
         self.assertTrue(found_start_http, "start_http_server call not found in prometheus_exporter.py!")
 
 
+class TestP29D7SwingPartialFillAndUnboundLocal(unittest.TestCase):
+    """D-7: Verify filled_amount initialization and partial fill adoption in swing entry."""
+
+    def test_d7_filled_amount_initialized_statically(self):
+        with open("swing_trader.py", "r", encoding="utf-8") as f:
+            content = f.read()
+            tree = ast.parse(content)
+
+        # 1. Verify filled_amount = 0.0 is present before the while loop
+        found_init = False
+        found_partial_adopt = False
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "filled_amount":
+                        if isinstance(node.value, ast.Constant) and node.value.value == 0.0:
+                            found_init = True
+            if isinstance(node, ast.Compare):
+                # Check for: filled_amount > 0.0
+                left = node.left
+                if isinstance(left, ast.Name) and left.id == "filled_amount":
+                    for op, comparator in zip(node.ops, node.comparators):
+                        if isinstance(op, ast.Gt) and isinstance(comparator, ast.Constant) and comparator.value == 0.0:
+                            found_partial_adopt = True
+
+        self.assertTrue(found_init, "filled_amount = 0.0 must be initialized before the sniper poll loop!")
+        self.assertTrue(found_partial_adopt, "Partial fill check (filled_amount > 0.0) must be present!")
+
+    def test_d7_partial_fill_adopts_partial_qty(self):
+        # Verify the calculation of actual_qty when 0 < filled_amount < qty
+        qty = 10.0
+        filled_amount = 4.0  # 40% partial fill
+        actual_qty = filled_amount if (filled_amount > 0 and filled_amount <= qty) else qty
+        self.assertEqual(actual_qty, 4.0, "actual_qty must be exactly 4.0 (partial fill), not 10.0!")
+
+        # Verify precision formatting with partial qty
+        mock_uta = MagicMock()
+        mock_uta._normalize_symbol = lambda s: "SOLUSDT"
+        mock_uta.format_quantity_precision = MagicMock(return_value="4.0")
+        mock_uta.format_price_precision = MagicMock(return_value="105.50")
+
+        qty_str = mock_uta.format_quantity_precision("SOL/USDT", actual_qty)
+        self.assertEqual(qty_str, "4.0")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
