@@ -297,6 +297,8 @@ class SuperBotTrader:
         """Ensures Super Bot tables and state exist."""
         try:
             with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=10000;")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS super_bot_telemetry (
                         timestamp TEXT PRIMARY KEY,
@@ -340,6 +342,8 @@ class SuperBotTrader:
         """Adopts and syncs active positions from both swing_open_positions and mean_reversion_open_positions."""
         try:
             with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=10000;")
                 conn.row_factory = sqlite3.Row
                 
                 # 1. Adopt active 4H Swing and Chop Grid positions (including PENDING_CLOSE)
@@ -366,8 +370,15 @@ class SuperBotTrader:
                     rows_grid = conn.execute("SELECT * FROM mean_reversion_open_positions").fetchall()
                     for r in rows_grid:
                         pos = dict(r)
-                        pos["engine_type"] = "GRID_MAKER"
-                        active[pos["symbol"]] = pos
+                        sym = pos.get("symbol")
+                        if not sym:
+                            continue
+                        if configured_symbols and sym not in configured_symbols:
+                            log.warning(f"[ADOPT-SKIP-UNKNOWN] ⚠️ Skipping legacy mean_reversion symbol '{sym}' (not in config.SYMBOLS).")
+                            continue
+                        if sym not in active:
+                            pos["engine_type"] = "GRID_MAKER"
+                            active[sym] = pos
                 except Exception:
                     pass
                     
@@ -1422,7 +1433,7 @@ class SuperBotTrader:
                 # Microstructure Guard & VPIN
                 ms_is_degraded = False
                 try:
-                    clean_sym = symbol.replace("/", "").replace("-", "").upper()
+                    clean_sym = self.uta_client._normalize_symbol(symbol) if self.uta_client else symbol.replace("/", "").replace("-", "").upper()
                     ms_state = MicrostructureStateCache.get_state(clean_sym)
                     ms_is_degraded = (not ms_state)
                     vpin_score = float(ms_state.get("vpin", 0.0) or 0.0)
