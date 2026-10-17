@@ -402,13 +402,13 @@ class SuperBotTrader:
                         DELETE FROM asset_locks
                         WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
                           AND symbol NOT IN ({placeholders})
-                          AND (julianday('now') - julianday(heartbeat)) * 86400.0 > 900.0
+                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
                     """, active_syms)
                 else:
                     conn.execute("""
                         DELETE FROM asset_locks
                         WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
-                          AND (julianday('now') - julianday(heartbeat)) * 86400.0 > 900.0
+                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
                     """)
                 conn.commit()
                 

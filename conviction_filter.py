@@ -4,9 +4,102 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
+import config
 from ai_engine import red_team_deliberation
 
 log = logging.getLogger("conviction_boardroom")
+
+PROD_DATABASES = ["trading_data.db", "trading_ledger.db", "live_paper_trades.db"]
+
+def check_database_integrity(conn, max_age_sec: float = None):
+    """
+    Evaluates database integrity across production databases from system_state.
+    Returns:
+        dict with:
+            is_ok: bool (True only if all OK/HEALTHY and not stale/absent)
+            is_stale: bool (True if absent, missing updated_at, or age > max_age_sec)
+            is_corrupt: bool (True if any DB is CRITICAL, CORRUPT, or ERROR with consecutive >= 2)
+            stale_dbs: list of str
+            corrupt_dbs: list of str
+            latest_utc_dt: datetime or None (the latest updated_at across prod DBs)
+            details: dict of {db_name: (status, age_sec, consecutive_errors)}
+    """
+    if max_age_sec is None:
+        max_age_sec = getattr(config, "DB_INTEGRITY_MAX_AGE_SEC", 900.0)
+
+    integ_rows = conn.execute(
+        "SELECT key, value, updated_at FROM system_state WHERE key LIKE 'db_integrity_%'"
+    ).fetchall()
+    integ_map = {}
+    for r in integ_rows:
+        k, v, u_at = r[0], str(r[1] or "").strip().upper(), r[2]
+        integ_map[k] = (v, u_at)
+
+    now_utc = datetime.now(timezone.utc)
+    stale_dbs = []
+    corrupt_dbs = []
+    details = {}
+    latest_utc_dt = None
+
+    for db_name in PROD_DATABASES:
+        integ_key = f"db_integrity_{db_name}"
+        if integ_key not in integ_map:
+            stale_dbs.append(db_name)
+            details[db_name] = ("ABSENT", None, 0)
+            continue
+
+        val_str, u_at = integ_map[integ_key]
+        age_sec = None
+        parsed_dt = None
+        if u_at:
+            try:
+                clean_ts = str(u_at).strip().replace("Z", "+00:00")
+                if "T" not in clean_ts and " " in clean_ts:
+                    clean_ts = clean_ts.replace(" ", "T")
+                parsed_dt = datetime.fromisoformat(clean_ts)
+                if parsed_dt.tzinfo is None:
+                    parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                age_sec = max(0.0, (now_utc - parsed_dt).total_seconds())
+                if latest_utc_dt is None or parsed_dt > latest_utc_dt:
+                    latest_utc_dt = parsed_dt
+            except Exception:
+                age_sec = None
+
+        consec_key = f"db_integrity_{db_name}_consecutive_errors"
+        consec_cnt = 0
+        if consec_key in integ_map:
+            try:
+                consec_cnt = int(integ_map[consec_key][0])
+            except Exception:
+                consec_cnt = 2
+
+        details[db_name] = (val_str, age_sec, consec_cnt)
+
+        # Staleness check
+        if age_sec is None or age_sec > max_age_sec:
+            stale_dbs.append(db_name)
+
+        # Corruption / Error check
+        if val_str in ("CRITICAL", "CORRUPT"):
+            corrupt_dbs.append(db_name)
+        elif val_str == "ERROR":
+            if consec_cnt >= 2:
+                corrupt_dbs.append(db_name)
+
+    is_stale = len(stale_dbs) > 0
+    is_corrupt = len(corrupt_dbs) > 0
+    is_ok = (not is_stale) and (not is_corrupt)
+
+    return {
+        "is_ok": is_ok,
+        "is_stale": is_stale,
+        "is_corrupt": is_corrupt,
+        "stale_dbs": stale_dbs,
+        "corrupt_dbs": corrupt_dbs,
+        "latest_utc_dt": latest_utc_dt,
+        "details": details
+    }
+
 
 class ConvictionBoardroom:
     """
@@ -25,90 +118,28 @@ class ConvictionBoardroom:
             try:
                 conn = sqlite3.connect(self.db_path, timeout=5.0)
                 # 0. Database Integrity Gate (Fail-Closed on corrupted, stale, or unverified production DBs)
-                # Expected production databases (test_ledger.db is an offline test artifact, excluded)
-                prod_dbs = ["trading_data.db", "trading_ledger.db", "live_paper_trades.db"]
-                integ_rows = conn.execute(
-                    "SELECT key, value, updated_at FROM system_state WHERE key LIKE 'db_integrity_%'"
-                ).fetchall()
-                integ_map = {}
-                for r in integ_rows:
-                    k, v, u_at = r[0], str(r[1] or "").strip().upper(), r[2]
-                    integ_map[k] = (v, u_at)
-
-                now_utc = datetime.now(timezone.utc)
-                for db_name in prod_dbs:
-                    integ_key = f"db_integrity_{db_name}"
-                    if integ_key not in integ_map:
+                integ_report = check_database_integrity(conn)
+                if not integ_report["is_ok"]:
+                    if integ_report["is_stale"]:
+                        stale_list = ", ".join(integ_report["stale_dbs"])
                         res["veto"] = {
                             "execute": False,
                             "conviction_score": 0.0,
                             "stage": "database_integrity_stale",
-                            "final_rationale": f"integrity signal stale/absent: {db_name} has no db_integrity status recorded."
+                            "final_rationale": f"integrity signal stale/absent: {stale_list} integrity status is older than {getattr(config, 'DB_INTEGRITY_MAX_AGE_SEC', 900)}s or unparseable/absent."
                         }
-                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} has no integrity status (absent). Halting new entries."
+                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {stale_list} integrity signal is stale/absent. Halting new entries."
                         return res
-
-                    val_str, u_at = integ_map[integ_key]
-                    # Check staleness: ceiling is 3 x CHECKPOINT_INTERVAL_SECS (900s)
-                    is_stale = False
-                    if not u_at:
-                        is_stale = True
-                    else:
-                        try:
-                            clean_ts = str(u_at).strip().replace("Z", "+00:00")
-                            if "T" not in clean_ts and " " in clean_ts:
-                                clean_ts = clean_ts.replace(" ", "T")
-                            parsed_ts = datetime.fromisoformat(clean_ts)
-                            if parsed_ts.tzinfo is None:
-                                parsed_ts = parsed_ts.replace(tzinfo=timezone.utc)
-                            age_sec = (now_utc - parsed_ts).total_seconds()
-                            if age_sec > 900.0:
-                                is_stale = True
-                        except Exception:
-                            is_stale = True
-
-                    if is_stale:
-                        res["veto"] = {
-                            "execute": False,
-                            "conviction_score": 0.0,
-                            "stage": "database_integrity_stale",
-                            "final_rationale": f"integrity signal stale/absent: {db_name} integrity status is older than 900s or unparseable."
-                        }
-                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} integrity signal is stale (>900s). Halting new entries."
-                        return res
-
-                    # Gate on (CRITICAL or CORRUPT) OR (ERROR and consecutive_errors >= 2)
-                    if val_str in ("CRITICAL", "CORRUPT"):
+                    elif integ_report["is_corrupt"]:
+                        corrupt_list = ", ".join(integ_report["corrupt_dbs"])
                         res["veto"] = {
                             "execute": False,
                             "conviction_score": 0.0,
                             "stage": "database_integrity_gate",
-                            "final_rationale": f"Database Integrity Gate Veto: {db_name} integrity status is {val_str}. Halting new entries (Fail-Closed)."
+                            "final_rationale": f"Database Integrity Gate Veto: {corrupt_list} integrity status is CRITICAL/CORRUPT or persistent ERROR. Halting new entries (Fail-Closed)."
                         }
-                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} reported {val_str}. Halting new order entries."
+                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {corrupt_list} failed integrity verification. Halting new order entries."
                         return res
-                    elif val_str == "ERROR":
-                        consec_key = f"db_integrity_{db_name}_consecutive_errors"
-                        consec_cnt = 0
-                        if consec_key in integ_map:
-                            try:
-                                consec_cnt = int(integ_map[consec_key][0])
-                            except Exception:
-                                consec_cnt = 2  # Fail-closed if count is unparseable
-                        else:
-                            # If no explicit consecutive key is found, assume fail-closed (2)
-                            consec_cnt = 2
-                        if consec_cnt >= 2:
-                            res["veto"] = {
-                                "execute": False,
-                                "conviction_score": 0.0,
-                                "stage": "database_integrity_gate",
-                                "final_rationale": f"Database Integrity Gate Veto: {db_name} raised verification ERROR across {consec_cnt} consecutive passes. Halting new entries (Fail-Closed)."
-                            }
-                            res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} has {consec_cnt} consecutive checkpoint errors. Halting new order entries."
-                            return res
-                        else:
-                            log.warning(f"[BOARDROOM] ⚠️ {db_name} reported checkpoint ERROR (transient blip 1/2). Permitting entries while monitoring.")
 
                 # 1. Config-owned symbol whitelist (intersected with config.SYMBOLS)
                 row = conn.execute("SELECT value FROM system_state WHERE key = 'ALLOWED_SYMBOLS'").fetchone()

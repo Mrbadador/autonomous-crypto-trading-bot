@@ -38,11 +38,51 @@ DATABASES = [
     os.path.join(BASE_DIR, "test_ledger.db")
 ]
 
-CHECKPOINT_INTERVAL_SECS = 300  # Run maintenance every 5 minutes
+import config
+
+CHECKPOINT_INTERVAL_SECS = getattr(config, "DB_INTEGRITY_CHECKPOINT_INTERVAL_SECS", 300)  # Run maintenance every 5 minutes
 RETENTION_DAYS = 7              # Retain ephemeral telemetry for 7 days
 
 _WAL_MODE_WARNED = set()
 _CONSECUTIVE_ERRORS = {}
+
+def get_durable_consecutive_errors(db_name: str, window_sec: float = None) -> int:
+    """
+    Reads previously published db_integrity_<db>_consecutive_errors from system_state.
+    If the row is within window_sec (default 1 x CHECKPOINT_INTERVAL_SECS), returns its
+    integer count; otherwise returns 0 (stale or absent, starting a fresh run).
+    """
+    if window_sec is None:
+        window_sec = float(CHECKPOINT_INTERVAL_SECS)
+    data_db = os.path.join(BASE_DIR, "trading_data.db")
+    if not os.path.exists(data_db):
+        return 0
+    try:
+        with contextlib.closing(sqlite3.connect(data_db, timeout=5.0)) as conn:
+            _ensure_wal(conn, "trading_data.db", 5000)
+            key = f"db_integrity_{db_name}_consecutive_errors"
+            row = conn.execute(
+                "SELECT value, updated_at FROM system_state WHERE key = ?", (key,)
+            ).fetchone()
+            if not row or not row[0] or not row[1]:
+                return 0
+            val_str, u_at = str(row[0]).strip(), str(row[1]).strip()
+            
+            clean_ts = u_at.replace("Z", "+00:00")
+            if "T" not in clean_ts and " " in clean_ts:
+                clean_ts = clean_ts.replace(" ", "T")
+            parsed_dt = datetime.fromisoformat(clean_ts)
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=UTC)
+            
+            age_sec = max(0.0, (datetime.now(UTC) - parsed_dt).total_seconds())
+            if age_sec <= window_sec:
+                return int(val_str)
+            else:
+                return 0
+    except Exception as e:
+        log.warning(f"Failed to read durable consecutive errors for {db_name}: {e}")
+        return 0
 
 def _ensure_wal(conn, db_name: str, busy_timeout_ms: int) -> str:
     """Set busy_timeout first, then attempt WAL, and report the mode actually granted.
@@ -69,20 +109,6 @@ EPHEMERAL_TABLES = [
     {"db": "trading_data.db", "table": "telemetry", "time_col": "timestamp"},
     {"db": "live_paper_trades.db", "table": "telemetry", "time_col": "timestamp"},
     {"db": "live_paper_trades.db", "table": "berserker_telemetry", "time_col": "timestamp"},
-    {
-        "db": "live_paper_trades.db",
-        "table": "open_positions",
-        "time_col": "entry_time",
-        "retention_days": 30,
-        "extra_where": "status IN ('CLOSED', 'FILLED', 'CANCELLED')"
-    },
-    {
-        "db": "live_paper_trades.db",
-        "table": "berserker_open_positions",
-        "time_col": "entry_time",
-        "retention_days": 30,
-        "extra_where": "status IN ('CLOSED', 'FILLED', 'CANCELLED')"
-    },
 ]
 
 def update_system_state(key: str, value: str):
@@ -154,9 +180,13 @@ def run_wal_checkpoints():
             log.info(f"[{db_name}] {results[db_name]}")
         except Exception as e:
             # An exception in this path means checkpoint/check raised (e.g. transient DB lock).
-            # Increment consecutive error counter and publish to system_state.
-            _CONSECUTIVE_ERRORS[db_name] = _CONSECUTIVE_ERRORS.get(db_name, 0) + 1
-            curr_consec = _CONSECUTIVE_ERRORS[db_name]
+            # Increment durable consecutive error counter and publish to system_state.
+            prior_consec = _CONSECUTIVE_ERRORS.get(db_name)
+            if prior_consec is None:
+                prior_consec = get_durable_consecutive_errors(db_name, float(CHECKPOINT_INTERVAL_SECS))
+            curr_consec = prior_consec + 1
+            _CONSECUTIVE_ERRORS[db_name] = curr_consec
+
             statuses[db_name] = "ERROR"
             results[db_name] = f"WAL Checkpoint ERROR (consecutive={curr_consec}, unverified): {e}"
             log.error(f"[{db_name}] 🚨 Checkpoint/integrity pass raised (consecutive={curr_consec}): {e}")

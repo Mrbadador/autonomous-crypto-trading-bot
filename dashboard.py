@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import config
+from conviction_filter import check_database_integrity
 from indicators import (
     detect_momentum_divergence,
     compute_volume_profile,
@@ -1046,28 +1047,43 @@ with st.sidebar:
         st.caption("🟢 **Funding Carry Shield:** Active (Pre-Settlement)")
         st.caption("🟢 **Session Macro Blueprint:** Active (Every 6h / 4x Daily)")
         # Database Quick Check status
-        db_integ_data = query_system_state("db_maintenance_stats", "{}")
-        db_integ_ok = True
+        integ_report = {"is_ok": True, "is_stale": False, "is_corrupt": False, "stale_dbs": [], "corrupt_dbs": [], "latest_utc_dt": None}
         try:
-            db_stats_dict = json.loads(db_integ_data)
-            db_statuses = db_stats_dict.get("integrity", {})
-            for d_name, d_stat in db_statuses.items():
-                if d_stat in ("CORRUPT", "ERROR", "CRITICAL", "BUSY", "DEGRADED"):
-                    db_integ_ok = False
+            if os.path.exists(TRADING_DATA_DB):
+                with connect_readonly(TRADING_DATA_DB) as _conn:
+                    integ_report = check_database_integrity(_conn)
         except Exception:
-            pass
-        st.caption(f"{'🟢' if db_integ_ok else '🚨'} **Database Integrity:** {'Verified OK' if db_integ_ok else 'CRITICAL ERROR'}")
+            integ_report["is_ok"] = False
+            integ_report["is_stale"] = True
+
+        if integ_report["is_ok"]:
+            st.caption("🟢 **Database Integrity:** Verified OK")
+        elif integ_report["is_stale"]:
+            last_ts_str = integ_report["latest_utc_dt"].strftime('%H:%M:%S UTC') if integ_report.get("latest_utc_dt") else "UNKNOWN"
+            st.caption(f"🟠 **Database Integrity:** SIGNAL STALE (last verified {last_ts_str}, daemon not publishing)")
+        else:
+            st.caption("🚨 **Database Integrity:** CRITICAL ERROR")
     st.markdown("---")
     st.caption(f"Last HUD Refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
 # ── Top Database Integrity Alert Banner ─────────────────────────────────────────
-df_corrupt_dbs = query_db(
-    TRADING_DATA_DB,
-    "SELECT key, value FROM system_state WHERE key LIKE 'db_integrity_%' AND UPPER(value) IN ('CRITICAL', 'CORRUPT', 'ERROR')"
-)
-if not df_corrupt_dbs.empty:
-    corrupted_names = [row["key"].replace("db_integrity_", "") for _, row in df_corrupt_dbs.iterrows()]
-    st.error(f"🚨 **DATABASE CORRUPTION DETECTED (Fail-Closed):** {', '.join(corrupted_names)}. New trade entries are blocked.")
+top_integ_report = {"is_ok": True, "is_stale": False, "is_corrupt": False, "stale_dbs": [], "corrupt_dbs": []}
+try:
+    if os.path.exists(TRADING_DATA_DB):
+        with connect_readonly(TRADING_DATA_DB) as _conn:
+            top_integ_report = check_database_integrity(_conn)
+except Exception:
+    top_integ_report["is_ok"] = False
+    top_integ_report["is_stale"] = True
+
+if not top_integ_report["is_ok"]:
+    if top_integ_report["is_corrupt"]:
+        corrupted_names = top_integ_report["corrupt_dbs"]
+        st.error(f"🚨 **DATABASE CORRUPTION DETECTED (Fail-Closed):** {', '.join(corrupted_names)}. New trade entries are BLOCKED.")
+    elif top_integ_report["is_stale"]:
+        stale_names = top_integ_report["stale_dbs"]
+        last_str = top_integ_report["latest_utc_dt"].strftime('%H:%M:%S UTC') if top_integ_report.get("latest_utc_dt") else "UNKNOWN"
+        st.warning(f"🟠 **DATABASE INTEGRITY SIGNAL STALE:** {', '.join(stale_names)} (last verified {last_str}, daemon not publishing). New trade entries are BLOCKED.")
 
 # ── Top Macro & Intelligence Banner ─────────────────────────────────────────
 macro_trend = query_system_state("btc_macro_trend", "BULLISH").upper()

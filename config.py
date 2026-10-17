@@ -97,9 +97,10 @@ SCALPERS_ENABLED              = os.getenv("SCALPERS_ENABLED", "false").lower() i
 # ---------------------------------------------------------------------------
 SUPER_BOT_ENABLED             = os.getenv("SUPER_BOT_ENABLED", "true").lower() in ("true", "1")
 # Maximum age of the market_regime row for opening NEW positions. The classifier republishes
-# roughly every 5 minutes, so 900s tolerates three missed cycles before the router stops
-# trusting it. Stale/absent/unparseable regime data blocks new entries only; managing and
-# exiting live positions is never gated on it.
+# Database Integrity & WAL Maintenance Intervals
+DB_INTEGRITY_CHECKPOINT_INTERVAL_SECS = int(os.getenv("DB_INTEGRITY_CHECKPOINT_INTERVAL_SECS", "300"))
+DB_INTEGRITY_MAX_AGE_SEC              = float(os.getenv("DB_INTEGRITY_MAX_AGE_SEC", str(DB_INTEGRITY_CHECKPOINT_INTERVAL_SECS * 3)))
+
 REGIME_MAX_AGE_SEC            = float(os.getenv("REGIME_MAX_AGE_SEC", "900"))
 GRID_LEVERAGE                 = int(os.getenv("GRID_LEVERAGE", "3"))
 GRID_ALLOCATION_USDT          = float(os.getenv("GRID_ALLOCATION_USDT", "85.0"))  # Proportional Sizing: $85 margin per trade
