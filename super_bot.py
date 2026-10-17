@@ -390,16 +390,26 @@ class SuperBotTrader:
                 now_iso = datetime.now(timezone.utc).isoformat()
                 active_syms = list(active.keys())
                 for sym in active_syms:
-                    conn.execute("UPDATE asset_locks SET heartbeat = ? WHERE symbol = ?", (now_iso, sym))
+                    conn.execute("""
+                        UPDATE asset_locks SET heartbeat = ?
+                        WHERE symbol = ?
+                          AND locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                    """, (now_iso, sym))
 
                 if active_syms:
                     placeholders = ",".join("?" for _ in active_syms)
-                    conn.execute(
-                        f"DELETE FROM asset_locks WHERE symbol NOT IN ({placeholders})",
-                        active_syms,
-                    )
+                    conn.execute(f"""
+                        DELETE FROM asset_locks
+                        WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                          AND symbol NOT IN ({placeholders})
+                          AND (julianday('now') - julianday(heartbeat)) * 86400.0 > 900.0
+                    """, active_syms)
                 else:
-                    conn.execute("DELETE FROM asset_locks")
+                    conn.execute("""
+                        DELETE FROM asset_locks
+                        WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                          AND (julianday('now') - julianday(heartbeat)) * 86400.0 > 900.0
+                    """)
                 conn.commit()
                 
         except Exception as e:
@@ -1481,6 +1491,20 @@ class SuperBotTrader:
         await self.initialize_clients()
         await asyncio.to_thread(self._load_all_positions_sync)
 
+        # Reconcile system_state.SWING_TRADER_ENABLED with config at startup
+        def _reconcile_swing_enabled():
+            try:
+                cfg_val = "1" if getattr(config, "SWING_TRADER_ENABLED", False) else "0"
+                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    conn.execute(
+                        "INSERT INTO system_state (key, value, updated_at) VALUES ('SWING_TRADER_ENABLED', ?, datetime('now')) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                        (cfg_val,)
+                    )
+            except Exception as se_err:
+                log.warning(f"[RECONCILE-SWING-CONFIG-ERR] {se_err}")
+        await asyncio.to_thread(_reconcile_swing_enabled)
+
         log.info(f"[STARTUP-AUDIT] Adopted {len(self.active_positions)} active position(s): {list(self.active_positions.keys())}")
         for sym, pos in self.active_positions.items():
             log.info(f"   -> {sym}: {pos.get('side', 'long').upper()} | Size: {pos.get('size')} | Entry: ${pos.get('entry_price')} | SL: ${pos.get('stop_loss')} | TP: ${pos.get('take_profit')}")
@@ -1581,24 +1605,10 @@ class SuperBotTrader:
                                 len([p for p in self.active_positions.values() if p.get("engine_type") in ("GRID_MAKER", "SCALP_SHORT")]),
                                 round(total_unrealized_pnl, 4), "OPERATIONAL"
                             ))
-                            # Keep swing_trader_telemetry in system_state alive and synchronized
-                            live_swing_telem = {
-                                "engine": "super_bot_orchestrator",
-                                "status": "ONLINE",
-                                "timestamp": now_iso,
-                                "active_positions_count": len(self.active_positions),
-                                "max_locks": self.max_locks,
-                                "active_positions": self.active_positions,
-                                "timeframe": "4h_5m_dual",
-                                "allocation_usdt": getattr(self, "allocation_usdt", 20.0),
-                                "leverage": getattr(self, "grid_leverage", 3)
-                            }
-                            conn.execute(
-                                "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('swing_trader_telemetry', ?, ?)",
-                                (json.dumps(live_swing_telem), now_iso)
-                            )
                             conn.commit()
                     await asyncio.to_thread(_write_telemetry)
+                    # Delegate swing_trader_telemetry exclusively to swing_engine.publish_telemetry()
+                    self.swing_engine.publish_telemetry()
 
             except Exception as e:
                 log.error(f"[SUPER-BOT-LOOP-ERR] {e}")

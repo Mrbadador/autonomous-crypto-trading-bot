@@ -42,6 +42,7 @@ CHECKPOINT_INTERVAL_SECS = 300  # Run maintenance every 5 minutes
 RETENTION_DAYS = 7              # Retain ephemeral telemetry for 7 days
 
 _WAL_MODE_WARNED = set()
+_CONSECUTIVE_ERRORS = {}
 
 def _ensure_wal(conn, db_name: str, busy_timeout_ms: int) -> str:
     """Set busy_timeout first, then attempt WAL, and report the mode actually granted.
@@ -68,8 +69,20 @@ EPHEMERAL_TABLES = [
     {"db": "trading_data.db", "table": "telemetry", "time_col": "timestamp"},
     {"db": "live_paper_trades.db", "table": "telemetry", "time_col": "timestamp"},
     {"db": "live_paper_trades.db", "table": "berserker_telemetry", "time_col": "timestamp"},
-    {"db": "live_paper_trades.db", "table": "open_positions", "time_col": "entry_time"},
-    {"db": "live_paper_trades.db", "table": "berserker_open_positions", "time_col": "entry_time"},
+    {
+        "db": "live_paper_trades.db",
+        "table": "open_positions",
+        "time_col": "entry_time",
+        "retention_days": 30,
+        "extra_where": "status IN ('CLOSED', 'FILLED', 'CANCELLED')"
+    },
+    {
+        "db": "live_paper_trades.db",
+        "table": "berserker_open_positions",
+        "time_col": "entry_time",
+        "retention_days": 30,
+        "extra_where": "status IN ('CLOSED', 'FILLED', 'CANCELLED')"
+    },
 ]
 
 def update_system_state(key: str, value: str):
@@ -113,7 +126,9 @@ def run_wal_checkpoints():
 
             if not integrity_ok:
                 log.critical(f"[{db_name}] 🚨 DATABASE INTEGRITY QUICK_CHECK FAILED: {qc_status}")
+            _CONSECUTIVE_ERRORS[db_name] = 0
             update_system_state(f"db_integrity_{db_name}", "OK" if integrity_ok else "CRITICAL")
+            update_system_state(f"db_integrity_{db_name}_consecutive_errors", "0")
 
             busy = int(res[0]) if res and res[0] is not None else -1
             log_frames = int(res[1]) if res and res[1] is not None else -1
@@ -138,25 +153,31 @@ def run_wal_checkpoints():
             )
             log.info(f"[{db_name}] {results[db_name]}")
         except Exception as e:
-            # An exception in this path is worse than a failed result: the DB was not
-            # verified at all. Route it to the same machine-readable CRITICAL signal.
+            # An exception in this path means checkpoint/check raised (e.g. transient DB lock).
+            # Increment consecutive error counter and publish to system_state.
+            _CONSECUTIVE_ERRORS[db_name] = _CONSECUTIVE_ERRORS.get(db_name, 0) + 1
+            curr_consec = _CONSECUTIVE_ERRORS[db_name]
             statuses[db_name] = "ERROR"
-            results[db_name] = f"WAL Checkpoint ERROR (integrity unverified): {e}"
-            log.error(f"[{db_name}] 🚨 Checkpoint/integrity pass raised before verification: {e}")
+            results[db_name] = f"WAL Checkpoint ERROR (consecutive={curr_consec}, unverified): {e}"
+            log.error(f"[{db_name}] 🚨 Checkpoint/integrity pass raised (consecutive={curr_consec}): {e}")
             update_system_state(f"db_integrity_{db_name}", "ERROR")
+            update_system_state(f"db_integrity_{db_name}_consecutive_errors", str(curr_consec))
     return results, statuses
 
 def prune_ephemeral_records():
     """Prunes high-frequency market tick logs and telemetry older than RETENTION_DAYS."""
     pruned_summary = {}
-    cutoff_dt = datetime.now(UTC) - timedelta(days=RETENTION_DAYS)
-    cutoff_space = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
-    cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S")
     
     for item in EPHEMERAL_TABLES:
         db_path = os.path.join(BASE_DIR, item["db"])
         table = item["table"]
         time_col = item["time_col"]
+        retention = item.get("retention_days", RETENTION_DAYS)
+        extra_where = item.get("extra_where", None)
+        
+        cutoff_dt = datetime.now(UTC) - timedelta(days=retention)
+        cutoff_space = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S")
         
         if not os.path.exists(db_path):
             continue
@@ -170,17 +191,33 @@ def prune_ephemeral_records():
                 )
                 if not cursor.fetchone():
                     continue
-                    
-                # Delete rows older than cutoff (handling both standard space and ISO-T string formats)
+
+                # Inspect schema to see if status column exists
+                cols = [c[1].lower() for c in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                where_clauses = [f"({time_col} < ? OR ({time_col} LIKE '%T%' AND {time_col} < ?))"]
+                params = [cutoff_space, cutoff_iso]
+
+                if "status" in cols:
+                    # Table has a status column: NEVER delete ACTIVE or PENDING_CLOSE rows
+                    where_clauses.append("UPPER(COALESCE(status, '')) NOT IN ('ACTIVE', 'PENDING_CLOSE')")
+                    if extra_where:
+                        where_clauses.append(f"({extra_where})")
+                else:
+                    # If this is an open positions table without a status column, protect live rows
+                    if "open_position" in table.lower():
+                        log.info(f"[{item['db']}] Table {table} has no status column; skipping prune to protect live positions.")
+                        continue
+                    if extra_where and "status" not in extra_where.lower():
+                        where_clauses.append(f"({extra_where})")
+
+                where_sql = " AND ".join(where_clauses)
+                query = f"DELETE FROM {table} WHERE {where_sql}"
                 with conn:
-                    res = conn.execute(
-                        f"DELETE FROM {table} WHERE {time_col} < ? OR ({time_col} LIKE '%T%' AND {time_col} < ?)",
-                        (cutoff_space, cutoff_iso)
-                    )
+                    res = conn.execute(query, tuple(params))
                     deleted = res.rowcount
                 if deleted > 0:
                     pruned_summary[f"{item['db']}.{table}"] = deleted
-                    log.info(f"[{item['db']}] Pruned {deleted} rows older than {RETENTION_DAYS}d from {table}")
+                    log.info(f"[{item['db']}] Pruned {deleted} rows older than {retention}d from {table}")
         except Exception as e:
             log.warning(f"Prune skip for {item['db']}.{table}: {e}")
             

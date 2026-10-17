@@ -1050,9 +1050,9 @@ with st.sidebar:
         db_integ_ok = True
         try:
             db_stats_dict = json.loads(db_integ_data)
-            db_statuses = db_stats_dict.get("statuses", {})
+            db_statuses = db_stats_dict.get("integrity", {})
             for d_name, d_stat in db_statuses.items():
-                if d_stat in ("CORRUPT", "ERROR", "CRITICAL"):
+                if d_stat in ("CORRUPT", "ERROR", "CRITICAL", "BUSY", "DEGRADED"):
                     db_integ_ok = False
         except Exception:
             pass

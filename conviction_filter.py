@@ -24,14 +24,61 @@ class ConvictionBoardroom:
             conn = None
             try:
                 conn = sqlite3.connect(self.db_path, timeout=5.0)
-                # 0. Database Integrity Gate (Fail-Closed on any corrupted or unverified DB)
+                # 0. Database Integrity Gate (Fail-Closed on corrupted, stale, or unverified production DBs)
+                # Expected production databases (test_ledger.db is an offline test artifact, excluded)
+                prod_dbs = ["trading_data.db", "trading_ledger.db", "live_paper_trades.db"]
                 integ_rows = conn.execute(
-                    "SELECT key, value FROM system_state WHERE key LIKE 'db_integrity_%'"
+                    "SELECT key, value, updated_at FROM system_state WHERE key LIKE 'db_integrity_%'"
                 ).fetchall()
-                for i_key, i_val in integ_rows:
-                    val_str = str(i_val or "").strip().upper()
-                    if val_str in ("CRITICAL", "CORRUPT", "ERROR"):
-                        db_name = i_key.replace("db_integrity_", "")
+                integ_map = {}
+                for r in integ_rows:
+                    k, v, u_at = r[0], str(r[1] or "").strip().upper(), r[2]
+                    integ_map[k] = (v, u_at)
+
+                now_utc = datetime.now(timezone.utc)
+                for db_name in prod_dbs:
+                    integ_key = f"db_integrity_{db_name}"
+                    if integ_key not in integ_map:
+                        res["veto"] = {
+                            "execute": False,
+                            "conviction_score": 0.0,
+                            "stage": "database_integrity_stale",
+                            "final_rationale": f"integrity signal stale/absent: {db_name} has no db_integrity status recorded."
+                        }
+                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} has no integrity status (absent). Halting new entries."
+                        return res
+
+                    val_str, u_at = integ_map[integ_key]
+                    # Check staleness: ceiling is 3 x CHECKPOINT_INTERVAL_SECS (900s)
+                    is_stale = False
+                    if not u_at:
+                        is_stale = True
+                    else:
+                        try:
+                            clean_ts = str(u_at).strip().replace("Z", "+00:00")
+                            if "T" not in clean_ts and " " in clean_ts:
+                                clean_ts = clean_ts.replace(" ", "T")
+                            parsed_ts = datetime.fromisoformat(clean_ts)
+                            if parsed_ts.tzinfo is None:
+                                parsed_ts = parsed_ts.replace(tzinfo=timezone.utc)
+                            age_sec = (now_utc - parsed_ts).total_seconds()
+                            if age_sec > 900.0:
+                                is_stale = True
+                        except Exception:
+                            is_stale = True
+
+                    if is_stale:
+                        res["veto"] = {
+                            "execute": False,
+                            "conviction_score": 0.0,
+                            "stage": "database_integrity_stale",
+                            "final_rationale": f"integrity signal stale/absent: {db_name} integrity status is older than 900s or unparseable."
+                        }
+                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} integrity signal is stale (>900s). Halting new entries."
+                        return res
+
+                    # Gate on (CRITICAL or CORRUPT) OR (ERROR and consecutive_errors >= 2)
+                    if val_str in ("CRITICAL", "CORRUPT"):
                         res["veto"] = {
                             "execute": False,
                             "conviction_score": 0.0,
@@ -40,6 +87,28 @@ class ConvictionBoardroom:
                         }
                         res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} reported {val_str}. Halting new order entries."
                         return res
+                    elif val_str == "ERROR":
+                        consec_key = f"db_integrity_{db_name}_consecutive_errors"
+                        consec_cnt = 0
+                        if consec_key in integ_map:
+                            try:
+                                consec_cnt = int(integ_map[consec_key][0])
+                            except Exception:
+                                consec_cnt = 2  # Fail-closed if count is unparseable
+                        else:
+                            # If no explicit consecutive key is found, assume fail-closed (2)
+                            consec_cnt = 2
+                        if consec_cnt >= 2:
+                            res["veto"] = {
+                                "execute": False,
+                                "conviction_score": 0.0,
+                                "stage": "database_integrity_gate",
+                                "final_rationale": f"Database Integrity Gate Veto: {db_name} raised verification ERROR across {consec_cnt} consecutive passes. Halting new entries (Fail-Closed)."
+                            }
+                            res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} has {consec_cnt} consecutive checkpoint errors. Halting new order entries."
+                            return res
+                        else:
+                            log.warning(f"[BOARDROOM] ⚠️ {db_name} reported checkpoint ERROR (transient blip 1/2). Permitting entries while monitoring.")
 
                 # 1. Config-owned symbol whitelist (intersected with config.SYMBOLS)
                 row = conn.execute("SELECT value FROM system_state WHERE key = 'ALLOWED_SYMBOLS'").fetchone()
