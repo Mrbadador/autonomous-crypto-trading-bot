@@ -24,6 +24,23 @@ class ConvictionBoardroom:
             conn = None
             try:
                 conn = sqlite3.connect(self.db_path, timeout=5.0)
+                # 0. Database Integrity Gate (Fail-Closed on any corrupted or unverified DB)
+                integ_rows = conn.execute(
+                    "SELECT key, value FROM system_state WHERE key LIKE 'db_integrity_%'"
+                ).fetchall()
+                for i_key, i_val in integ_rows:
+                    val_str = str(i_val or "").strip().upper()
+                    if val_str in ("CRITICAL", "CORRUPT", "ERROR"):
+                        db_name = i_key.replace("db_integrity_", "")
+                        res["veto"] = {
+                            "execute": False,
+                            "conviction_score": 0.0,
+                            "stage": "database_integrity_gate",
+                            "final_rationale": f"Database Integrity Gate Veto: {db_name} integrity status is {val_str}. Halting new entries (Fail-Closed)."
+                        }
+                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {db_name} reported {val_str}. Halting new order entries."
+                        return res
+
                 # 1. Config-owned symbol whitelist (intersected with config.SYMBOLS)
                 row = conn.execute("SELECT value FROM system_state WHERE key = 'ALLOWED_SYMBOLS'").fetchone()
                 import config as _cfg

@@ -470,7 +470,7 @@ class SwingArchitectTrader:
                         WHERE locked_by IN ('swing_architect', 'super_bot_grid', 'super_bot_scalp_short')
                     """)
         except Exception as e:
-            log.debug(f"[HEARTBEAT-NOTE] Lock heartbeat refresh error: {e}")
+            log.warning(f"[HEARTBEAT-NOTE] Lock heartbeat refresh error: {e}")
         finally:
             if conn:
                 try:

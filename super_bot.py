@@ -386,8 +386,12 @@ class SuperBotTrader:
                 # Mirror ALL active positions to swing engine so manage_active_positions tracks them with ratchets
                 self.swing_engine.active_positions = dict(active)
 
-                # Prune orphaned asset_locks that have no active position
+                # Renew heartbeats for active positions and prune orphaned asset_locks that have no active position
+                now_iso = datetime.now(timezone.utc).isoformat()
                 active_syms = list(active.keys())
+                for sym in active_syms:
+                    conn.execute("UPDATE asset_locks SET heartbeat = ? WHERE symbol = ?", (now_iso, sym))
+
                 if active_syms:
                     placeholders = ",".join("?" for _ in active_syms)
                     conn.execute(
@@ -399,7 +403,7 @@ class SuperBotTrader:
                 conn.commit()
                 
         except Exception as e:
-            log.error(f"[SYNC-ERR] Error adopting positions: {e}")
+            log.warning(f"[SYNC-ERR] Error adopting positions or refreshing lock heartbeats: {e}")
 
     @staticmethod
     def _regime_row_age_sec(raw_ts):
@@ -1577,6 +1581,22 @@ class SuperBotTrader:
                                 len([p for p in self.active_positions.values() if p.get("engine_type") in ("GRID_MAKER", "SCALP_SHORT")]),
                                 round(total_unrealized_pnl, 4), "OPERATIONAL"
                             ))
+                            # Keep swing_trader_telemetry in system_state alive and synchronized
+                            live_swing_telem = {
+                                "engine": "super_bot_orchestrator",
+                                "status": "ONLINE",
+                                "timestamp": now_iso,
+                                "active_positions_count": len(self.active_positions),
+                                "max_locks": self.max_locks,
+                                "active_positions": self.active_positions,
+                                "timeframe": "4h_5m_dual",
+                                "allocation_usdt": getattr(self, "allocation_usdt", 20.0),
+                                "leverage": getattr(self, "grid_leverage", 3)
+                            }
+                            conn.execute(
+                                "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('swing_trader_telemetry', ?, ?)",
+                                (json.dumps(live_swing_telem), now_iso)
+                            )
                             conn.commit()
                     await asyncio.to_thread(_write_telemetry)
 

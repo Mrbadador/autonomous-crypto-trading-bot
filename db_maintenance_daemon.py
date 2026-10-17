@@ -66,6 +66,10 @@ EPHEMERAL_TABLES = [
     {"db": "trading_ledger.db", "table": "macro_market_context", "time_col": "timestamp"},
     {"db": "trading_data.db", "table": "ghost_trades", "time_col": "timestamp"},
     {"db": "trading_data.db", "table": "telemetry", "time_col": "timestamp"},
+    {"db": "live_paper_trades.db", "table": "telemetry", "time_col": "timestamp"},
+    {"db": "live_paper_trades.db", "table": "berserker_telemetry", "time_col": "timestamp"},
+    {"db": "live_paper_trades.db", "table": "open_positions", "time_col": "entry_time"},
+    {"db": "live_paper_trades.db", "table": "berserker_open_positions", "time_col": "entry_time"},
 ]
 
 def update_system_state(key: str, value: str):

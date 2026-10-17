@@ -1045,8 +1045,29 @@ with st.sidebar:
         st.caption(f"🟢 **Rule Enforcement Gate:** Active ({rule_cnt_str})")
         st.caption("🟢 **Funding Carry Shield:** Active (Pre-Settlement)")
         st.caption("🟢 **Session Macro Blueprint:** Active (Every 6h / 4x Daily)")
+        # Database Quick Check status
+        db_integ_data = query_system_state("db_maintenance_stats", "{}")
+        db_integ_ok = True
+        try:
+            db_stats_dict = json.loads(db_integ_data)
+            db_statuses = db_stats_dict.get("statuses", {})
+            for d_name, d_stat in db_statuses.items():
+                if d_stat in ("CORRUPT", "ERROR", "CRITICAL"):
+                    db_integ_ok = False
+        except Exception:
+            pass
+        st.caption(f"{'🟢' if db_integ_ok else '🚨'} **Database Integrity:** {'Verified OK' if db_integ_ok else 'CRITICAL ERROR'}")
     st.markdown("---")
     st.caption(f"Last HUD Refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+
+# ── Top Database Integrity Alert Banner ─────────────────────────────────────────
+df_corrupt_dbs = query_db(
+    TRADING_DATA_DB,
+    "SELECT key, value FROM system_state WHERE key LIKE 'db_integrity_%' AND UPPER(value) IN ('CRITICAL', 'CORRUPT', 'ERROR')"
+)
+if not df_corrupt_dbs.empty:
+    corrupted_names = [row["key"].replace("db_integrity_", "") for _, row in df_corrupt_dbs.iterrows()]
+    st.error(f"🚨 **DATABASE CORRUPTION DETECTED (Fail-Closed):** {', '.join(corrupted_names)}. New trade entries are blocked.")
 
 # ── Top Macro & Intelligence Banner ─────────────────────────────────────────
 macro_trend = query_system_state("btc_macro_trend", "BULLISH").upper()
