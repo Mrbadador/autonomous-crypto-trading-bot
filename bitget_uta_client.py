@@ -710,7 +710,11 @@ class BitgetUTAClient:
                 params["clientOid"] = str(client_oid)[:32]
             res = await self.exchange.private_uta_get_v3_trade_fills(params)
             data = res.get("data", {})
-            fills = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            raw_fills = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            fills = [
+                f for f in raw_fills
+                if self._normalize_symbol(str(f.get("symbol", ""))) == clean_sym
+            ]
             return fills
         except Exception as e:
             log.warning(f"[BITGET-UTA] get_order_fills note for {clean_sym} ({order_id}): {e}")
@@ -727,7 +731,11 @@ class BitgetUTAClient:
             params = {"category": "USDT-FUTURES", "symbol": clean_sym, "startTime": str(since_ms), "limit": "50"}
             res = await self.exchange.private_uta_get_v3_trade_fills(params)
             data = res.get("data", {})
-            fills = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            raw_fills = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            fills = [
+                f for f in raw_fills
+                if self._normalize_symbol(str(f.get("symbol", ""))) == clean_sym
+            ]
             return fills
         except Exception as e:
             log.warning(f"[BITGET-UTA] get_recent_fills note for {clean_sym}: {e}")

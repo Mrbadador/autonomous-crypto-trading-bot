@@ -524,6 +524,181 @@ class TestP29D3TimestampFormat(unittest.TestCase):
                 os.remove(db_path)
 
 
+
+class TestP29D4ExitPriceGuard(unittest.TestCase):
+    """D-4: Verify exit price plausibility validation, fills filtering, and reconciliation script."""
+
+    REAL_SWING_TRADES_SCHEMA = """
+    CREATE TABLE swing_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        exit_price REAL,
+        size REAL NOT NULL,
+        pnl REAL,
+        roe_pct REAL,
+        holding_hours REAL,
+        exit_reason TEXT,
+        notes TEXT,
+        intended_entry_price REAL,
+        actual_fill_price REAL,
+        slippage_bps REAL,
+        fee_paid_usd REAL,
+        fee_maker_usd REAL,
+        fee_taker_usd REAL,
+        funding_usd REAL,
+        funding_source TEXT,
+        gates_snapshot TEXT,
+        status TEXT
+    );
+    """
+
+    def test_d4_validate_exit_price_plausibility_blocks_corrupt_prices(self):
+        from reconciliation_engine import validate_exit_price_plausibility
+
+        # Corrupt cases (must BLOCK):
+        self.assertFalse(validate_exit_price_plausibility("BNB/USDT", "LONG", 751.61, 11.60), "BNB exiting at $11.60 must be blocked!")
+        self.assertFalse(validate_exit_price_plausibility("SOL/USDT", "LONG", 111.3, 0.504), "SOL exiting at $0.504 must be blocked!")
+        self.assertFalse(validate_exit_price_plausibility("BTC/USDT", "LONG", 83149.9, 4855.8), "BTC exiting at $4855.8 must be blocked!")
+        self.assertFalse(validate_exit_price_plausibility("SUI/USDT", "LONG", 1.052, 2.106), "SUI exiting at 100% gain on 5x must be blocked!")
+        self.assertFalse(validate_exit_price_plausibility("ETH/USDT", "LONG", 2422.41, 14.85), "ETH exiting at $14.85 must be blocked!")
+
+        # Invalid prices (must BLOCK):
+        self.assertFalse(validate_exit_price_plausibility("BTC/USDT", "LONG", 0.0, 60000.0), "Zero entry price must be blocked!")
+        self.assertFalse(validate_exit_price_plausibility("BTC/USDT", "LONG", 60000.0, -100.0), "Negative exit price must be blocked!")
+
+        # Directional contradiction (must BLOCK):
+        self.assertFalse(
+            validate_exit_price_plausibility("BTC/USDT", "LONG", 60000.0, 50000.0, size=1.0, pnl=500.0),
+            "LONG with positive PnL but exit well below entry must be blocked!",
+        )
+
+        # Plausible prices (must PASS):
+        self.assertTrue(validate_exit_price_plausibility("BTC/USDT", "LONG", 83149.9, 83422.5), "Normal BTC gain must pass!")
+        self.assertTrue(validate_exit_price_plausibility("ETH/USDT", "LONG", 2422.41, 2415.90), "Normal ETH stop-loss must pass!")
+
+    def test_d4_bitget_uta_client_filters_fills_by_symbol(self):
+        from bitget_uta_client import BitgetUTAClient
+        client = BitgetUTAClient.__new__(BitgetUTAClient)
+        client.exchange = MagicMock()
+        client.ensure_time_sync = AsyncMock()
+
+        raw_exchange_fills = {
+            "data": {
+                "list": [
+                    {"symbol": "BTCUSDT", "orderId": "101", "execPrice": "83000", "execQty": "0.001", "tradeSide": "close"},
+                    {"symbol": "LINKUSDT", "orderId": "102", "execPrice": "11.60", "execQty": "10.0", "tradeSide": "close"},
+                    {"symbol": "ETHUSDT", "orderId": "103", "execPrice": "2400", "execQty": "0.1", "tradeSide": "close"},
+                ]
+            }
+        }
+        client.exchange.private_uta_get_v3_trade_fills = AsyncMock(return_value=raw_exchange_fills)
+
+        # 1. get_order_fills for BTC/USDT must filter out LINK and ETH fills
+        btc_fills = asyncio.run(client.get_order_fills("BTC/USDT", order_id="101"))
+        self.assertEqual(len(btc_fills), 1)
+        self.assertEqual(btc_fills[0]["symbol"], "BTCUSDT")
+
+        # 2. get_recent_fills for LINK/USDT must filter out BTC and ETH fills
+        link_fills = asyncio.run(client.get_recent_fills("LINK/USDT", lookback_mins=15))
+        self.assertEqual(len(link_fills), 1)
+        self.assertEqual(link_fills[0]["symbol"], "LINKUSDT")
+
+    def test_d4_fetch_live_price_staleness_and_symbol_isolation(self):
+        from unittest.mock import patch
+        import time
+        from reconciliation_engine import fetch_live_price
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+            state_file = tf.name
+
+        try:
+            with open(state_file, "w") as f:
+                f.write('{"best_bid": 99999.0, "symbol": "BTC/USDT"}')
+
+            with patch("reconciliation_engine.BASE_DIR", os.path.dirname(state_file)), \
+                 patch("os.path.join", side_effect=lambda *args: state_file if "microstructure_state.json" in args[-1] else os.path.join(*args)):
+
+                # 1. Non-BTC symbol must NEVER read BTC microstructure price
+                non_btc_price = fetch_live_price("ETH/USDT")
+                self.assertNotEqual(non_btc_price, 99999.0, "Non-BTC symbol read BTC microstructure state!")
+
+                # 2. Stale BTC microstructure state (>300s) must be rejected
+                stale_mtime = time.time() - 350.0
+                os.utime(state_file, (stale_mtime, stale_mtime))
+                stale_btc_price = fetch_live_price("BTC/USDT")
+                self.assertNotEqual(stale_btc_price, 99999.0, "Stale (>300s) microstructure state was erroneously accepted!")
+
+                # 3. Fresh BTC microstructure state (<=300s) is accepted
+                fresh_mtime = time.time() - 10.0
+                os.utime(state_file, (fresh_mtime, fresh_mtime))
+                fresh_btc_price = fetch_live_price("BTC/USDT")
+                self.assertEqual(fresh_btc_price, 99999.0, "Fresh BTC microstructure state should be accepted!")
+        finally:
+            if os.path.exists(state_file):
+                os.remove(state_file)
+
+    def test_d4_migration_script_dry_run_and_apply(self):
+        from scripts.reconcile_d4_corrupt_exits import reconcile_corrupt_exits
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute(self.REAL_SWING_TRADES_SCHEMA)
+            # Insert the 9 corrupt entries
+            corrupt_data = [
+                (149, 'BNB/USDT', 'LONG', 751.61, 11.603, 0.2, 2.219, 'STOP_LOSS', 'Gross: $-148.0014 | Fees: $0.2125'),
+                (152, 'APT/USDT', 'LONG', 0.8951, 1.554, 169.09, -0.062, 'tp_hit', 'On-exchange TP_HIT on Bitget UTA (Net: $-0.06, Fee: -$0.182)'),
+                (156, 'SOL/USDT', 'LONG', 111.3, 0.504, 1.4, -1.227, 'STOP_LOSS', 'Gross: $-155.1137 | Fees: $0.2144'),
+                (163, 'BTC/USDT', 'LONG', 83149.9, 4855.83, 0.0009, 0.155, 'breakeven_hit', 'On-exchange BREAKEVEN_HIT on Bitget UTA (Net: $+0.16, Fee: -$0.090)'),
+                (166, 'BNB/USDT', 'LONG', 741.07, 12.038, 0.1, 0.124, 'STOP_LOSS', 'Gross: $-72.9032 | Fees: $0.1492'),
+                (168, 'BTC/USDT', 'LONG', 83213.0, 16.622, 0.0009, 0.396, 'sl_hit', 'On-exchange SL_HIT on Bitget UTA (Net: $+0.40, Fee: -$0.118)'),
+                (170, 'LINK/USDT', 'LONG', 12.894, 1.584, 12.0, 0.494, 'sl_hit', 'On-exchange SL_HIT on Bitget UTA (Net: $+0.49, Fee: -$0.184)'),
+                (172, 'SUI/USDT', 'LONG', 1.052, 2.106, 142.7, 0.154, 'STOP_LOSS', 'Gross: $+150.4656 | Fees: $0.2105'),
+                (192, 'ETH/USDT', 'LONG', 2422.41, 14.85, 0.03, -0.324, 'sl_hit', 'On-exchange SL_HIT on Bitget UTA (Net: $-0.32, Fee: -$0.129)'),
+            ]
+            for row in corrupt_data:
+                conn.execute("""
+                    INSERT INTO swing_trades (id, timestamp, symbol, side, entry_price, exit_price, size, pnl, exit_reason, notes, status)
+                    VALUES (?, '2026-10-14 00:00:00', ?, ?, ?, ?, ?, ?, ?, ?, 'CLOSED')
+                """, row)
+            conn.commit()
+            conn.close()
+
+            # 1. Dry run: must make NO changes
+            res_dry = reconcile_corrupt_exits(db_path, apply_changes=False)
+            self.assertEqual(res_dry, 0)
+            chk_conn = sqlite3.connect(db_path)
+            bnb_row = chk_conn.execute("SELECT exit_price FROM swing_trades WHERE id = 149").fetchone()
+            self.assertAlmostEqual(bnb_row[0], 11.603, places=3, msg="Dry run must NOT alter prices!")
+            chk_conn.close()
+
+            # 2. Apply: backup created, prices reconciled, 0 corrupt remain
+            res_apply = reconcile_corrupt_exits(db_path, apply_changes=True)
+            self.assertEqual(res_apply, 0)
+            chk_conn = sqlite3.connect(db_path)
+            b_cnt = chk_conn.execute("SELECT count(*) FROM swing_trades_backup_d4").fetchone()[0]
+            self.assertEqual(b_cnt, 9, "Backup table must preserve all 9 rows!")
+
+            # Verify no corrupt prices remain
+            corrupt_count = chk_conn.execute("""
+                SELECT count(*) FROM swing_trades
+                WHERE exit_price IS NOT NULL
+                  AND (exit_price / entry_price < 0.70 OR exit_price / entry_price > 1.40)
+            """).fetchone()[0]
+            self.assertEqual(corrupt_count, 0, "No corrupt prices should remain after reconciliation!")
+            chk_conn.close()
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
 

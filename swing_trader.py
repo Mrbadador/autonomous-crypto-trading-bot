@@ -30,6 +30,7 @@ from bitget_uta_client import BitgetUTAClient
 from conviction_filter import ConvictionBoardroom
 from db_manager import DBWriteQueue
 from indicators import detect_momentum_divergence, compute_volume_profile, compute_td_sequential
+from reconciliation_engine import validate_exit_price_plausibility
 
 
 # BUG-07 FIX: Use explicit handler attachment instead of basicConfig()
@@ -2418,10 +2419,14 @@ class SwingArchitectTrader:
                 else:
                     recent_all = await self.uta_client.get_recent_fills(symbol=symbol, lookback_mins=30)
                     opp_order_side = "sell" if is_long else "buy"
+                    clean_sym = self.uta_client._normalize_symbol(symbol)
                     fills = [
                         f for f in recent_all
-                        if str(f.get("tradeSide", "")).lower() == "close"
-                        or str(f.get("side", "")).lower() == opp_order_side
+                        if self.uta_client._normalize_symbol(str(f.get("symbol", ""))) == clean_sym
+                        and (
+                            str(f.get("tradeSide", "")).lower() == "close"
+                            or str(f.get("side", "")).lower() == opp_order_side
+                        )
                     ]
                 if fills:
                     total_fill_qty = sum(float(f.get("execQty", 0.0) or 0.0) for f in fills)
@@ -2430,13 +2435,21 @@ class SwingArchitectTrader:
                     fill_pnl_list = [float(f.get("execPnl", 0.0) or 0.0) for f in fills if f.get("execPnl") is not None]
 
                     if total_fill_qty > 0 and total_fill_val > 0:
-                        actual_exit_price = total_fill_val / total_fill_qty
-                    if total_fill_fee > 0:
-                        actual_exit_fee = total_fill_fee
-                    if fill_pnl_list:
-                        actual_realized_pnl = sum(fill_pnl_list) - (entry_fee + actual_exit_fee)
-
-                    log.info(f"[CLOSE-SPLIT-FILLS] Aggregated {len(fills)} fill tranche(s) for {symbol}: Avg Price=${actual_exit_price:,.4f}, Total Fees=${actual_exit_fee:.4f}")
+                        candidate_exit_p = total_fill_val / total_fill_qty
+                        cand_fee = total_fill_fee if total_fill_fee > 0 else exit_fee
+                        cand_pnl = (sum(fill_pnl_list) - (entry_fee + cand_fee)) if fill_pnl_list else None
+                        if validate_exit_price_plausibility(symbol, pos_side, entry_p, candidate_exit_p, qty, cand_pnl):
+                            actual_exit_price = candidate_exit_p
+                            if total_fill_fee > 0:
+                                actual_exit_fee = total_fill_fee
+                            if fill_pnl_list:
+                                actual_realized_pnl = cand_pnl
+                            log.info(f"[CLOSE-SPLIT-FILLS] Aggregated {len(fills)} fill tranche(s) for {symbol}: Avg Price=${actual_exit_price:,.4f}, Total Fees=${actual_exit_fee:.4f}")
+                        else:
+                            log.error(
+                                f"[CORRUPT-FILL-GUARD] Rejecting aggregated fill price ${candidate_exit_p:,.4f} for {symbol} "
+                                f"(entry=${entry_p:,.4f}). Preserving fallback exit price ${actual_exit_price:,.4f}"
+                            )
             except Exception as fill_err:
                 log.debug(f"[CLOSE-FILLS-NOTE] Note aggregating fills for {symbol}: {fill_err}")
 

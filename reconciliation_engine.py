@@ -65,18 +65,81 @@ def update_system_state(key: str, value: str):
     except Exception as e:
         log.debug(f"Failed to update system_state ({key}): {e}")
 
+def validate_exit_price_plausibility(
+    symbol: str,
+    side: str,
+    entry_p: float,
+    exit_p: float,
+    size: float = 0.0,
+    pnl: float | None = None,
+) -> bool:
+    """
+    Validates that an exit price is economically plausible relative to entry price.
+    Prevents corrupt fills from other symbols or failed order books from being recorded
+    into swing_trades or trades tables.
+
+    Rules:
+    1. Both entry_p and exit_p must be positive numbers.
+    2. Exit price must not deviate by more than 30% from entry price (0.70 <= exit_p / entry_p <= 1.40).
+    3. If size > 0 and pnl is provided:
+       - For LONG: if pnl > 0.5, exit_p cannot be significantly below entry_p (exit_p >= entry_p * 0.95).
+       - For SHORT: if pnl > 0.5, exit_p cannot be significantly above entry_p (exit_p <= entry_p * 1.05).
+    """
+    try:
+        e_p = float(entry_p)
+        x_p = float(exit_p)
+        if e_p <= 0.0 or x_p <= 0.0:
+            log.warning(f"[EXIT-PRICE-GUARD] Implausible non-positive price for {symbol}: entry={e_p}, exit={x_p}")
+            return False
+
+        ratio = x_p / e_p
+        if ratio < 0.70 or ratio > 1.40:
+            log.warning(
+                f"[EXIT-PRICE-GUARD] Extreme price divergence for {symbol} ({side}): "
+                f"entry={e_p}, exit={x_p} (ratio={ratio:.4f} outside [0.70, 1.40])"
+            )
+            return False
+
+        if pnl is not None and size is not None and float(size) > 0.0:
+            pnl_val = float(pnl)
+            norm_side = str(side).upper()
+            if "LONG" in norm_side:
+                if pnl_val > 0.5 and x_p < e_p * 0.95:
+                    log.warning(
+                        f"[EXIT-PRICE-GUARD] Directional contradiction for LONG {symbol}: "
+                        f"PnL=${pnl_val:+.2f} but exit={x_p} < entry={e_p}*0.95"
+                    )
+                    return False
+            elif "SHORT" in norm_side:
+                if pnl_val > 0.5 and x_p > e_p * 1.05:
+                    log.warning(
+                        f"[EXIT-PRICE-GUARD] Directional contradiction for SHORT {symbol}: "
+                        f"PnL=${pnl_val:+.2f} but exit={x_p} > entry={e_p}*1.05"
+                    )
+                    return False
+
+        return True
+    except Exception as err:
+        log.warning(f"[EXIT-PRICE-GUARD] Error validating exit price for {symbol}: {err}")
+        return False
+
+
 def fetch_live_price(symbol: str) -> float | None:
     """Fetches fast live price from Bitget futures ticker (or Binance fallback) or local cache."""
     sym_clean = str(symbol).upper().replace("/", "").replace("-", "")
     
-    # 1. Try local JSON microstructure fast feed if available
+    # 1. Try local JSON microstructure fast feed if available, fresh (<= 300s), and exactly BTC
     try:
         state_file = os.path.join(BASE_DIR, "microstructure_state.json")
-        if os.path.exists(state_file) and "BTC" in sym_clean:
-            with open(state_file, "r") as f:
-                data = json.load(f)
-                if "best_bid" in data and data["best_bid"] > 0:
-                    return float(data["best_bid"])
+        if os.path.exists(state_file) and sym_clean in ("BTCUSDT", "BTCUSDC"):
+            file_age = time.time() - os.path.getmtime(state_file)
+            if file_age <= 300.0:
+                with open(state_file, "r") as f:
+                    data = json.load(f)
+                    if "best_bid" in data and float(data["best_bid"]) > 0:
+                        return float(data["best_bid"])
+            else:
+                log.debug(f"[PRICE-ORACLE] microstructure_state.json is stale ({file_age:.1f}s > 300s). Bypassing.")
     except Exception:
         pass
 
@@ -447,6 +510,10 @@ async def audit_live_exchange_positions():
                                     log.debug(f"[RECONCILER-FILLS-NOTE] Error querying fills for {s_sym}: {fill_fetch_err}")
 
                                 # Handle ground-truth fill availability honestly (Stage 1 Quantitative Invariant)
+                                if exit_p is not None and not validate_exit_price_plausibility(s_sym, norm_side, entry_p, exit_p, qty, actual_pnl):
+                                    log.error(f"[RECONCILER-CORRUPT-EXIT] Exit price ${exit_p} for {s_sym} failed plausibility check vs entry ${entry_p}. Setting exit_p=None (UNRECONCILED).")
+                                    exit_p = None
+
                                 is_unreconciled = False
                                 if exit_p is None or exit_p <= 0:
                                     is_unreconciled = True
