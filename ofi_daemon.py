@@ -506,19 +506,29 @@ class MultiSymbolOFIDaemon:
             import time as _time  # explicit local import avoids closure UnboundLocalError in asyncio.to_thread
             pid = os.getpid()
             temp_file = f"{STATE_FILE}.tmp.{pid}"
+            renamed_successfully = False
             for i in range(5):
                 try:
                     with open(temp_file, "w", encoding="utf-8") as f:
                         json.dump(export_payload, f)
+                        f.flush()
+                        os.fsync(f.fileno())
                     os.replace(temp_file, STATE_FILE)
+                    renamed_successfully = True
                     break
+                except OSError as e:
+                    is_win_lock = getattr(e, "winerror", None) == 5 or isinstance(e, PermissionError)
+                    if i == 4:
+                        log.error(f"Failed to write microstructure state after 5 attempts: {e}")
+                    else:
+                        _time.sleep(0.10 * (i + 1) if is_win_lock else 0.05)
                 except Exception as e:
                     if i == 4:
                         log.error(f"Failed to write microstructure state: {e}")
                     else:
                         _time.sleep(0.05)
                 finally:
-                    if os.path.exists(temp_file):
+                    if not renamed_successfully and os.path.exists(temp_file):
                         try:
                             os.remove(temp_file)
                         except Exception:
@@ -620,6 +630,8 @@ async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
                         for db_file in ["trading_data.db", "trading_ledger.db"]:
                             try:
                                 with sqlite3.connect(db_file, timeout=10.0) as conn:
+                                    conn.execute("PRAGMA journal_mode=WAL;")
+                                    conn.execute("PRAGMA busy_timeout=10000;")
                                     if tape_intel:
                                         conn.execute("""
                                             INSERT OR REPLACE INTO system_state (key, value, updated_at)
@@ -630,8 +642,8 @@ async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
                                             INSERT OR REPLACE INTO system_state (key, value, updated_at)
                                             VALUES ('ai_ghost_walls', ?, ?)
                                         """, (json.dumps(ghost_walls), now_iso))
-                            except Exception:
-                                pass
+                            except Exception as db_err:
+                                log.debug(f"[TAPE-WHISPERER-DB-NOTE] {db_file}: {db_err}")
                     await asyncio.to_thread(_db_write)
         except Exception as e:
             log.warning(f"[WARN] Error in Tape Whisperer background loop: {e}")
@@ -715,8 +727,8 @@ async def stream_level2_data():
                                     t_side = str(tr.get("side") or "buy").lower()
                                     if t_price > 0 and t_size > 0:
                                         daemon.process_trade_tick(symbol, t_price, t_size, t_side)
-                                except Exception:
-                                    pass
+                                except Exception as tr_err:
+                                    log.debug(f"[OFI-TRADE-PARSE-NOTE] {symbol}: {tr_err}")
                             continue
 
                         # Handle 15-level L2 depth feed
@@ -731,8 +743,8 @@ async def stream_level2_data():
                                     if not verify_bitget_crc32_checksum(bids, asks, int(chk)):
                                         log.warning(f"[WARN] CRC32 Checksum mismatch for {symbol}! Re-syncing book.")
                                         daemon.symbol_states[symbol].reset()
-                                except Exception:
-                                    pass
+                                except Exception as crc_err:
+                                    log.debug(f"[OFI-CRC32-NOTE] {symbol}: {crc_err}")
 
                             if bids and asks:
                                 daemon.process_tick(symbol, bids, asks)
