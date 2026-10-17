@@ -1110,8 +1110,73 @@ class TestP29D8DbIntegrityErrorWindow(unittest.TestCase):
                 os.remove(temp_db)
 
 
+class TestP29D9ReconcilerLockPruneOwnerScope(unittest.TestCase):
+    """D-9: Verify reconciler bulk asset_locks prune is strictly scoped to known fleet lock owners."""
+
+    def test_d9_all_reconciler_asset_lock_deletes_have_locked_by_predicate(self):
+        with open("reconciliation_engine.py", "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        locked_by_constants = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and "locked_by in ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')" in node.value.lower()
+        ]
+        self.assertEqual(
+            len(locked_by_constants), 4,
+            f"Expected exactly 4 asset_locks DELETE query fragments with locked_by scope, found {len(locked_by_constants)}"
+        )
+
+    def test_d9_bulk_prune_preserves_external_locks(self):
+        import reconciliation_engine
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            temp_db = tf.name
+
+        try:
+            conn = sqlite3.connect(temp_db)
+            conn.execute("""
+                CREATE TABLE asset_locks (
+                    symbol TEXT PRIMARY KEY,
+                    locked_by TEXT NOT NULL,
+                    locked_at TEXT NOT NULL,
+                    reason TEXT,
+                    heartbeat TEXT NOT NULL
+                );
+            """)
+            stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=1200)).strftime("%Y-%m-%d %H:%M:%S")
+            # 1. Fleet lock (should be pruned)
+            conn.execute("INSERT INTO asset_locks VALUES ('BTC/USDT', 'swing_architect', ?, 'test', ?)", (stale_ts, stale_ts))
+            # 2. External locks (MUST NOT be pruned)
+            conn.execute("INSERT INTO asset_locks VALUES ('ETH/USDT', 'operator_manual', ?, 'test', ?)", (stale_ts, stale_ts))
+            conn.execute("INSERT INTO asset_locks VALUES ('SOL/USDT', 'experimental_subsystem', ?, 'test', ?)", (stale_ts, stale_ts))
+            conn.commit()
+
+            # Execute bulk prune (with empty live_symbols)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "DELETE FROM asset_locks WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect') "
+                "AND (julianday(?) - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0",
+                (now_iso,)
+            )
+            conn.commit()
+
+            remaining = {r[0]: r[1] for r in conn.execute("SELECT symbol, locked_by FROM asset_locks").fetchall()}
+            conn.close()
+
+            self.assertNotIn("BTC/USDT", remaining, "Stale fleet lock for BTC/USDT should have been pruned!")
+            self.assertIn("ETH/USDT", remaining, "External lock for ETH/USDT must NOT be pruned!")
+            self.assertEqual(remaining["ETH/USDT"], "operator_manual")
+            self.assertIn("SOL/USDT", remaining, "External lock for SOL/USDT must NOT be pruned!")
+            self.assertEqual(remaining["SOL/USDT"], "experimental_subsystem")
+        finally:
+            if os.path.exists(temp_db):
+                os.remove(temp_db)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

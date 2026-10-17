@@ -1078,12 +1078,14 @@ async def audit_live_exchange_positions():
                             placeholders = ",".join("?" for _ in live_symbols)
                             stale_cur = conn.execute(
                                 f"DELETE FROM asset_locks WHERE symbol NOT IN ({placeholders}) "
+                                f"AND locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect') "
                                 f"AND (julianday(?) - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0",
                                 (*list(live_symbols), now_iso)
                             )
                         else:
                             stale_cur = conn.execute(
-                                "DELETE FROM asset_locks WHERE (julianday(?) - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0",
+                                "DELETE FROM asset_locks WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect') "
+                                "AND (julianday(?) - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0",
                                 (now_iso,)
                             )
                         if stale_cur.rowcount and stale_cur.rowcount > 0:
