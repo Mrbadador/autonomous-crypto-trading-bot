@@ -830,7 +830,7 @@ class DatabaseManager:
                 MAX(pnl) as best_trade,
                 MIN(pnl) as worst_trade
             FROM trades 
-            WHERE timestamp > datetime('now', '-1 day')
+            WHERE replace(substr(timestamp, 1, 19), 'T', ' ') > datetime('now', '-1 day')
         """
         try:
             with self._get_conn() as conn:
@@ -951,7 +951,7 @@ class DatabaseManager:
                     try:
                         cutoff = f"datetime('now', '-{days} days')"
                         deleted = conn.execute(
-                            f"DELETE FROM {table} WHERE timestamp < {cutoff}"
+                            f"DELETE FROM {table} WHERE replace(substr(timestamp, 1, 19), 'T', ' ') < {cutoff}"
                         ).rowcount
                         results[table] = deleted
                         if deleted > 0:

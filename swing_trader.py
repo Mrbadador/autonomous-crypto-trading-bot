@@ -2476,14 +2476,14 @@ class SwingArchitectTrader:
             gates_snapshot_str = json.dumps(pos["gates_snapshot"])
 
         # Record in swing_trades history (with deduplication check)
-        now_iso = datetime.now(UTC).isoformat()
+        now_ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         notes_str = f"Gross: ${gross_pnl:+.4f} | Fees: ${fee_paid_usd:.4f} (M:${fee_maker_usd:.4f}/T:${fee_taker_usd:.4f}) | Funding: ${funding_usd:+.4f} ({funding_source}) | {pos.get('notes', '')}".strip(" |")
         def _finalize_db():
             with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                 existing = conn.execute("""
                     SELECT id FROM swing_trades
                     WHERE symbol = ? AND ABS(entry_price - ?) < 0.0001
-                    AND (timestamp >= datetime('now', '-15 minutes') OR timestamp >= datetime('now', '-15 minutes', 'utc'))
+                    AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes')
                 """, (symbol, entry_p)).fetchone()
                 if existing:
                     log.info(f"[SWING-DEDUP] Trade {symbol} already recorded by reconciler (ID: {existing[0]}). Updating with accurate fills.")
@@ -2511,7 +2511,7 @@ class SwingArchitectTrader:
                         )
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        now_iso, symbol, pos_side, entry_p, actual_exit_price, qty, pnl, roe_pct,
+                        now_ts, symbol, pos_side, entry_p, actual_exit_price, qty, pnl, roe_pct,
                         holding_hours, reason, notes_str, intended_entry, actual_fill_entry,
                         pos_slippage_bps, fee_paid_usd, fee_maker_usd, fee_taker_usd,
                         funding_usd, funding_source, gates_snapshot_str, 'CLOSED'

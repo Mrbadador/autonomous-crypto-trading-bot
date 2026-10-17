@@ -398,5 +398,132 @@ class TestP29D2AssetLockLifecycle(unittest.TestCase):
                 os.remove(db_path)
 
 
+
+class TestP29D3TimestampFormat(unittest.TestCase):
+    """D-3: Verify timestamp normalization across writers, readers, and backfill script."""
+
+    REAL_SWING_TRADES_SCHEMA = """
+    CREATE TABLE swing_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        exit_price REAL NOT NULL,
+        size REAL NOT NULL,
+        pnl REAL,
+        roe_pct REAL,
+        holding_hours REAL,
+        exit_reason TEXT,
+        notes TEXT,
+        intended_entry_price REAL,
+        actual_fill_price REAL,
+        slippage_bps REAL,
+        fee_paid_usd REAL,
+        fee_maker_usd REAL,
+        fee_taker_usd REAL,
+        funding_usd REAL,
+        funding_source TEXT,
+        gates_snapshot TEXT,
+        status TEXT
+    );
+    """
+
+    def test_d3_ast_extracted_queries_use_normalized_timestamps(self):
+        # 1. swing_trader.py
+        with open("swing_trader.py", "r", encoding="utf-8") as f:
+            st_src = f.read()
+        self.assertIn("replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes')", st_src)
+        self.assertIn('.strftime("%Y-%m-%d %H:%M:%S")', st_src)
+
+        # 2. reconciliation_engine.py
+        with open("reconciliation_engine.py", "r", encoding="utf-8") as f:
+            rec_src = f.read()
+        self.assertEqual(
+            rec_src.count("replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes')"),
+            2,
+            "Expected 2 occurrences of normalized timestamp query in reconciliation_engine.py (Step 1 and Step 4)",
+        )
+
+        # 3. db_manager.py
+        with open("db_manager.py", "r", encoding="utf-8") as f:
+            db_src = f.read()
+        self.assertIn("replace(substr(timestamp, 1, 19), 'T', ' ') > datetime('now', '-1 day')", db_src)
+        self.assertIn("replace(substr(timestamp, 1, 19), 'T', ' ') < {cutoff}", db_src)
+
+    def test_d3_query_matches_both_iso_and_space_timestamps(self):
+        from datetime import datetime, timezone
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(self.REAL_SWING_TRADES_SCHEMA)
+            now_dt = datetime.now(timezone.utc)
+            now_iso = now_dt.isoformat()
+            now_space = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            conn.execute(
+                "INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size) VALUES (?, 'BTC/USDT', 'LONG', 60000, 61000, 1.0)",
+                (now_iso,),
+            )
+            conn.execute(
+                "INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size) VALUES (?, 'ETH/USDT', 'LONG', 3000, 3100, 1.0)",
+                (now_space,),
+            )
+            conn.commit()
+
+            matched = conn.execute("""
+                SELECT symbol FROM swing_trades
+                WHERE replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes')
+            """).fetchall()
+            matched_syms = [r[0] for r in matched]
+            self.assertIn("BTC/USDT", matched_syms, "ISO timestamp failed to match normalized query!")
+            self.assertIn("ETH/USDT", matched_syms, "Space timestamp failed to match normalized query!")
+        finally:
+            conn.close()
+
+    def test_d3_backfill_script_dry_run_and_apply(self):
+        from scripts.backfill_d3_timestamps import backfill_timestamps
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute(self.REAL_SWING_TRADES_SCHEMA)
+            # Insert 5 ISO format rows and 3 space format rows
+            for i in range(5):
+                conn.execute(
+                    "INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size) VALUES (?, 'SOL/USDT', 'LONG', 100, 105, 1.0)",
+                    (f"2026-10-17T12:0{i}:00.123456+00:00",),
+                )
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO swing_trades (timestamp, symbol, side, entry_price, exit_price, size) VALUES (?, 'AVAX/USDT', 'LONG', 20, 22, 1.0)",
+                    (f"2026-10-17 14:0{i}:00",),
+                )
+            conn.commit()
+            conn.close()
+
+            # 1. Dry run: 0 rows modified
+            res_dry = backfill_timestamps(db_path, apply_changes=False)
+            self.assertEqual(res_dry, 0)
+            chk_conn = sqlite3.connect(db_path)
+            iso_cnt = chk_conn.execute("SELECT count(*) FROM swing_trades WHERE timestamp LIKE '%T%'").fetchone()[0]
+            self.assertEqual(iso_cnt, 5, "Dry run must NOT modify any rows!")
+            chk_conn.close()
+
+            # 2. Apply: backup created, 5 rows updated, 0 ISO remain
+            res_apply = backfill_timestamps(db_path, apply_changes=True)
+            self.assertEqual(res_apply, 0)
+            chk_conn = sqlite3.connect(db_path)
+            iso_cnt_post = chk_conn.execute("SELECT count(*) FROM swing_trades WHERE timestamp LIKE '%T%'").fetchone()[0]
+            self.assertEqual(iso_cnt_post, 0, "All ISO rows must be normalized!")
+            backup_cnt = chk_conn.execute("SELECT count(*) FROM swing_trades_backup_d3").fetchone()[0]
+            self.assertEqual(backup_cnt, 8, "Backup table must preserve all 8 rows!")
+            chk_conn.close()
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+
 if __name__ == "__main__":
     unittest.main()
+

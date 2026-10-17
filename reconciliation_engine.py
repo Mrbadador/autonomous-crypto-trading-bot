@@ -500,7 +500,7 @@ async def audit_live_exchange_positions():
                                 
                                 # Check if engine already closed & recorded this trade in closed_tbl recently (last 15 minutes)
                                 recent_close = conn.execute(
-                                    f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND (timestamp >= datetime('now', '-15 minutes') OR timestamp >= datetime('now', '-15 minutes', 'utc')) ORDER BY rowid DESC LIMIT 1",
+                                    f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') ORDER BY rowid DESC LIMIT 1",
                                     (s_sym, s_sym.replace('/', ''), entry_p, entry_p)
                                 ).fetchone()
                                 
@@ -842,7 +842,7 @@ async def audit_live_exchange_positions():
                                 
                                 # Check if engine already closed & recorded this trade in closed_tbl recently (last 15 minutes)
                                 recent_close = conn.execute(
-                                    f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND (timestamp >= datetime('now', '-15 minutes') OR timestamp >= datetime('now', '-15 minutes', 'utc')) ORDER BY rowid DESC LIMIT 1",
+                                    f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') ORDER BY rowid DESC LIMIT 1",
                                     (sym, sym.replace('/', ''), entry_p, entry_p)
                                 ).fetchone()
                                 
