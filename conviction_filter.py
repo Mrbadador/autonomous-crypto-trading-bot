@@ -78,7 +78,7 @@ class ConvictionBoardroom:
                     if row_crash and row_crash[0]:
                         crash_val = str(row_crash[0]).upper()
                         crash_ts = row_crash[1]
-                        # TTL Guard: scout loop runs every 1-4 hours; if older than 4h (14400s), fail-to-NORMAL
+                        # TTL Guard: scout loop runs every 15m-4h; if CRITICAL, preserve veto even if stale (fail-closed)
                         is_stale = False
                         if crash_ts:
                             try:
@@ -88,8 +88,12 @@ class ConvictionBoardroom:
                                     updated_dt = updated_dt.replace(tzinfo=timezone.utc)
                                 age_sec = (datetime.now(timezone.utc) - updated_dt).total_seconds()
                                 if age_sec > 14400.0:
-                                    is_stale = True
-                                    log.warning(f"[BOARDROOM-BIS] ⚠️ funding_crash_risk is stale ({age_sec:.1f}s > 14400s). Failing to NORMAL.")
+                                    if crash_val == "CRITICAL":
+                                        is_stale = False
+                                        log.critical(f"[BOARDROOM-BIS] 🚨 funding_crash_risk is CRITICAL and stale ({age_sec:.1f}s > 14400s). Enforcing FAIL-CLOSED (veto preserved).")
+                                    else:
+                                        is_stale = True
+                                        log.warning(f"[BOARDROOM-BIS] ⚠️ funding_crash_risk is stale ({age_sec:.1f}s > 14400s, val={crash_val}). Holding NORMAL.")
                             except Exception as ts_err:
                                 # N-11 FIX: Bounded fail-safe. If timestamp is corrupt, do NOT blindly fail-open if the reading is CRITICAL.
                                 # Maintain defensive shield to prevent bypassing risk during telemetry corruption.
@@ -382,7 +386,9 @@ class ConvictionBoardroom:
 
             def _persist_debate_sync():
                 try:
-                    with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                        conn.execute("PRAGMA journal_mode=WAL;")
+                        conn.execute("PRAGMA busy_timeout=5000;")
                         conn.execute(
                             "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('latest_ai_debate', ?, ?)",
                             (json.dumps(debate_record), now_str)

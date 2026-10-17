@@ -232,7 +232,7 @@ async def _query_gemini_cloud(session: aiohttp.ClientSession | None, prompt: str
                     elif resp.status == 404:
                         _set_model_cooldown("gemini", model_name, 86400.0, reason="HTTP 404 model unavailable")
                         continue
-                    elif resp.status in (429, 503):
+                    elif resp.status in (429, 503, 504):
                         err_txt = await resp.text()
                         is_daily = ("free_tier_requests" in err_txt or "Quota exceeded" in err_txt or "per day" in err_txt.lower())
                         cd_sec = 1800.0 if is_daily else 60.0
@@ -384,14 +384,15 @@ async def _query_groq_cloud_with_rotation(session: aiohttp.ClientSession | None,
                             _key_index = _key_index % len(keys)
                     continue  # Instantly retry query with the next available, healthy key
                 
-                if status in (429, 503):
+                if status in (429, 503, 504):
                     is_daily_tpd = ("tokens per day" in text.lower() or "(tpd)" in text.lower() or "requests per day" in text.lower() or "(rpd)" in text.lower())
                     if is_daily_tpd:
-                        # Organization-wide daily limit on this specific model: cool down model for 30m and switch model immediately!
+                        # Cool down model for 30m AND rotate API key so separate-account keys are tried immediately
                         _set_model_cooldown("groq", active_model, 1800.0, reason="Daily TPD/RPD limit reached")
+                        await rotate_groq_key(current_key)
                         continue
                     else:
-                        # Per-minute TPM/RPM burst or 503: cool down model briefly (45s) so next attempt uses sibling model AND rotate key
+                        # Per-minute TPM/RPM burst or 503/504: cool down model briefly (45s) so next attempt uses sibling model AND rotate key
                         _set_model_cooldown("groq", active_model, 45.0, reason=f"HTTP {status} burst limit")
                         await rotate_groq_key(current_key)
                         await asyncio.sleep(min(backoff, 1.5))
