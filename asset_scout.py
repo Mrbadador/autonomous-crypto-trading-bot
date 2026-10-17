@@ -20,8 +20,11 @@ yield_hunter = FundingArbitrageur(capital=500.0, min_annual_yield=0.08)
 
 
 def init_db(db_path="trading_data.db"):
+    conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=60.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
         with conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS active_fleet_config (
@@ -31,10 +34,15 @@ def init_db(db_path="trading_data.db"):
                     updated_at TEXT
                 )
             """)
-        conn.close()
     except Exception as e:
         log.critical(f"Failed to init active_fleet_config table: {e}")
         raise
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def get_top_futures_pairs(limit=50):
     """
@@ -458,14 +466,24 @@ def run_scout():
 
                         funding_crash_state = "CRITICAL" if (high_funding and btc_roc_negative) else "NORMAL"
                         for db_name in ["trading_data.db", "trading_ledger.db"]:
+                            conn_cr = None
                             try:
-                                with sqlite3.connect(db_name, timeout=5.0) as conn_cr:
+                                conn_cr = sqlite3.connect(db_name, timeout=10.0)
+                                conn_cr.execute("PRAGMA journal_mode=WAL;")
+                                conn_cr.execute("PRAGMA busy_timeout=10000;")
+                                with conn_cr:
                                     conn_cr.execute("""
                                         INSERT OR REPLACE INTO system_state (key, value, updated_at)
                                         VALUES ('funding_crash_risk', ?, ?)
                                     """, (funding_crash_state, datetime.now(timezone.utc).isoformat()))
-                            except Exception:
-                                pass
+                            except Exception as cr_err:
+                                log.warning(f"Failed to write funding_crash_risk to {db_name}: {cr_err}")
+                            finally:
+                                if conn_cr:
+                                    try:
+                                        conn_cr.close()
+                                    except Exception:
+                                        pass
 
                         valid_opps = yield_hunter.evaluate_opportunities(funding_rates)
                         for opp in valid_opps:
@@ -522,6 +540,7 @@ def run_scout():
                 attempts = 3
                 success = False
                 while attempts > 0 and not success:
+                    conn = None
                     try:
                         conn = sqlite3.connect("trading_data.db", timeout=60.0)
                         conn.execute("PRAGMA journal_mode=WAL;")
@@ -562,7 +581,14 @@ def run_scout():
                             time.sleep(2.0)
                         else:
                             log.error(f"Failed to update active fleet config database after 3 attempts: {e}")
+                    finally:
+                        if conn:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
             else:
+                conn = None
                 try:
                     conn = sqlite3.connect("trading_data.db", timeout=10.0)
                     conn.execute("PRAGMA journal_mode=WAL;")
@@ -572,9 +598,14 @@ def run_scout():
                             INSERT OR REPLACE INTO system_state (key, value, updated_at)
                             VALUES ('current_status_asset_scout', 'OFFLINE', ?)
                         """, (datetime.now(UTC).isoformat(),))
-                    conn.close()
-                except Exception:
-                    pass
+                except Exception as off_err:
+                    log.warning(f"Failed to record OFFLINE status for asset_scout: {off_err}")
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
                     
         cycle_count += 1
         log.info(f"[ASSET_SCOUT] Cycle #{cycle_count} complete. Sleeping 15 minutes until next AI Liquidity sweep...")
