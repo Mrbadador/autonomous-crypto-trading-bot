@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 import importlib
 import os
 import sqlite3
+import shutil
 import tempfile
 import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -1172,6 +1173,82 @@ class TestP29D9ReconcilerLockPruneOwnerScope(unittest.TestCase):
         finally:
             if os.path.exists(temp_db):
                 os.remove(temp_db)
+
+
+class TestP29D10MicrostructureGuardSymbolScope(unittest.TestCase):
+    """
+    D-10 (P2): Verify microstructure guard queries oracle_microstructure
+    with symbol filter and read-only connection, avoiding cross-symbol veto.
+    """
+
+    def test_d10_ast_oracle_ms_query_has_symbol_filter_and_mode_ro(self):
+        with open("microstructure_guard.py", "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        found_query = False
+        found_mode_ro = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "oracle_microstructure" in node.value and "SELECT" in node.value:
+                    found_query = True
+                    self.assertIn("WHERE", node.value.upper(), "oracle_microstructure query must include WHERE clause!")
+                    self.assertIn("symbol", node.value.lower(), "oracle_microstructure query must filter on symbol!")
+                if "file:trading_ledger.db?mode=ro" in node.value:
+                    found_mode_ro = True
+
+        self.assertTrue(found_query, "Must find oracle_microstructure SELECT query in microstructure_guard.py")
+        self.assertTrue(found_mode_ro, "Must use read-only URI 'file:trading_ledger.db?mode=ro'")
+
+    def test_d10_functional_symbol_scoped_oracle_veto(self):
+        import asyncio
+        from microstructure_guard import MicrostructureGuard
+
+        guard = MicrostructureGuard()
+        guard.active_veto = True
+
+        # In-memory or temp DB with oracle_microstructure
+        temp_dir = tempfile.mkdtemp()
+        temp_ledger = os.path.join(temp_dir, "trading_ledger.db")
+        try:
+            with sqlite3.connect(temp_ledger) as conn:
+                conn.execute("""
+                    CREATE TABLE oracle_microstructure (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT,
+                        symbol TEXT,
+                        liquidity_imbalance REAL,
+                        vacuum_detected INTEGER,
+                        bid_wall_price REAL,
+                        bid_wall_size REAL,
+                        ask_wall_price REAL,
+                        ask_wall_size REAL,
+                        signal_multiplier REAL
+                    )
+                """)
+                # Insert severe ask imbalance for BTC/USDT only
+                conn.execute("""
+                    INSERT INTO oracle_microstructure (timestamp, symbol, liquidity_imbalance, vacuum_detected, signal_multiplier)
+                    VALUES (datetime('now'), 'BTC/USDT', -0.55, 0, 1.0)
+                """)
+                conn.commit()
+
+            # Mock sqlite3.connect to point to our test ledger
+            orig_connect = sqlite3.connect
+            def patched_connect(dbname, *args, **kwargs):
+                if "trading_ledger.db" in str(dbname):
+                    return orig_connect(temp_ledger)
+                return orig_connect(dbname, *args, **kwargs)
+
+            with patch("sqlite3.connect", side_effect=patched_connect):
+                # 1. BTCUSDT (long) should be VETOED by the -0.55 imbalance
+                ok_btc, reason_btc = asyncio.run(guard.evaluate_pre_trade_veto({"symbol": "BTCUSDT", "side": "long"}))
+                self.assertFalse(ok_btc, f"BTCUSDT long should be vetoed by severe ask imbalance, got: {ok_btc}, {reason_btc}")
+
+                # 2. ETHUSDT (long) has NO records in oracle_microstructure -> should NOT be vetoed
+                ok_eth, reason_eth = asyncio.run(guard.evaluate_pre_trade_veto({"symbol": "ETHUSDT", "side": "long"}))
+                self.assertTrue(ok_eth, f"ETHUSDT long should NOT be vetoed by BTC's order book, got: {ok_eth}, {reason_eth}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

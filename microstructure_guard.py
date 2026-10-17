@@ -756,13 +756,16 @@ class MicrostructureGuard:
             # 4. Live Order Book Microstructure Table Inspection (oracle_microstructure)
             try:
                 import sqlite3 as _sqlite3
+                # Match both slash format ("BTC/USDT") and raw format ("BTCUSDT")
+                sym_with_slash = f"{symbol[:-4]}/{symbol[-4:]}" if len(symbol) > 4 and "/" not in str(raw_symbol) else str(raw_symbol)
                 def _check_oracle_ms():
-                    with _sqlite3.connect("trading_ledger.db", timeout=3.0) as conn:
+                    with _sqlite3.connect("file:trading_ledger.db?mode=ro", uri=True, timeout=3.0) as conn:
                         return conn.execute("""
                             SELECT liquidity_imbalance, vacuum_detected, bid_wall_price, ask_wall_price, signal_multiplier
                             FROM oracle_microstructure
+                            WHERE symbol = ? OR symbol = ?
                             ORDER BY id DESC LIMIT 1
-                        """).fetchone()
+                        """, (sym_with_slash, str(raw_symbol))).fetchone()
                 ms_row = await asyncio.to_thread(_check_oracle_ms)
                 if ms_row:
                     liq_imbalance, vac_detected, bid_w, ask_w, sig_mult = (
@@ -775,16 +778,20 @@ class MicrostructureGuard:
                     # Veto if severe order book imbalance opposes trade direction
                     if trade_side in ("long", "buy") and liq_imbalance < -0.40:
                         if self.active_veto:
-                            log.warning(f"[VETO] Severe Ask Liquidity Pressure (Imbalance: {liq_imbalance:.2f}). Blocking Long trade.")
+                            log.warning(f"[VETO] Severe Ask Liquidity Pressure for {symbol} (Imbalance: {liq_imbalance:.2f}). Blocking Long trade.")
                             return False, f"Order Book Imbalance Veto ({liq_imbalance:+.2f})"
                     elif trade_side in ("short", "sell") and liq_imbalance > 0.40:
                         if self.active_veto:
-                            log.warning(f"[VETO] Severe Bid Liquidity Wall (Imbalance: {liq_imbalance:.2f}). Blocking Short trade.")
+                            log.warning(f"[VETO] Severe Bid Liquidity Wall for {symbol} (Imbalance: {liq_imbalance:.2f}). Blocking Short trade.")
                             return False, f"Order Book Imbalance Veto ({liq_imbalance:+.2f})"
 
                     # Vacuum caution
                     if vac_detected == 1:
-                        log.info(f"[MICROSTRUCTURE] Liquidity Vacuum Flag Active (Multiplier: {sig_mult:.2f}).")
+                        log.info(f"[MICROSTRUCTURE] Liquidity Vacuum Flag Active for {symbol} (Multiplier: {sig_mult:.2f}).")
+                else:
+                    # Policy decision: live_oracle streams BTC/USDT depth by design. For non-BTC or missing-telemetry assets,
+                    # log explicitly that LOB imbalance check is bypassed rather than silently skipping.
+                    log.info(f"[MICROSTRUCTURE] No oracle_microstructure telemetry for {symbol} (oracle streams BTC/USDT); skipping LOB imbalance check.")
             except Exception as ms_err:
                 log.debug(f"Oracle microstructure table read note: {ms_err}")
 
@@ -792,7 +799,7 @@ class MicrostructureGuard:
             try:
                 import sqlite3 as _sqlite3
                 def _check_ai_tape():
-                    with _sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                    with _sqlite3.connect("file:trading_data.db?mode=ro", uri=True, timeout=3.0) as conn:
                         t_intel = conn.execute("SELECT value FROM system_state WHERE key = 'order_flow_tape_intel'").fetchone()
                         g_walls = conn.execute("SELECT value FROM system_state WHERE key = 'ai_ghost_walls'").fetchone()
                         return (t_intel[0] if t_intel else None, g_walls[0] if g_walls else None)
