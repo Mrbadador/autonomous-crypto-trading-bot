@@ -19,7 +19,7 @@ import glob
 import sqlite3
 import logging
 import contextlib
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, timezone, UTC, timedelta
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
@@ -51,6 +51,11 @@ def get_durable_consecutive_errors(db_name: str, window_sec: float = None) -> in
     Reads previously published db_integrity_<db>_consecutive_errors from system_state.
     If the row is within window_sec (default 1 x CHECKPOINT_INTERVAL_SECS), returns its
     integer count; otherwise returns 0 (stale or absent, starting a fresh run).
+
+    NOTE (R2): get_durable_consecutive_errors reads trading_data.db, so when trading_data.db
+    is the locked DB the counter resets to 1 every pass and never escalates; the escalation
+    path is inert for that DB. Only the 900s staleness backstop blocks entries when trading_data.db
+    is locked/unreachable.
     """
     if window_sec is None:
         window_sec = float(CHECKPOINT_INTERVAL_SECS)
@@ -113,20 +118,26 @@ EPHEMERAL_TABLES = [
 
 def update_system_state(key: str, value: str):
     """Safely writes a key-value record to the system_state table."""
-    try:
-        data_db = os.path.join(BASE_DIR, "trading_data.db")
-        with contextlib.closing(sqlite3.connect(data_db, timeout=10.0)) as conn:
-            with conn:
-                _ensure_wal(conn, "trading_data.db", 10000)
-                conn.execute(
-                    "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now')) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                    (key, value)
-                )
-    except Exception as e:
-        # A silently dropped health write is itself a fault: downstream guards gate on
-        # freshness of these keys, so callers must be able to see the publish failure.
-        log.warning(f"Failed to update system_state ({key}): {e}")
+    update_system_state_batch([(key, value)])
+
+def update_system_state_batch(kvs: list) -> bool:
+    """
+    Atomically writes a batch of (key, value) pairs to the system_state table in a single transaction.
+    Returns True on success. Raises an exception on failure so callers know the write failed.
+    """
+    if not kvs:
+        return True
+    data_db = os.path.join(BASE_DIR, "trading_data.db")
+    with contextlib.closing(sqlite3.connect(data_db, timeout=10.0)) as conn:
+        with conn:
+            _ensure_wal(conn, "trading_data.db", 10000)
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            conn.executemany(
+                "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                [(k, v, now_str) for (k, v) in kvs]
+            )
+    return True
 
 def run_wal_checkpoints():
     """Runs non-blocking WAL checkpoints and PRAGMA quick_check across all databases.
@@ -152,9 +163,23 @@ def run_wal_checkpoints():
 
             if not integrity_ok:
                 log.critical(f"[{db_name}] 🚨 DATABASE INTEGRITY QUICK_CHECK FAILED: {qc_status}")
-            _CONSECUTIVE_ERRORS[db_name] = 0
-            update_system_state(f"db_integrity_{db_name}", "OK" if integrity_ok else "CRITICAL")
-            update_system_state(f"db_integrity_{db_name}_consecutive_errors", "0")
+            
+            # Atomic publish of status and counter in ONE transaction
+            status_val = "OK" if integrity_ok else "CRITICAL"
+            try:
+                update_system_state_batch([
+                    (f"db_integrity_{db_name}", status_val),
+                    (f"db_integrity_{db_name}_consecutive_errors", "0")
+                ])
+                _CONSECUTIVE_ERRORS[db_name] = 0
+            except Exception as pub_err:
+                log.error(f"[{db_name}] 🚨 Failed to publish integrity status/counter to system_state: {pub_err}")
+                prior_consec = _CONSECUTIVE_ERRORS.get(db_name)
+                if prior_consec is None:
+                    prior_consec = get_durable_consecutive_errors(db_name, float(CHECKPOINT_INTERVAL_SECS))
+                curr_consec = prior_consec + 1
+                _CONSECUTIVE_ERRORS[db_name] = curr_consec
+                raise pub_err
 
             busy = int(res[0]) if res and res[0] is not None else -1
             log_frames = int(res[1]) if res and res[1] is not None else -1
@@ -179,8 +204,9 @@ def run_wal_checkpoints():
             )
             log.info(f"[{db_name}] {results[db_name]}")
         except Exception as e:
-            # An exception in this path means checkpoint/check raised (e.g. transient DB lock).
-            # Increment durable consecutive error counter and publish to system_state.
+            # An exception in this path means checkpoint/check raised (e.g. transient DB lock)
+            # OR publishing to system_state failed.
+            # Increment durable consecutive error counter and publish to system_state in ONE atomic transaction.
             prior_consec = _CONSECUTIVE_ERRORS.get(db_name)
             if prior_consec is None:
                 prior_consec = get_durable_consecutive_errors(db_name, float(CHECKPOINT_INTERVAL_SECS))
@@ -190,8 +216,13 @@ def run_wal_checkpoints():
             statuses[db_name] = "ERROR"
             results[db_name] = f"WAL Checkpoint ERROR (consecutive={curr_consec}, unverified): {e}"
             log.error(f"[{db_name}] 🚨 Checkpoint/integrity pass raised (consecutive={curr_consec}): {e}")
-            update_system_state(f"db_integrity_{db_name}", "ERROR")
-            update_system_state(f"db_integrity_{db_name}_consecutive_errors", str(curr_consec))
+            try:
+                update_system_state_batch([
+                    (f"db_integrity_{db_name}", "ERROR"),
+                    (f"db_integrity_{db_name}_consecutive_errors", str(curr_consec))
+                ])
+            except Exception as batch_err:
+                log.warning(f"[{db_name}] Failed to atomically publish ERROR status and consecutive errors: {batch_err}")
     return results, statuses
 
 def prune_ephemeral_records():

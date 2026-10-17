@@ -68,10 +68,25 @@ def check_database_integrity(conn, max_age_sec: float = None):
         consec_key = f"db_integrity_{db_name}_consecutive_errors"
         consec_cnt = 0
         if consec_key in integ_map:
+            c_val_str, c_u_at = integ_map[consec_key]
             try:
-                consec_cnt = int(integ_map[consec_key][0])
+                consec_cnt = int(c_val_str)
+                # Check if counter row's updated_at is older than status row's updated_at
+                if parsed_dt is not None:
+                    c_clean_ts = str(c_u_at or "").strip().replace("Z", "+00:00")
+                    if "T" not in c_clean_ts and " " in c_clean_ts:
+                        c_clean_ts = c_clean_ts.replace(" ", "T")
+                    c_parsed_dt = datetime.fromisoformat(c_clean_ts)
+                    if c_parsed_dt.tzinfo is None:
+                        c_parsed_dt = c_parsed_dt.replace(tzinfo=timezone.utc)
+                    # If counter row was updated before the status row, it is stale/unpaired
+                    if c_parsed_dt < parsed_dt:
+                        consec_cnt = max(consec_cnt, 2)
             except Exception:
                 consec_cnt = 2
+        else:
+            # If counter row is absent, fail-closed at 2 when status is not OK
+            consec_cnt = 2
 
         details[db_name] = (val_str, age_sec, consec_cnt)
 

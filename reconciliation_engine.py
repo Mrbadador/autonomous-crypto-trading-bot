@@ -544,7 +544,12 @@ async def audit_live_exchange_positions():
                                 # (already recorded by the engine, or our insert reported exactly 1 row).
                                 if ledger_write_ok:
                                     conn.execute(f"DELETE FROM {tbl} WHERE symbol = ? AND side = ?", (s_sym, row_dict.get("side", norm_side)))
-                                    conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (s_sym,))
+                                    conn.execute("""
+                                        DELETE FROM asset_locks
+                                        WHERE symbol = ?
+                                          AND locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
+                                    """, (s_sym,))
                                     pruned_count += 1
                                 else:
                                     log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{s_sym} — closed-trade row not written; will retry next pass")
@@ -884,7 +889,12 @@ async def audit_live_exchange_positions():
                                 # 2. Delete from open positions and commit immediately — only when the ledger row is confirmed
                                 if ledger_write_ok:
                                     conn.execute(f"DELETE FROM {tbl} WHERE symbol = ?", (sym,))
-                                    conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (sym,))
+                                    conn.execute("""
+                                        DELETE FROM asset_locks
+                                        WHERE symbol = ?
+                                          AND locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
+                                    """, (sym,))
                                     pruned_count += 1
                                 else:
                                     log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{sym} — closed-trade row not written; will retry next pass")
@@ -945,12 +955,12 @@ async def audit_live_exchange_positions():
                             placeholders = ",".join("?" for _ in live_symbols)
                             stale_cur = conn.execute(
                                 f"DELETE FROM asset_locks WHERE symbol NOT IN ({placeholders}) "
-                                f"AND (julianday(?) - julianday(heartbeat)) * 86400.0 > 900.0",
+                                f"AND (julianday(?) - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0",
                                 (*list(live_symbols), now_iso)
                             )
                         else:
                             stale_cur = conn.execute(
-                                "DELETE FROM asset_locks WHERE (julianday(?) - julianday(heartbeat)) * 86400.0 > 900.0",
+                                "DELETE FROM asset_locks WHERE (julianday(?) - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0",
                                 (now_iso,)
                             )
                         if stale_cur.rowcount and stale_cur.rowcount > 0:
