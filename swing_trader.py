@@ -422,16 +422,21 @@ class SwingArchitectTrader:
                 except Exception:
                     pass
 
-    def _release_lock_sync(self, symbol: str):
-        """Releases exclusive asset lock for symbol across all unified Super Bot engines."""
+    def _release_lock_sync(self, symbol: str, owner: str = "swing_architect") -> int:
+        """Releases exclusive asset lock for symbol and specific owner (defaults to 'swing_architect')."""
         conn = None
+        deleted = 0
         try:
             conn = sqlite3.connect("trading_data.db", timeout=10.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout=10000;")
             with conn:
-                conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = 'swing_architect'", (symbol,))
-            log.info(f"[LOCK-RELEASED] Exclusive Mutex Lock freed for {symbol}. Intraday bots unblocked.")
+                cur = conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = ?", (symbol, owner))
+                deleted = cur.rowcount
+            if deleted > 0:
+                log.info(f"[LOCK-RELEASED] Exclusive Mutex Lock freed for {symbol} (owner={owner}, rows={deleted}). Intraday bots unblocked.")
+            else:
+                log.debug(f"[LOCK-RELEASE-NOOP] No active lock found for {symbol} (owner={owner}, rows=0).")
         except Exception as e:
             log.error(f"[LOCK-ERROR] Failed to release lock for {symbol}: {e}")
         finally:
@@ -440,9 +445,10 @@ class SwingArchitectTrader:
                     conn.close()
                 except Exception:
                     pass
+        return deleted
 
     def _refresh_heartbeats_sync(self):
-        """Refreshes heartbeat for all actively locked assets and prunes orphaned Super Bot locks."""
+        """Refreshes heartbeat for all actively locked assets and prunes orphaned Super Bot locks (>900s)."""
         now_iso = datetime.now(UTC).isoformat()
         conn = None
         try:
@@ -452,22 +458,36 @@ class SwingArchitectTrader:
             with conn:
                 active_symbols = list(self.active_positions.keys())
                 for sym in active_symbols:
+                    pos = self.active_positions.get(sym, {})
+                    owner = pos.get("lock_owner")
+                    if not owner:
+                        eng_type = pos.get("engine_type")
+                        notes = str(pos.get("notes", "")).lower()
+                        if eng_type == "GRID_MAKER" or "grid" in notes or "chop" in notes:
+                            owner = "super_bot_grid"
+                        elif eng_type == "SCALP_SHORT" or "scalp_short" in notes or "scalp short" in notes:
+                            owner = "super_bot_scalp_short"
+                        else:
+                            owner = "swing_architect"
                     conn.execute("""
                         UPDATE asset_locks SET heartbeat = ?
                         WHERE symbol = ?
-                    """, (now_iso, sym))
-                # Prune orphaned locks whose positions are no longer active
+                          AND locked_by = ?
+                    """, (now_iso, sym, owner))
+                # Prune orphaned locks whose positions are no longer active and exceeded 900s TTL
                 if active_symbols:
                     placeholders = ",".join("?" for _ in active_symbols)
                     conn.execute(f"""
                         DELETE FROM asset_locks
                         WHERE locked_by IN ('swing_architect', 'super_bot_grid', 'super_bot_scalp_short')
                           AND symbol NOT IN ({placeholders})
+                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
                     """, active_symbols)
                 else:
                     conn.execute("""
                         DELETE FROM asset_locks
                         WHERE locked_by IN ('swing_architect', 'super_bot_grid', 'super_bot_scalp_short')
+                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
                     """)
         except Exception as e:
             log.warning(f"[HEARTBEAT-NOTE] Lock heartbeat refresh error: {e}")
@@ -2263,6 +2283,17 @@ class SwingArchitectTrader:
         if not pos:
             return
 
+        owner = pos.get("lock_owner")
+        if not owner:
+            eng_type = pos.get("engine_type")
+            notes = str(pos.get("notes", "")).lower()
+            if eng_type == "GRID_MAKER" or "grid" in notes or "chop" in notes:
+                owner = "super_bot_grid"
+            elif eng_type == "SCALP_SHORT" or "scalp_short" in notes or "scalp short" in notes:
+                owner = "super_bot_scalp_short"
+            else:
+                owner = "swing_architect"
+
         # Q-4 DEFENSE: Refuse to dispatch live exchange close order for unknown non-whitelisted symbols
         configured_symbols = set(getattr(config, "SYMBOLS", []))
         if configured_symbols and symbol not in configured_symbols:
@@ -2271,7 +2302,7 @@ class SwingArchitectTrader:
             def _clean_unknown_db():
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                     conn.execute("DELETE FROM swing_open_positions WHERE symbol = ?", (symbol,))
-                    conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = 'swing_architect'", (symbol,))
+                    conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = ?", (symbol, owner))
                     conn.commit()
             await asyncio.to_thread(_clean_unknown_db)
             return
@@ -2494,8 +2525,8 @@ class SwingArchitectTrader:
         self.active_positions.pop(symbol, None)
 
         # Release the exclusive asset lock so scalpers can resume
-        await asyncio.to_thread(self._release_lock_sync, symbol)
-        log.info(f"[POSITION-CLOSED] {symbol} trade finalized. Mutex lock released.")
+        deleted_locks = await asyncio.to_thread(self._release_lock_sync, symbol, owner)
+        log.info(f"[POSITION-CLOSED] {symbol} trade finalized. Mutex lock released (owner={owner}, rows={deleted_locks}).")
 
         # Enforce Anti-Whipsaw Cooldown (Rule #166) if closed by stop-loss or loss
         if "stop" in reason.lower() or "sl" in reason.lower() or pnl < 0:

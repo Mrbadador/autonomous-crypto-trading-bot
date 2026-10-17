@@ -27,7 +27,6 @@ import sqlite3
 import tempfile
 import importlib
 from datetime import datetime, timezone, timedelta
-import pytest
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -69,16 +68,31 @@ def test_r5_swing_trader_ast_extracted_sql_lock_scoping():
       Symbol 'SOL/USDT' owned by 'super_bot_grid' must NOT be deleted by swing_architect release.
     """
     st_path = os.path.join(BASE_DIR, "swing_trader.py")
-    st_queries = extract_sql_calls(st_path, "DELETE FROM asset_locks")
-    assert 433 in st_queries, "Could not find _release_lock_sync query at line 433"
-    assert 2262 in st_queries, "Could not find _clean_unknown_db query at line 2262"
+    st_queries = extract_sql_calls(st_path, "DELETE FROM asset_locks WHERE symbol = ?")
+    
+    # Locate queries inside _release_lock_sync and _clean_unknown_db
+    with open(st_path, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=st_path)
 
-    sql_433 = st_queries[433]
-    sql_2262 = st_queries[2262]
+    release_sql = None
+    clean_sql = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "_release_lock_sync":
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call) and sub.lineno in st_queries:
+                        release_sql = st_queries[sub.lineno]
+            elif node.name == "_clean_unknown_db":
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call) and sub.lineno in st_queries:
+                        clean_sql = st_queries[sub.lineno]
+
+    assert release_sql is not None, "Could not find _release_lock_sync DELETE query"
+    assert clean_sql is not None, "Could not find _clean_unknown_db DELETE query"
 
     # Check that source SQL contains owner guard
-    assert "locked_by = 'swing_architect'" in sql_433
-    assert "locked_by = 'swing_architect'" in sql_2262
+    assert "locked_by" in release_sql
+    assert "locked_by" in clean_sql
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
         db_path = tf.name
@@ -95,8 +109,9 @@ def test_r5_swing_trader_ast_extracted_sql_lock_scoping():
         )
         conn.commit()
 
-        # Execute AST-extracted swing_trader.py:433 SQL targeting SOL/USDT
-        conn.execute(sql_433, ("SOL/USDT",))
+        # Execute AST-extracted _release_lock_sync SQL targeting SOL/USDT for swing_architect
+        params_sol = ("SOL/USDT", "swing_architect") if release_sql.count("?") >= 2 else ("SOL/USDT",)
+        conn.execute(release_sql, params_sol)
         conn.commit()
 
         # Assert super_bot_grid lock SURVIVES
@@ -104,8 +119,9 @@ def test_r5_swing_trader_ast_extracted_sql_lock_scoping():
         assert row is not None, "Race defect! swing_trader deleted super_bot_grid lock!"
         assert row[1] == "super_bot_grid"
 
-        # Execute AST-extracted swing_trader.py:2262 SQL targeting SOL/USDT
-        conn.execute(sql_2262, ("SOL/USDT",))
+        # Execute AST-extracted _clean_unknown_db SQL targeting SOL/USDT for swing_architect
+        params_clean_sol = ("SOL/USDT", "swing_architect") if clean_sql.count("?") >= 2 else ("SOL/USDT",)
+        conn.execute(clean_sql, params_clean_sol)
         conn.commit()
 
         row = conn.execute("SELECT symbol, locked_by FROM asset_locks WHERE symbol = 'SOL/USDT'").fetchone()
@@ -119,8 +135,9 @@ def test_r5_swing_trader_ast_extracted_sql_lock_scoping():
         )
         conn.commit()
 
-        # Execute AST-extracted swing_trader.py:433 targeting AVAX/USDT
-        conn.execute(sql_433, ("AVAX/USDT",))
+        # Execute AST-extracted _release_lock_sync targeting AVAX/USDT for swing_architect
+        params_avax = ("AVAX/USDT", "swing_architect") if release_sql.count("?") >= 2 else ("AVAX/USDT",)
+        conn.execute(release_sql, params_avax)
         conn.commit()
 
         # Assert swing_architect's OWN lock IS deleted
@@ -265,3 +282,14 @@ def test_r7_reconciler_ast_extracted_sql_lock_scoping():
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
+
+
+if __name__ == "__main__":
+    import inspect
+    tests = [obj for name, obj in inspect.getmembers(sys.modules[__name__]) if name.startswith("test_") and inspect.isfunction(obj)]
+    passed = 0
+    for t in tests:
+        print(f"Running {t.__name__}...")
+        t()
+        passed += 1
+    print(f"ALL {passed} P2-8 REGRESSION TESTS PASSED!")

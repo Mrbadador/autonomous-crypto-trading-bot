@@ -9,6 +9,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import tests.conftest as quarantine
 
@@ -167,21 +168,24 @@ class TestP29D1SetLeverage(unittest.TestCase):
             "kijun": 59000.0,
         }
 
-        asyncio.run(
-            trader.open_swing_position(
-                symbol="BTCUSDT",
-                ind_4h=ind_4h,
-                direction="LONG",
-                conviction_score=0.85,
+        # Mock ai_engine.tune_exit_geometry to prevent external network calls during test
+        import ai_engine
+        with patch.object(ai_engine, "tune_exit_geometry", new=AsyncMock(return_value={})):
+            asyncio.run(
+                trader.open_swing_position(
+                    symbol="BTCUSDT",
+                    ind_4h=ind_4h,
+                    direction="LONG",
+                    conviction_score=0.85,
+                )
             )
-        )
 
         # Must release lock and veto order placement
         trader._release_lock_sync.assert_called_with("BTCUSDT")
         trader.client.create_order.assert_not_called()
 
     def test_d1_open_swing_position_vetoes_on_leverage_exception(self):
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock, MagicMock, patch
         from swing_trader import SwingArchitectTrader
 
         trader = SwingArchitectTrader.__new__(SwingArchitectTrader)
@@ -220,17 +224,178 @@ class TestP29D1SetLeverage(unittest.TestCase):
             "kijun": 2920.0,
         }
 
-        asyncio.run(
-            trader.open_swing_position(
-                symbol="ETHUSDT",
-                ind_4h=ind_4h,
-                direction="LONG",
-                conviction_score=0.80,
+        import ai_engine
+        with patch.object(ai_engine, "tune_exit_geometry", new=AsyncMock(return_value={})):
+            asyncio.run(
+                trader.open_swing_position(
+                    symbol="ETHUSDT",
+                    ind_4h=ind_4h,
+                    direction="LONG",
+                    conviction_score=0.80,
+                )
             )
-        )
 
         trader._release_lock_sync.assert_called_with("ETHUSDT")
         trader.client.create_order.assert_not_called()
+
+
+class TestP29D2AssetLockLifecycle(unittest.TestCase):
+    """D-2: Verify asset-lock lifecycle in both directions, owner threading, and 900s age guard."""
+
+    REAL_ASSET_LOCKS_SCHEMA = """
+    CREATE TABLE asset_locks (
+        symbol TEXT PRIMARY KEY,
+        locked_by TEXT NOT NULL,
+        locked_at TEXT NOT NULL,
+        reason TEXT,
+        heartbeat TEXT NOT NULL
+    );
+    """
+
+    def test_d2_ast_extracted_queries_have_owner_and_age_guards(self):
+        st_path = os.path.join(quarantine.PROJECT_ROOT, "swing_trader.py")
+        with open(st_path, "r", encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src, filename=st_path)
+
+        release_query = None
+        heartbeat_update = None
+        heartbeat_deletes = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == "_release_lock_sync":
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Call):
+                            for a in sub.args:
+                                if isinstance(a, ast.Constant) and isinstance(a.value, str) and "DELETE FROM asset_locks" in a.value:
+                                    release_query = a.value
+                elif node.name == "_refresh_heartbeats_sync":
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Call):
+                            for a in sub.args:
+                                val = None
+                                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                                    val = a.value
+                                elif isinstance(a, ast.JoinedStr):
+                                    val = "".join(part.value for part in a.values if isinstance(part, ast.Constant))
+                                if val:
+                                    if "UPDATE asset_locks SET heartbeat" in val:
+                                        heartbeat_update = val
+                                    elif "DELETE FROM asset_locks" in val:
+                                        heartbeat_deletes.append(val)
+
+        self.assertIsNotNone(release_query, "Could not find DELETE query in _release_lock_sync")
+        self.assertIn("locked_by", release_query)
+
+        self.assertIsNotNone(heartbeat_update, "Could not find UPDATE query in _refresh_heartbeats_sync")
+        self.assertIn("locked_by", heartbeat_update)
+
+        self.assertGreaterEqual(len(heartbeat_deletes), 2, "Expected at least 2 DELETE queries in _refresh_heartbeats_sync")
+        for dq in heartbeat_deletes:
+            self.assertIn("86400.0 > 900.0", dq, f"Expected 900s age predicate in heartbeat delete: {dq}")
+
+    def test_d2_release_lock_sync_owner_isolation_in_memory(self):
+        from unittest.mock import patch
+        from swing_trader import SwingArchitectTrader
+        trader = SwingArchitectTrader.__new__(SwingArchitectTrader)
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute(self.REAL_ASSET_LOCKS_SCHEMA)
+            now_ts = "2026-10-18 00:00:00"
+
+            # Seed super_bot_grid lock on SOL/USDT and swing_architect lock on AVAX/USDT
+            conn.execute(
+                "INSERT INTO asset_locks VALUES ('SOL/USDT', 'super_bot_grid', ?, 'grid_order', ?)",
+                (now_ts, now_ts),
+            )
+            conn.execute(
+                "INSERT INTO asset_locks VALUES ('AVAX/USDT', 'swing_architect', ?, 'swing_breakout', ?)",
+                (now_ts, now_ts),
+            )
+            conn.commit()
+            conn.close()
+
+            real_connect = sqlite3.connect
+            # Monkey-patch sqlite3.connect to connect to our isolated test db
+            with patch("sqlite3.connect", side_effect=lambda *a, **kw: real_connect(db_path)):
+                # Attempt release by swing_architect on SOL/USDT -> must return 0 deleted, grid lock survives!
+                del_cnt = trader._release_lock_sync("SOL/USDT", owner="swing_architect")
+                self.assertEqual(del_cnt, 0)
+                
+                chk_conn = real_connect(db_path)
+                surviving = chk_conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = 'SOL/USDT'").fetchone()
+                chk_conn.close()
+                self.assertIsNotNone(surviving)
+                self.assertEqual(surviving[0], "super_bot_grid")
+
+                # Release by super_bot_grid on SOL/USDT -> must return 1 deleted, grid lock freed!
+                del_cnt_grid = trader._release_lock_sync("SOL/USDT", owner="super_bot_grid")
+                self.assertEqual(del_cnt_grid, 1)
+                chk_conn = real_connect(db_path)
+                freed = chk_conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = 'SOL/USDT'").fetchone()
+                chk_conn.close()
+                self.assertIsNone(freed)
+
+                # Release by swing_architect on AVAX/USDT -> must return 1 deleted
+                del_cnt_avax = trader._release_lock_sync("AVAX/USDT", owner="swing_architect")
+                self.assertEqual(del_cnt_avax, 1)
+                chk_conn = real_connect(db_path)
+                freed_avax = chk_conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = 'AVAX/USDT'").fetchone()
+                chk_conn.close()
+                self.assertIsNone(freed_avax)
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+    def test_d2_refresh_heartbeats_does_not_prune_fresh_unmirrored_locks(self):
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import patch
+        from swing_trader import SwingArchitectTrader
+        trader = SwingArchitectTrader.__new__(SwingArchitectTrader)
+        trader.active_positions = {}  # Empty active positions (simulating lag before sync)
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute(self.REAL_ASSET_LOCKS_SCHEMA)
+            now_dt = datetime.now(timezone.utc)
+            fresh_ts = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+            stale_ts = (now_dt - timedelta(seconds=1200)).strftime("%Y-%m-%d %H:%M:%S")
+
+            # Insert fresh grid lock (0 age) and stale swing lock (1200s age)
+            conn.execute(
+                "INSERT INTO asset_locks VALUES ('SOL/USDT', 'super_bot_grid', ?, 'grid', ?)",
+                (fresh_ts, fresh_ts),
+            )
+            conn.execute(
+                "INSERT INTO asset_locks VALUES ('NEAR/USDT', 'swing_architect', ?, 'stale', ?)",
+                (stale_ts, stale_ts),
+            )
+            conn.commit()
+            conn.close()
+
+            real_connect = sqlite3.connect
+            with patch("sqlite3.connect", side_effect=lambda *a, **kw: real_connect(db_path)):
+                trader._refresh_heartbeats_sync()
+
+            chk_conn = real_connect(db_path)
+            # SOL/USDT must survive (age < 900s), NEAR/USDT must be pruned (age > 900s)
+            sol_row = chk_conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = 'SOL/USDT'").fetchone()
+            self.assertIsNotNone(sol_row, "Fresh super_bot_grid lock was pruned prematurely!")
+
+            near_row = chk_conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = 'NEAR/USDT'").fetchone()
+            self.assertIsNone(near_row, "Stale (>900s) lock was not pruned!")
+            chk_conn.close()
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
 
 
 if __name__ == "__main__":

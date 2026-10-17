@@ -359,10 +359,13 @@ class SuperBotTrader:
                     notes = str(pos.get("notes", "")).lower()
                     if "scalp_short" in notes or "scalp short" in notes or "short scalp" in notes:
                         pos["engine_type"] = "SCALP_SHORT"
+                        pos["lock_owner"] = "super_bot_scalp_short"
                     elif "grid" in notes or "chop" in notes:
                         pos["engine_type"] = "GRID_MAKER"
+                        pos["lock_owner"] = "super_bot_grid"
                     else:
                         pos["engine_type"] = "SWING_4H"
+                        pos["lock_owner"] = "swing_architect"
                     active[pos["symbol"]] = pos
                     
                 # 2. Adopt active Mean Reversion Grid positions (legacy fallback if any)
@@ -378,6 +381,7 @@ class SuperBotTrader:
                             continue
                         if sym not in active:
                             pos["engine_type"] = "GRID_MAKER"
+                            pos["lock_owner"] = "super_bot_grid"
                             active[sym] = pos
                 except Exception:
                     pass
@@ -1156,6 +1160,9 @@ class SuperBotTrader:
                 if is_long
                 else f"Quick Scalp Short [Post-Only Limit] (TP: +{self.scalp_short_tp_pct*100:.1f}%)"
             )
+            lock_who = 'super_bot_grid' if is_long else 'super_bot_scalp_short'
+            lock_why = 'CHOP_GRID_LONG' if is_long else 'SCALP_SHORT'
+
             pos_record = {
                 "symbol": symbol,
                 "side": pos_side,
@@ -1173,6 +1180,7 @@ class SuperBotTrader:
                 "initial_risk_usd": init_risk,
                 "notes": notes_str,
                 "engine_type": engine_tag,
+                "lock_owner": lock_who,
                 "intended_entry_price": intended_p,
                 "actual_fill_price": actual_fill_p,
                 "slippage_bps": slippage_bps,
@@ -1196,8 +1204,6 @@ class SuperBotTrader:
                         intended_p, actual_fill_p, slippage_bps, fee_entry_usd, "maker", grid_gates_json
                     ))
                     # Acquire exclusive lock
-                    lock_who = 'super_bot_grid' if is_long else 'super_bot_scalp_short'
-                    lock_why = 'CHOP_GRID_LONG' if is_long else 'SCALP_SHORT'
                     conn.execute("""
                         INSERT OR REPLACE INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
                         VALUES (?, ?, ?, ?, ?)
