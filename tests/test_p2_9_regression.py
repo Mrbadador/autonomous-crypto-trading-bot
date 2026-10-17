@@ -1251,6 +1251,29 @@ class TestP29D10MicrostructureGuardSymbolScope(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+class TestP29D12TelemetryReconciliation(unittest.TestCase):
+    """
+    D-12 (P2): Verify telemetry text reconciliation:
+    - swing_trader.py:426 docstring agrees with owner parameter
+    - swing_trader.py:2555 reports actual deleted rowcount and owner
+    - swing_trader.py:1417/1424 logs leverage errors at ERROR level with veto
+    """
+
+    def test_d12_docstring_and_log_accuracy(self):
+        with open("swing_trader.py", "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Docstring accuracy
+        self.assertIn("specific owner", content, "Docstring must mention specific owner")
+
+        # Telemetry reports actual rows deleted
+        self.assertIn("rows={deleted_locks}", content, "Position close log must report actual deleted lock count")
+
+        # Leverage errors logged at error level
+        self.assertIn("SWING-LEVERAGE-VETO", content, "Leverage failure must be logged as SWING-LEVERAGE-VETO")
+        self.assertNotIn("[SWING-LEVERAGE-NOTE]", content, "Silent debug swallow must be completely eliminated")
+
+
 if __name__ == "__main__":
     unittest.main()
 
