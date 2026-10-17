@@ -166,20 +166,11 @@ def run_wal_checkpoints():
             
             # Atomic publish of status and counter in ONE transaction
             status_val = "OK" if integrity_ok else "CRITICAL"
-            try:
-                update_system_state_batch([
-                    (f"db_integrity_{db_name}", status_val),
-                    (f"db_integrity_{db_name}_consecutive_errors", "0")
-                ])
-                _CONSECUTIVE_ERRORS[db_name] = 0
-            except Exception as pub_err:
-                log.error(f"[{db_name}] 🚨 Failed to publish integrity status/counter to system_state: {pub_err}")
-                prior_consec = _CONSECUTIVE_ERRORS.get(db_name)
-                if prior_consec is None:
-                    prior_consec = get_durable_consecutive_errors(db_name, float(CHECKPOINT_INTERVAL_SECS))
-                curr_consec = prior_consec + 1
-                _CONSECUTIVE_ERRORS[db_name] = curr_consec
-                raise pub_err
+            update_system_state_batch([
+                (f"db_integrity_{db_name}", status_val),
+                (f"db_integrity_{db_name}_consecutive_errors", "0")
+            ])
+            _CONSECUTIVE_ERRORS[db_name] = 0
 
             busy = int(res[0]) if res and res[0] is not None else -1
             log_frames = int(res[1]) if res and res[1] is not None else -1

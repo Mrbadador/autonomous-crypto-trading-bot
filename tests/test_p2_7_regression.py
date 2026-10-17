@@ -15,6 +15,7 @@ Tests:
 
 import os
 import sys
+import ast
 import time
 import json
 import sqlite3
@@ -146,13 +147,28 @@ def test_r1_atomic_publish_batch():
             db_maintenance_daemon.BASE_DIR = orig_base
 
 
+
+
 def test_r4_reconciler_locks_scoped_and_preserves_other_engines():
     """
-    Tests that reconciliation_engine scoped delete queries:
-    1. Do NOT delete a lock owned by another engine (e.g. 'basis_trader' or 'external').
-    2. Do NOT delete a freshly-acquired live lock owned by 'super_bot_grid' (age <= 900s).
-    3. DO delete an expired lock owned by 'super_bot_grid' (age > 900s).
+    R4 & R7: Tests that reconciler's closure delete query is extracted via AST from reconciliation_engine.py
+    and uses the real production schema with NOT NULL constraints.
+    Asserts that super_bot_grid lock survives when expired lock is deleted, and fresh locks survive.
     """
+    re_path = os.path.join(BASE_DIR, "reconciliation_engine.py")
+    src = open(re_path, "r", encoding="utf-8").read()
+    tree = ast.parse(src)
+    queries = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and "DELETE FROM asset_locks" in arg.value:
+                    queries[node.lineno] = arg.value
+
+    # Lines 547 and 892 contain the scoped closure delete
+    sql_closure = queries.get(547) or queries.get(892)
+    assert sql_closure is not None, "Could not find AST-extracted closure delete query in reconciliation_engine.py"
+
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
         db_path = tf.name
 
@@ -161,38 +177,34 @@ def test_r4_reconciler_locks_scoped_and_preserves_other_engines():
         conn.execute("""
             CREATE TABLE asset_locks (
                 symbol TEXT PRIMARY KEY,
-                locked_by TEXT,
-                locked_at TEXT,
-                heartbeat TEXT
+                locked_by TEXT NOT NULL,
+                locked_at TEXT NOT NULL,
+                reason TEXT,
+                heartbeat TEXT NOT NULL
             )
         """)
 
         old_ts = (datetime.now(timezone.utc) - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
         fresh_ts = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
 
-        # Lock 1: Owned by basis_trader (different engine) -> MUST SURVIVE
-        conn.execute("INSERT INTO asset_locks VALUES ('BTC/USDT', 'basis_trader', ?, ?)", (old_ts, old_ts))
+        # Lock 1: Owned by external_bot (not in scoped locked_by list) -> MUST SURVIVE
+        conn.execute("INSERT INTO asset_locks VALUES ('BTC/USDT', 'external_bot', ?, ?, ?)", (old_ts, 'test', old_ts))
         
         # Lock 2: Owned by super_bot_grid, fresh (2 min old) -> MUST SURVIVE
-        conn.execute("INSERT INTO asset_locks VALUES ('ETH/USDT', 'super_bot_grid', ?, ?)", (old_ts, fresh_ts))
+        conn.execute("INSERT INTO asset_locks VALUES ('ETH/USDT', 'super_bot_grid', ?, ?, ?)", (old_ts, 'test', fresh_ts))
 
         # Lock 3: Owned by super_bot_grid, expired (> 900s) -> MUST BE PRUNED
-        conn.execute("INSERT INTO asset_locks VALUES ('ADA/USDT', 'super_bot_grid', ?, ?)", (old_ts, old_ts))
+        conn.execute("INSERT INTO asset_locks VALUES ('ADA/USDT', 'super_bot_grid', ?, ?, ?)", (old_ts, 'test', old_ts))
 
         conn.commit()
 
-        # Execute scoped reconciler delete on all 3 symbols
+        # Execute AST-extracted scoped reconciler delete on all 3 symbols
         for sym in ("BTC/USDT", "ETH/USDT", "ADA/USDT"):
-            conn.execute("""
-                DELETE FROM asset_locks
-                WHERE symbol = ?
-                  AND locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
-                  AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
-            """, (sym,))
+            conn.execute(sql_closure, (sym,))
         conn.commit()
 
         remaining = {r[0]: r[1] for r in conn.execute("SELECT symbol, locked_by FROM asset_locks").fetchall()}
-        assert "BTC/USDT" in remaining, "Lock owned by another engine ('basis_trader') was erroneously deleted!"
+        assert "BTC/USDT" in remaining, "Lock owned by external engine was erroneously deleted!"
         assert "ETH/USDT" in remaining, "Fresh live lock owned by 'super_bot_grid' was erroneously deleted!"
         assert "ADA/USDT" not in remaining, "Expired lock owned by 'super_bot_grid' was not pruned!"
         conn.close()
@@ -203,8 +215,21 @@ def test_r4_reconciler_locks_scoped_and_preserves_other_engines():
 
 def test_r4_reconciler_null_heartbeat_prune():
     """
-    Tests that reconciler's background prune query cleans locks with NULL heartbeat and old locked_at.
+    R4 & R7: Tests that reconciler's background prune query is extracted via AST from reconciliation_engine.py.
     """
+    re_path = os.path.join(BASE_DIR, "reconciliation_engine.py")
+    src = open(re_path, "r", encoding="utf-8").read()
+    tree = ast.parse(src)
+    prune_queries = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and "COALESCE(heartbeat, locked_at)" in arg.value:
+                    prune_queries[node.lineno] = arg.value
+
+    sql_prune = prune_queries.get(962) or next(iter(prune_queries.values()), None)
+    assert sql_prune is not None, "Could not find AST-extracted background prune query in reconciliation_engine.py"
+
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
         db_path = tf.name
 
@@ -213,33 +238,31 @@ def test_r4_reconciler_null_heartbeat_prune():
         conn.execute("""
             CREATE TABLE asset_locks (
                 symbol TEXT PRIMARY KEY,
-                locked_by TEXT,
-                locked_at TEXT,
-                heartbeat TEXT
+                locked_by TEXT NOT NULL,
+                locked_at TEXT NOT NULL,
+                reason TEXT,
+                heartbeat TEXT NOT NULL
             )
         """)
 
         now_utc = datetime.now(timezone.utc)
-        old_locked_at = (now_utc - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
-        fresh_locked_at = (now_utc - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
+        old_ts = (now_utc - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
+        fresh_ts = (now_utc - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
         now_iso = now_utc.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Zombie lock: NULL heartbeat, old locked_at -> MUST BE DELETED
-        conn.execute("INSERT INTO asset_locks VALUES ('SOL/USDT', 'super_bot_grid', ?, NULL)", (old_locked_at,))
-        # Fresh lock: NULL heartbeat, fresh locked_at -> MUST SURVIVE
-        conn.execute("INSERT INTO asset_locks VALUES ('NEAR/USDT', 'super_bot_grid', ?, NULL)", (fresh_locked_at,))
+        # Expired lock (> 900s) -> MUST BE DELETED
+        conn.execute("INSERT INTO asset_locks VALUES ('SOL/USDT', 'super_bot_grid', ?, ?, ?)", (old_ts, 'test', old_ts))
+        # Fresh lock -> MUST SURVIVE
+        conn.execute("INSERT INTO asset_locks VALUES ('NEAR/USDT', 'super_bot_grid', ?, ?, ?)", (fresh_ts, 'test', fresh_ts))
         conn.commit()
 
-        # Reconciler background prune query
-        conn.execute(
-            "DELETE FROM asset_locks WHERE (julianday(?) - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0",
-            (now_iso,)
-        )
+        # Reconciler background prune query using AST-extracted SQL
+        conn.execute(sql_prune, (now_iso,))
         conn.commit()
 
         remaining = [r[0] for r in conn.execute("SELECT symbol FROM asset_locks").fetchall()]
-        assert "SOL/USDT" not in remaining, "Zombie lock with NULL heartbeat was NOT deleted!"
-        assert "NEAR/USDT" in remaining, "Recent lock with NULL heartbeat was erroneously deleted!"
+        assert "SOL/USDT" not in remaining, "Expired lock was NOT deleted by reconciler background prune!"
+        assert "NEAR/USDT" in remaining, "Recent lock was erroneously deleted by reconciler background prune!"
         conn.close()
     finally:
         if os.path.exists(db_path):

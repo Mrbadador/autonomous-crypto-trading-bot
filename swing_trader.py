@@ -430,7 +430,7 @@ class SwingArchitectTrader:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout=10000;")
             with conn:
-                conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (symbol,))
+                conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = 'swing_architect'", (symbol,))
             log.info(f"[LOCK-RELEASED] Exclusive Mutex Lock freed for {symbol}. Intraday bots unblocked.")
         except Exception as e:
             log.error(f"[LOCK-ERROR] Failed to release lock for {symbol}: {e}")
@@ -2259,7 +2259,7 @@ class SwingArchitectTrader:
             def _clean_unknown_db():
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                     conn.execute("DELETE FROM swing_open_positions WHERE symbol = ?", (symbol,))
-                    conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (symbol,))
+                    conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = 'swing_architect'", (symbol,))
                     conn.commit()
             await asyncio.to_thread(_clean_unknown_db)
             return
