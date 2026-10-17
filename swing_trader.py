@@ -347,18 +347,23 @@ class SwingArchitectTrader:
     # Exclusive Asset Mutex Lock Management
     # ---------------------------------------------------------------------------
     def _acquire_lock_sync(self, symbol: str, reason: str = "4H_SWING_LONG") -> bool:
-        """Acquires exclusive asset lock in asset_locks table without overwriting other engines' locks."""
+        """Acquires exclusive asset lock in asset_locks table atomically without overwriting other engines' locks."""
         now_utc = datetime.now(UTC)
         now_iso = now_utc.isoformat()
+        conn = None
         try:
-            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                # Check active swing position count against maximum capacity
-                active_count = len(self.active_positions)
-                if active_count >= self.max_locks:
-                    log.warning(f"[LOCK-GATE] Cannot lock {symbol}: Active swing positions ({active_count}) at max ({self.max_locks}).")
-                    return False
+            # Check active swing position count against maximum capacity
+            active_count = len(self.active_positions)
+            if active_count >= self.max_locks:
+                log.warning(f"[LOCK-GATE] Cannot lock {symbol}: Active swing positions ({active_count}) at max ({self.max_locks}).")
+                return False
 
-                # Verify no other fleet engine holds a live lock on this symbol
+            conn = sqlite3.connect("trading_data.db", timeout=10.0, isolation_level=None)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=10000;")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Verify no other fleet engine holds a live lock on this symbol inside the exclusive write lock
                 existing = conn.execute(
                     "SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?",
                     (symbol,)
@@ -376,36 +381,75 @@ class SwingArchitectTrader:
                     except Exception:
                         lock_is_fresh = True
                     if lock_is_fresh:
+                        conn.execute("ROLLBACK")
                         log.warning(f"[LOCK-GATE] Cannot lock {symbol}: Already locked by '{existing[0]}' (heartbeat: {hb_str}).")
                         return False
 
-                # Acquire lock for swing_architect
-                conn.execute("""
-                    INSERT OR REPLACE INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
+                # Conditional atomic UPSERT guarded against concurrent ownership
+                cur = conn.execute("""
+                    INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
                     VALUES (?, 'swing_architect', ?, ?, ?)
-                """, (symbol, now_iso, reason, now_iso))
-                conn.commit()
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        locked_by = 'swing_architect',
+                        locked_at = excluded.locked_at,
+                        reason = excluded.reason,
+                        heartbeat = excluded.heartbeat
+                    WHERE asset_locks.locked_by = 'swing_architect'
+                       OR asset_locks.locked_by IS NULL
+                       OR (julianday(?) - julianday(asset_locks.heartbeat)) * 86400.0 > 900.0
+                """, (symbol, now_iso, reason, now_iso, now_iso))
+                if cur.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    log.warning(f"[LOCK-GATE] Atomic UPSERT rejected lock acquisition for {symbol} (concurrent lock held).")
+                    return False
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
             log.info(f"[LOCK-ACQUIRED] Exclusive Mutex Lock granted for {symbol} (Reason: {reason}).")
             return True
         except Exception as e:
             log.error(f"[LOCK-ERROR] Failed to acquire lock for {symbol}: {e}")
             return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _release_lock_sync(self, symbol: str):
         """Releases exclusive asset lock for symbol across all unified Super Bot engines."""
+        conn = None
         try:
-            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+            conn = sqlite3.connect("trading_data.db", timeout=10.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=10000;")
+            with conn:
                 conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (symbol,))
-                conn.commit()
             log.info(f"[LOCK-RELEASED] Exclusive Mutex Lock freed for {symbol}. Intraday bots unblocked.")
         except Exception as e:
             log.error(f"[LOCK-ERROR] Failed to release lock for {symbol}: {e}")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _refresh_heartbeats_sync(self):
         """Refreshes heartbeat for all actively locked assets and prunes orphaned Super Bot locks."""
         now_iso = datetime.now(UTC).isoformat()
+        conn = None
         try:
-            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+            conn = sqlite3.connect("trading_data.db", timeout=10.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=10000;")
+            with conn:
                 active_symbols = list(self.active_positions.keys())
                 for sym in active_symbols:
                     conn.execute("""
@@ -425,9 +469,14 @@ class SwingArchitectTrader:
                         DELETE FROM asset_locks
                         WHERE locked_by IN ('swing_architect', 'super_bot_grid', 'super_bot_scalp_short')
                     """)
-                conn.commit()
         except Exception as e:
             log.debug(f"[HEARTBEAT-NOTE] Lock heartbeat refresh error: {e}")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # ---------------------------------------------------------------------------
     # Quantitative Technical Analysis (4H & 1D)
@@ -1200,7 +1249,7 @@ class SwingArchitectTrader:
                 # Target fair share (e.g. 70% / 4 locks = 17.5% of wallet), bounded by remaining headroom and per-trade clamp
                 target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
                 
-                # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight
+                # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Sizing
                 try:
                     from risk_manager import RiskManager
                     rm = RiskManager()
@@ -1216,9 +1265,22 @@ class SwingArchitectTrader:
                             finrl_mult = max(0.75, min(1.25, float(sw.get("allocation_weight_mult", 1.0))))
                     except Exception:
                         pass
-                    target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult
+                    markov_mult = 1.0
+                    try:
+                        def _read_markov_mult():
+                            db_uri = f"file:{os.path.abspath('trading_data.db').replace(os.sep, '/')}?mode=ro"
+                            with sqlite3.connect(db_uri, timeout=3.0, uri=True) as mc:
+                                mrow = mc.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                if mrow and mrow[0]:
+                                    mdata = json.loads(mrow[0])
+                                    return max(0.50, min(1.25, float(mdata.get("sizing_multiplier", 1.0) or 1.0)))
+                            return 1.0
+                        markov_mult = await asyncio.to_thread(_read_markov_mult)
+                    except Exception:
+                        markov_mult = 1.0
+                    target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
                     target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
-                    log.info(f"[SWING-KELLY-SIZING] Empirical Kelly: {kelly_frac:.2%} | FinRL Sharpe Mult: {finrl_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
+                    log.info(f"[SWING-KELLY-SIZING] Empirical Kelly: {kelly_frac:.2%} | FinRL Mult: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
                 except Exception as ke:
                     log.debug(f"[SWING-KELLY-NOTE] {ke}")
 
@@ -1325,6 +1387,13 @@ class SwingArchitectTrader:
         if not lock_acquired:
             log.warning(f"[ABORT] Cannot open {symbol} swing trade: Lock acquisition failed.")
             return
+
+        # Explicitly set exchange leverage before placing entry order
+        try:
+            if hasattr(self.uta_client, "set_leverage"):
+                await self.uta_client.set_leverage(symbol, int(assigned_leverage))
+        except Exception as lev_err:
+            log.debug(f"[SWING-LEVERAGE-NOTE] {symbol}: {lev_err}")
 
         tp_dist_pct = abs(take_profit - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
         log.info("=" * 60)
