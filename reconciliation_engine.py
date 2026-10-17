@@ -22,7 +22,7 @@ from datetime import datetime, UTC
 from dotenv import load_dotenv
 
 # Ensure environment is loaded from the script directory
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 import dns_fix  # noqa: F401
 import config
 
@@ -55,6 +55,8 @@ def update_system_state(key: str, value: str):
     """Safely writes a key-value record to the system_state table."""
     try:
         with sqlite3.connect(DATA_DB, timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=10000;")
             conn.execute(
                 "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now')) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -304,6 +306,8 @@ async def audit_live_exchange_positions():
                 log.debug(f"[RECONCILER] Unfilled orders check note: {uo_err}")
 
             with sqlite3.connect(DATA_DB, timeout=10.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=10000;")
                 # Store live position funding telemetry in system_state for Streamlit HUD & risk agents
                 try:
                     conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('live_position_funding', ?, ?)",
@@ -721,8 +725,8 @@ async def audit_live_exchange_positions():
                                     "UPDATE open_positions SET qty = ?, entry_price = ? WHERE (symbol = ? OR symbol = ?) AND side = ?",
                                     (qty, entry_p, sym_clean, sym_raw, side)
                                 )
-                            except Exception:
-                                pass
+                            except Exception as sync_upd_err:
+                                log.warning(f"[RECONCILER-SYNC-WARN] Failed to update open_positions qty/entry for {sym_clean}: {sync_upd_err}")
 
                 # 3. AUTOMATED PROFIT SWEEPER: Auto-close residual dust runners in profit (margin < $0.05 & gain >= 10%)
                 for p in active_exchange_positions:
@@ -880,6 +884,7 @@ async def audit_live_exchange_positions():
                                 # 2. Delete from open positions and commit immediately — only when the ledger row is confirmed
                                 if ledger_write_ok:
                                     conn.execute(f"DELETE FROM {tbl} WHERE symbol = ?", (sym,))
+                                    conn.execute("DELETE FROM asset_locks WHERE symbol = ?", (sym,))
                                     pruned_count += 1
                                 else:
                                     log.error(f"[RECONCILER] DEFERRING prune of {tbl}/{sym} — closed-trade row not written; will retry next pass")
@@ -932,6 +937,26 @@ async def audit_live_exchange_positions():
                                         log.warning(f"[RECONCILER] Failed to send email for {sym}: {mail_e}")
                     except Exception as fleet_e:
                         log.debug(f"[RECONCILER] Error processing fleet table {tbl}: {fleet_e}")
+
+                # 5. Prune stale asset_locks older than 900s (15 min) that have no active position on exchange
+                try:
+                    if exchange_verified_empty or len(active_exchange_positions) > 0:
+                        if live_symbols:
+                            placeholders = ",".join("?" for _ in live_symbols)
+                            stale_cur = conn.execute(
+                                f"DELETE FROM asset_locks WHERE symbol NOT IN ({placeholders}) "
+                                f"AND (julianday(?) - julianday(heartbeat)) * 86400.0 > 900.0",
+                                (*list(live_symbols), now_iso)
+                            )
+                        else:
+                            stale_cur = conn.execute(
+                                "DELETE FROM asset_locks WHERE (julianday(?) - julianday(heartbeat)) * 86400.0 > 900.0",
+                                (now_iso,)
+                            )
+                        if stale_cur.rowcount and stale_cur.rowcount > 0:
+                            log.info(f"[RECONCILER-LOCK-PRUNE] Pruned {stale_cur.rowcount} stale asset_locks (>900s old with no exchange position).")
+                except Exception as lk_err:
+                    log.debug(f"[RECONCILER-LOCK-PRUNE-NOTE] {lk_err}")
 
                 conn.commit()
 

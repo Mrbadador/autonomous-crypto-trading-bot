@@ -20,7 +20,7 @@ import logging
 from datetime import datetime, UTC, timedelta
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +52,8 @@ def update_system_state(key: str, value: str):
     try:
         data_db = os.path.join(BASE_DIR, "trading_data.db")
         with sqlite3.connect(data_db, timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=10000;")
             conn.execute(
                 "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now')) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -61,7 +63,7 @@ def update_system_state(key: str, value: str):
         log.debug(f"Failed to update system_state ({key}): {e}")
 
 def run_wal_checkpoints():
-    """Runs non-blocking WAL checkpoints across all databases."""
+    """Runs non-blocking WAL checkpoints and PRAGMA quick_check across all databases."""
     results = {}
     for db_path in DATABASES:
         if not os.path.exists(db_path):
@@ -69,10 +71,15 @@ def run_wal_checkpoints():
         db_name = os.path.basename(db_path)
         try:
             with sqlite3.connect(db_path, timeout=30.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("PRAGMA busy_timeout=30000;")
+                qc = conn.execute("PRAGMA quick_check(1);").fetchone()
+                qc_status = str(qc[0]) if qc else "unknown"
+                if qc_status.lower() != "ok":
+                    log.critical(f"[{db_name}] 🚨 DATABASE INTEGRITY QUICK_CHECK FAILED: {qc_status}")
                 res = conn.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
                 conn.execute("PRAGMA optimize;")
-                results[db_name] = f"WAL Checkpoint OK (busy={res[0]}, log={res[1]}, checkpointed={res[2]})"
+                results[db_name] = f"WAL Checkpoint OK (busy={res[0]}, log={res[1]}, checkpointed={res[2]}, integrity={qc_status})"
                 log.info(f"[{db_name}] {results[db_name]}")
         except Exception as e:
             results[db_name] = f"Checkpoint Error: {e}"

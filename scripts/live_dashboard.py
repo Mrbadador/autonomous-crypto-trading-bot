@@ -34,7 +34,7 @@ st.set_page_config(
 )
 
 # ── Paths & SQLite Connections ───────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRADING_DATA_DB = os.path.join(BASE_DIR, "trading_data.db")
 TRADING_LEDGER_DB = os.path.join(BASE_DIR, "trading_ledger.db")
 
