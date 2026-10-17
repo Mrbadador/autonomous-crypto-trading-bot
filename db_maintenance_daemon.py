@@ -41,6 +41,7 @@ DATABASES = [
 import config
 
 CHECKPOINT_INTERVAL_SECS = getattr(config, "DB_INTEGRITY_CHECKPOINT_INTERVAL_SECS", 300)  # Run maintenance every 5 minutes
+ERROR_COUNTER_WINDOW_SECS = float(CHECKPOINT_INTERVAL_SECS + 60.0)  # 360s window to cover 304-305s inter-pass interval plus margin
 RETENTION_DAYS = 7              # Retain ephemeral telemetry for 7 days
 
 _WAL_MODE_WARNED = set()
@@ -49,7 +50,7 @@ _CONSECUTIVE_ERRORS = {}
 def get_durable_consecutive_errors(db_name: str, window_sec: float = None) -> int:
     """
     Reads previously published db_integrity_<db>_consecutive_errors from system_state.
-    If the row is within window_sec (default 1 x CHECKPOINT_INTERVAL_SECS), returns its
+    If the row is within window_sec (default ERROR_COUNTER_WINDOW_SECS = CHECKPOINT_INTERVAL_SECS + 60.0), returns its
     integer count; otherwise returns 0 (stale or absent, starting a fresh run).
 
     NOTE (R2): get_durable_consecutive_errors reads trading_data.db, so when trading_data.db
@@ -58,7 +59,7 @@ def get_durable_consecutive_errors(db_name: str, window_sec: float = None) -> in
     is locked/unreachable.
     """
     if window_sec is None:
-        window_sec = float(CHECKPOINT_INTERVAL_SECS)
+        window_sec = ERROR_COUNTER_WINDOW_SECS
     data_db = os.path.join(BASE_DIR, "trading_data.db")
     if not os.path.exists(data_db):
         return 0
@@ -200,7 +201,7 @@ def run_wal_checkpoints():
             # Increment durable consecutive error counter and publish to system_state in ONE atomic transaction.
             prior_consec = _CONSECUTIVE_ERRORS.get(db_name)
             if prior_consec is None:
-                prior_consec = get_durable_consecutive_errors(db_name, float(CHECKPOINT_INTERVAL_SECS))
+                prior_consec = get_durable_consecutive_errors(db_name, ERROR_COUNTER_WINDOW_SECS)
             curr_consec = prior_consec + 1
             _CONSECUTIVE_ERRORS[db_name] = curr_consec
 
