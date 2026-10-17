@@ -2,6 +2,7 @@ import unittest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 
+import tests.conftest  # noqa: F401 — enforce D-11 quarantine
 import config
 from super_bot import SuperBotTrader
 

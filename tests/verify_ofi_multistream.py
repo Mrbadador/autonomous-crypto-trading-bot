@@ -10,7 +10,10 @@ import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+import tempfile
+import tests.conftest  # noqa: F401 — enforce D-11 quarantine
 import ofi_daemon
+ofi_daemon.STATE_FILE = os.path.join(tempfile.mkdtemp(prefix="verify_ofi_"), "microstructure_state.json")
 
 async def main():
     print("===============================================================")

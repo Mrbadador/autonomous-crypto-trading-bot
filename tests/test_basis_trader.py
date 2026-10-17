@@ -2,6 +2,8 @@ import asyncio
 import json
 import sqlite3
 import os
+import tempfile
+import tests.conftest  # noqa: F401 — enforce D-11 quarantine when run as a script
 from basis_trader import BTCBasisTrader
 
 async def run_verification():
@@ -9,8 +11,10 @@ async def run_verification():
     print("   BTC CASH-AND-CARRY BASIS TRADER VERIFICATION")
     print("==================================================")
     
-    # 1. Initialize
+    # 1. Initialize against isolated temp DB
+    tmp_db = os.path.join(tempfile.mkdtemp(prefix="test_basis_"), "trading_data.db")
     trader = BTCBasisTrader()
+    trader.db_path = tmp_db
     await trader.initialize_clients()
     print("[OK] 1. Engine initialized & DB tables verified.")
     
@@ -29,7 +33,7 @@ async def run_verification():
     trader.publish_telemetry(market)
     await asyncio.sleep(0.5)
     
-    conn = sqlite3.connect("trading_data.db", timeout=5.0)
+    conn = sqlite3.connect(tmp_db, timeout=5.0)
     row = conn.execute("SELECT value FROM system_state WHERE key = 'basis_trader_telemetry'").fetchone()
     conn.close()
     assert row is not None, "Telemetry not found in system_state"

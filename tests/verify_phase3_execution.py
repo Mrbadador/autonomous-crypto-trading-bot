@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+import tests.conftest  # noqa: F401 — enforce D-11 quarantine
 LEGACY_DIR = os.path.join(PROJECT_ROOT, "archive", "legacy_agents")
 if os.path.exists(LEGACY_DIR) and LEGACY_DIR not in sys.path:
     sys.path.insert(0, LEGACY_DIR)

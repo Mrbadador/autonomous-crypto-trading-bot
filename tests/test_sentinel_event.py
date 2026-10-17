@@ -2,12 +2,18 @@ import asyncio
 import sqlite3
 import json
 import logging
+import os
+import tempfile
+import tests.conftest  # noqa: F401 — enforce D-11 quarantine
 from sentinel_agent import SentimentSentinel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 async def test_sentinel():
+    tmp_dir = tempfile.mkdtemp(prefix="test_sentinel_")
+    tmp_db = os.path.join(tmp_dir, "trading_data.db")
     sentinel = SentimentSentinel()
+    sentinel.db_path = tmp_db
     
     # Simulate a simulated high impact war headline arriving
     test_headlines = [
@@ -22,8 +28,8 @@ async def test_sentinel():
     
     assert sentinel._active_event_playbook in ("SECULAR_SHORT_BREAKDOWN", "FLASH_REBOUND_TRAP", "BULL_MOMENTUM_EXPANSION", "IGNORE_NOISE", "CASH_PRESERVATION")
 
-    # Verify SQLite persistence
-    with sqlite3.connect("trading_data.db") as conn:
+    # Verify SQLite persistence in quarantined DB
+    with sqlite3.connect(tmp_db) as conn:
         row = conn.execute("SELECT value FROM system_state WHERE key = 'ai_event_playbook'").fetchone()
         assert row is not None, "ai_event_playbook key not persisted in system_state!"
         print(f"SQLite verified: ai_event_playbook = {row[0]}")

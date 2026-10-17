@@ -3,33 +3,44 @@ import sqlite3
 import json
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone, timedelta
 import asyncio
 
+import tests.conftest  # noqa: F401 — enforce D-11 quarantine
 from conviction_filter import ConvictionBoardroom
 import config
 
 class TestTradFiGateFailClosed(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.db_path = "trading_data.db"
-        self.backup_path = "trading_data.db.test_backup"
-        if os.path.exists(self.db_path):
-            shutil.copyfile(self.db_path, self.backup_path)
+        self.tmp_dir = tempfile.mkdtemp(prefix="test_tradfi_")
+        self.db_path = os.path.join(self.tmp_dir, "trading_data.db")
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
         self.boardroom = ConvictionBoardroom()
 
     def tearDown(self):
-        if os.path.exists(self.backup_path):
-            shutil.copyfile(self.backup_path, self.db_path)
-            os.remove(self.backup_path)
+        os.chdir(self.old_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def _set_state(self, val, updated_at=None):
         if updated_at is None:
             updated_at = datetime.now(timezone.utc).isoformat()
+        fresh_now = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+            for db_name in ("trading_data.db", "trading_ledger.db", "live_paper_trades.db", "test_ledger.db"):
+                conn.execute(
+                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, 'OK', ?)",
+                    (f"db_integrity_{db_name}", fresh_now),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, '0', ?)",
+                    (f"db_integrity_{db_name}_consecutive_errors", fresh_now),
+                )
             # also ensure allowed symbols doesn't block ADA/USDT
             conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('ALLOWED_SYMBOLS', ?, ?)",
-                         (json.dumps(["ADA/USDT"]), updated_at))
+                         (json.dumps(["ADA/USDT"]), fresh_now))
             if val is None:
                 conn.execute("DELETE FROM system_state WHERE key = 'etf_macro_telemetry'")
             else:
