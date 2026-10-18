@@ -56,6 +56,12 @@ else:
     log.critical("[ENV] START_SYSTEM FATAL: BITGET_API_KEY or BITGET_API_SECRET is EMPTY. Check .env file! Aborting launch.")
     sys.exit(1)
 
+
+def _validate_credentials() -> bool:
+    """Wrapper around credential_validator.validate_credentials for startup."""
+    from credential_validator import validate_credentials
+    return validate_credentials()
+
 class ManagedProcess:
     def __init__(self, cmd):
         self.cmd = cmd
@@ -363,6 +369,12 @@ def _spawn_managed_process(mp):
 
 def main():
     _enforce_single_instance()
+    
+    # P0-1: Validate credentials before spawning any daemons
+    if not _validate_credentials():
+        log.critical("Credential validation failed. Refusing to start.")
+        sys.exit(1)
+    
     log.info("=" * 60)
     log.info("     LAUNCHING V15.0 SWARM ECOSYSTEM COMMAND CENTER")
     log.info("=" * 60)
