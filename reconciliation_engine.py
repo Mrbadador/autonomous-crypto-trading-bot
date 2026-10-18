@@ -1065,6 +1065,8 @@ async def audit_live_exchange_positions():
                                                 "notes": notes_str
                                             }
                                         ))
+                                        _background_tasks.add(t_close)
+                                        t_close.add_done_callback(_background_tasks.discard)
                                         log.info(f"[RECONCILER] Dispatched trade closure email task for {sym} (PnL: {net_pnl})")
                                     except Exception as mail_e:
                                         log.warning(f"[RECONCILER] Failed to send email for {sym}: {mail_e}")
