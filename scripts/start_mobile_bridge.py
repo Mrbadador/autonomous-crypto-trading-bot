@@ -24,7 +24,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8765"))
-APP_PASSWORD = os.getenv("APP_PASSWORD", "SovereignSwarm2026!")
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+if not APP_PASSWORD:
+    raise EnvironmentError(
+        "APP_PASSWORD environment variable is required. Set it in .env before starting the mobile bridge."
+    )
 
 CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
 CLOUDFLARED_BIN = os.path.join(BASE_DIR, "cloudflared.exe")
@@ -53,7 +57,7 @@ def print_qr_banner(url):
     print("=" * 65)
     print(f"\n  Local Access  : http://localhost:{BRIDGE_PORT}")
     print(f"  Remote HTTPS  : {url}")
-    print(f"  App Password  : {APP_PASSWORD}\n")
+    print(f"  App Password  : (set in .env - never share this)\n")
     print("  [SCAN WITH PHONE CAMERA FOR INSTANT ACCESS]:\n")
     
     try:
@@ -71,32 +75,19 @@ def print_qr_banner(url):
 def main():
     print("[*] Starting Sovereign Swarm Mobile Web Bridge...")
     
-    # 1. Start FastAPI backend
-    web_cmd = [sys.executable, "-m", "uvicorn", "mobile_web_bridge:app", "--host", "0.0.0.0", "--port", str(BRIDGE_PORT)]
+    # 1. Start FastAPI backend (bind to localhost only for security)
+    web_cmd = [sys.executable, "-m", "uvicorn", "mobile_web_bridge:app", "--host", "127.0.0.1", "--port", str(BRIDGE_PORT)]
     web_proc = subprocess.Popen(web_cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     time.sleep(1.5)
     
-    # 2. Start Cloudflare Tunnel
-    cf_bin = ensure_cloudflared()
-    if not cf_bin:
-        print(f"[!] Running in local-only mode: http://localhost:{BRIDGE_PORT}")
-        web_proc.wait()
-        return
-
-    print("[*] Initializing secure encrypted Cloudflare Tunnel...")
-    cf_cmd = [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{BRIDGE_PORT}"]
-    cf_proc = subprocess.Popen(cf_cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-    tunnel_url = None
-    url_pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
-
-    for line in iter(cf_proc.stdout.readline, ""):
-        match = url_pattern.search(line)
-        if match:
-            tunnel_url = match.group(0)
-            print_qr_banner(tunnel_url)
-            break
+    print(f"[*] Mobile bridge running on http://127.0.0.1:{BRIDGE_PORT}")
+    print("[SECURITY] Cloudflare Tunnel disabled. Use VPN or SSH tunnel for remote access.")
+    print(f"[SECURITY] App Password required from .env file.\n")
+    
+    # Wait for the web process
+    web_proc.wait()
+    return
 
     # Keep alive and pipe logs
     try:

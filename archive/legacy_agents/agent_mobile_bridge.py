@@ -34,7 +34,11 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-APP_PASSWORD = os.getenv("APP_PASSWORD", "SovereignSwarm2026!")
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+if not APP_PASSWORD:
+    raise EnvironmentError(
+        "APP_PASSWORD environment variable is required. Set it in .env before starting the mobile bridge."
+    )
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8766"))
 SESSION_SECRET = os.getenv("SESSION_SECRET_KEY", secrets.token_hex(32))
 
