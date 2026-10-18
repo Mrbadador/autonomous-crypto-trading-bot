@@ -93,10 +93,12 @@ def validate_exit_price_plausibility(
             return False
 
         ratio = x_p / e_p
-        if ratio < 0.70 or ratio > 1.40:
+        # Allow wide-ranging altcoin swings (up to ±45-50% moves) while catching cross-symbol fill pollution
+        # (cross-fill pollution exhibits extreme ratios like <0.50 or >1.70).
+        if ratio < 0.50 or ratio > 1.70:
             log.warning(
                 f"[EXIT-PRICE-GUARD] Extreme price divergence for {symbol} ({side}): "
-                f"entry={e_p}, exit={x_p} (ratio={ratio:.4f} outside [0.70, 1.40])"
+                f"entry={e_p}, exit={x_p} (ratio={ratio:.4f} outside [0.50, 1.70])"
             )
             return False
 
