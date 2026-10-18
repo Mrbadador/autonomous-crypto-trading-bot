@@ -814,7 +814,7 @@ class DatabaseManager:
         try:
             with self._get_conn() as conn:
                 conn.row_factory = sqlite3.Row
-                cursor = conn.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?", (limit,))
+                cursor = conn.execute("SELECT * FROM trades ORDER BY replace(substr(timestamp, 1, 19), 'T', ' ') DESC LIMIT ?", (limit,))
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             log.error(f"Failed to get recent trades: {e}")

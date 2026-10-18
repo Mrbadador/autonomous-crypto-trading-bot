@@ -147,7 +147,9 @@ def get_heartbeat_data():
             with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
                 for tbl in ["trades", "berserker_trades", "marl_live_trades"]:
                     try:
-                        row = conn.execute(f"SELECT SUM(pnl) FROM {tbl} WHERE timestamp >= datetime('now', '-24 hours')").fetchone()
+                        row = conn.execute(
+                            f"SELECT SUM(pnl) FROM {tbl} WHERE replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-24 hours')"
+                        ).fetchone()
                         if row and row[0] is not None:
                             fleet_pnl += float(row[0])
                     except: pass

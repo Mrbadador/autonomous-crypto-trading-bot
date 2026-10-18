@@ -678,7 +678,9 @@ def send_hourly_heartbeat_report(fleet_pnl, active_exposure, warden_status, posi
                 for tbl, eng_name in [("trades", "Sniper (15m)"), ("berserker_trades", "Berserker (5m)")]:
                     try:
                         rows = conn.execute(
-                            f"SELECT timestamp, symbol, side, entry_price, exit_price, pnl, exit_reason FROM {tbl} WHERE timestamp >= datetime('now', '-60 minutes') ORDER BY timestamp DESC"
+                            f"SELECT timestamp, symbol, side, entry_price, exit_price, pnl, exit_reason FROM {tbl} "
+                            f"WHERE replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-60 minutes') "
+                            f"ORDER BY replace(substr(timestamp, 1, 19), 'T', ' ') DESC"
                         ).fetchall()
                         for r in rows:
                             recent_trades_found.append({

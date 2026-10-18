@@ -18,52 +18,53 @@ import sqlite3
 import sys
 
 
-def backfill_timestamps(db_path: str, apply_changes: bool = False) -> int:
+def backfill_timestamps(db_path: str, table_name: str = "swing_trades", apply_changes: bool = False) -> int:
     if not os.path.exists(db_path):
         print(f"[ERROR] Database file not found: {db_path}")
         return 1
 
-    print(f"Connecting to {db_path}...")
+    print(f"Connecting to {db_path} (table: {table_name})...")
     conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         conn.execute("PRAGMA busy_timeout = 10000;")
 
-        # Check if swing_trades exists
+        # Check if table exists
         has_table = conn.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='swing_trades'"
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = ?", (table_name,)
         ).fetchone()[0]
         if not has_table:
-            print("[ERROR] Table 'swing_trades' does not exist.")
+            print(f"[ERROR] Table '{table_name}' does not exist.")
             return 1
 
         # Find ISO rows
         iso_rows = conn.execute(
-            "SELECT id, timestamp FROM swing_trades WHERE timestamp LIKE '%T%' ORDER BY id"
+            f"SELECT rowid, timestamp FROM {table_name} WHERE timestamp LIKE '%T%' ORDER BY rowid"
         ).fetchall()
-        print(f"Found {len(iso_rows)} rows in swing_trades with ISO 'T' timestamps.")
+        print(f"Found {len(iso_rows)} rows in {table_name} with ISO 'T' timestamps.")
 
         if not iso_rows:
-            print("No rows need normalization. swing_trades is already canonical!")
+            print(f"No rows need normalization. {table_name} is already canonical!")
             return 0
 
         print("\nSample before -> after transformations:")
         for r_id, r_ts in iso_rows[:5]:
             norm_ts = str(r_ts)[:19].replace("T", " ")
-            print(f"  ID {r_id}: '{r_ts}' -> '{norm_ts}'")
+            print(f"  Row {r_id}: '{r_ts}' -> '{norm_ts}'")
 
         if not apply_changes:
             print("\n[DRY RUN] No changes applied. Run with --apply to execute migration.")
             return 0
 
         # Apply mode: backup then update
-        print("\n[APPLY] Creating backup table 'swing_trades_backup_d3'...")
-        conn.execute("CREATE TABLE IF NOT EXISTS swing_trades_backup_d3 AS SELECT * FROM swing_trades")
-        backup_count = conn.execute("SELECT count(*) FROM swing_trades_backup_d3").fetchone()[0]
+        backup_table = f"{table_name}_backup_d3"
+        print(f"\n[APPLY] Creating backup table '{backup_table}'...")
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {backup_table} AS SELECT * FROM {table_name}")
+        backup_count = conn.execute(f"SELECT count(*) FROM {backup_table}").fetchone()[0]
         print(f"[APPLY] Backup table verified with {backup_count} rows.")
 
-        print(f"[APPLY] Normalizing {len(iso_rows)} timestamps in swing_trades...")
-        cur = conn.execute("""
-            UPDATE swing_trades
+        print(f"[APPLY] Normalizing {len(iso_rows)} timestamps in {table_name}...")
+        cur = conn.execute(f"""
+            UPDATE {table_name}
             SET timestamp = replace(substr(timestamp, 1, 19), 'T', ' ')
             WHERE timestamp LIKE '%T%'
         """)
@@ -73,11 +74,11 @@ def backfill_timestamps(db_path: str, apply_changes: bool = False) -> int:
 
         # Post-verification
         rem_count = conn.execute(
-            "SELECT count(*) FROM swing_trades WHERE timestamp LIKE '%T%'"
+            f"SELECT count(*) FROM {table_name} WHERE timestamp LIKE '%T%'"
         ).fetchone()[0]
         print(f"[VERIFY] Remaining rows with 'T' in timestamp: {rem_count}")
         if rem_count == 0:
-            print("[SUCCESS] All swing_trades timestamps are now in canonical SQLite space format!")
+            print(f"[SUCCESS] All {table_name} timestamps are now in canonical SQLite space format!")
             return 0
         else:
             print(f"[WARNING] {rem_count} rows still have 'T'!")
@@ -87,9 +88,10 @@ def backfill_timestamps(db_path: str, apply_changes: bool = False) -> int:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backfill ISO timestamps in swing_trades to canonical space format.")
+    parser = argparse.ArgumentParser(description="Backfill ISO timestamps in trade tables to canonical space format.")
     parser.add_argument("--db", default="trading_data.db", help="Path to SQLite database (default: trading_data.db)")
+    parser.add_argument("--table", default="swing_trades", help="Table name to backfill (default: swing_trades)")
     parser.add_argument("--apply", action="store_true", default=False, help="Apply changes to database (default is dry-run)")
     args = parser.parse_args()
 
-    sys.exit(backfill_timestamps(args.db, apply_changes=args.apply))
+    sys.exit(backfill_timestamps(args.db, table_name=args.table, apply_changes=args.apply))
