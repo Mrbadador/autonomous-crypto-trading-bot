@@ -507,7 +507,7 @@ class MultiSymbolOFIDaemon:
             pid = os.getpid()
             temp_file = f"{STATE_FILE}.tmp.{pid}"
             renamed_successfully = False
-            for i in range(5):
+            for i in range(10):
                 try:
                     with open(temp_file, "w", encoding="utf-8") as f:
                         json.dump(export_payload, f)
@@ -518,8 +518,8 @@ class MultiSymbolOFIDaemon:
                     break
                 except OSError as e:
                     is_win_lock = getattr(e, "winerror", None) == 5 or isinstance(e, PermissionError)
-                    if i == 4:
-                        log.error(f"Failed to write microstructure state after 5 attempts: {e}")
+                    if i == 9:
+                        log.error(f"Failed to write microstructure state after 10 attempts: {e}")
                     else:
                         _time.sleep(0.10 * (i + 1) if is_win_lock else 0.05)
                 except Exception as e:

@@ -152,10 +152,10 @@ def check_portfolio() -> str:
         lines.append("  Open Swarm Positions : 0  (flat — no active exposure)")
 
     # 24-hour closed trades
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     closed = safe_query(
         TRADING_DATA_DB,
-        "SELECT * FROM trades WHERE (status = 'closed' OR status = 'CLOSED') AND timestamp >= ? ORDER BY timestamp DESC",
+        "SELECT * FROM trades WHERE (status = 'closed' OR status = 'CLOSED') AND replace(substr(timestamp, 1, 19), 'T', ' ') >= ? ORDER BY replace(substr(timestamp, 1, 19), 'T', ' ') DESC",
         (cutoff,)
     )
 

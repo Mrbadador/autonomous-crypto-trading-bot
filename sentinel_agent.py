@@ -627,13 +627,27 @@ class SentimentSentinel:
             return "CLEAR", f"No recent adverse news detected for {ticker_up} ({len(headlines)} global headlines scanned)."
 
         # 1. Check severe catastrophe keywords -> VETO (BLOCK)
+        # Individual-victim / scam-story headlines (user losses, phishing, spy-chip wallets) are
+        # not protocol- or exchange-level catastrophes: downgrade them to a WARNING (0.5x size-down).
+        individual_victim_markers = (
+            "scammer", "scammed", "phishing", "spy-chip", "spy chip", "address poisoning",
+            "social engineering", "wrench attack", "loses almost", "lost almost",
+        )
+        downgraded = None
         for headline in matched_headlines:
             headline_lower = headline.lower()
             for disaster in self.disaster_keywords:
                 if re.search(rf"\b{re.escape(disaster)}\b", headline_lower):
+                    if any(m in headline_lower for m in individual_victim_markers):
+                        downgraded = downgraded or (disaster, headline)
+                        continue
                     reason = f"CATASTROPHIC HEADLINE DETECTED ({disaster}): '{headline}'"
                     log.warning(f"[SENTINEL] VETO cached for {ticker_up} — {reason}")
                     return "VETO", reason
+        if downgraded:
+            reason = f"CAUTION HEADLINE DETECTED ({downgraded[0]}, individual-victim story): '{downgraded[1]}'"
+            log.info(f"[SENTINEL] WARNING (0.5x size-down) cached for {ticker_up} — {reason}")
+            return "WARNING", reason
 
         # 2. Check moderate caution keywords -> WARNING (0.5x size-down)
         for headline in matched_headlines:

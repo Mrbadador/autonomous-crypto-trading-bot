@@ -404,10 +404,10 @@ def build_report_html() -> tuple[str, str]:
     session_label = session_labels.get(slot, f"{slot:02d}:00 UTC")
 
     # PnL quick-read for subject line
-    cutoff = (now_utc - timedelta(hours=WINDOW_HOURS)).isoformat()
+    cutoff = (now_utc - timedelta(hours=WINDOW_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
     closed = _safe_query(
         TRADING_DATA_DB,
-        "SELECT pnl FROM trades WHERE (status = 'closed' OR status = 'CLOSED') AND timestamp >= ?", (cutoff,)
+        "SELECT pnl FROM trades WHERE (status = 'closed' OR status = 'CLOSED') AND replace(substr(timestamp, 1, 19), 'T', ' ') >= ?", (cutoff,)
     )
     total_pnl = sum(float(t.get("pnl") or 0) for t in closed)
     alert_tag  = " [ALERT]" if any("CRITICAL" in a for a in all_alerts) else ""
