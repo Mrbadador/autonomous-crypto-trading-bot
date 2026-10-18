@@ -117,7 +117,7 @@ class NightlyAuditor:
                 ai_rationale,
                 quality
             FROM trades
-            WHERE status = 'closed'
+            WHERE (status = 'closed' OR status = 'CLOSED')
               AND timestamp >= ?
             ORDER BY timestamp ASC
         """

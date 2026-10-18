@@ -76,7 +76,7 @@ class ModelCalibrationTracker:
                 rows = conn_data.execute("""
                     SELECT id, timestamp, symbol, side, pnl, quality, ai_rationale 
                     FROM trades 
-                    WHERE status = 'closed'
+                    WHERE (status = 'closed' OR status = 'CLOSED')
                 """).fetchall()
 
             if not rows:

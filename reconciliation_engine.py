@@ -39,11 +39,11 @@ LEDGER_DB = os.path.join(BASE_DIR, "trading_ledger.db")
 RECONCILIATION_INTERVAL_SECS = 30  # Run full audit every 30 seconds
 
 FLEET_TABLES = [
-    {"table": "open_positions", "bot": "Sniper", "closed_table": "trades", "is_live": True},
-    {"table": "berserker_open_positions", "bot": "Berserker", "closed_table": "berserker_trades", "is_live": True},
-    {"table": "marl_live_open_positions", "bot": "MARL", "closed_table": "marl_live_trades", "is_live": True},
-    {"table": "swing_open_positions", "bot": "Swing", "closed_table": "swing_trades", "is_live": True},
-    {"table": "mean_reversion_open_positions", "bot": "MeanRev", "closed_table": "mean_reversion_trades", "is_live": False},
+    {"table": "open_positions", "bot": "Sniper", "closed_table": "trades", "is_live": True, "closed_status": "closed", "unreconciled_status": "unreconciled"},
+    {"table": "berserker_open_positions", "bot": "Berserker", "closed_table": "berserker_trades", "is_live": True, "closed_status": "closed", "unreconciled_status": "unreconciled"},
+    {"table": "marl_live_open_positions", "bot": "MARL", "closed_table": "marl_live_trades", "is_live": True, "closed_status": "closed", "unreconciled_status": "unreconciled"},
+    {"table": "swing_open_positions", "bot": "Swing", "closed_table": "swing_trades", "is_live": True, "closed_status": "CLOSED", "unreconciled_status": "UNRECONCILED"},
+    {"table": "mean_reversion_open_positions", "bot": "MeanRev", "closed_table": "mean_reversion_trades", "is_live": False, "closed_status": "closed", "unreconciled_status": "unreconciled"},
 ]
 
 # In-memory deduplication tracker for closure alerts to prevent email spam
@@ -578,7 +578,7 @@ async def audit_live_exchange_positions():
                                         actual_fill_entry_val = row_dict.get("actual_fill_price") or entry_p
                                         slippage_bps_val = row_dict.get("slippage_bps") or 0.0
                                         gates_snap_val = row_dict.get("gates_snapshot")
-                                        rec_status = "UNRECONCILED" if is_unreconciled else "CLOSED"
+                                        rec_status = fleet.get("unreconciled_status", "unreconciled") if is_unreconciled else fleet.get("closed_status", "closed")
 
                                         if closed_tbl == "swing_trades":
                                             cur_ins = conn.execute(
@@ -980,7 +980,7 @@ async def audit_live_exchange_positions():
                                         actual_fill_entry_val = row_dict.get("actual_fill_price") or entry_p
                                         slippage_bps_val = row_dict.get("slippage_bps") or 0.0
                                         gates_snap_val = row_dict.get("gates_snapshot")
-                                        rec_status = "UNRECONCILED" if is_unreconciled else "CLOSED"
+                                        rec_status = fleet.get("unreconciled_status", "unreconciled") if is_unreconciled else fleet.get("closed_status", "closed")
 
                                         if closed_tbl == "swing_trades":
                                             cur_ins = conn.execute(

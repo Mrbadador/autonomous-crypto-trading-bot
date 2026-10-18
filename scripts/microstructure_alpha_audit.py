@@ -23,7 +23,7 @@ def load_data():
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT timestamp, symbol, side, entry_price, exit_price, pnl, slippage_bps FROM trades WHERE status = 'closed'")
+            cursor.execute("SELECT timestamp, symbol, side, entry_price, exit_price, pnl, slippage_bps FROM trades WHERE (status = 'closed' OR status = 'CLOSED')")
             trades = [dict(r) for r in cursor.fetchall()]
             conn.close()
         except Exception as e:

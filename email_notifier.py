@@ -130,7 +130,7 @@ def _section_financials() -> tuple[str, list[str]]:
     closed = _safe_query(
         TRADING_DATA_DB,
         "SELECT symbol, side, pnl, type, regime, timestamp FROM trades "
-        "WHERE status='closed' AND timestamp >= ? ORDER BY timestamp DESC",
+        "WHERE (status = 'closed' OR status = 'CLOSED') AND timestamp >= ? ORDER BY timestamp DESC",
         (cutoff,)
     )
     total_pnl = sum(float(t.get("pnl") or 0) for t in closed)
@@ -407,7 +407,7 @@ def build_report_html() -> tuple[str, str]:
     cutoff = (now_utc - timedelta(hours=WINDOW_HOURS)).isoformat()
     closed = _safe_query(
         TRADING_DATA_DB,
-        "SELECT pnl FROM trades WHERE status='closed' AND timestamp >= ?", (cutoff,)
+        "SELECT pnl FROM trades WHERE (status = 'closed' OR status = 'CLOSED') AND timestamp >= ?", (cutoff,)
     )
     total_pnl = sum(float(t.get("pnl") or 0) for t in closed)
     alert_tag  = " [ALERT]" if any("CRITICAL" in a for a in all_alerts) else ""

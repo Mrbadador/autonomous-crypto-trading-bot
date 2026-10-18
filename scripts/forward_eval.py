@@ -62,7 +62,7 @@ def evaluate_ledger(db_path: str = "trading_data.db") -> None:
     # 1. Fetch swing trades
     st_df = pd.read_sql_query("SELECT * FROM swing_trades WHERE status = 'CLOSED' OR exit_price IS NOT NULL", conn)
     # 2. Fetch general trades
-    tr_df = pd.read_sql_query("SELECT * FROM trades WHERE status = 'closed'", conn)
+    tr_df = pd.read_sql_query("SELECT * FROM trades WHERE (status = 'closed' OR status = 'CLOSED')", conn)
 
     print("=" * 80)
     print("FORWARD-VALIDATION EVALUATION & MinTRL SIZING GATE REPORT")

@@ -428,7 +428,7 @@ class NightlyTrainer:
                 except Exception as _ve:
                     log.debug(f"[PPO-GUARD] Could not query veto telemetry: {_ve}")
 
-                trades = conn.execute("SELECT * FROM marl_live_trades WHERE status = 'closed'").fetchall()
+                trades = conn.execute("SELECT * FROM marl_live_trades WHERE (status = 'closed' OR status = 'CLOSED')").fetchall()
                 if len(trades) < 5:
                     fallback_trades = conn.execute("SELECT * FROM trades WHERE pnl IS NOT NULL AND entry_price > 0 ORDER BY id DESC LIMIT 50").fetchall()
                     trades = list(trades) + list(fallback_trades)

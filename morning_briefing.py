@@ -155,7 +155,7 @@ def check_portfolio() -> str:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     closed = safe_query(
         TRADING_DATA_DB,
-        "SELECT * FROM trades WHERE status='closed' AND timestamp >= ? ORDER BY timestamp DESC",
+        "SELECT * FROM trades WHERE (status = 'closed' OR status = 'CLOSED') AND timestamp >= ? ORDER BY timestamp DESC",
         (cutoff,)
     )
 
