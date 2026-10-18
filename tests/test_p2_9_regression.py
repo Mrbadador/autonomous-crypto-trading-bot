@@ -1072,43 +1072,39 @@ class TestP29D8DbIntegrityErrorWindow(unittest.TestCase):
     def test_d8_consecutive_errors_counted_across_305s_interval(self):
         import db_maintenance_daemon
 
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-            temp_db = tf.name
-
+        temp_dir = tempfile.mkdtemp()
+        temp_data_db = os.path.join(temp_dir, "trading_data.db")
         try:
-            conn = sqlite3.connect(temp_db)
+            conn = sqlite3.connect(temp_data_db)
             conn.execute("CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);")
             # Row updated 305 seconds ago (the exact inter-pass interval that previously caused resets)
             ts_305s = (datetime.now(timezone.utc) - timedelta(seconds=305)).strftime("%Y-%m-%d %H:%M:%S")
             conn.execute(
-                "INSERT INTO system_state (key, value, updated_at) VALUES ('db_integrity_trading_ledger_consecutive_errors', '2', ?)",
+                "INSERT INTO system_state (key, value, updated_at) VALUES ('db_integrity_trading_ledger.db_consecutive_errors', '2', ?)",
                 (ts_305s,)
             )
             conn.commit()
             conn.close()
 
-            with patch("db_maintenance_daemon.BASE_DIR", os.path.dirname(temp_db)), \
-                 patch("os.path.join", side_effect=lambda *args: temp_db if "trading_data.db" in args[-1] else os.path.join(*args)):
-
+            with patch("db_maintenance_daemon.BASE_DIR", temp_dir):
                 # Under the updated window, a 305s old row must be RECOGNIZED as consecutive (returns 2), NOT reset to 0!
-                consec = db_maintenance_daemon.get_durable_consecutive_errors("trading_ledger")
+                consec = db_maintenance_daemon.get_durable_consecutive_errors("trading_ledger.db")
                 self.assertEqual(consec, 2, "A 305s old error counter must be retained, not prematurely dropped as stale!")
 
                 # An older row beyond 360s (e.g. 400s) should be treated as stale (returns 0)
-                conn = sqlite3.connect(temp_db)
+                conn = sqlite3.connect(temp_data_db)
                 ts_400s = (datetime.now(timezone.utc) - timedelta(seconds=400)).strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute(
-                    "UPDATE system_state SET updated_at = ? WHERE key = 'db_integrity_trading_ledger_consecutive_errors'",
+                    "UPDATE system_state SET updated_at = ? WHERE key = 'db_integrity_trading_ledger.db_consecutive_errors'",
                     (ts_400s,)
                 )
                 conn.commit()
                 conn.close()
 
-                consec_stale = db_maintenance_daemon.get_durable_consecutive_errors("trading_ledger")
+                consec_stale = db_maintenance_daemon.get_durable_consecutive_errors("trading_ledger.db")
                 self.assertEqual(consec_stale, 0, "A 400s old error counter (>360s window) should be recognized as stale!")
         finally:
-            if os.path.exists(temp_db):
-                os.remove(temp_db)
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class TestP29D9ReconcilerLockPruneOwnerScope(unittest.TestCase):

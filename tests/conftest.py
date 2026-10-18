@@ -46,11 +46,14 @@ _ORIG_OPEN = builtins.open
 _ORIG_COPYFILE = shutil.copyfile
 
 
+import atexit
+
 def _seed_temp_files():
     """
     Creates a consistent read-only snapshot of production DBs and state JSONs
     into _SESSION_TEMP_DIR using sqlite3 online backup with mode=ro URI.
     Production databases are NEVER opened writable.
+    Fails loudly if a seed backup fails so tests never run against an empty schema.
     """
     for db_name in QUARANTINED_DB_BASENAMES:
         prod_path = os.path.join(PROJECT_ROOT_RAW, db_name)
@@ -64,18 +67,29 @@ def _seed_temp_files():
                     src_conn.backup(dst_conn)
                 dst_conn.close()
                 src_conn.close()
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(f"[QUARANTINE-SEED-ERROR] Failed to seed temp DB for {db_name}: {e}") from e
+
     for st_name in QUARANTINED_STATE_BASENAMES:
         prod_st = os.path.join(PROJECT_ROOT_RAW, st_name)
         dst_st = os.path.join(_SESSION_TEMP_DIR, st_name)
         if os.path.exists(prod_st) and not os.path.exists(dst_st):
             try:
                 _ORIG_COPYFILE(prod_st, dst_st)
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(f"[QUARANTINE-SEED-ERROR] Failed to seed temp state for {st_name}: {e}") from e
 
 
+def _cleanup_session_temp_dir():
+    """Removes the session quarantine temporary directory on interpreter exit."""
+    if os.path.exists(_SESSION_TEMP_DIR):
+        try:
+            shutil.rmtree(_SESSION_TEMP_DIR, ignore_errors=True)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_session_temp_dir)
 _seed_temp_files()
 
 
