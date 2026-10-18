@@ -1172,8 +1172,8 @@ async def reconciliation_main_loop():
             except Exception as sig_err:
                 log.debug(f"[FORCE-RESYNC-NOTE] Signal check: {sig_err}")
 
-            # 1. Run local cross-fleet paper audit
-            paper_audit = audit_paper_positions()
+            # 1. Run local cross-fleet paper audit (offloaded to thread to unblock async event loop)
+            paper_audit = await asyncio.to_thread(audit_paper_positions)
             
             # 2. Run live exchange audit if live credentials exist
             live_audit = await audit_live_exchange_positions()
