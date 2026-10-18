@@ -838,81 +838,319 @@ def fetch_ai_usage_stats() -> dict:
         "today_str": today_str
     }
 
-# ── High-Contrast Cyberpunk UI Styling ───────────────────────────────────────
+# ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&family=Roboto+Mono:wght@400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0,1&family=IBM+Plex+Mono:ital,wght@0,400;0,600;0,700;1,400&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
 
 :root {
-    --bg-main: #06080e;
-    --card-bg: #0d121f;
-    --neon-cyan: #00e5ff;
-    --neon-green: #00ff66;
-    --neon-danger: #ff003c;
-    --neon-orange: #ff9900;
-    --border-color: #1e293b;
+    --terminal-bg: #0a0a0c;
+    --panel-bg: #111114;
+    --accent-amber: #d4a017;
+    --accent-cyan: #00bcd4;
+    --accent-emerald: #00c853;
+    --accent-rose: #e91e63;
+    --text-primary: #e8e6e1;
+    --text-muted: #6b6b6f;
+    --grid-line: rgba(212, 160, 23, 0.06);
+    --border-subtle: rgba(255, 255, 255, 0.06);
 }
 
+/* Global reset */
 .stApp {
-    background-color: var(--bg-main);
-    color: #e2e8f0;
-    font-family: 'Outfit', sans-serif;
+    background: var(--terminal-bg) !important;
+    background-image: 
+        linear-gradient(var(--grid-line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid-line) 1px, transparent 1px) !important;
+    background-size: 40px 40px !important;
+    color: var(--text-primary) !important;
+    font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif !important;
 }
 
-/* Metric Cards */
+/* Typography hierarchy */
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'DM Serif Display', Georgia, serif !important;
+    font-weight: 400 !important;
+    letter-spacing: -0.02em !important;
+    color: var(--text-primary) !important;
+}
+
+p, span, div, label {
+    font-family: 'Space Grotesk', sans-serif !important;
+}
+
+code, pre, .monospace {
+    font-family: 'IBM Plex Mono', 'Fira Code', monospace !important;
+    font-size: 0.875em !important;
+}
+
+/* Sidebar refinement */
+section[data-testid="stSidebar"] {
+    background: var(--panel-bg) !important;
+    border-right: 1px solid var(--border-subtle) !important;
+}
+
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+    font-family: 'DM Serif Display', serif !important;
+    color: var(--accent-amber) !important;
+}
+
+/* Metric cards — terminal-style data blocks */
 div[data-testid="stMetric"] {
-    background: var(--card-bg) !important;
-    border: 1px solid var(--border-color) !important;
-    border-left: 3px solid var(--neon-cyan) !important;
-    border-radius: 6px !important;
-    padding: 12px 16px !important;
-    box-shadow: 0 4px 15px rgba(0,0,0,0.5) !important;
+    background: var(--panel-bg) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-top: 2px solid var(--accent-amber) !important;
+    border-radius: 2px !important;
+    padding: 16px 20px !important;
+    position: relative;
+    overflow: hidden;
+}
+
+div[data-testid="stMetric"]::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent-amber), transparent);
+    opacity: 0.4;
 }
 
 [data-testid="stMetricValue"] {
-    font-family: 'Roboto Mono', 'JetBrains Mono', monospace !important;
-    font-size: 1.8rem !important;
-    font-weight: 700 !important;
-    color: #ffffff !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 2rem !important;
+    font-weight: 600 !important;
+    color: var(--text-primary) !important;
+    letter-spacing: -0.03em !important;
 }
 
 [data-testid="stMetricLabel"] p {
-    font-size: 0.75rem !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-size: 0.7rem !important;
     text-transform: uppercase !important;
-    letter-spacing: 0.12em !important;
-    color: #94a3b8 !important;
-    font-weight: 700 !important;
+    letter-spacing: 0.15em !important;
+    color: var(--text-muted) !important;
+    font-weight: 500 !important;
 }
 
-/* Tabs */
+/* Tab navigation — understated elegance */
 button[data-baseweb="tab"] {
-    font-family: 'JetBrains Mono', monospace !important;
-    font-weight: 700 !important;
-    font-size: 0.85rem !important;
-    letter-spacing: 0.08em !important;
-    color: #94a3b8 !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.8rem !important;
+    letter-spacing: 0.06em !important;
+    color: var(--text-muted) !important;
     text-transform: uppercase;
+    padding: 12px 20px !important;
+    border-bottom: 2px solid transparent !important;
+    transition: all 0.2s ease;
+}
+
+button[data-baseweb="tab"]:hover {
+    color: var(--text-primary) !important;
+    background: rgba(255, 255, 255, 0.02) !important;
 }
 
 button[data-baseweb="tab"][aria-selected="true"] {
-    background-color: rgba(0, 229, 255, 0.08) !important;
-    border-bottom: 2px solid var(--neon-cyan) !important;
-    color: #00e5ff !important;
+    color: var(--accent-amber) !important;
+    border-bottom: 2px solid var(--accent-amber) !important;
+    background: transparent !important;
 }
 
-/* Badges & Tables */
-.badge-green { background: rgba(0,255,102,0.15); color: #00ff66; border: 1px solid #00ff66; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
-.badge-red { background: rgba(255,0,60,0.15); color: #ff003c; border: 1px solid #ff003c; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
-.badge-cyan { background: rgba(0,229,255,0.15); color: #00e5ff; border: 1px solid #00e5ff; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
-.badge-orange { background: rgba(255,153,0,0.15); color: #ff9900; border: 1px solid #ff9900; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
+/* Data tables — clean terminal readout */
+div[data-testid="stDataFrame"] {
+    background: var(--panel-bg) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 2px !important;
+    overflow: hidden;
+}
 
+table {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.85rem !important;
+}
+
+thead th {
+    background: rgba(212, 160, 23, 0.08) !important;
+    color: var(--accent-amber) !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.08em !important;
+    font-size: 0.75rem !important;
+    border-bottom: 1px solid var(--border-subtle) !important;
+}
+
+tbody td {
+    border-bottom: 1px solid var(--border-subtle) !important;
+    color: var(--text-primary) !important;
+}
+
+tbody tr:hover {
+    background: rgba(255, 255, 255, 0.02) !important;
+}
+
+/* Status badges */
+.badge-green {
+    background: rgba(0, 200, 83, 0.12) !important;
+    color: var(--accent-emerald) !important;
+    border: 1px solid var(--accent-emerald) !important;
+    padding: 3px 10px !important;
+    border-radius: 2px !important;
+    font-weight: 600 !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.05em !important;
+}
+
+.badge-red {
+    background: rgba(233, 30, 99, 0.12) !important;
+    color: var(--accent-rose) !important;
+    border: 1px solid var(--accent-rose) !important;
+    padding: 3px 10px !important;
+    border-radius: 2px !important;
+    font-weight: 600 !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.05em !important;
+}
+
+.badge-cyan {
+    background: rgba(0, 188, 212, 0.12) !important;
+    color: var(--accent-cyan) !important;
+    border: 1px solid var(--accent-cyan) !important;
+    padding: 3px 10px !important;
+    border-radius: 2px !important;
+    font-weight: 600 !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.05em !important;
+}
+
+.badge-orange {
+    background: rgba(212, 160, 23, 0.12) !important;
+    color: var(--accent-amber) !important;
+    border: 1px solid var(--accent-amber) !important;
+    padding: 3px 10px !important;
+    border-radius: 2px !important;
+    font-weight: 600 !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.05em !important;
+}
+
+/* Position cards */
 .pos-card {
-    background: #0d121f;
-    border: 1px solid #1e293b;
-    border-radius: 8px;
-    padding: 14px 18px;
-    margin-bottom: 12px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    background: var(--panel-bg) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-left: 3px solid var(--accent-cyan) !important;
+    border-radius: 2px !important;
+    padding: 16px 20px !important;
+    margin-bottom: 12px !important;
+    position: relative;
+}
+
+.pos-card::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent-cyan), transparent);
+    opacity: 0.3;
+}
+
+/* Buttons and controls */
+button[kind="primary"] {
+    background: var(--accent-amber) !important;
+    color: var(--terminal-bg) !important;
+    border: none !important;
+    border-radius: 2px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.08em !important;
+    font-size: 0.75rem !important;
+    padding: 10px 20px !important;
+    transition: all 0.15s ease;
+}
+
+button[kind="primary"]:hover {
+    background: #e6b422 !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(212, 160, 23, 0.3);
+}
+
+button[kind="secondary"] {
+    background: transparent !important;
+    color: var(--text-muted) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 2px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.75rem !important;
+    padding: 10px 20px !important;
+    transition: all 0.15s ease;
+}
+
+button[kind="secondary"]:hover {
+    border-color: var(--accent-amber) !important;
+    color: var(--accent-amber) !important;
+}
+
+/* Expanders and containers */
+details {
+    background: var(--panel-bg) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 2px !important;
+    margin-bottom: 8px !important;
+}
+
+summary {
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 500 !important;
+    color: var(--text-primary) !important;
+    padding: 12px 16px !important;
+}
+
+/* Alert banners */
+div[data-testid="stAlert"] {
+    background: var(--panel-bg) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-left: 3px solid var(--accent-amber) !important;
+    border-radius: 2px !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--terminal-bg);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-subtle);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--accent-amber);
+}
+
+/* Subtle animation for live data */
+@keyframes pulse-amber {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.live-indicator {
+    animation: pulse-amber 2s ease-in-out infinite;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -935,14 +1173,16 @@ if _carried_feed_failures:
 
 # ── Sidebar Controls & Configuration ─────────────────────────────────────────
 with st.sidebar:
-    st.image("https://cryptologos.cc/logos/bitcoin-btc-logo.png", width=40)
-    st.title("⚡ Sovereign Swarm")
-    st.caption("Institutional Autonomous Multi-Agent Trading Fleet")
-    st.markdown("---")
+    st.markdown("""
+    <div style="padding: 20px 0; border-bottom: 1px solid var(--border-subtle); margin-bottom: 20px;">
+        <h2 style="font-family: 'DM Serif Display', serif; color: var(--accent-amber); margin: 0; font-size: 1.6rem; letter-spacing: -0.01em;">Sovereign Swarm</h2>
+        <p style="font-family: 'Space Grotesk', sans-serif; color: var(--text-muted); margin: 8px 0 0 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.12em;">Autonomous Trading Fleet</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # P0: Auto-Refresh Toggle Engine
-    st.markdown("##### ⏱️ Telemetry Refresh Engine")
-    auto_refresh_enabled = st.checkbox("⚡ Live Auto-Refresh (4s)", value=True, help="Refreshes HUD telemetry automatically every 4 seconds.")
+    st.markdown("**Telemetry Refresh**")
+    auto_refresh_enabled = st.checkbox("Live Auto-Refresh (4s)", value=True, help="Refreshes HUD telemetry automatically every 4 seconds.")
     if auto_refresh_enabled and AUTOREFRESH_AVAILABLE:
         st_autorefresh(interval=4000, key="sovereign_swarm_hud_autorefresh")
     
