@@ -462,19 +462,31 @@ class SwingArchitectTrader:
                     pos = self.active_positions.get(sym, {})
                     owner = pos.get("lock_owner")
                     if not owner:
-                        eng_type = pos.get("engine_type")
-                        notes = str(pos.get("notes", "")).lower()
-                        if eng_type == "GRID_MAKER" or "grid" in notes or "chop" in notes:
-                            owner = "super_bot_grid"
-                        elif eng_type == "SCALP_SHORT" or "scalp_short" in notes or "scalp short" in notes:
-                            owner = "super_bot_scalp_short"
+                        # Authoritative lookup from asset_locks table first
+                        row_lock = conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = ?", (sym,)).fetchone()
+                        if row_lock and row_lock[0]:
+                            owner = row_lock[0]
                         else:
-                            owner = "swing_architect"
-                    conn.execute("""
+                            eng_type = pos.get("engine_type")
+                            notes = str(pos.get("notes", "")).lower()
+                            if eng_type == "GRID_MAKER" or "grid" in notes or "chop" in notes:
+                                owner = "super_bot_grid"
+                            elif eng_type == "SCALP_SHORT" or "scalp_short" in notes or "scalp short" in notes:
+                                owner = "super_bot_scalp_short"
+                            else:
+                                owner = "swing_architect"
+                    cur_hb = conn.execute("""
                         UPDATE asset_locks SET heartbeat = ?
                         WHERE symbol = ?
                           AND locked_by = ?
                     """, (now_iso, sym, owner))
+                    if cur_hb.rowcount == 0:
+                        actual_row = conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = ?", (sym,)).fetchone()
+                        actual_locked_by = actual_row[0] if actual_row else None
+                        log.warning(
+                            f"[HEARTBEAT-MISMATCH] 0 rows updated for {sym} (derived_owner='{owner}', "
+                            f"actual_locked_by='{actual_locked_by}'). Lock may age out."
+                        )
                 # Prune orphaned locks whose positions are no longer active and exceeded 900s TTL
                 if active_symbols:
                     placeholders = ",".join("?" for _ in active_symbols)
