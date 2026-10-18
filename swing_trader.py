@@ -1721,11 +1721,12 @@ class SwingArchitectTrader:
             if not order_success:
                 # S2-16 FIX: Verify against real exchange positions before placing market order
                 try:
-                    active_ex_pos = await self.uta_client.get_open_position(symbol)
-                    if active_ex_pos and float(active_ex_pos.get("total", 0.0) or 0.0) > 0.0:
+                    positions = await self.uta_client.fetch_positions(symbol=symbol)
+                    active_ex_pos = next((p for p in positions if float(p.get("contracts", p.get("total", 0.0))) > 0), None)
+                    if active_ex_pos and float(active_ex_pos.get("contracts", active_ex_pos.get("total", 0.0)) or 0.0) > 0.0:
                         log.critical(
                             f"[PRE-TRADE-DRIFT-VETO] 🚨 Exchange reports existing open position on {symbol} "
-                            f"(size: {active_ex_pos.get('total')}) untracked by local active_positions! "
+                            f"(size: {active_ex_pos.get('contracts', active_ex_pos.get('total'))}) untracked by local active_positions! "
                             f"Aborting new entry to avoid inadvertent position stacking."
                         )
                         await asyncio.to_thread(self._release_lock_sync, symbol)
