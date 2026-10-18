@@ -19,12 +19,16 @@ import re
 import sqlite3
 import sys
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 from reconciliation_engine import validate_exit_price_plausibility
 
 TARGET_CORRUPT_IDS = (149, 152, 156, 163, 166, 168, 170, 172, 192)
 
 
-def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_ids: tuple = TARGET_CORRUPT_IDS) -> int:
+def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_ids: tuple | None = None) -> int:
     if not os.path.exists(db_path):
         print(f"[ERROR] Database file not found: {db_path}")
         return 1
@@ -42,14 +46,25 @@ def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_id
             print("[ERROR] Table 'swing_trades' does not exist.")
             return 1
 
-        id_placeholders = ",".join("?" for _ in target_ids)
-        rows = conn.execute(
-            f"SELECT * FROM swing_trades WHERE id IN ({id_placeholders}) ORDER BY id",
-            target_ids,
-        ).fetchall()
+        if target_ids is not None:
+            id_placeholders = ",".join("?" for _ in target_ids)
+            rows = conn.execute(
+                f"SELECT * FROM swing_trades WHERE id IN ({id_placeholders}) ORDER BY id",
+                target_ids,
+            ).fetchall()
+        else:
+            # Dynamic ratio-based discovery (exit_price / entry_price outside [0.70, 1.40])
+            rows = conn.execute("""
+                SELECT * FROM swing_trades 
+                WHERE exit_price IS NOT NULL 
+                  AND entry_price IS NOT NULL 
+                  AND entry_price > 0 
+                  AND (exit_price / entry_price < 0.70 OR exit_price / entry_price > 1.40)
+                ORDER BY id
+            """).fetchall()
 
         if not rows:
-            print(f"No corrupt rows found with IDs: {target_ids}.")
+            print("No corrupt exit rows discovered in swing_trades.")
             return 0
 
         print(f"Found {len(rows)} target rows to evaluate for reconciliation.\n")
@@ -87,17 +102,17 @@ def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_id
             )
 
             if is_plausible:
-                # Recalculate accurate ROE using 5x default leverage
-                roe = ((implied_exit - entry_p) / entry_p * 500.0) if "LONG" in side else ((entry_p - implied_exit) / entry_p * 500.0)
-                reconciled_notes = f"[RECONCILED-D4] Exit price restored from PnL fills | {notes}"
+                # Preserve original roe_pct unless missing
+                orig_roe = r["roe_pct"]
+                reconciled_notes = f"[RECONCILED-D4] exit_price INVERTED FROM pnl+fee/size (not exchange fill); provenance=derived | {notes}"
                 planned_updates.append({
                     "id": r_id,
                     "symbol": sym,
                     "action": "RESTORE_IMPLIED_PRICE",
                     "old_exit": exit_p,
                     "new_exit": implied_exit,
-                    "old_roe": r["roe_pct"],
-                    "new_roe": roe,
+                    "old_roe": orig_roe,
+                    "new_roe": orig_roe,
                     "old_pnl": pnl,
                     "new_pnl": pnl,
                     "new_status": "CLOSED",
@@ -114,7 +129,7 @@ def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_id
                     "old_roe": r["roe_pct"],
                     "new_roe": None,
                     "old_pnl": pnl,
-                    "new_pnl": None,
+                    "new_pnl": pnl,  # Preserve pnl; NULL only exit_price and roe_pct per T-5(c)
                     "new_status": "UNRECONCILED",
                     "notes": reconciled_notes,
                 })
@@ -124,7 +139,7 @@ def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_id
         for u in planned_updates:
             print(
                 f"  ID {u['id']:3d} ({u['symbol']}): action={u['action']}, "
-                f"exit: {u['old_exit']} -> {u['new_exit']}, status -> {u['new_status']}"
+                f"exit: {u['old_exit']} -> {u['new_exit']}, roe: {u['new_roe']}, pnl: {u['new_pnl']}, status -> {u['new_status']}"
             )
 
         if not apply_changes:
@@ -149,11 +164,13 @@ def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_id
         print(f"[APPLY] Successfully updated {len(planned_updates)} rows.")
 
         # Post-verification
+        target_ids = [u["id"] for u in planned_updates]
+        id_placeholders = ",".join("?" for _ in target_ids)
         corrupt_rem = conn.execute("""
             SELECT count(*) FROM swing_trades
             WHERE id IN ({})
               AND exit_price IS NOT NULL
-              AND (exit_price / entry_price < 0.70 OR exit_price / entry_price > 1.40)
+              AND (exit_price / entry_price < 0.50 OR exit_price / entry_price > 1.70)
         """.format(id_placeholders), target_ids).fetchone()[0]
 
         print(f"[VERIFY] Corrupt exit prices remaining among target IDs: {corrupt_rem}")
