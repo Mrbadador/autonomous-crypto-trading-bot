@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import html  # L-1 FIX: HTML escaping for unsafe_allow_html=True blocks
 import sqlite3
 import pytz
 import requests
@@ -1173,6 +1174,40 @@ if _carried_feed_failures:
 
 # ── Sidebar Controls & Configuration ─────────────────────────────────────────
 with st.sidebar:
+    # H-2 FIX: Password authentication for operator controls
+    import hashlib
+    
+    APP_PASSWORD = os.getenv("APP_PASSWORD", "SovereignSwarm2026!")
+    
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    
+    if not st.session_state.authenticated:
+        st.markdown("""
+        <div style="padding: 20px 0; border-bottom: 1px solid var(--border-subtle); margin-bottom: 20px;">
+            <h2 style="font-family: 'DM Serif Display', serif; color: var(--accent-amber); margin: 0; font-size: 1.6rem; letter-spacing: -0.01em;">Sovereign Swarm</h2>
+            <p style="font-family: 'Space Grotesk', sans-serif; color: var(--text-muted); margin: 8px 0 0 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.12em;">Autonomous Trading Fleet</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("#### 🔐 Operator Authentication")
+        password_input = st.text_input("Password", type="password", help="Enter APP_PASSWORD from .env to access operator controls")
+        
+        if st.button("Authenticate", width="stretch"):
+            pwd_hash = hashlib.sha256(password_input.encode()).hexdigest()
+            expected_hash = hashlib.sha256(APP_PASSWORD.encode()).hexdigest()
+            
+            if pwd_hash == expected_hash:
+                st.session_state.authenticated = True
+                st.success("✅ Authenticated")
+                st.rerun()
+            else:
+                st.error("❌ Invalid password")
+                st.stop()
+        else:
+            st.info("🔒 Enter password to unlock operator controls and trading commands")
+            st.stop()
+    
     st.markdown("""
     <div style="padding: 20px 0; border-bottom: 1px solid var(--border-subtle); margin-bottom: 20px;">
         <h2 style="font-family: 'DM Serif Display', serif; color: var(--accent-amber); margin: 0; font-size: 1.6rem; letter-spacing: -0.01em;">Sovereign Swarm</h2>
@@ -3592,11 +3627,15 @@ with tab_risk:
         macro_4h = query_system_state("macro_trend_4h", "NEUTRAL")
         
         reg_color = "#00ff66" if market_label in ("BULL_TREND", "BULLISH", "TRENDING") else ("#ef4444" if market_label in ("BEAR_TREND", "BEARISH") else "#f59e0b")
-        st.write(f"• **Market Regime Label:** <b style='color: {reg_color};'>{market_label}</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(4H: {macro_4h})</span>", unsafe_allow_html=True)
-        st.write(f"• **DI Polarity Spread:** <b style='color: {reg_color};'>{di_spread}</b>", unsafe_allow_html=True)
-        st.write(f"• **60m Warden Bias:** <b style='color: #00ff66;'>{warden_regime}</b>", unsafe_allow_html=True)
+        # L-1 FIX: Escape all DB/LLM-derived text before interpolation into unsafe_allow_html=True
+        safe_market_label = html.escape(str(market_label))
+        safe_last_veto = html.escape(str(last_sniper_veto))
+        st.write(f"• **Market Regime Label:** <b style='color: {reg_color};'>{safe_market_label}</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(4H: {html.escape(str(macro_4h))})</span>", unsafe_allow_html=True)
+        st.write(f"• **DI Polarity Spread:** <b style='color: {reg_color};'>{html.escape(str(di_spread))}</b>", unsafe_allow_html=True)
+        st.write(f"• **60m Warden Bias:** <b style='color: #00ff66;'>{html.escape(str(warden_regime))}</b>", unsafe_allow_html=True)
         st.write(f"• **Volatility Cascade Risk:** <b style='color: #00ff66;'>CLEAR (Normal Flow)</b>", unsafe_allow_html=True)
-        st.write(f"• **Last Filter Gate:** <span style='color: #94a3b8; font-size: 0.8rem;'>{last_sniper_veto[:40]}...</span>", unsafe_allow_html=True)
+        veto_preview = safe_last_veto[:40] + ("..." if len(safe_last_veto) > 40 else "")
+        st.write(f"• **Last Filter Gate:** <span style='color: #94a3b8; font-size: 0.8rem;'>{veto_preview}</span>", unsafe_allow_html=True)
 
     # P1: Visual OFI Depth Imbalance Meter & Regime Strength Deck
     st.markdown("---")

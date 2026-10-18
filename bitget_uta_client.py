@@ -316,12 +316,55 @@ class BitgetUTAClient:
 
                 if not sl_attached:
                     log.critical(f"[BITGET-UTA] 🚨 CRITICAL STOP-LOSS FAILURE: Could not register native SL on {clean_sym} after 3 attempts ({last_strat_err})! Aborting position to eliminate naked capital exposure.")
+                    close_success = False
                     try:
                         await self.close_position_order(symbol=clean_sym, side=pos_side, qty=qty)
                         log.warning(f"[BITGET-UTA] Emergency position abort SUCCESS for {clean_sym}.")
+                        close_success = True
                     except Exception as abort_err:
                         log.error(f"[BITGET-UTA] Emergency position abort failed for {clean_sym}: {abort_err}")
-                    raise RuntimeError(f"Native Stop Loss placement failed on {clean_sym} after 3 retries ({last_strat_err}). Position was aborted to prevent naked loss.")
+                    
+                    # M-1 FIX: Write emergency state row when BOTH SL and close fail
+                    if not close_success:
+                        try:
+                            import sqlite3
+                            from datetime import datetime, timezone
+                            now_iso = datetime.now(timezone.utc).isoformat()
+                            
+                            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                                conn.execute("""
+                                    INSERT INTO system_state (key, value, updated_at)
+                                    VALUES (?, ?, ?)
+                                    ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+                                """, (
+                                    f"emergency_sl_failure_{clean_sym}",
+                                    json.dumps({
+                                        "symbol": clean_sym,
+                                        "side": pos_side,
+                                        "qty": qty,
+                                        "sl_error": str(last_strat_err),
+                                        "close_error": str(abort_err),
+                                        "timestamp": now_iso,
+                                        "status": "UNPROTECTED_NAKED_POSITION"
+                                    }),
+                                    now_iso,
+                                    json.dumps({
+                                        "symbol": clean_sym,
+                                        "side": pos_side,
+                                        "qty": qty,
+                                        "sl_error": str(last_strat_err),
+                                        "close_error": str(abort_err),
+                                        "timestamp": now_iso,
+                                        "status": "UNPROTECTED_NAKED_POSITION"
+                                    }),
+                                    now_iso
+                                ))
+                                conn.commit()
+                                log.critical(f"[EMERGENCY-STATE] Persisted critical failure record for {clean_sym} — manual intervention required!")
+                        except Exception as state_err:
+                            log.critical(f"[EMERGENCY-STATE] Failed to persist emergency state for {clean_sym}: {state_err}")
+                    
+                    raise RuntimeError(f"Native Stop Loss placement failed on {clean_sym} after 3 retries ({last_strat_err}). Position was {'aborted' if close_success else 'NOT aborted - UNPROTECTED'} to prevent naked loss.")
 
             if tp and tp > 0.0:
                 try:

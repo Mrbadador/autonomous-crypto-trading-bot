@@ -1203,11 +1203,22 @@ class SuperBotTrader:
                         self.grid_leverage, now_iso, now_iso, "ACTIVE", 0.0, pos_record["initial_risk_usd"], pos_record["notes"],
                         intended_p, actual_fill_p, slippage_bps, fee_entry_usd, "maker", grid_gates_json
                     ))
-                    # Acquire exclusive lock
-                    conn.execute("""
-                        INSERT OR REPLACE INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (symbol, lock_who, now_iso, lock_why, now_iso))
+                    # Acquire exclusive lock atomically — only if no other engine holds it
+                    lock_acquired = conn.execute("""
+                        INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
+                        SELECT ?, ?, ?, ?, ?
+                        WHERE NOT EXISTS (SELECT 1 FROM asset_locks WHERE symbol = ? AND locked_by != ?)
+                    """, (symbol, lock_who, now_iso, lock_why, now_iso, symbol, lock_who)).rowcount > 0
+                    
+                    if not lock_acquired:
+                        existing_owner = conn.execute(
+                            "SELECT locked_by FROM asset_locks WHERE symbol = ?", (symbol,)
+                        ).fetchone()
+                        conn.rollback()
+                        raise RuntimeError(
+                            f"Cannot acquire lock on {symbol}: already held by {existing_owner[0] if existing_owner else 'unknown'}"
+                        )
+                    
                     conn.commit()
                     
             await asyncio.to_thread(_save)
