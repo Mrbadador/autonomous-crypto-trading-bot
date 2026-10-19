@@ -1606,7 +1606,7 @@ class SuperBotTrader:
                 
                 is_bull = any(x in regime for x in ("BULL", "TRENDING")) and self.market_regime_di_spread >= 0.0
                 is_bear = any(x in regime for x in ("BEAR", "CRASH", "BREAKDOWN")) or (adx >= 26.0 and self.market_regime_di_spread < -5.0)
-                is_chop = (not is_bear) and any(x in regime for x in ("CHOP", "SIDEWAYS", "UNKNOWN", "RANGING", "NEUTRAL", "CONSOLIDATION"))
+                is_chop = (not is_bear) and (not is_bull) and any(x in regime for x in ("CHOP", "SIDEWAYS", "UNKNOWN", "RANGING", "NEUTRAL", "CONSOLIDATION"))
 
                 # 3. Route Scans Based on Live Regime
                 if not self.regime_data_ok:
@@ -1619,12 +1619,13 @@ class SuperBotTrader:
                     if now_ts - last_4h_scan >= self.check_interval_4h:
                         log.info(f"[REGIME: BEAR_SHIELD] 🛡️ (ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) -> Bear Shield Active (Zero Longs).")
                         last_4h_scan = now_ts
-                    if self.scalp_short_enabled:
+                    # Strict Regime Gate: Only permit short scans in confirmed BEAR_TREND
+                    if self.scalp_short_enabled and regime == "BEAR_TREND":
                         await self.scan_quick_scalp_short_opportunities(mode="BEAR")
 
                 else:
                     # 3a. 4H Swing Architect + AI Boardroom Scan (every 5m when not in Bear Shield and DI spread >= -2.0)
-                    # Unchains decoupled momentum leaders (NEAR, LINK, AVAX, SUI, APT) even when BTC ADX is in CHOP
+                    # Unchains decoupled momentum leaders (NEAR, LINK, AVAX, SUI, APT) in Bull Trend or neutral chop
                     if now_ts - last_4h_scan >= self.check_interval_4h:
                         if self.turbulence_state == "EXTREME_SHOCK":
                             log.warning(
@@ -1640,8 +1641,9 @@ class SuperBotTrader:
                             await self.swing_engine.scan_fleet(allowed_direction="LONG")
                         last_4h_scan = now_ts
 
-                    # 3b. Clean Sept 30 Chop Maker Grid Dip-Buy Scan (in CHOP regime with ADX dead-band hysteresis)
-                    if is_chop:
+                    # 3b. Clean Chop Maker Grid Dip-Buy Scan
+                    # Strict Regime Gate: NEVER run mean-reversion chop dip-buys in a confirmed BULL_TREND (divert 100% margin to 4H trend-following)
+                    if is_chop and not is_bull:
                         # Q-2 FIX: Market ADX dead-band hysteresis to prevent toggle noise around 25.0
                         # Deactivates at ADX >= 25.5 (expansion); reactivates once ADX cools down <= 24.5.
                         if self._chop_grid_adx_active and adx >= 25.5:
@@ -1653,8 +1655,8 @@ class SuperBotTrader:
                             log.info(f"[CHOP-GRID-VETO] Market ADX={adx:.1f} >= 25.0 (hysteresis ceiling 25.5) indicates directional expansion. Chop Grid dip-buying suppressed.")
                         else:
                             await self.scan_chop_grid_opportunities()
-                        if self.scalp_short_enabled:
-                            await self.scan_quick_scalp_short_opportunities(mode="CHOP")
+                    elif is_bull:
+                        log.debug(f"[REGIME-GATE] 🚀 Confirmed BULL_TREND active ({regime}): Suppressing Chop Grid mean-reversion dip-buys to prioritize 4H trend-following runners.")
 
                 # 4. Telemetry Logging (every 60s)
                 if now_ts - last_telemetry >= 60:

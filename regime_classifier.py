@@ -73,6 +73,12 @@ class RegimeClassifier:
             "evaluated_at_utc": None,
             "evaluated_at_epoch": 0.0,
         }
+        # Hysteresis & Stabilization for AI Regime Arbiter (prevents 15m ping-pong flip-flopping)
+        self.active_ai_bias = "DEFENSIVE_CHOP"
+        self.pending_ai_bias = None
+        self.pending_ai_bias_count = 0
+        self.ai_bias_dwell_ts = 0.0
+        self.min_ai_bias_dwell_sec = 2700.0  # 45 minutes minimum dwell time or 2 consecutive matches
         try:
             from markov_regime import MarkovRegimeEngine
             self.markov_engine = MarkovRegimeEngine()
@@ -865,33 +871,64 @@ class RegimeClassifier:
             except Exception as ai_e:
                 log.warning(f"[AI-REGIME-ARBITER-NOTE] Error querying AI arbiter: {ai_e}")
 
-        # Apply Cognitive Arbitration Rules.
-        # Every field is coerced through a bounded parser: the cached verdict is external
-        # provider output, and a bare float(None) here used to abort the whole daemon.
+        # Apply Cognitive Arbitration Rules with Hysteresis & Symmetric Veto.
         cached = self.latest_ai_arbiter if isinstance(self.latest_ai_arbiter, dict) else {}
         raw_bias = str(cached.get("ai_regime_bias") or "").strip().upper()
-        # The offline baseline is a defensive posture, not a provider opinion.
-        ai_bias = raw_bias if raw_bias in AI_REGIME_BIASES else "DEFENSIVE_CHOP"
+        incoming_bias = raw_bias if raw_bias in AI_REGIME_BIASES else "DEFENSIVE_CHOP"
         trap_risk = self._bounded_float(cached.get("trap_risk_score"), AI_TRAP_RISK_DEFAULT, 0.0, 1.0)
         ai_thesis = str(cached.get("structural_thesis") or "")[:AI_THESIS_MAX_CHARS]
         ai_lev_cap = self._bounded_int(cached.get("recommended_leverage_cap"), AI_LEVERAGE_DEFAULT, AI_LEVERAGE_ALLOWLIST)
         ai_evaluated_at = cached.get("evaluated_at_utc")
         ai_eval_epoch = self._bounded_float(cached.get("evaluated_at_epoch"), 0.0, 0.0, now_epoch + 1.0)
-        # Age of the verdict actually being applied, measured from when a provider answered,
-        # not from when this row was published. The classifier runs every 5 minutes against a
-        # 15 minute AI cadence, so without this a verdict can be quoted as if it were current
-        # for hours after the model last spoke.
+
         ai_verdict_age_sec = (now_epoch - ai_eval_epoch) if ai_eval_epoch > 0.0 else None
-        ai_verdict_usable = ai_verdict_age_sec is not None and ai_verdict_age_sec <= self.ai_eval_interval_sec
+        ai_verdict_usable = (ai_verdict_age_sec is not None) and (ai_verdict_age_sec <= self.ai_eval_interval_sec)
+
+        # -----------------------------------------------------------------------
+        # Recommendation 1: AI Bias Hysteresis Filter
+        # Prevents 15m ping-pong flips. Only change active_ai_bias if:
+        # (a) 2 consecutive matching incoming verdicts from the AI arbiter, OR
+        # (b) Minimum dwell time of 45 minutes (2700s) has elapsed.
+        # -----------------------------------------------------------------------
+        if ai_is_fresh and ai_verdict_usable:
+            if incoming_bias == self.active_ai_bias:
+                self.pending_ai_bias = None
+                self.pending_ai_bias_count = 0
+            else:
+                if incoming_bias == self.pending_ai_bias:
+                    self.pending_ai_bias_count += 1
+                else:
+                    self.pending_ai_bias = incoming_bias
+                    self.pending_ai_bias_count = 1
+
+                dwell_elapsed = now_epoch - self.ai_bias_dwell_ts
+                if self.pending_ai_bias_count >= 2 or dwell_elapsed >= self.min_ai_bias_dwell_sec or self.ai_bias_dwell_ts == 0.0:
+                    old_b = self.active_ai_bias
+                    self.active_ai_bias = incoming_bias
+                    self.ai_bias_dwell_ts = now_epoch
+                    self.pending_ai_bias = None
+                    self.pending_ai_bias_count = 0
+                    log.info(f"[AI-REGIME-HYSTERESIS] 🔄 AI Bias switched: {old_b} -> {incoming_bias} (dwell: {dwell_elapsed:.0f}s, confirmation: {self.pending_ai_bias_count})")
+                else:
+                    log.info(f"[AI-REGIME-HYSTERESIS] ⏳ Pending switch {self.active_ai_bias} -> {incoming_bias} buffered (count: {self.pending_ai_bias_count}/2, dwell: {dwell_elapsed:.0f}s/{self.min_ai_bias_dwell_sec:.0f}s)")
+
+        ai_bias = self.active_ai_bias
 
         regime = math_regime
         recommended_leverage = math_leverage
 
+        # -----------------------------------------------------------------------
+        # Recommendation 2: Symmetric & Validated Veto
+        # Only override mathematical BULL_TREND when:
+        # - AI verdict is fresh and usable (non-stale)
+        # - trap_risk >= 0.70 AND active AI bias confirms an active liquidity trap
+        # Offline defaults or held/stale verdicts CANNOT veto a valid mathematical trend.
+        # -----------------------------------------------------------------------
         if math_regime == "BULL_TREND":
-            if trap_risk >= 0.60 or ai_bias in ("LIQUIDITY_HUNT_TRAP", "DEFENSIVE_CHOP"):
+            if ai_verdict_usable and trap_risk >= 0.70 and ai_bias in ("LIQUIDITY_HUNT_TRAP", "BEAR_DUMP"):
                 regime = "DEFENSIVE_CHOP"
                 recommended_leverage = min(recommended_leverage, ai_lev_cap, 3)
-                log.warning(f"[AI-REGIME-ARBITER] 🛡️ VETO: Math signaled BULL_TREND, but AI detected {ai_bias} (Trap Risk: {trap_risk:.2f}). Overriding to DEFENSIVE_CHOP ({recommended_leverage}x cap). Thesis: {ai_thesis}")
+                log.warning(f"[AI-REGIME-ARBITER] 🛡️ VETO: Math signaled BULL_TREND, but fresh AI detected {ai_bias} (Trap Risk: {trap_risk:.2f} >= 0.70). Overriding to DEFENSIVE_CHOP ({recommended_leverage}x cap). Thesis: {ai_thesis}")
             else:
                 recommended_leverage = min(5, ai_lev_cap)
         elif math_regime == "BEAR_TREND":
@@ -900,9 +937,6 @@ class RegimeClassifier:
             log.info(f"[AI-REGIME-ARBITER] 🛡️ BEAR_TREND confirmed: Preserving 100% USDT shield in super_bot (no counter-trend dip-buys).")
         elif math_regime == "CHOP":
             if ai_bias == "BULL_EXPANSION" and trap_risk < 0.25 and di_spread > 6.0 and macro_trend in ("BULL", "MILD_BULL"):
-                # Loosening (CHOP -> BULL_TREND, leverage straight from the provider) needs a
-                # verdict a model actually produced inside the cadence. Tightening above may
-                # act on a held verdict; relaxing may not.
                 if not ai_verdict_usable:
                     log.warning(
                         f"[AI-REGIME-ARBITER] 🚫 PROMOTION SUPPRESSED: BULL_EXPANSION verdict is "

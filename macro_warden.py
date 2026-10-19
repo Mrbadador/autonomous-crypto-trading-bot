@@ -177,12 +177,14 @@ class MacroWarden:
                     with sqlite3.connect(trading_data_path, timeout=10.0) as data_conn:
                         data_conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('tradfi_macro_regime', ?, ?)",
                                           (macro_regime_label, now_iso))
+                        data_conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_regime', ?, ?)",
+                                          (macro_regime_label, now_iso))
                         data_conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('spy_health', ?, ?)",
                                           (str(round(spy_health, 4)), now_iso))
                         data_conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('dxy_momentum', ?, ?)",
                                           (str(round(dxy_momentum, 4)), now_iso))
                         data_conn.commit()
-                        log.info(f"[MACRO-WARDEN] Dispatched tradfi_macro_regime '{macro_regime_label}' to trading_data.db system_state.")
+                        log.info(f"[MACRO-WARDEN] Dispatched tradfi_macro_regime & macro_regime '{macro_regime_label}' to trading_data.db system_state.")
                 except Exception as de:
                     log.warning(f"[MACRO-WARDEN] system_state broadcast note: {de}")
 
