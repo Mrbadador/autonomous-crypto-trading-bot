@@ -78,6 +78,7 @@ class RegimeClassifier:
         self.pending_ai_bias = None
         self.pending_ai_bias_count = 0
         self.ai_bias_dwell_ts = 0.0
+        self.last_counted_ai_eval_epoch = None
         self.min_ai_bias_dwell_sec = 2700.0  # 45 minutes minimum dwell time or 2 consecutive matches
         try:
             from markov_regime import MarkovRegimeEngine
@@ -892,26 +893,32 @@ class RegimeClassifier:
         # (c) First initialization (dwell_ts == 0.0)
         # -----------------------------------------------------------------------
         if ai_verdict_usable or ai_is_fresh:
-            if incoming_bias == self.active_ai_bias:
-                self.pending_ai_bias = None
-                self.pending_ai_bias_count = 0
-            else:
-                if incoming_bias == self.pending_ai_bias:
-                    self.pending_ai_bias_count += 1
-                else:
-                    self.pending_ai_bias = incoming_bias
-                    self.pending_ai_bias_count = 1
-
-                dwell_elapsed = now_epoch - self.ai_bias_dwell_ts
-                if self.pending_ai_bias_count >= 2 or dwell_elapsed >= self.min_ai_bias_dwell_sec or self.ai_bias_dwell_ts == 0.0:
-                    old_b = self.active_ai_bias
-                    self.active_ai_bias = incoming_bias
-                    self.ai_bias_dwell_ts = now_epoch
+            # Only count a verdict the first time it is seen
+            is_new_verdict = (ai_eval_epoch > 0.0 and ai_eval_epoch != self.last_counted_ai_eval_epoch) or (ai_eval_epoch == 0.0 and self.last_counted_ai_eval_epoch is None)
+            if is_new_verdict:
+                self.last_counted_ai_eval_epoch = ai_eval_epoch
+                if incoming_bias == self.active_ai_bias:
                     self.pending_ai_bias = None
                     self.pending_ai_bias_count = 0
-                    log.info(f"[AI-REGIME-HYSTERESIS] 🔄 AI Bias switched: {old_b} -> {incoming_bias} (dwell: {dwell_elapsed:.0f}s, confirmation: {self.pending_ai_bias_count})")
                 else:
-                    log.info(f"[AI-REGIME-HYSTERESIS] ⏳ Pending switch {self.active_ai_bias} -> {incoming_bias} buffered (count: {self.pending_ai_bias_count}/2, dwell: {dwell_elapsed:.0f}s/{self.min_ai_bias_dwell_sec:.0f}s)")
+                    if incoming_bias == self.pending_ai_bias:
+                        self.pending_ai_bias_count += 1
+                    else:
+                        self.pending_ai_bias = incoming_bias
+                        self.pending_ai_bias_count = 1
+
+                    dwell_elapsed = now_epoch - self.ai_bias_dwell_ts
+                    if self.pending_ai_bias_count >= 2 or dwell_elapsed >= self.min_ai_bias_dwell_sec or self.ai_bias_dwell_ts == 0.0:
+                        old_b = self.active_ai_bias
+                        self.active_ai_bias = incoming_bias
+                        self.ai_bias_dwell_ts = now_epoch
+                        self.pending_ai_bias = None
+                        self.pending_ai_bias_count = 0
+                        log.info(f"[AI-REGIME-HYSTERESIS] 🔄 AI Bias switched: {old_b} -> {incoming_bias} (dwell: {dwell_elapsed:.0f}s, confirmation: {self.pending_ai_bias_count})")
+                    else:
+                        log.info(f"[AI-REGIME-HYSTERESIS] ⏳ Pending switch {self.active_ai_bias} -> {incoming_bias} buffered (count: {self.pending_ai_bias_count}/2, dwell: {dwell_elapsed:.0f}s/{self.min_ai_bias_dwell_sec:.0f}s)")
+            else:
+                log.debug(f"[AI-REGIME-HYSTERESIS] Skipping counting step: verdict epoch {ai_eval_epoch} already counted.")
         elif not ai_verdict_usable and not self.latest_ai_arbiter.get("evaluated_at_utc"):
             # Unstamped/offline/poisoned baseline: reflect default directly
             self.active_ai_bias = incoming_bias

@@ -128,6 +128,7 @@ class TestAiPayloadValidation(unittest.TestCase):
         self.clf.pending_ai_bias = None
         self.clf.pending_ai_bias_count = 0
         self.clf.ai_bias_dwell_ts = 0.0
+        self.clf.last_counted_ai_eval_epoch = None
 
     # ------------------------------------------------------- contract validation
     def test_valid_verdict_is_normalised(self):
@@ -499,6 +500,43 @@ class TestAiPayloadValidation(unittest.TestCase):
         ok2, row2, state2, _ = self._run_classify(arbiter=at_thresh, adx=30.0, plus_di=34.0, minus_di=20.0)
         self.assertTrue(ok2)
         self.assertEqual(row2["regime"], "DEFENSIVE_CHOP", "trap_risk >= 0.70 must veto to DEFENSIVE_CHOP")
+
+    def test_same_cached_verdict_classified_twice_does_not_switch_bias(self):
+        """Classifying twice with the identical cached verdict skips the counting step and does not switch bias."""
+        self._stub_market(prior_math="CHOP", prior_label="CHOP")
+        self.clf.active_ai_bias = "DEFENSIVE_CHOP"
+        self.clf.ai_bias_dwell_ts = time.time()  # recent dwell, no dwell timeout
+        self.clf.pending_ai_bias = None
+        self.clf.pending_ai_bias_count = 0
+        self.clf.last_counted_ai_eval_epoch = None
+
+        cached_verdict = {
+            "ai_regime_bias": "BULL_EXPANSION",
+            "trap_risk_score": 0.10,
+            "recommended_leverage_cap": 5,
+            "structural_thesis": "cached verdict static epoch",
+            "override_math_regime": True,
+            "evaluated_by": "Gemini:model-a",
+            "evaluated_at_utc": datetime.now(UTC).isoformat(),
+            "evaluated_at_epoch": time.time() - 30,
+        }
+
+        # 1st classify pass: first time verdict is seen -> pending_ai_bias_count becomes 1
+        ok1, row1, state1, _ = self._run_classify(arbiter=cached_verdict, plus_di=30.0, minus_di=20.0)
+        self.assertTrue(ok1)
+        self.assertEqual(self.clf.active_ai_bias, "DEFENSIVE_CHOP")
+        self.assertEqual(self.clf.pending_ai_bias, "BULL_EXPANSION")
+        self.assertEqual(self.clf.pending_ai_bias_count, 1)
+        self.assertEqual(self.clf.last_counted_ai_eval_epoch, cached_verdict["evaluated_at_epoch"])
+
+        # 2nd classify pass: identical cached verdict (same evaluated_at_epoch)
+        # Must skip counting step -> count remains 1 and active_ai_bias does NOT switch
+        ok2, row2, state2, _ = self._run_classify(arbiter=cached_verdict, plus_di=30.0, minus_di=20.0)
+        self.assertTrue(ok2)
+        self.assertEqual(self.clf.active_ai_bias, "DEFENSIVE_CHOP", "cached verdict must not trigger a switch on re-classification")
+        self.assertEqual(self.clf.pending_ai_bias, "BULL_EXPANSION")
+        self.assertEqual(self.clf.pending_ai_bias_count, 1, "counting step must be skipped when evaluated_at_epoch is unchanged")
+        self.assertEqual(row2["regime"], "CHOP")
 
 
 if __name__ == "__main__":
