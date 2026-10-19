@@ -11,18 +11,19 @@ def validate_credentials() -> bool:
     
     Returns True if all checks pass, False otherwise.
     """
-    # Check .env file permissions
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if os.path.exists(env_path):
-        try:
-            file_stat = os.stat(env_path)
-            mode = file_stat.st_mode
-            # Check if others have read permission (world-readable)
-            if mode & stat.S_IROTH:
-                log.critical("[SECURITY] .env file is world-readable! Run: chmod 600 .env")
-                return False
-        except Exception as perm_err:
-            log.warning(f"[SECURITY] Could not check .env permissions: {perm_err}")
+    # Check .env file permissions (POSIX platforms only - Windows os.stat mode is synthetic)
+    if os.name != "nt":
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        if os.path.exists(env_path):
+            try:
+                file_stat = os.stat(env_path)
+                mode = file_stat.st_mode
+                # Check if others have read permission (world-readable)
+                if mode & stat.S_IROTH:
+                    log.critical("[SECURITY] .env file is world-readable! Run: chmod 600 .env")
+                    return False
+            except Exception as perm_err:
+                log.warning(f"[SECURITY] Could not check .env permissions: {perm_err}")
     
     # Validate required credentials are present
     required_keys = [

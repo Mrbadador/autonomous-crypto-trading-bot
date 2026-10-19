@@ -1173,41 +1173,6 @@ if _carried_feed_failures:
     )
 
 # ── Sidebar Controls & Configuration ─────────────────────────────────────────
-with st.sidebar:
-    # H-2 FIX: Password authentication for operator controls
-    import hashlib
-    
-    APP_PASSWORD = os.getenv("APP_PASSWORD", "SovereignSwarm2026!")
-    
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    
-    if not st.session_state.authenticated:
-        st.markdown("""
-        <div style="padding: 20px 0; border-bottom: 1px solid var(--border-subtle); margin-bottom: 20px;">
-            <h2 style="font-family: 'DM Serif Display', serif; color: var(--accent-amber); margin: 0; font-size: 1.6rem; letter-spacing: -0.01em;">Sovereign Swarm</h2>
-            <p style="font-family: 'Space Grotesk', sans-serif; color: var(--text-muted); margin: 8px 0 0 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.12em;">Autonomous Trading Fleet</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("#### 🔐 Operator Authentication")
-        password_input = st.text_input("Password", type="password", help="Enter APP_PASSWORD from .env to access operator controls")
-        
-        if st.button("Authenticate", width="stretch"):
-            pwd_hash = hashlib.sha256(password_input.encode()).hexdigest()
-            expected_hash = hashlib.sha256(APP_PASSWORD.encode()).hexdigest()
-            
-            if pwd_hash == expected_hash:
-                st.session_state.authenticated = True
-                st.success("✅ Authenticated")
-                st.rerun()
-            else:
-                st.error("❌ Invalid password")
-                st.stop()
-        else:
-            st.info("🔒 Enter password to unlock operator controls and trading commands")
-            st.stop()
-    
     st.markdown("""
     <div style="padding: 20px 0; border-bottom: 1px solid var(--border-subtle); margin-bottom: 20px;">
         <h2 style="font-family: 'DM Serif Display', serif; color: var(--accent-amber); margin: 0; font-size: 1.6rem; letter-spacing: -0.01em;">Sovereign Swarm</h2>
@@ -1223,58 +1188,80 @@ with st.sidebar:
     
     st.markdown("---")
 
-    # P1: Operator Safe Controls Drawer
+    # P1: Operator Safe Controls Drawer (Protected by Password Auth Gate)
     with st.expander("🛠️ Fleet Operator Controls", expanded=False):
-        st.markdown("##### ⚙️ Operational Overrides")
-        curr_op_halt = state_flag_now("OPERATOR_HALT")
-        curr_auto_halt = state_flag("RISK_HALT")
-        pause_entries = st.toggle(
-            "⏸️ Pause Entries (Close-Only)",
-            value=curr_op_halt,
-            help="Sticky manual pause (`OPERATOR_HALT`). Halts all new trade entries across the fleet while letting existing positions trail safely to SL/TP."
-        )
-        if curr_auto_halt and not curr_op_halt:
-            st.caption("⚠️ *Auto Risk Cap Halt is currently active (margin/slot ceiling).*")
-        if pause_entries != curr_op_halt:
-            new_val = "1" if pause_entries else "0"
-            wrote = execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('OPERATOR_HALT', ?, datetime('now'))", (new_val,))
-            persisted = read_state_now("OPERATOR_HALT")
-            if wrote and str(persisted) == new_val:
-                st.toast(f"Fleet State Updated (verified): {'Entries Paused (Close-Only)' if pause_entries else 'Manual Pause Cleared'}")
+        import hashlib
+        APP_PASSWORD = os.getenv("APP_PASSWORD", "SovereignSwarm2026!")
+        if "operator_authenticated" not in st.session_state:
+            st.session_state.operator_authenticated = False
+            
+        if not st.session_state.operator_authenticated:
+            st.markdown("##### 🔐 Operator Authentication")
+            password_input = st.text_input("Operator Password", type="password", key="operator_pwd_gate", help="Enter APP_PASSWORD from .env to unlock fleet mutation commands")
+            if st.button("Unlock Controls", key="btn_unlock_op_controls", width="stretch"):
+                pwd_hash = hashlib.sha256(password_input.encode()).hexdigest()
+                expected_hash = hashlib.sha256(APP_PASSWORD.encode()).hexdigest()
+                if pwd_hash == expected_hash:
+                    st.session_state.operator_authenticated = True
+                    st.success("✅ Operator Controls Unlocked")
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid password")
+            st.info("🔒 Enter password to unlock pause/resume and exchange re-sync controls.")
+        else:
+            if st.button("🔒 Lock Controls", key="btn_lock_op_controls", width="stretch"):
+                st.session_state.operator_authenticated = False
                 st.rerun()
-            else:
-                st.warning(
-                    f"⚠️ PAUSE COMMAND DID NOT LAND — write {'succeeded' if wrote else 'FAILED'}, "
-                    f"ledger read-back is {persisted!r} instead of {new_val!r}. The fleet is still in its "
-                    f"previous entry state; do not rely on this toggle until it re-reads as intended."
-                )
+            st.markdown("##### ⚙️ Operational Overrides")
+            curr_op_halt = state_flag_now("OPERATOR_HALT")
+            curr_auto_halt = state_flag("RISK_HALT")
+            pause_entries = st.toggle(
+                "⏸️ Pause Entries (Close-Only)",
+                value=curr_op_halt,
+                help="Sticky manual pause (`OPERATOR_HALT`). Halts all new trade entries across the fleet while letting existing positions trail safely to SL/TP."
+            )
+            if curr_auto_halt and not curr_op_halt:
+                st.caption("⚠️ *Auto Risk Cap Halt is currently active (margin/slot ceiling).*")
+            if pause_entries != curr_op_halt:
+                new_val = "1" if pause_entries else "0"
+                wrote = execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('OPERATOR_HALT', ?, datetime('now'))", (new_val,))
+                persisted = read_state_now("OPERATOR_HALT")
+                if wrote and str(persisted) == new_val:
+                    st.toast(f"Fleet State Updated (verified): {'Entries Paused (Close-Only)' if pause_entries else 'Manual Pause Cleared'}")
+                    st.rerun()
+                else:
+                    st.warning(
+                        f"⚠️ PAUSE COMMAND DID NOT LAND — write {'succeeded' if wrote else 'FAILED'}, "
+                        f"ledger read-back is {persisted!r} instead of {new_val!r}. The fleet is still in its "
+                        f"previous entry state; do not rely on this toggle until it re-reads as intended."
+                    )
 
-        st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-        if st.button("🔄 Force Exchange Re-Sync", width="stretch", help="Dispatches an immediate re-sync signal to the Reconciliation Engine."):
-            wrote = execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('force_resync', '1', datetime('now'))", ())
-            persisted = str(read_state_now("force_resync"))
-            if wrote and persisted == "1":
-                st.toast("✅ Force Re-Sync signal dispatched to Reconciliation Engine!")
-            elif wrote:
-                st.toast(f"✅ Force Re-Sync committed; the engine has already moved the flag to {persisted!r}")
-            else:
-                st.warning("⚠️ Force Re-Sync signal was NOT persisted to trading_data.db — the Reconciliation Engine will not see it.")
+            st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+            if st.button("🔄 Force Exchange Re-Sync", width="stretch", help="Dispatches an immediate re-sync signal to the Reconciliation Engine."):
+                wrote = execute_safe_write(TRADING_DATA_DB, "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('force_resync', '1', datetime('now'))", ())
+                persisted = str(read_state_now("force_resync"))
+                if wrote and persisted == "1":
+                    st.toast("✅ Force Re-Sync signal dispatched to Reconciliation Engine!")
+                elif wrote:
+                    st.toast(f"✅ Force Re-Sync committed; the engine has already moved the flag to {persisted!r}")
+                else:
+                    st.warning("⚠️ Force Re-Sync signal was NOT persisted to trading_data.db — the Reconciliation Engine will not see it.")
 
-        st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-        if st.button("📧 Send 1h Rollup Email", width="stretch", help="Immediately synthesizes the last 60 minutes of 5-minute briefings and sends the 1-Hour Executive Briefing email via Gmail SMTP."):
-            try:
-                import hourly_briefing
-                import importlib
-                importlib.reload(hourly_briefing)
-                with st.spinner("Dispatching 1h Executive Rollup Email..."):
-                    sent_ok = hourly_briefing.run_single_hourly_briefing(force=True)
-                    if sent_ok:
-                        st.toast("🏆 1-Hour Executive Rollup Email dispatched successfully!")
-                        st.success("🏆 1-Hour Executive Rollup Email dispatched to your inbox!")
-                    else:
-                        st.error("Email dispatch returned false. Check SMTP logs.")
-            except Exception as em_ui_err:
-                st.error(f"Failed to dispatch email: {em_ui_err}")
+            st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+            if st.button("📧 Send 1h Rollup Email", width="stretch", help="Immediately synthesizes the last 60 minutes of 5-minute briefings and sends the 1-Hour Executive Briefing email via Gmail SMTP."):
+                try:
+                    import hourly_briefing
+                    import importlib
+                    importlib.reload(hourly_briefing)
+                    with st.spinner("Dispatching 1h Executive Rollup Email..."):
+                        sent_ok = hourly_briefing.run_single_hourly_briefing(force=True)
+                        if sent_ok:
+                            st.toast("🏆 1-Hour Executive Rollup Email dispatched successfully!")
+                            st.success("🏆 1-Hour Executive Rollup Email dispatched to your inbox!")
+                        else:
+                            st.error("Email dispatch returned false. Check SMTP logs.")
+                except Exception as em_ui_err:
+                    st.error(f"Failed to dispatch email: {em_ui_err}")
 
     st.markdown("---")
     live_bal_val = num(query_system_state("balance", ""), None)
