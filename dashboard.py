@@ -1192,11 +1192,13 @@ with st.sidebar:
     # P1: Operator Safe Controls Drawer (Protected by Password Auth Gate)
     with st.expander("🛠️ Fleet Operator Controls", expanded=False):
         import hashlib
-        APP_PASSWORD = os.getenv("APP_PASSWORD", "SovereignSwarm2026!")
-        if "operator_authenticated" not in st.session_state:
+        APP_PASSWORD = os.getenv("APP_PASSWORD")
+        if not APP_PASSWORD:
+            st.error("🔒 Operator Controls Disabled: APP_PASSWORD is not set in environment.")
+        elif "operator_authenticated" not in st.session_state:
             st.session_state.operator_authenticated = False
             
-        if not st.session_state.operator_authenticated:
+        if APP_PASSWORD and not st.session_state.get("operator_authenticated", False):
             st.markdown("##### 🔐 Operator Authentication")
             password_input = st.text_input("Operator Password", type="password", key="operator_pwd_gate", help="Enter APP_PASSWORD from .env to unlock fleet mutation commands")
             if st.button("Unlock Controls", key="btn_unlock_op_controls", width="stretch"):

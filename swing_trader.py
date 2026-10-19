@@ -1262,98 +1262,95 @@ class SwingArchitectTrader:
         # Allows the fleet to deploy up to GLOBAL_MARGIN_LIMIT% of total wallet equity across concurrent positions.
         global_margin_limit = float(getattr(config, "GLOBAL_MARGIN_LIMIT", 70.0))
         max_wallet_margin_pct = global_margin_limit / 100.0
-        max_margin_per_trade_pct = float(getattr(config, "MAX_MARGIN_PER_TRADE_PCT", 0.20))
-        margin_collateral = self.allocation_usdt
+        # Dynamic Balance Sizing: Global Margin Utilization Protocol
+        # F-04 FIX: Strictly Fail-Closed. Never enter or size trades from unverified default allocation.
         try:
             live_bal = await self.uta_client.fetch_balance()
-            if live_bal and live_bal > 10.0:
-                # Calculate currently locked margin across active positions
-                total_locked_margin = sum(
-                    (float(p.get("size", 0.0)) * float(p.get("entry_price", 0.0))) / max(1.0, float(p.get("leverage", 3.0)))
-                    for p in self.active_positions.values()
-                )
-                max_allowed_margin = live_bal * max_wallet_margin_pct
-                available_margin_buffer = max(0.0, max_allowed_margin - total_locked_margin)
-
-                if available_margin_buffer < 5.0:
-                    log.warning(f"[MARGIN-CEILING] {global_margin_limit:.0f}% Wallet Utilization Ceiling reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing entry.")
-                    return
-
-                # Target fair share (e.g. 70% / 4 locks = 17.5% of wallet), bounded by remaining headroom and per-trade clamp
-                target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
-                
-                # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Sizing
-                try:
-                    from risk_manager import RiskManager
-                    rm = RiskManager()
-                    kelly_frac = await asyncio.to_thread(rm.calculate_empirical_kelly_fraction)
-                    conv_mult = max(0.6, min(1.2, float(conviction_score or 0.7)))
-                    finrl_mult = 1.0
-                    try:
-                        rep_path = os.path.join("cache", "quant_validation_report.json")
-                        if os.path.exists(rep_path):
-                            with open(rep_path, "r", encoding="utf-8") as rf:
-                                rep_data = json.load(rf)
-                            sw = ((rep_data.get("finrl_ensemble_selector") or {}).get("strategy_weights") or {}).get("SWING_4H") or {}
-                            finrl_mult = max(0.75, min(1.25, float(sw.get("allocation_weight_mult", 1.0))))
-                    except Exception:
-                        pass
-                    markov_mult = 1.0
-                    try:
-                        def _read_markov_mult():
-                            db_uri = f"file:{os.path.abspath('trading_data.db').replace(os.sep, '/')}?mode=ro"
-                            with sqlite3.connect(db_uri, timeout=3.0, uri=True) as mc:
-                                mrow = mc.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
-                                if mrow and mrow[0]:
-                                    mdata = json.loads(mrow[0])
-                                    return max(0.50, min(1.25, float(mdata.get("sizing_multiplier", 1.0) or 1.0)))
-                            return 1.0
-                        markov_mult = await asyncio.to_thread(_read_markov_mult)
-                    except Exception:
-                        markov_mult = 1.0
-                    target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
-                    target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
-                    log.info(f"[SWING-KELLY-SIZING] Empirical Kelly: {kelly_frac:.2%} | FinRL Mult: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
-                except Exception as ke:
-                    log.debug(f"[SWING-KELLY-NOTE] {ke}")
-
-                # Q-10 FIX: Clamp target margin per trade to MAX_MARGIN_PER_TRADE_PCT ceiling (e.g. 14% or 20% of equity)
-                max_trade_margin_cap = live_bal * max_margin_per_trade_pct
-                if target_per_trade > max_trade_margin_cap:
-                    log.info(f"[SWING-TRADE-MARGIN-CLAMP] Clamping target margin ${target_per_trade:.2f} to {max_margin_per_trade_pct:.0%} per-trade cap (${max_trade_margin_cap:.2f}).")
-                    target_per_trade = max_trade_margin_cap
-
-                margin_collateral = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
-
-                # Hard Per-Trade Dollar Risk Cap (default 2.0% of account equity)
-                sl_pct_actual = abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0.015
-                max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0
-                if sl_pct_actual > 0 and assigned_leverage > 0:
-                    max_risk_usd = live_bal * max_risk_pct
-                    max_margin_by_risk = max_risk_usd / (assigned_leverage * sl_pct_actual)
-                    if max_margin_by_risk < 6.0:
-                        # S2-03 FIX: Enforce hard risk veto if account equity / SL cannot accommodate exchange minimum margin
-                        log.warning(
-                            f"[RISK-CAP-VETO] 🛑 Cannot safely enter {symbol}: required margin cap (${max_margin_by_risk:.2f}) "
-                            f"is below exchange minimum ($6.00). Entering would risk {((6.0 * assigned_leverage * sl_pct_actual) / live_bal)*100:.2f}% "
-                            f"(exceeding {max_risk_pct*100:.1f}% limit). Vetoing entry."
-                        )
-                        # N-8 FIX: Do NOT call _release_lock_sync here! Lock is only acquired later at line 1287.
-                        return
-                    if margin_collateral > max_margin_by_risk:
-                        margin_collateral = round(max_margin_by_risk, 2)
-                        log.info(
-                            f"[RISK-CAP] Clamped {symbol} margin to ${margin_collateral:.2f} "
-                            f"to enforce {max_risk_pct*100:.1f}% max equity risk (${max_risk_usd:.2f} on {sl_pct_actual*100:.2f}% SL at {assigned_leverage}x)."
-                        )
-                else:
-                    # N-10 FIX: Live balance could not be resolved or is below threshold -> Fail-Closed
-                    log.warning(f"[BALANCE-VETO] 🛑 Live balance unresolved or invalid (${live_bal}). Vetoing {symbol} entry to enforce strict risk caps.")
-                    return
+            if not live_bal or live_bal <= 10.0:
+                log.warning(f"[SWING-BALANCE-VETO] 🛑 Live balance unresolved or below threshold (${live_bal}). Vetoing {symbol} entry to enforce strict risk caps.")
+                return
         except Exception as be:
-            # N-10 FIX: Fail-closed on balance query error
-            log.warning(f"[BALANCE-VETO] 🛑 Exception fetching balance for {symbol}: {be}. Vetoing entry to protect capital.")
+            log.warning(f"[SWING-BALANCE-VETO] 🛑 Exception fetching balance for {symbol}: {be}. Vetoing entry to protect capital.")
             return
+
+        # Calculate currently locked margin across active positions
+        total_locked_margin = sum(
+            (float(p.get("size", 0.0)) * float(p.get("entry_price", 0.0))) / max(1.0, float(p.get("leverage", 3.0)))
+            for p in self.active_positions.values()
+        )
+        max_allowed_margin = live_bal * max_wallet_margin_pct
+        available_margin_buffer = max(0.0, max_allowed_margin - total_locked_margin)
+
+        if available_margin_buffer < 5.0:
+            log.warning(f"[MARGIN-CEILING] {global_margin_limit:.0f}% Wallet Utilization Ceiling reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing entry.")
+            return
+
+        # Target fair share (e.g. 70% / 4 locks = 17.5% of wallet), bounded by remaining headroom and per-trade clamp
+        target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+        
+        # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Sizing
+        try:
+            from risk_manager import RiskManager
+            rm = RiskManager()
+            kelly_frac = await asyncio.to_thread(rm.calculate_empirical_kelly_fraction)
+            conv_mult = max(0.6, min(1.2, float(conviction_score or 0.7)))
+            finrl_mult = 1.0
+            try:
+                rep_path = os.path.join("cache", "quant_validation_report.json")
+                if os.path.exists(rep_path):
+                    with open(rep_path, "r", encoding="utf-8") as rf:
+                        rep_data = json.load(rf)
+                    sw = ((rep_data.get("finrl_ensemble_selector") or {}).get("strategy_weights") or {}).get("SWING_4H") or {}
+                    finrl_mult = max(0.75, min(1.25, float(sw.get("allocation_weight_mult", 1.0))))
+            except Exception:
+                pass
+            markov_mult = 1.0
+            try:
+                def _read_markov_mult():
+                    db_uri = f"file:{os.path.abspath('trading_data.db').replace(os.sep, '/')}?mode=ro"
+                    with sqlite3.connect(db_uri, timeout=3.0, uri=True) as mc:
+                        mrow = mc.execute("SELECT value FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                        if mrow and mrow[0]:
+                            mdata = json.loads(mrow[0])
+                            return max(0.50, min(1.25, float(mdata.get("sizing_multiplier", 1.0) or 1.0)))
+                    return 1.0
+                markov_mult = await asyncio.to_thread(_read_markov_mult)
+            except Exception:
+                markov_mult = 1.0
+            target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
+            target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
+            log.info(f"[SWING-KELLY-SIZING] Empirical Kelly: {kelly_frac:.2%} | FinRL Mult: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
+        except Exception as ke:
+            log.debug(f"[SWING-KELLY-NOTE] {ke}")
+
+        # Q-10 FIX: Clamp target margin per trade to MAX_MARGIN_PER_TRADE_PCT ceiling (e.g. 14% or 20% of equity)
+        max_trade_margin_cap = live_bal * max_margin_per_trade_pct
+        if target_per_trade > max_trade_margin_cap:
+            log.info(f"[SWING-TRADE-MARGIN-CLAMP] Clamping target margin ${target_per_trade:.2f} to {max_margin_per_trade_pct:.0%} per-trade cap (${max_trade_margin_cap:.2f}).")
+            target_per_trade = max_trade_margin_cap
+
+        margin_collateral = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
+
+        # Hard Per-Trade Dollar Risk Cap (default 2.0% of account equity)
+        sl_pct_actual = abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0.015
+        max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0
+        if sl_pct_actual > 0 and assigned_leverage > 0:
+            max_risk_usd = live_bal * max_risk_pct
+            max_margin_by_risk = max_risk_usd / (assigned_leverage * sl_pct_actual)
+            if max_margin_by_risk < 6.0:
+                # S2-03 FIX: Enforce hard risk veto if account equity / SL cannot accommodate exchange minimum margin
+                log.warning(
+                    f"[RISK-CAP-VETO] 🛑 Cannot safely enter {symbol}: required margin cap (${max_margin_by_risk:.2f}) "
+                    f"is below exchange minimum ($6.00). Entering would risk {((6.0 * assigned_leverage * sl_pct_actual) / live_bal)*100:.2f}% "
+                    f"(exceeding {max_risk_pct*100:.1f}% limit). Vetoing entry."
+                )
+                return
+            if margin_collateral > max_margin_by_risk:
+                margin_collateral = round(max_margin_by_risk, 2)
+                log.info(
+                    f"[RISK-CAP] Clamped {symbol} margin to ${margin_collateral:.2f} "
+                    f"to enforce {max_risk_pct*100:.1f}% max equity risk (${max_risk_usd:.2f} on {sl_pct_actual*100:.2f}% SL at {assigned_leverage}x)."
+                )
 
         # Apply Sentinel WARNING size-down multiplier (e.g. 0.5x on caution news)
         news_mult = float(self._news_size_multipliers.get(symbol, 1.0))
@@ -1364,7 +1361,6 @@ class SwingArchitectTrader:
                     f"[SENTINEL-SIZE-VETO] 🛑 News-downscaled margin (${scaled_margin:.2f}) falls below $6.00 minimum. "
                     f"Vetoing {symbol} entry to maintain capital safety."
                 )
-                # N-8 FIX: Do NOT release lock here (not acquired yet)
                 return
             prev_margin = margin_collateral
             margin_collateral = scaled_margin
@@ -1384,32 +1380,44 @@ class SwingArchitectTrader:
             log.warning(f"[SWING-MS-DEGRADED-SIZING] {symbol} Microstructure degraded -> scaling margin ${prev_margin:.2f} -> ${margin_collateral:.2f} (0.50x)")
 
         target_notional = margin_collateral * assigned_leverage
-        qty = target_notional / entry_price
+        raw_qty = target_notional / entry_price
 
-        # Format minimum order qty per asset to satisfy Bitget contract minimums
+        # F-14 FIX: Sizing step formatting & minimum lot verification (VETO on sub-minimum instead of inflating)
         if "BTC" in symbol:
-            qty = max(round(qty, 4), 0.0001)
+            min_lot = 0.0001
+            qty = round(raw_qty, 4)
         elif "ETH" in symbol or "BNB" in symbol:
-            qty = max(round(qty, 2), 0.01)
-        elif "SOL" in symbol:
-            qty = max(round(qty, 1), 0.1)
+            min_lot = 0.01
+            qty = round(raw_qty, 2)
+        elif "SOL" in symbol or "AVAX" in symbol:
+            min_lot = 0.1
+            qty = round(raw_qty, 1)
+        elif any(c in symbol for c in ["LINK", "ADA", "XRP", "DOGE", "NEAR"]):
+            min_lot = 1.0
+            qty = float(round(raw_qty))
         else:
-            qty = max(float(round(qty)), 1.0)
+            min_lot = 0.1
+            qty = round(raw_qty, 2)
+
+        if qty < min_lot:
+            log.warning(
+                f"[QTY-FLOOR-VETO] 🛑 Calculated order qty {raw_qty:.4f} (rounded={qty}) for {symbol} "
+                f"falls below minimum contract lot {min_lot}. Target notional ${target_notional:.2f} insufficient. Vetoing entry."
+            )
+            return
 
         # R-6 / N-9 FIX: Strict 2.0% equity cap (no 1.15x relaxation)
         actual_notional = qty * entry_price
         actual_risk_usd = actual_notional * (sl_distance / entry_price if entry_price > 0 else 0.015)
         try:
-            max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0
-            if 'live_bal' in locals() and live_bal > 0:
-                max_allowed_risk_usd = live_bal * max_risk_pct  # Strict 1.0x cap (2.0% max)
-                if actual_risk_usd > max_allowed_risk_usd:
-                    log.warning(
-                        f"[CONTRACT-STEP-RISK-VETO] 🛑 Minimum contract step for {symbol} (qty={qty}) forces dollar risk "
-                        f"${actual_risk_usd:.2f} ({actual_risk_usd/live_bal*100:.2f}%), exceeding strict budget ${max_allowed_risk_usd:.2f} "
-                        f"({max_risk_pct*100:.1f}% equity limit). Vetoing entry."
-                    )
-                    return
+            max_allowed_risk_usd = live_bal * max_risk_pct  # Strict 1.0x cap (2.0% max)
+            if actual_risk_usd > max_allowed_risk_usd:
+                log.warning(
+                    f"[CONTRACT-STEP-RISK-VETO] 🛑 Minimum contract step for {symbol} (qty={qty}) forces dollar risk "
+                    f"${actual_risk_usd:.2f} ({actual_risk_usd/live_bal*100:.2f}%), exceeding strict budget ${max_allowed_risk_usd:.2f} "
+                    f"({max_risk_pct*100:.1f}% equity limit). Vetoing entry."
+                )
+                return
         except Exception as step_risk_err:
             log.warning(f"[STEP-RISK-WARNING] Risk step check error: {step_risk_err}")
             return
@@ -1655,7 +1663,6 @@ class SwingArchitectTrader:
                                 
                                 if not close_success:
                                     try:
-                                        import sqlite3
                                         from datetime import datetime, timezone
                                         now_iso = datetime.now(timezone.utc).isoformat()
                                         clean_sym = self.uta_client._normalize_symbol(symbol)

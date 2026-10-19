@@ -385,6 +385,64 @@ class TestEmergencyStatePersistence(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row_emerg)
 
+    def test_f04_fail_closed_balance_sizing(self):
+        """Verify F-04: balance <= 10.0 or 0.0 fails closed immediately without sizing from default."""
+        from swing_trader import SwingArchitectTrader
+        with patch.object(SwingArchitectTrader, "__init__", lambda self: None):
+            trader = SwingArchitectTrader()
+            trader.uta_client = MagicMock()
+            trader.active_positions = {}
+            
+            from unittest.mock import AsyncMock
+            trader.uta_client._normalize_symbol = MagicMock(return_value="SOLUSDT")
+            trader.uta_client.exchange = MagicMock()
+            trader.uta_client.exchange.fetch_ticker = AsyncMock(return_value={"last": 150.0, "close": 150.0})
+            trader.uta_client.fetch_balance = AsyncMock(return_value=0.0)
+            trader.uta_client.fetch_positions = AsyncMock(return_value=[])
+            trader.symbols = ["SOL/USDT"]
+            trader.allocation_usdt = 85.0
+            trader.balance_pct = 0.175
+            trader.standard_leverage = 3
+            trader.high_quality_leverage = 5
+            trader.high_quality_conviction = 0.85
+            trader.high_quality_adx = 32.0
+            trader.leverage = 3
+            trader.max_locks = 4
+            trader.atr_sl_mult = 3.0
+            trader.runner_tp_mult = 4.0
+            trader.be_threshold_r = 2.0
+            trader.min_adx = 22.0
+            trader._news_size_multipliers = {}
+            trader._count_fleet_long_positions_sync = MagicMock(return_value=0)
+            trader._get_cooldown_sync = MagicMock(return_value=None)
+            trader._check_microstructure_entry_cache = MagicMock(return_value=(True, "OK", {}))
+            trader.boardroom = MagicMock()
+            trader.boardroom.evaluate_swing_entry = AsyncMock(return_value=(True, "OK", 0.90, {}))
+            
+            import asyncio
+            async def run_test():
+                mock_ind = {
+                    "close": 150.0,
+                    "atr": 5.0,
+                    "adx": 30.0,
+                    "rsi": 55.0,
+                    "cloud_top": 140.0,
+                    "cloud_bottom": 130.0,
+                    "kijun": 145.0
+                }
+                res = await trader.open_swing_position("SOL/USDT", mock_ind, "LONG")
+                return res
+
+            result = asyncio.run(run_test())
+            self.assertIsNone(result)
+            trader.uta_client.exchange.private_uta_post_v3_trade_place_order.assert_not_called()
+
+    def test_f18_dashboard_no_default_password(self):
+        """Verify F-18: dashboard.py does not contain fallback password 'SovereignSwarm2026!'."""
+        with open("dashboard.py", "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn("SovereignSwarm2026!", content)
+
 
 class TestP210T7ConftestHardening(unittest.TestCase):
     """
