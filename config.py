@@ -183,7 +183,7 @@ TRADFI_FAIL_CLOSED                = os.getenv("TRADFI_FAIL_CLOSED", "true").lowe
 # Chop Grid Hyperparameters (V36.5 Quantitative Calibration)
 
 GRID_MAX_5M_ADX                 = float(os.getenv("GRID_MAX_5M_ADX", "36.0"))           # Raised from 32.0 to 36.0 to allow moderate volatility dips
-GRID_BREAKEVEN_TRIGGER_PCT      = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0050")) # +0.50% profit triggers micro-breakeven
+GRID_BREAKEVEN_TRIGGER_PCT      = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0075")) # +0.75% profit triggers micro-breakeven (gives breathing room before ratcheting to +0.35%)
 GRID_BREAKEVEN_FEE_BUFFER_PCT   = float(os.getenv("GRID_BREAKEVEN_FEE_BUFFER_PCT", "0.0035")) # +0.35% above entry price (locks in net profit after fees + slippage)
 
 # ---------------------------------------------------------------------------

@@ -2272,8 +2272,11 @@ class SwingArchitectTrader:
                             # Avoids preempting trades with an instant market loss; lets price action confirm structural invalidation.
                             tight_sl = h_sl if h_sl is not None else (curr_price * 0.997 if is_long else curr_price * 1.003)
                             min_delta = entry_p * 0.001
-                            if (is_long and (tight_sl - pos["stop_loss"]) >= min_delta and tight_sl < curr_price) or \
-                               (not is_long and (pos["stop_loss"] - tight_sl) >= min_delta and tight_sl > curr_price):
+                            is_valid_direction = (is_long and tight_sl < curr_price) or (not is_long and tight_sl > curr_price)
+                            is_tighter = (is_long and (tight_sl - pos["stop_loss"]) >= min_delta) or \
+                                         (not is_long and (pos["stop_loss"] - tight_sl) >= min_delta)
+
+                            if is_valid_direction and is_tighter:
                                 old_sl_val = pos["stop_loss"]
                                 pos["stop_loss"] = round(tight_sl, 4)
                                 pos["trailing_stop"] = round(tight_sl, 4)
@@ -2282,6 +2285,8 @@ class SwingArchitectTrader:
                                     self.uta_client.modify_strategy_order(symbol, sl=round(tight_sl, 4), tp=pos.get("take_profit")),
                                     f"ai_tighten_sl_{symbol}"
                                 )
+                            elif not is_valid_direction:
+                                log.warning(f"[AI-SHEPHERD] ⚠️ {symbol} AI suggested stop (${tight_sl:.4f}) is on wrong side of current market (${curr_price:.4f}). Retaining valid SL (${pos['stop_loss']:.4f}).")
                             else:
                                 log.info(f"[AI-SHEPHERD] 🚨 {symbol} AI CLOSE_NOW received, but existing SL (${pos['stop_loss']:.4f}) is already tighter than structural floor (${tight_sl:.4f}). Retaining stop.")
 
