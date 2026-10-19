@@ -1598,10 +1598,12 @@ class SwingArchitectTrader:
                             opp_side = "sell" if is_long else "buy"
                             sl_str = self.uta_client.format_price_precision(symbol, stop_loss) if hasattr(self.uta_client, "format_price_precision") else str(round(stop_loss, 4) if stop_loss < 10 else round(stop_loss, 2))
                             
-                            # Register native strategy stop loss on Bitget with 3-attempt backoff retry
+                            # Register native strategy stop loss on Bitget with 5-attempt progressive backoff retry
+                            # Give Bitget matching engine 0.75s to settle the filled position before attaching strategy orders
+                            await asyncio.sleep(0.75)
                             sl_attached = False
                             last_sl_err = None
-                            for sl_attempt in range(3):
+                            for sl_attempt in range(5):
                                 try:
                                     sl_p = {
                                         "category": "USDT-FUTURES",
@@ -1622,11 +1624,11 @@ class SwingArchitectTrader:
                                     break
                                 except Exception as sl_reg_err:
                                     last_sl_err = sl_reg_err
-                                    log.warning(f"[ENTRY-SNIPER] Native SL registration attempt {sl_attempt+1}/3 failed for {symbol}: {sl_reg_err}")
-                                    await asyncio.sleep(0.5 * (sl_attempt + 1))
+                                    log.warning(f"[ENTRY-SNIPER] Native SL registration attempt {sl_attempt+1}/5 failed for {symbol}: {sl_reg_err}")
+                                    await asyncio.sleep(1.0 + 0.5 * sl_attempt)
 
                             if not sl_attached:
-                                log.critical(f"[ENTRY-SNIPER] 🚨 CRITICAL NAKED STOP FAILURE: Failed to attach native SL on {symbol} after 3 attempts ({last_sl_err})! Aborting position to eliminate naked risk.")
+                                log.critical(f"[ENTRY-SNIPER] 🚨 CRITICAL NAKED STOP FAILURE: Failed to attach native SL on {symbol} after 5 attempts ({last_sl_err})! Aborting position to eliminate naked risk.")
                                 try:
                                     await self.uta_client.close_position_order(symbol=symbol, side="long" if is_long else "short", qty=actual_qty)
                                     log.warning(f"[ENTRY-SNIPER] Emergency position abort SUCCESS for {symbol}.")

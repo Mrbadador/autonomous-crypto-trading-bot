@@ -196,7 +196,7 @@ class BitgetUTAClient:
             raise e
 
     async def set_leverage(self, leverage: int = None, symbol: str = "BTCUSDT", margin_mode: str = None) -> bool:
-        """Sets leverage for positions on Bitget Unified Account (V3)."""
+        """Sets leverage for positions on Bitget Unified Account (V3) with retry and caching."""
         import config
         try:
             clean_sym = self._normalize_symbol(symbol)
@@ -210,6 +210,18 @@ class BitgetUTAClient:
                 margin_mode = getattr(config, "MARGIN_MODE", "isolated").lower()
             else:
                 margin_mode = str(margin_mode).lower()
+
+            # Initialize cache attribute if missing
+            if not hasattr(self, "_leverage_cache"):
+                self._leverage_cache = {}
+
+            cache_key = f"{clean_sym}:{margin_mode}"
+            now = time.time()
+            cached_val, cached_time = self._leverage_cache.get(cache_key, (None, 0.0))
+            if cached_val == lev_int and (now - cached_time) < 1800.0:  # 30-min cache
+                log.debug(f"[BITGET-UTA] Leverage already confirmed at {lev}x on {clean_sym} ({margin_mode.upper()} cached)")
+                return True
+
             params = {
                 "category": "USDT-FUTURES",
                 "symbol": clean_sym,
@@ -219,9 +231,22 @@ class BitgetUTAClient:
                 "longLeverage": lev,
                 "shortLeverage": lev
             }
-            res = await self.exchange.private_uta_post_v3_account_set_leverage(params)
-            log.info(f"[BITGET-UTA] Leverage successfully anchored to {lev}x on {clean_sym} ({margin_mode.upper()} DOUBLE_SIDE): {res.get('msg', 'success')}")
-            return True
+
+            last_err = None
+            for attempt in range(3):
+                try:
+                    res = await self.exchange.private_uta_post_v3_account_set_leverage(params)
+                    log.info(f"[BITGET-UTA] Leverage successfully anchored to {lev}x on {clean_sym} ({margin_mode.upper()} DOUBLE_SIDE): {res.get('msg', 'success')}")
+                    self._leverage_cache[cache_key] = (lev_int, now)
+                    return True
+                except Exception as e:
+                    last_err = e
+                    log.warning(f"[BITGET-UTA] set_leverage attempt {attempt+1}/3 failed for {clean_sym} ({lev}x): {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(0.75 * (attempt + 1))
+
+            log.error(f"[BITGET-UTA] set_leverage exhausted 3 attempts for {clean_sym}: {last_err}")
+            return False
         except Exception as e:
             log.warning(f"[BITGET-UTA] Note on set_leverage for {symbol}: {e}")
             return False
@@ -284,9 +309,11 @@ class BitgetUTAClient:
             opp_side = "sell" if is_long else "buy"
             strat_ids = []
             if sl and sl > 0.0:
+                # Give Bitget matching engine 0.75s to settle the filled position before attaching strategy orders
+                await asyncio.sleep(0.75)
                 sl_attached = False
                 last_strat_err = None
-                for sl_attempt in range(3):
+                for sl_attempt in range(5):
                     try:
                         sl_str = self.format_price_precision(symbol, sl)
                         qty_str = self.format_quantity_precision(symbol, qty)
@@ -311,11 +338,11 @@ class BitgetUTAClient:
                         break
                     except Exception as strat_err:
                         last_strat_err = strat_err
-                        log.warning(f"[BITGET-UTA] Native Stop Loss attempt {sl_attempt+1}/3 failed: {strat_err}")
-                        await asyncio.sleep(0.5 * (sl_attempt + 1))
+                        log.warning(f"[BITGET-UTA] Native Stop Loss attempt {sl_attempt+1}/5 failed: {strat_err}")
+                        await asyncio.sleep(1.0 + 0.5 * sl_attempt)
 
                 if not sl_attached:
-                    log.critical(f"[BITGET-UTA] 🚨 CRITICAL STOP-LOSS FAILURE: Could not register native SL on {clean_sym} after 3 attempts ({last_strat_err})! Aborting position to eliminate naked capital exposure.")
+                    log.critical(f"[BITGET-UTA] 🚨 CRITICAL STOP-LOSS FAILURE: Could not register native SL on {clean_sym} after 5 attempts ({last_strat_err})! Aborting position to eliminate naked capital exposure.")
                     close_success = False
                     try:
                         await self.close_position_order(symbol=clean_sym, side=pos_side, qty=qty)

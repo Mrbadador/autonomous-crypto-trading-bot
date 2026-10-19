@@ -1080,10 +1080,12 @@ class SuperBotTrader:
                 sl_price = actual_entry * (1.0 + self.scalp_short_sl_pct)
 
             # Register native strategy stop loss on Bitget with aggressive retry
+            # Give Bitget matching engine 0.75s to settle the filled position before attaching strategy orders
+            await asyncio.sleep(0.75)
             sl_attached = False
             last_se = None
             sl_qty_str = self.uta_client.format_quantity_precision(symbol, qty) if hasattr(self.uta_client, "format_quantity_precision") else str(self.uta_client.format_qty_precision(symbol, qty))
-            for sl_att in range(3):
+            for sl_att in range(5):
                 try:
                     sl_str = self.uta_client.format_price_precision(symbol, sl_price)
                     sl_p = {
@@ -1105,11 +1107,11 @@ class SuperBotTrader:
                     break
                 except Exception as se:
                     last_se = se
-                    log.warning(f"[{engine_tag}-SHIELD-NOTE] Stop loss attach attempt {sl_att+1}/3 failed: {se}")
-                    await asyncio.sleep(0.5 * (sl_att + 1))
+                    log.warning(f"[{engine_tag}-SHIELD-NOTE] Stop loss attach attempt {sl_att+1}/5 failed: {se}")
+                    await asyncio.sleep(1.0 + 0.5 * sl_att)
 
             if not sl_attached:
-                log.critical(f"[{engine_tag}-SHIELD] 🚨 Native Stop Loss failed on {symbol} after 3 retries ({last_se})! Aborting position to eliminate naked capital exposure.")
+                log.critical(f"[{engine_tag}-SHIELD] 🚨 Native Stop Loss failed on {symbol} after 5 retries ({last_se})! Aborting position to eliminate naked capital exposure.")
                 try:
                     await self.uta_client.close_position_order(symbol=symbol, side=pos_side, qty=qty)
                     log.warning(f"[{engine_tag}-SHIELD] Emergency position abort SUCCESS for {symbol}.")
