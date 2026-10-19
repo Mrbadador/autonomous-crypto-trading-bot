@@ -1173,6 +1173,7 @@ if _carried_feed_failures:
     )
 
 # ── Sidebar Controls & Configuration ─────────────────────────────────────────
+with st.sidebar:
     st.markdown("""
     <div style="padding: 20px 0; border-bottom: 1px solid var(--border-subtle); margin-bottom: 20px;">
         <h2 style="font-family: 'DM Serif Display', serif; color: var(--accent-amber); margin: 0; font-size: 1.6rem; letter-spacing: -0.01em;">Sovereign Swarm</h2>
