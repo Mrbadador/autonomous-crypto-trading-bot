@@ -2003,10 +2003,10 @@ class SwingArchitectTrader:
 
                 if is_long:
                     # Ratchet 0: Dedicated Micro-Breakeven Ratchet for Chop Grid (GRID_MAKER) positions
-                    # Protects winning trades by ratcheting stop to Entry * (1 + 0.0018) when Peak Profit >= +0.50% (covering 2x taker fees + buffer)
+                    # Protects winning trades by ratcheting stop to Entry * (1 + fee_buffer) when Peak Profit >= +0.50% (covering 2x taker fees + slippage)
                     peak_profit_pct = (peak_p - entry_p) / entry_p
                     grid_be_trigger = max(float(getattr(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0050)), 0.0050)
-                    grid_fee_buffer = max(float(getattr(config, "GRID_BREAKEVEN_FEE_BUFFER_PCT", 0.0018)), 0.0018)
+                    grid_fee_buffer = max(float(getattr(config, "GRID_BREAKEVEN_FEE_BUFFER_PCT", 0.0035)), 0.0035)
 
                     # Only ratchet if peak profit has cleanly cleared the hurdle (minimum peak ROE >= +0.50%)
                     if is_grid_pos and peak_profit_pct >= grid_be_trigger and sl < (entry_p * (1.0 + grid_fee_buffer)):
@@ -2017,8 +2017,9 @@ class SwingArchitectTrader:
                         self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"grid_be_long_{symbol}")
 
                     # Ratchet 1: Breakeven at +1.5R (LONG)
-                    if r_multiple >= self.be_threshold_r and sl < (entry_p * 1.0018):
-                        fee_buffer = max(entry_p * 0.0018, 0.05 * initial_risk_unit)
+                    long_be_buffer_pct = max(float(getattr(config, "BREAKEVEN_FEE_BUFFER_PCT", 0.0035)), 0.0035)
+                    if r_multiple >= self.be_threshold_r and sl < (entry_p * (1.0 + long_be_buffer_pct)):
+                        fee_buffer = max(entry_p * long_be_buffer_pct, 0.05 * initial_risk_unit)
                         new_sl = entry_p + fee_buffer  # Lock in guaranteed positive net exit after round-trip fees
                         pos["stop_loss"] = round(new_sl, 4)
                         pos["trailing_stop"] = round(new_sl, 4)
@@ -2082,7 +2083,7 @@ class SwingArchitectTrader:
                     # Ratchet 0A: Fast Micro-Breakeven Ratchet for Quick Scalp Short & Short Grid positions
                     peak_profit_pct = (entry_p - peak_p) / entry_p
                     short_be_trigger = max(float(getattr(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0050)), 0.0050)
-                    short_fee_buffer = max(float(getattr(config, "SCALP_SHORT_BE_FEE_BUFFER_PCT", 0.0018)), 0.0018)
+                    short_fee_buffer = max(float(getattr(config, "SCALP_SHORT_BE_FEE_BUFFER_PCT", 0.0035)), 0.0035)
 
                     if (is_scalp_short or is_grid_pos) and peak_profit_pct >= short_be_trigger and sl > (entry_p * (1.0 - short_fee_buffer)):
                         new_sl = entry_p * (1.0 - short_fee_buffer)
@@ -2093,8 +2094,9 @@ class SwingArchitectTrader:
                         self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"scalp_be_short_{symbol}")
 
                     # Ratchet 1: Breakeven at +1.5R (SHORT)
-                    if r_multiple >= self.be_threshold_r and sl > (entry_p * 0.9982):
-                        fee_buffer = max(entry_p * 0.0018, 0.05 * initial_risk_unit)
+                    short_be_buffer_pct = max(float(getattr(config, "BREAKEVEN_FEE_BUFFER_PCT", 0.0035)), 0.0035)
+                    if r_multiple >= self.be_threshold_r and sl > (entry_p * (1.0 - short_be_buffer_pct)):
+                        fee_buffer = max(entry_p * short_be_buffer_pct, 0.05 * initial_risk_unit)
                         new_sl = entry_p - fee_buffer  # Lock in guaranteed positive net exit below entry after round-trip fees
                         pos["stop_loss"] = round(new_sl, 4)
                         pos["trailing_stop"] = round(new_sl, 4)
@@ -2266,9 +2268,22 @@ class SwingArchitectTrader:
                             continue
 
                         elif h_verdict == "CLOSE_NOW":
-                            log.warning(f"[AI-SHEPHERD] 🚨 {symbol} AI Emergency Structural Close: {h_diag}")
-                            await self.close_swing_position(symbol, exit_price=curr_price, reason="AI_STRUCTURAL_INVALIDATION")
-                            continue
+                            # Refactored: Demote instant market exit to an aggressive stop tighten.
+                            # Avoids preempting trades with an instant market loss; lets price action confirm structural invalidation.
+                            tight_sl = h_sl if h_sl is not None else (curr_price * 0.997 if is_long else curr_price * 1.003)
+                            min_delta = entry_p * 0.001
+                            if (is_long and (tight_sl - pos["stop_loss"]) >= min_delta and tight_sl < curr_price) or \
+                               (not is_long and (pos["stop_loss"] - tight_sl) >= min_delta and tight_sl > curr_price):
+                                old_sl_val = pos["stop_loss"]
+                                pos["stop_loss"] = round(tight_sl, 4)
+                                pos["trailing_stop"] = round(tight_sl, 4)
+                                log.warning(f"[AI-SHEPHERD] 🚨 {symbol} AI Structural Invalidation Alert: Demoting CLOSE_NOW to tight stop (${old_sl_val:.4f} -> ${tight_sl:.4f}). Diag: {h_diag}")
+                                self._track_task(
+                                    self.uta_client.modify_strategy_order(symbol, sl=round(tight_sl, 4), tp=pos.get("take_profit")),
+                                    f"ai_tighten_sl_{symbol}"
+                                )
+                            else:
+                                log.info(f"[AI-SHEPHERD] 🚨 {symbol} AI CLOSE_NOW received, but existing SL (${pos['stop_loss']:.4f}) is already tighter than structural floor (${tight_sl:.4f}). Retaining stop.")
 
                         else:
                             log.info(f"[AI-SHEPHERD] 🩺 {symbol} Health Check: {h_verdict} ({health_res.get('health_grade', 'PRISTINE')}) | PnL: {unr_pnl_pct:+.2f}% | Holding: {holding_mins:.1f}m | {h_diag}")

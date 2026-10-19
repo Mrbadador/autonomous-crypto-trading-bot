@@ -102,8 +102,10 @@ def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_id
             )
 
             if is_plausible:
-                # Preserve original roe_pct unless missing
-                orig_roe = r["roe_pct"]
+                # Recompute roe_pct based on margin
+                lev = float(r["leverage"] or 5.0) if "leverage" in r.keys() else 5.0
+                margin = (entry_p * size) / lev
+                corr_roe = (pnl / margin) * 100.0 if margin > 0 else 0.0
                 reconciled_notes = f"[RECONCILED-D4] exit_price INVERTED FROM pnl+fee/size (not exchange fill); provenance=derived | {notes}"
                 planned_updates.append({
                     "id": r_id,
@@ -111,8 +113,8 @@ def reconcile_corrupt_exits(db_path: str, apply_changes: bool = False, target_id
                     "action": "RESTORE_IMPLIED_PRICE",
                     "old_exit": exit_p,
                     "new_exit": implied_exit,
-                    "old_roe": orig_roe,
-                    "new_roe": orig_roe,
+                    "old_roe": r["roe_pct"],
+                    "new_roe": corr_roe,
                     "old_pnl": pnl,
                     "new_pnl": pnl,
                     "new_status": "CLOSED",

@@ -242,7 +242,7 @@ class SuperBotTrader:
         self.grid_max_adx = getattr(config, "GRID_MAX_5M_ADX", 24.0)   # 5m ADX exhaustion ceiling (blocks waterfall dips)
         
         # Quick Scalp Short Parameters (Fast Turnover Protocol V36.6)
-        self.scalp_short_enabled = getattr(config, "SCALP_SHORT_ENABLED", True)
+        self.scalp_short_enabled = getattr(config, "SCALP_SHORT_ENABLED", False)
         self.scalp_short_tp_pct = getattr(config, "SCALP_SHORT_TP_PCT", 0.0120)     # +1.20% limit target
         self.scalp_short_sl_pct = getattr(config, "SCALP_SHORT_SL_PCT", 0.0100)     # -1.00% tight stop
         self.scalp_short_be_trigger = getattr(config, "SCALP_SHORT_BE_TRIGGER_PCT", 0.0050) # +0.50% profit triggers breakeven ratchet

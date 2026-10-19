@@ -120,7 +120,7 @@ SCALP_SHORT_ENABLED            = os.getenv("SCALP_SHORT_ENABLED", "false").lower
 SCALP_SHORT_TP_PCT             = float(os.getenv("SCALP_SHORT_TP_PCT", "0.0120"))     # +1.20% limit target (1.20 R:R vs 1.00% SL)
 SCALP_SHORT_SL_PCT             = float(os.getenv("SCALP_SHORT_SL_PCT", "0.0100"))     # -1.00% tight stop
 SCALP_SHORT_BE_TRIGGER_PCT     = float(os.getenv("SCALP_SHORT_BE_TRIGGER_PCT", "0.0050")) # +0.50% gain triggers breakeven ratchet
-SCALP_SHORT_BE_FEE_BUFFER_PCT  = float(os.getenv("SCALP_SHORT_BE_FEE_BUFFER_PCT", "0.0018")) # 0.18% fee cushion (covers 2x taker fees + slippage)
+SCALP_SHORT_BE_FEE_BUFFER_PCT  = float(os.getenv("SCALP_SHORT_BE_FEE_BUFFER_PCT", "0.0035")) # 0.35% fee cushion (covers 2x taker fees + slippage)
 SCALP_SHORT_MAX_HOLD_MINS      = float(os.getenv("SCALP_SHORT_MAX_HOLD_MINS", "45.0")) # 45 minutes soft profit harvest / stop-tighten checkpoint
 SCALP_SHORT_HARD_EXPIRY_MINS   = float(os.getenv("SCALP_SHORT_HARD_EXPIRY_MINS", "90.0")) # 90 minutes hard time decay limit
 SCALP_SHORT_RSI_OVERBOUGHT     = float(os.getenv("SCALP_SHORT_RSI_OVERBOUGHT", "68.0")) # Chop range top RSI floor
@@ -184,7 +184,7 @@ TRADFI_FAIL_CLOSED                = os.getenv("TRADFI_FAIL_CLOSED", "true").lowe
 
 GRID_MAX_5M_ADX                 = float(os.getenv("GRID_MAX_5M_ADX", "36.0"))           # Raised from 32.0 to 36.0 to allow moderate volatility dips
 GRID_BREAKEVEN_TRIGGER_PCT      = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0050")) # +0.50% profit triggers micro-breakeven
-GRID_BREAKEVEN_FEE_BUFFER_PCT   = float(os.getenv("GRID_BREAKEVEN_FEE_BUFFER_PCT", "0.0005")) # +0.05% above entry price (locks in net fees)
+GRID_BREAKEVEN_FEE_BUFFER_PCT   = float(os.getenv("GRID_BREAKEVEN_FEE_BUFFER_PCT", "0.0035")) # +0.35% above entry price (locks in net profit after fees + slippage)
 
 # ---------------------------------------------------------------------------
 # Strategy Timeframe & Data
@@ -300,7 +300,7 @@ MAX_PRICE_CHANGE_PCT          = float(os.getenv("MAX_PRICE_CHANGE_PCT", "1000.0"
 POST_LOSS_COOLDOWN_MINUTES    = int(os.getenv("POST_LOSS_COOLDOWN_MINUTES", "0" if IS_REPLAY else "120"))
 POST_TP_COOLDOWN_MINUTES      = int(os.getenv("POST_TP_COOLDOWN_MINUTES", "120"))
 EARLY_BE_ATR_MULT             = float(os.getenv("EARLY_BE_ATR_MULT", "1.0"))
-BREAKEVEN_FEE_BUFFER_PCT      = float(os.getenv("BREAKEVEN_FEE_BUFFER_PCT", "0.001"))
+BREAKEVEN_FEE_BUFFER_PCT      = float(os.getenv("BREAKEVEN_FEE_BUFFER_PCT", "0.0035"))
 GLOBAL_HALT_COOLDOWN_HOURS    = int(os.getenv("GLOBAL_HALT_COOLDOWN_HOURS", "24"))
 FAST_SL_TIME_MINS             = int(os.getenv("FAST_SL_TIME_MINS", "5"))
 MAX_POSITIONS_PER_SYMBOL      = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "4"))
