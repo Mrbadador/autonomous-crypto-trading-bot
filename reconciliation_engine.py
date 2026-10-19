@@ -370,6 +370,56 @@ async def audit_live_exchange_positions():
             except Exception as uo_err:
                 log.debug(f"[RECONCILER] Unfilled orders check note: {uo_err}")
 
+            # P0-3 SAFEGUARD: Gather all local open position symbols to check for false-positive purge
+            local_open_symbols = set()
+            try:
+                with sqlite3.connect(DATA_DB, timeout=5.0) as conn:
+                    for fleet in FLEET_TABLES:
+                        if not fleet.get("is_live", True):
+                            continue
+                        tbl = fleet["table"]
+                        try:
+                            t_rows = conn.execute(f"SELECT symbol FROM {tbl}").fetchall()
+                            for (ts,) in t_rows:
+                                if ts:
+                                    local_open_symbols.add(ts)
+                        except Exception:
+                            pass
+            except Exception as read_sym_err:
+                log.debug(f"[RECONCILER] Reading local open symbols note: {read_sym_err}")
+
+            # If exchange returned 0 positions globally but local tables have open positions:
+            # Verify with targeted single-symbol checks before allowing any deletions! (Done OUTSIDE DB txn)
+            exchange_verified_empty = True
+            if len(local_open_symbols) > 0 and len(active_exchange_positions) == 0:
+                log.warning(f"[RECONCILER-SAFEGUARD] Global fetch returned 0 positions, but {len(local_open_symbols)} open positions exist locally ({local_open_symbols}). Running targeted verification...")
+                for sym_to_check in list(local_open_symbols):
+                    try:
+                        target_res = await uta.fetch_positions(symbol=sym_to_check)
+                        matching = [p for p in (target_res or []) if float(p.get("total", 0.0) or p.get("contracts", 0.0) or 0.0) > 0]
+                        if matching:
+                            exchange_verified_empty = False
+                            log.critical(f"[RECONCILER-SAFEGUARD] 🚨 API GLITCH PREVENTED! Global fetch was empty, but targeted query found active position for {sym_to_check}! Aborting false purge.")
+                            for mp in matching:
+                                active_exchange_positions.append(mp)
+                                s_r = mp.get("symbol", "")
+                                s_c = s_r.replace("USDT", "/USDT") if "/" not in s_r and s_r.endswith("USDT") else s_r
+                                live_symbols.add(s_c)
+                                live_symbols.add(s_r)
+                    except Exception as check_err:
+                        exchange_verified_empty = False
+                        log.warning(f"[RECONCILER-SAFEGUARD] Targeted verification for {sym_to_check} threw error ({check_err}). Aborting deletions this cycle to protect data.")
+                        break
+
+            # 1. Clean up stale local positions that no longer exist on Bitget exchange
+            live_exchange_keys = set()
+            for p in active_exchange_positions:
+                s_r = p.get("symbol", "")
+                s_c = s_r.replace("USDT", "/USDT") if "/" not in s_r and s_r.endswith("USDT") else s_r
+                sd = str(p.get("posSide", "long")).lower()
+                live_exchange_keys.add((s_c, sd))
+                live_exchange_keys.add((s_r, sd))
+
             with sqlite3.connect(DATA_DB, timeout=10.0) as conn:
                 conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("PRAGMA busy_timeout=10000;")
@@ -377,54 +427,9 @@ async def audit_live_exchange_positions():
                 try:
                     conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('live_position_funding', ?, ?)",
                                  (json.dumps(funding_telemetry), now_iso))
+                    conn.commit()
                 except Exception as f_err:
                     log.debug(f"[RECONCILER] Note saving live funding telemetry: {f_err}")
-
-                # P0-3 SAFEGUARD: Gather all local open position symbols to check for false-positive purge
-                local_open_symbols = set()
-                for fleet in FLEET_TABLES:
-                    if not fleet.get("is_live", True):
-                        continue
-                    tbl = fleet["table"]
-                    try:
-                        t_rows = conn.execute(f"SELECT symbol FROM {tbl}").fetchall()
-                        for (ts,) in t_rows:
-                            if ts:
-                                local_open_symbols.add(ts)
-                    except Exception:
-                        pass
-
-                # If exchange returned 0 positions globally but local tables have open positions:
-                # Verify with targeted single-symbol checks before allowing any deletions!
-                exchange_verified_empty = True
-                if len(local_open_symbols) > 0 and len(active_exchange_positions) == 0:
-                    log.warning(f"[RECONCILER-SAFEGUARD] Global fetch returned 0 positions, but {len(local_open_symbols)} open positions exist locally ({local_open_symbols}). Running targeted verification...")
-                    for sym_to_check in list(local_open_symbols):
-                        try:
-                            target_res = await uta.fetch_positions(symbol=sym_to_check)
-                            matching = [p for p in (target_res or []) if float(p.get("total", 0.0) or p.get("contracts", 0.0) or 0.0) > 0]
-                            if matching:
-                                exchange_verified_empty = False
-                                log.critical(f"[RECONCILER-SAFEGUARD] 🚨 API GLITCH PREVENTED! Global fetch was empty, but targeted query found active position for {sym_to_check}! Aborting false purge.")
-                                for mp in matching:
-                                    active_exchange_positions.append(mp)
-                                    s_r = mp.get("symbol", "")
-                                    s_c = s_r.replace("USDT", "/USDT") if "/" not in s_r and s_r.endswith("USDT") else s_r
-                                    live_symbols.add(s_c)
-                                    live_symbols.add(s_r)
-                        except Exception as check_err:
-                            exchange_verified_empty = False
-                            log.warning(f"[RECONCILER-SAFEGUARD] Targeted verification for {sym_to_check} threw error ({check_err}). Aborting deletions this cycle to protect data.")
-                            break
-
-                # 1. Clean up stale local positions that no longer exist on Bitget exchange
-                live_exchange_keys = set()
-                for p in active_exchange_positions:
-                    s_r = p.get("symbol", "")
-                    s_c = s_r.replace("USDT", "/USDT") if "/" not in s_r and s_r.endswith("USDT") else s_r
-                    sd = str(p.get("posSide", "long")).lower()
-                    live_exchange_keys.add((s_c, sd))
-                    live_exchange_keys.add((s_r, sd))
 
                 if not exchange_verified_empty and len(active_exchange_positions) == 0:
                     log.warning("[RECONCILER-SAFEGUARD] Skipping position deletion: Exchange state not verified clean.")
@@ -755,11 +760,20 @@ async def audit_live_exchange_positions():
                                 hard_sl = max(entry_p * 1.03, mark_p * 1.05)
                             rec_note = "Auto-synced from Bitget (Fallback 2% SL)"
 
-                        conn.execute(
-                            "INSERT OR REPLACE INTO open_positions (symbol, side, entry_price, qty, take_profit, stop_loss, peak_price, entry_time, is_closing, partial_tp_hit, action_confidence, comments, leverage, hard_sl) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1.0, ?, ?, ?)",
-                            (sym_clean, side, entry_p, qty, tp, sl, max(entry_p, mark_p), now_iso, rec_note, lev, hard_sl)
-                        )
+                        conn.execute("""
+                            INSERT INTO open_positions (symbol, side, entry_price, qty, take_profit, stop_loss, peak_price, entry_time, is_closing, partial_tp_hit, action_confidence, comments, leverage, hard_sl)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1.0, ?, ?, ?)
+                            ON CONFLICT(symbol) DO UPDATE SET
+                                side = excluded.side,
+                                entry_price = excluded.entry_price,
+                                qty = excluded.qty,
+                                take_profit = excluded.take_profit,
+                                stop_loss = excluded.stop_loss,
+                                peak_price = MAX(open_positions.peak_price, excluded.peak_price),
+                                comments = excluded.comments,
+                                leverage = excluded.leverage,
+                                hard_sl = excluded.hard_sl
+                        """, (sym_clean, side, entry_p, qty, tp, sl, max(entry_p, mark_p), now_iso, rec_note, lev, hard_sl))
                         log.warning(f"[RECONCILER-RECOVERY] Auto-recovered active Bitget position into local DB: {sym_clean} {side.upper()} @ ${entry_p:,.4f} (Qty={qty}, SL=${sl:,.2f}, TP=${tp:,.2f}, HardSL=${hard_sl:,.2f})")
                         
                         # Dispatch Trade Open Email Alert

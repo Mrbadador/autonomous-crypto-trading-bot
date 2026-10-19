@@ -19,8 +19,9 @@ class TestCredentialValidation(unittest.TestCase):
             # Import and test the validation function
             from credential_validator import validate_credentials
             
-            # Patch the env path to use our temp file
-            with patch('credential_validator.os.path.join', return_value=temp_env), \
+            # Patch the env path and os.name to simulate posix permission check
+            with patch('credential_validator.os.name', 'posix'), \
+                 patch('credential_validator.os.path.join', return_value=temp_env), \
                  patch('credential_validator.os.path.exists', return_value=True), \
                  patch('credential_validator.os.stat') as mock_stat:
                 mock_stat.return_value = os.stat_result((0o100644, 0, 0, 0, 0, 0, 0, 0, 0, 0))

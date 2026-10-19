@@ -1080,13 +1080,26 @@ class SuperBotTrader:
                 sl_price = actual_entry * (1.0 + self.scalp_short_sl_pct)
 
             # Register native strategy stop loss on Bitget with aggressive retry
-            # Give Bitget matching engine 0.75s to settle the filled position before attaching strategy orders
-            await asyncio.sleep(0.75)
+            # F-08 FIX: Give Bitget matching engine 1.5s to settle the filled position before attaching strategy orders
+            await asyncio.sleep(1.5)
             sl_attached = False
             last_se = None
-            sl_qty_str = self.uta_client.format_quantity_precision(symbol, qty) if hasattr(self.uta_client, "format_quantity_precision") else str(self.uta_client.format_qty_precision(symbol, qty))
+            effective_qty = qty
             for sl_att in range(5):
                 try:
+                    # Re-confirm actual filled position size from exchange to prevent 25610 precision mismatch
+                    try:
+                        clean_sym_norm = self.uta_client._normalize_symbol(symbol)
+                        live_pos = await self.uta_client.fetch_positions(symbol=clean_sym_norm)
+                        pos_match = [p for p in (live_pos or []) if str(p.get("posSide", "long")).lower() == pos_side]
+                        if pos_match:
+                            real_tot = float(pos_match[0].get("total", 0.0) or pos_match[0].get("contracts", 0.0) or 0.0)
+                            if real_tot > 0:
+                                effective_qty = real_tot
+                    except Exception as pos_chk_err:
+                        log.debug(f"[{engine_tag}-SHIELD-NOTE] Position size query note: {pos_chk_err}")
+
+                    sl_qty_str = self.uta_client.format_quantity_precision(symbol, effective_qty) if hasattr(self.uta_client, "format_quantity_precision") else str(self.uta_client.format_qty_precision(symbol, effective_qty))
                     sl_str = self.uta_client.format_price_precision(symbol, sl_price)
                     sl_p = {
                         "category": "USDT-FUTURES",
@@ -1108,15 +1121,63 @@ class SuperBotTrader:
                 except Exception as se:
                     last_se = se
                     log.warning(f"[{engine_tag}-SHIELD-NOTE] Stop loss attach attempt {sl_att+1}/5 failed: {se}")
-                    await asyncio.sleep(1.0 + 0.5 * sl_att)
+                    await asyncio.sleep(1.5 + 1.0 * sl_att)
 
             if not sl_attached:
                 log.critical(f"[{engine_tag}-SHIELD] 🚨 Native Stop Loss failed on {symbol} after 5 retries ({last_se})! Aborting position to eliminate naked capital exposure.")
+                close_success = False
+                abort_err_str = "None"
                 try:
                     await self.uta_client.close_position_order(symbol=symbol, side=pos_side, qty=qty)
                     log.warning(f"[{engine_tag}-SHIELD] Emergency position abort SUCCESS for {symbol}.")
+                    close_success = True
                 except Exception as ab_err:
+                    abort_err_str = str(ab_err)
                     log.error(f"[{engine_tag}-SHIELD] Failed to abort position on {symbol}: {ab_err}")
+                
+                # F-07 REMEDIATION: Write emergency state row when BOTH SL and close fail
+                if not close_success:
+                    try:
+                        import sqlite3
+                        import json
+                        from datetime import datetime, timezone
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        clean_sym = symbol.replace("/", "")
+                        
+                        with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                            conn.execute("""
+                                INSERT INTO system_state (key, value, updated_at)
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+                            """, (
+                                f"emergency_sl_failure_{clean_sym}",
+                                json.dumps({
+                                    "symbol": clean_sym,
+                                    "side": pos_side,
+                                    "qty": qty,
+                                    "sl_error": str(last_se),
+                                    "close_error": abort_err_str,
+                                    "timestamp": now_iso,
+                                    "status": "UNPROTECTED_NAKED_POSITION",
+                                    "engine": engine_tag
+                                }),
+                                now_iso,
+                                json.dumps({
+                                    "symbol": clean_sym,
+                                    "side": pos_side,
+                                    "qty": qty,
+                                    "sl_error": str(last_se),
+                                    "close_error": abort_err_str,
+                                    "timestamp": now_iso,
+                                    "status": "UNPROTECTED_NAKED_POSITION",
+                                    "engine": engine_tag
+                                }),
+                                now_iso
+                            ))
+                            conn.commit()
+                            log.critical(f"[{engine_tag}-EMERGENCY-STATE] Persisted critical failure record for {clean_sym} — manual intervention required!")
+                    except Exception as state_err:
+                        log.critical(f"[{engine_tag}-EMERGENCY-STATE] Failed to persist emergency state for {symbol}: {state_err}")
                 return
 
             # Register native strategy Take Profit (pos_profit) on Bitget so TP executes immediately on-exchange

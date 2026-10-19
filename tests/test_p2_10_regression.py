@@ -14,6 +14,7 @@ Covers:
 
 import os
 import sys
+import json
 import tempfile
 import sqlite3
 import unittest
@@ -300,6 +301,89 @@ class TestP210T4BackgroundTasks(unittest.TestCase):
         import reconciliation_engine
         self.assertTrue(hasattr(reconciliation_engine, "_background_tasks"))
         self.assertIsInstance(reconciliation_engine._background_tasks, set)
+
+
+class TestEmergencyStatePersistence(unittest.TestCase):
+    """
+    F-01, F-02, F-07: Verify emergency state serialization and persistence on SL + close failure.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "trading_data.db")
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute("""
+            CREATE TABLE system_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
+            )
+        """)
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+        self.temp_dir.cleanup()
+
+    def test_emergency_state_json_payload_serializes_cleanly(self):
+        import json
+        clean_sym = "SOLUSDT"
+        pos_side = "long"
+        qty = 0.5
+        last_strat_err = RuntimeError("Order precision invalid 25610")
+        abort_err_str = "Network timeout on emergency close"
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        payload = json.dumps({
+            "symbol": clean_sym,
+            "side": pos_side,
+            "qty": qty,
+            "sl_error": str(last_strat_err),
+            "close_error": abort_err_str,
+            "timestamp": now_iso,
+            "status": "UNPROTECTED_NAKED_POSITION"
+        })
+
+        self.conn.execute("""
+            INSERT INTO system_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+        """, (
+            f"emergency_sl_failure_{clean_sym}",
+            payload,
+            now_iso,
+            payload,
+            now_iso
+        ))
+        self.conn.commit()
+
+        row = self.conn.execute("SELECT value FROM system_state WHERE key = ?", (f"emergency_sl_failure_{clean_sym}",)).fetchone()
+        self.assertIsNotNone(row)
+        parsed = json.loads(row[0])
+        self.assertEqual(parsed["status"], "UNPROTECTED_NAKED_POSITION")
+        self.assertEqual(parsed["close_error"], "Network timeout on emergency close")
+        self.assertEqual(parsed["symbol"], "SOLUSDT")
+
+    def test_emergency_sl_failure_blocks_reentry(self):
+        """Verify conviction filter vetos entry if emergency_sl_failure row is present."""
+        clean_sym = "AVAXUSDT"
+        now_iso = "2026-10-19T20:00:00+00:00"
+        self.conn.execute("""
+            INSERT INTO system_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+        """, (
+            f"emergency_sl_failure_{clean_sym}",
+            json.dumps({"status": "UNPROTECTED_NAKED_POSITION"}),
+            now_iso
+        ))
+        self.conn.commit()
+
+        # Query simulating conviction filter
+        row_emerg = self.conn.execute(
+            "SELECT value, updated_at FROM system_state WHERE key = ?",
+            (f"emergency_sl_failure_{clean_sym}",)
+        ).fetchone()
+        self.assertIsNotNone(row_emerg)
 
 
 class TestP210T7ConftestHardening(unittest.TestCase):

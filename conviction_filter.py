@@ -195,6 +195,19 @@ class ConvictionBoardroom:
                         res["log"] = f"[BOARDROOM] VETO: {symbol} is not in ALLOWED_SYMBOLS whitelist ({allowed}). Bypassing entry."
                         return res
 
+                # 1B. Emergency SL Failure Quarantining Gate (F-03 Defense)
+                sym_clean_key = symbol.upper().replace("/", "").replace("-", "")
+                row_emerg = conn.execute("SELECT value, updated_at FROM system_state WHERE key = ?", (f"emergency_sl_failure_{sym_clean_key}",)).fetchone()
+                if row_emerg and row_emerg[0]:
+                    res["veto"] = {
+                        "execute": False,
+                        "conviction_score": 0.0,
+                        "stage": "emergency_sl_failure_quarantine",
+                        "final_rationale": f"Emergency stop-loss failure row active in system_state for {symbol}. Re-entry blocked until position protected or operator cleared."
+                    }
+                    res["log_warning"] = f"[BOARDROOM] 🚨 EMERGENCY SL FAILURE QUARANTINE: {symbol} has an un-cleared emergency_sl_failure record. Halting entry."
+                    return res
+
                 # Check if this is a mean-reversion dip buy (oversold scalp)
                 is_dip_buy = (
                     context_data.get("strategy") == "Mean Reversion Maker Dip-Buy" or

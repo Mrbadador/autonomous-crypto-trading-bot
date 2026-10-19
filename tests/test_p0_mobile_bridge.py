@@ -5,13 +5,18 @@ import unittest
 class TestMobileBridgeSecurity(unittest.TestCase):
     def test_missing_password_raises_error(self):
         """Verify mobile bridge refuses to start without APP_PASSWORD."""
-        with self.assertRaises(EnvironmentError) as ctx:
-            # Force reload to trigger the check at module level
-            import archive.legacy_agents.agent_mobile_bridge as bridge
-            import importlib
-            importlib.reload(bridge)
-        
-        self.assertIn("APP_PASSWORD", str(ctx.exception))
+        old_val = os.environ.pop("APP_PASSWORD", None)
+        try:
+            with self.assertRaises(EnvironmentError) as ctx:
+                # Force reload to trigger the check at module level
+                import archive.legacy_agents.agent_mobile_bridge as bridge
+                import importlib
+                importlib.reload(bridge)
+            
+            self.assertIn("APP_PASSWORD", str(ctx.exception))
+        finally:
+            if old_val is not None:
+                os.environ["APP_PASSWORD"] = old_val
     
     def test_hardcoded_password_removed(self):
         """Verify no hardcoded fallback password exists in source."""
@@ -46,6 +51,17 @@ class TestMobileBridgeSecurity(unittest.TestCase):
         # Should have safe message instead
         self.assertIn("(set in .env - never share this)", content,
                      "Should display safe placeholder message")
+
+
+    def test_remote_agent_security(self):
+        """Verify scripts/start_remote_agent.py has localhost binding, no hardcoded password, and tunnel disabled."""
+        with open("scripts/start_remote_agent.py", "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        self.assertNotIn("SovereignSwarm2026!", content, "Hardcoded fallback password present in start_remote_agent.py")
+        self.assertIn('"--host", "127.0.0.1"', content, "start_remote_agent.py must bind to 127.0.0.1, not 0.0.0.0")
+        self.assertIn("Cloudflare Tunnel disabled", content, "Cloudflare Tunnel should be disabled by default")
+        self.assertNotIn('print(f"  App Password  : {APP_PASSWORD}', content, "Password should not be printed to stdout")
 
 
 if __name__ == '__main__':

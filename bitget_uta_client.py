@@ -6,6 +6,7 @@ on Bitget Unified Trading Accounts (UTA / V3) without legacy Classic API errors.
 import os
 import time
 import math
+import json
 import logging
 import asyncio
 import ccxt.async_support as ccxt_async
@@ -309,14 +310,26 @@ class BitgetUTAClient:
             opp_side = "sell" if is_long else "buy"
             strat_ids = []
             if sl and sl > 0.0:
-                # Give Bitget matching engine 0.75s to settle the filled position before attaching strategy orders
-                await asyncio.sleep(0.75)
+                # F-08 FIX: Give Bitget matching engine 1.5s to settle the filled position before attaching strategy orders
+                await asyncio.sleep(1.5)
                 sl_attached = False
                 last_strat_err = None
                 for sl_attempt in range(5):
                     try:
+                        # Re-confirm actual filled position size from exchange to prevent 25610 precision mismatch
+                        effective_qty = qty
+                        try:
+                            live_pos = await self.fetch_positions(symbol=clean_sym)
+                            pos_match = [p for p in (live_pos or []) if str(p.get("posSide", "long")).lower() == pos_side]
+                            if pos_match:
+                                real_tot = float(pos_match[0].get("total", 0.0) or pos_match[0].get("contracts", 0.0) or 0.0)
+                                if real_tot > 0:
+                                    effective_qty = real_tot
+                        except Exception as pos_fetch_err:
+                            log.debug(f"[BITGET-UTA] Note fetching live position for SL precision: {pos_fetch_err}")
+
                         sl_str = self.format_price_precision(symbol, sl)
-                        qty_str = self.format_quantity_precision(symbol, qty)
+                        qty_str = self.format_quantity_precision(symbol, effective_qty)
                         sl_params = {
                             "category": "USDT-FUTURES",
                             "symbol": clean_sym,
@@ -333,22 +346,24 @@ class BitgetUTAClient:
                         strat_res = await self.exchange.private_uta_post_v3_trade_place_strategy_order(sl_params)
                         sl_id = strat_res.get("data", {}).get("orderId")
                         strat_ids.append(f"SL:{sl_id}")
-                        log.info(f"[BITGET-UTA] [SHIELD] Native Stop Loss REGISTERED on Bitget! ID: {sl_id} (SL={sl_str})")
+                        log.info(f"[BITGET-UTA] [SHIELD] Native Stop Loss REGISTERED on Bitget! ID: {sl_id} (SL={sl_str}, Qty={qty_str})")
                         sl_attached = True
                         break
                     except Exception as strat_err:
                         last_strat_err = strat_err
                         log.warning(f"[BITGET-UTA] Native Stop Loss attempt {sl_attempt+1}/5 failed: {strat_err}")
-                        await asyncio.sleep(1.0 + 0.5 * sl_attempt)
+                        await asyncio.sleep(1.5 + 1.0 * sl_attempt)
 
                 if not sl_attached:
                     log.critical(f"[BITGET-UTA] 🚨 CRITICAL STOP-LOSS FAILURE: Could not register native SL on {clean_sym} after 5 attempts ({last_strat_err})! Aborting position to eliminate naked capital exposure.")
                     close_success = False
+                    abort_err_str = "None"
                     try:
                         await self.close_position_order(symbol=clean_sym, side=pos_side, qty=qty)
                         log.warning(f"[BITGET-UTA] Emergency position abort SUCCESS for {clean_sym}.")
                         close_success = True
                     except Exception as abort_err:
+                        abort_err_str = str(abort_err)
                         log.error(f"[BITGET-UTA] Emergency position abort failed for {clean_sym}: {abort_err}")
                     
                     # M-1 FIX: Write emergency state row when BOTH SL and close fail
@@ -370,7 +385,7 @@ class BitgetUTAClient:
                                         "side": pos_side,
                                         "qty": qty,
                                         "sl_error": str(last_strat_err),
-                                        "close_error": str(abort_err),
+                                        "close_error": abort_err_str,
                                         "timestamp": now_iso,
                                         "status": "UNPROTECTED_NAKED_POSITION"
                                     }),
@@ -380,7 +395,7 @@ class BitgetUTAClient:
                                         "side": pos_side,
                                         "qty": qty,
                                         "sl_error": str(last_strat_err),
-                                        "close_error": str(abort_err),
+                                        "close_error": abort_err_str,
                                         "timestamp": now_iso,
                                         "status": "UNPROTECTED_NAKED_POSITION"
                                     }),

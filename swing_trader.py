@@ -1599,12 +1599,26 @@ class SwingArchitectTrader:
                             sl_str = self.uta_client.format_price_precision(symbol, stop_loss) if hasattr(self.uta_client, "format_price_precision") else str(round(stop_loss, 4) if stop_loss < 10 else round(stop_loss, 2))
                             
                             # Register native strategy stop loss on Bitget with 5-attempt progressive backoff retry
-                            # Give Bitget matching engine 0.75s to settle the filled position before attaching strategy orders
-                            await asyncio.sleep(0.75)
+                            # F-08 FIX: Give Bitget matching engine 1.5s to settle the filled position before attaching strategy orders
+                            await asyncio.sleep(1.5)
                             sl_attached = False
                             last_sl_err = None
                             for sl_attempt in range(5):
                                 try:
+                                    # Re-confirm actual filled position size from exchange to prevent 25610 precision mismatch
+                                    effective_sl_qty = actual_qty
+                                    try:
+                                        clean_sym_norm = self.uta_client._normalize_symbol(symbol)
+                                        live_pos = await self.uta_client.fetch_positions(symbol=clean_sym_norm)
+                                        pos_match = [p for p in (live_pos or []) if str(p.get("posSide", "long")).lower() == ("long" if is_long else "short")]
+                                        if pos_match:
+                                            real_tot = float(pos_match[0].get("total", 0.0) or pos_match[0].get("contracts", 0.0) or 0.0)
+                                            if real_tot > 0:
+                                                effective_sl_qty = real_tot
+                                    except Exception as pos_chk_err:
+                                        log.debug(f"[ENTRY-SNIPER-SHIELD-NOTE] Position size query note: {pos_chk_err}")
+
+                                    qty_str = self.uta_client.format_quantity_precision(symbol, effective_sl_qty) if hasattr(self.uta_client, "format_quantity_precision") else str(effective_sl_qty)
                                     sl_p = {
                                         "category": "USDT-FUTURES",
                                         "symbol": self.uta_client._normalize_symbol(symbol),
@@ -1619,23 +1633,61 @@ class SwingArchitectTrader:
                                         "size": qty_str
                                     }
                                     await self.uta_client.exchange.private_uta_post_v3_trade_place_strategy_order(sl_p)
-                                    log.info(f"[ENTRY-SNIPER-SHIELD] Native Stop Loss REGISTERED on Bitget! (SL=${stop_loss:,.4f})")
+                                    log.info(f"[ENTRY-SNIPER-SHIELD] Native Stop Loss REGISTERED on Bitget! (SL=${stop_loss:,.4f}, Qty={qty_str})")
                                     sl_attached = True
                                     break
                                 except Exception as sl_reg_err:
                                     last_sl_err = sl_reg_err
                                     log.warning(f"[ENTRY-SNIPER] Native SL registration attempt {sl_attempt+1}/5 failed for {symbol}: {sl_reg_err}")
-                                    await asyncio.sleep(1.0 + 0.5 * sl_attempt)
+                                    await asyncio.sleep(1.5 + 1.0 * sl_attempt)
 
                             if not sl_attached:
                                 log.critical(f"[ENTRY-SNIPER] 🚨 CRITICAL NAKED STOP FAILURE: Failed to attach native SL on {symbol} after 5 attempts ({last_sl_err})! Aborting position to eliminate naked risk.")
+                                close_success = False
+                                abort_err_str = "None"
                                 try:
                                     await self.uta_client.close_position_order(symbol=symbol, side="long" if is_long else "short", qty=actual_qty)
                                     log.warning(f"[ENTRY-SNIPER] Emergency position abort SUCCESS for {symbol}.")
+                                    close_success = True
                                 except Exception as abort_err:
+                                    abort_err_str = str(abort_err)
                                     log.error(f"[ENTRY-SNIPER] Emergency position abort FAILED for {symbol}: {abort_err}")
+                                
+                                if not close_success:
+                                    try:
+                                        import sqlite3
+                                        from datetime import datetime, timezone
+                                        now_iso = datetime.now(timezone.utc).isoformat()
+                                        clean_sym = self.uta_client._normalize_symbol(symbol)
+                                        with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                                            conn.execute("""
+                                                INSERT INTO system_state (key, value, updated_at)
+                                                VALUES (?, ?, ?)
+                                                ON CONFLICT(key) DO UPDATE SET
+                                                    value = excluded.value,
+                                                    updated_at = excluded.updated_at
+                                            """, (
+                                                f"emergency_sl_failure_{clean_sym}",
+                                                json.dumps({
+                                                    "symbol": clean_sym,
+                                                    "side": "long" if is_long else "short",
+                                                    "qty": actual_qty,
+                                                    "sl_intended": stop_loss,
+                                                    "last_sl_error": str(last_sl_err),
+                                                    "close_error": abort_err_str,
+                                                    "status": "UNPROTECTED_NAKED_POSITION",
+                                                    "engine": "swing_trader",
+                                                    "timestamp": now_iso
+                                                }),
+                                                now_iso
+                                            ))
+                                            conn.commit()
+                                        log.critical(f"[ENTRY-SNIPER] 🚨 Persisted emergency failure state for {clean_sym} to system_state!")
+                                    except Exception as db_err:
+                                        log.error(f"[ENTRY-SNIPER] Failed to persist emergency SL failure for {symbol}: {db_err}")
+
                                 await asyncio.to_thread(self._release_lock_sync, symbol)
-                                raise RuntimeError(f"Native Stop Loss placement failed on sniper order for {symbol} after 3 retries ({last_sl_err}). Position aborted.")
+                                raise RuntimeError(f"Native Stop Loss placement failed on sniper order for {symbol} after 5 retries ({last_sl_err}). Position aborted.")
 
                             # Register native Take Profit
                             if take_profit and take_profit > 0.0:
