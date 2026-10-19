@@ -644,8 +644,12 @@ def update_macro_context():
                     with conn:
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_data_ok', ?, ?)",
                                      ("0", now_iso))
-                        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_regime', ?, ?)",
-                                     (fallback_regime, now_iso))
+                        # Only overwrite macro_regime if killswitch is active or no existing regime exists
+                        cur_row = conn.execute("SELECT value FROM system_state WHERE key = 'macro_regime'").fetchone()
+                        existing_regime = cur_row[0] if (cur_row and cur_row[0]) else None
+                        if fallback_regime == "RISK_OFF_KILLSWITCH" or not existing_regime or existing_regime == "UNKNOWN":
+                            conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_regime', ?, ?)",
+                                         (fallback_regime, now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('macro_heartbeat', ?, ?)",
                                      (now_iso, now_iso))
                         conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('etf_macro_telemetry', ?, ?)",

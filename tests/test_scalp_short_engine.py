@@ -62,7 +62,7 @@ class TestScalpShortEngine(unittest.TestCase):
         self.assertEqual(config.SCALP_SHORT_TP_PCT, 0.0120)  # +1.20% TP (1.20 R:R)
         self.assertEqual(config.SCALP_SHORT_SL_PCT, 0.0100)  # -1.00% SL
         self.assertEqual(config.SCALP_SHORT_BE_TRIGGER_PCT, 0.0050)  # +0.50% BE trigger
-        self.assertEqual(config.SCALP_SHORT_BE_FEE_BUFFER_PCT, 0.0018)  # 0.18% fee buffer
+        self.assertEqual(config.SCALP_SHORT_BE_FEE_BUFFER_PCT, 0.0035)  # 0.35% fee buffer
         self.assertEqual(config.SCALP_SHORT_MAX_HOLD_MINS, 45.0)  # 45 min harvest/tighten checkpoint
         self.assertEqual(config.SCALP_SHORT_HARD_EXPIRY_MINS, 90.0)  # 90 min hard expiry
         self.assertEqual(config.SCALP_SHORT_MIN_RSI, 38.0)  # Never short < 38 RSI
@@ -97,7 +97,7 @@ class TestScalpShortEngine(unittest.TestCase):
         self.assertEqual(pos["entry_price"], 100.0)
 
     def test_03_scalp_short_breakeven_ratchet(self):
-        """Verify that gaining +0.50% ratchets the stop loss to Entry - 0.18% fee buffer."""
+        """Verify that gaining +0.80% ratchets the stop loss to Entry - 0.35% fee buffer."""
         async def run_test():
             now_iso = datetime.now(UTC).isoformat()
             trader = SwingArchitectTrader()
@@ -114,11 +114,11 @@ class TestScalpShortEngine(unittest.TestCase):
             }
             trader._load_active_positions_sync = MagicMock()
 
-            # Return current price 99.50 (entry was 100.0, profit = +0.50% >= 0.50% trigger)
+            # Return current price 99.20 (entry was 100.0, profit = +0.80% >= 0.75% trigger)
             trader.uta_client.exchange = MagicMock()
-            trader.uta_client.exchange.fetch_ticker = AsyncMock(return_value={"last": 99.50, "close": 99.50})
+            trader.uta_client.exchange.fetch_ticker = AsyncMock(return_value={"last": 99.20, "close": 99.20})
             trader.uta_client.exchange.fetch_ohlcv = AsyncMock(return_value=[
-                [1000, 100.0, 100.5, 99.0, 99.5, 100.0] for _ in range(50)
+                [1000, 100.0, 100.5, 99.0, 99.20, 100.0] for _ in range(50)
             ])
             trader.uta_client.modify_strategy_order = AsyncMock(return_value={"retCode": 0})
 
@@ -126,9 +126,9 @@ class TestScalpShortEngine(unittest.TestCase):
 
             pos = trader.active_positions.get(self.test_symbol)
             self.assertIsNotNone(pos)
-            # Stop loss must be ratcheted down to 100 * (1 - 0.0018) = 99.82 (covering 2x taker fees + buffer)
+            # Stop loss must be ratcheted down to 100 * (1 - 0.0035) = 99.65 (covering 2x taker fees + buffer)
             self.assertLess(pos["stop_loss"], 100.0)
-            self.assertEqual(pos["stop_loss"], 99.82)
+            self.assertEqual(pos["stop_loss"], 99.65)
 
         asyncio.run(run_test())
 

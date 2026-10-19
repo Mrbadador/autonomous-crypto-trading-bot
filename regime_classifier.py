@@ -888,9 +888,10 @@ class RegimeClassifier:
         # Recommendation 1: AI Bias Hysteresis Filter
         # Prevents 15m ping-pong flips. Only change active_ai_bias if:
         # (a) 2 consecutive matching incoming verdicts from the AI arbiter, OR
-        # (b) Minimum dwell time of 45 minutes (2700s) has elapsed.
+        # (b) Minimum dwell time of 45 minutes (2700s) has elapsed, OR
+        # (c) First initialization (dwell_ts == 0.0)
         # -----------------------------------------------------------------------
-        if ai_is_fresh and ai_verdict_usable:
+        if ai_verdict_usable or ai_is_fresh:
             if incoming_bias == self.active_ai_bias:
                 self.pending_ai_bias = None
                 self.pending_ai_bias_count = 0
@@ -911,6 +912,9 @@ class RegimeClassifier:
                     log.info(f"[AI-REGIME-HYSTERESIS] 🔄 AI Bias switched: {old_b} -> {incoming_bias} (dwell: {dwell_elapsed:.0f}s, confirmation: {self.pending_ai_bias_count})")
                 else:
                     log.info(f"[AI-REGIME-HYSTERESIS] ⏳ Pending switch {self.active_ai_bias} -> {incoming_bias} buffered (count: {self.pending_ai_bias_count}/2, dwell: {dwell_elapsed:.0f}s/{self.min_ai_bias_dwell_sec:.0f}s)")
+        elif not ai_verdict_usable and not self.latest_ai_arbiter.get("evaluated_at_utc"):
+            # Unstamped/offline/poisoned baseline: reflect default directly
+            self.active_ai_bias = incoming_bias
 
         ai_bias = self.active_ai_bias
 

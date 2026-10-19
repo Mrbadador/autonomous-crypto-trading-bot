@@ -124,6 +124,10 @@ class TestAiPayloadValidation(unittest.TestCase):
             "evaluated_at_utc": None,
             "evaluated_at_epoch": 0.0,
         }
+        self.clf.active_ai_bias = "DEFENSIVE_CHOP"
+        self.clf.pending_ai_bias = None
+        self.clf.pending_ai_bias_count = 0
+        self.clf.ai_bias_dwell_ts = 0.0
 
     # ------------------------------------------------------- contract validation
     def test_valid_verdict_is_normalised(self):
@@ -302,6 +306,7 @@ class TestAiPayloadValidation(unittest.TestCase):
 
     def test_stale_verdict_cannot_promote_chop_to_bull_trend(self):
         self._stub_market(prior_math="CHOP", prior_label="CHOP")
+        self.clf.active_ai_bias = "BULL_EXPANSION"
         stale = {
             "ai_regime_bias": "BULL_EXPANSION",
             "trap_risk_score": 0.10,
@@ -337,7 +342,7 @@ class TestAiPayloadValidation(unittest.TestCase):
         self.assertEqual(state["recommended_leverage"], "5")
 
     def test_veto_may_still_act_on_a_held_verdict(self):
-        """Tightening is allowed from an out-of-cadence verdict - only loosening is not."""
+        """Symmetric Veto contract: held/stale verdicts cannot veto a valid mathematical BULL_TREND."""
         self._stub_market(prior_math="BULL_TREND", prior_label="BULL_TREND")
         held_trap = {
             "ai_regime_bias": "LIQUIDITY_HUNT_TRAP",
@@ -352,8 +357,8 @@ class TestAiPayloadValidation(unittest.TestCase):
         ok, row, state, _ = self._run_classify(arbiter=held_trap, adx=30.0, plus_di=34.0, minus_di=20.0)
         self.assertTrue(ok)
         self.assertEqual(row["math_regime"], "BULL_TREND")
-        self.assertEqual(row["regime"], "DEFENSIVE_CHOP")
-        self.assertEqual(state["recommended_leverage"], "2")
+        # Under Symmetric Veto, an expired 7200s verdict cannot veto BULL_TREND
+        self.assertEqual(row["regime"], "BULL_TREND")
 
     def test_offline_fallback_never_overwrites_a_held_protective_verdict(self):
         self._stub_market(prior_math="BULL_TREND", prior_label="BULL_TREND")
@@ -430,6 +435,70 @@ class TestAiPayloadValidation(unittest.TestCase):
             row = conn.execute("SELECT turbulence_index, turbulence_threshold FROM market_regime ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual(row[0], 0.0)
         self.assertEqual(row[1], 22.0)
+
+    # ------------------------------------------------------- Hysteresis & Veto Thresholds
+    def test_hysteresis_buffers_first_flip_and_commits_on_second(self):
+        """A single incoming flip is buffered (pending); a 2nd consecutive match commits the switch."""
+        self._stub_market(prior_math="CHOP", prior_label="CHOP")
+        self.clf.active_ai_bias = "DEFENSIVE_CHOP"
+        self.clf.ai_bias_dwell_ts = time.time()  # recent dwell, no timeout
+        self.clf.pending_ai_bias = None
+        self.clf.pending_ai_bias_count = 0
+
+        flip_verdict = {
+            "ai_regime_bias": "BULL_EXPANSION",
+            "trap_risk_score": 0.10,
+            "recommended_leverage_cap": 5,
+            "structural_thesis": "flip 1",
+            "override_math_regime": True,
+            "evaluated_by": "Gemini:model-a",
+            "evaluated_at_utc": datetime.now(UTC).isoformat(),
+            "evaluated_at_epoch": time.time() - 30,
+        }
+
+        # 1st incoming verdict -> buffered, active_ai_bias remains DEFENSIVE_CHOP
+        ok, row, state, _ = self._run_classify(arbiter=flip_verdict, plus_di=30.0, minus_di=20.0)
+        self.assertTrue(ok)
+        self.assertEqual(self.clf.active_ai_bias, "DEFENSIVE_CHOP", "first flip must be buffered")
+        self.assertEqual(self.clf.pending_ai_bias, "BULL_EXPANSION")
+        self.assertEqual(self.clf.pending_ai_bias_count, 1)
+        self.assertEqual(row["regime"], "CHOP")
+
+        # 2nd matching consecutive verdict -> committed, active_ai_bias switches
+        flip_verdict_2 = dict(flip_verdict, structural_thesis="flip 2", evaluated_at_epoch=time.time() - 10)
+        ok2, row2, state2, _ = self._run_classify(arbiter=flip_verdict_2, plus_di=30.0, minus_di=20.0)
+        self.assertTrue(ok2)
+        self.assertEqual(self.clf.active_ai_bias, "BULL_EXPANSION", "second matching flip must commit")
+        self.assertIsNone(self.clf.pending_ai_bias)
+        self.assertEqual(self.clf.pending_ai_bias_count, 0)
+        self.assertEqual(row2["regime"], "BULL_TREND", "now promoted to BULL_TREND")
+
+    def test_symmetric_veto_requires_trap_risk_at_least_0_70(self):
+        """BULL_TREND is only vetoed if trap_risk >= 0.70; below 0.70 it cannot veto."""
+        self._stub_market(prior_math="BULL_TREND", prior_label="BULL_TREND")
+        self.clf.active_ai_bias = "LIQUIDITY_HUNT_TRAP"
+        self.clf.ai_bias_dwell_ts = 0.0
+
+        # Sub-threshold trap risk (0.65 < 0.70)
+        sub_thresh = {
+            "ai_regime_bias": "LIQUIDITY_HUNT_TRAP",
+            "trap_risk_score": 0.65,
+            "recommended_leverage_cap": 2,
+            "structural_thesis": "mild trap below 0.70",
+            "override_math_regime": True,
+            "evaluated_by": "Gemini:model-a",
+            "evaluated_at_utc": datetime.now(UTC).isoformat(),
+            "evaluated_at_epoch": time.time() - 30,
+        }
+        ok, row, state, _ = self._run_classify(arbiter=sub_thresh, adx=30.0, plus_di=34.0, minus_di=20.0)
+        self.assertTrue(ok)
+        self.assertEqual(row["regime"], "BULL_TREND", "trap_risk < 0.70 cannot veto BULL_TREND")
+
+        # Threshold met (0.75 >= 0.70)
+        at_thresh = dict(sub_thresh, trap_risk_score=0.75, structural_thesis="confirmed high trap risk")
+        ok2, row2, state2, _ = self._run_classify(arbiter=at_thresh, adx=30.0, plus_di=34.0, minus_di=20.0)
+        self.assertTrue(ok2)
+        self.assertEqual(row2["regime"], "DEFENSIVE_CHOP", "trap_risk >= 0.70 must veto to DEFENSIVE_CHOP")
 
 
 if __name__ == "__main__":

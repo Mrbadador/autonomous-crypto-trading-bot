@@ -340,7 +340,8 @@ class TestRegimeFailClosedConsumer(unittest.TestCase):
         self.assertTrue(self.bot.regime_data_ok)
         self.assertEqual(calls["manage"].await_count, 1)
         self.assertEqual(calls["grid"].await_count, 1, "healthy CHOP must reach the grid scan")
-        self.assertEqual(calls["short"].await_count, 1)
+        # Scalp shorts are strictly gated to BEAR_TREND; in CHOP they must NOT execute
+        self.assertEqual(calls["short"].await_count, 0)
         self.assertEqual(calls["fleet"].await_count, 1)
 
     def test_routing_writes_land_in_the_fixture_database_not_the_repository(self):
