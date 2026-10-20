@@ -114,11 +114,10 @@ class TestTurbulenceStability(unittest.TestCase):
         clf = RegimeClassifier(db_path=self.db)
         seq_breach = [clf._advance_turbulence_tier(True) for _ in (1, 2)]
         self.assertEqual(seq_breach, ["CALM_NORMAL", "EXTREME_SHOCK"])
-        # The engaging pass itself is the first calm observation for disengagement
-        # purposes (it did not flip the tier on its own); two further calm passes
-        # release the breaker on the third.
-        seq = [clf._advance_turbulence_tier(False) for _ in (3, 4, 5)]
-        self.assertEqual(seq, ["EXTREME_SHOCK", "CALM_NORMAL", "CALM_NORMAL"])
+        # Disengagement counts genuine calm passes only: the breaker holds through
+        # three of them and releases on the third.
+        seq = [clf._advance_turbulence_tier(False) for _ in (1, 2, 3, 4)]
+        self.assertEqual(seq, ["EXTREME_SHOCK", "EXTREME_SHOCK", "CALM_NORMAL", "CALM_NORMAL"])
 
     def test_current_breach_flag_respects_engaged_tier(self):
         # Once EXTREME_SHOCK is engaged, breaching bars stay flagged until 3 calm passes clear it.

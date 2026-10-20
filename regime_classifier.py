@@ -600,9 +600,9 @@ class RegimeClassifier:
         else:
             self._turb_breach_streak = 0
             self._turb_calm_streak += 1
-            if self.turbulence_tier == "EXTREME_SHOCK" and self._turb_calm_streak >= TURB_DISENGAGE_CALMS - 1:
-                # TURB_DISENGAGE_CALMS calm observations total (the pass that engaged the
-                # tier last, then this streak) must land before the breaker releases.
+            if self.turbulence_tier == "EXTREME_SHOCK" and self._turb_calm_streak >= TURB_DISENGAGE_CALMS:
+                # Genuine calm passes only - a breaching bar resets the streak, so the
+                # breaker never releases early on the strength of the engaging pass.
                 self.turbulence_tier = "CALM_NORMAL"
                 log.info(
                     f"[FINRL-TURBULENCE-TIER] EXTREME_SHOCK disengaged after "
