@@ -1109,6 +1109,48 @@ class SwingArchitectTrader:
     # ---------------------------------------------------------------------------
     # Order Execution & Lifecycle Management
     # ---------------------------------------------------------------------------
+    @staticmethod
+    def _compute_target_margin(fair_share: float, kelly_margin: float, per_trade_cap: float) -> float:
+        """Fix #5: Kelly shrinks the fair share; it can never inflate past it, and the
+        per-trade cap binds last. No lower clamp - a shrinking Kelly must be able to
+        reach the minimum viable size instead of being rescued by a floor."""
+        return round(min(min(fair_share, kelly_margin), per_trade_cap), 2)
+
+    @staticmethod
+    def _resolve_swing_target(live_bal: float, max_wallet_margin_pct: float, max_locks: int,
+                              per_trade_cap_pct: float, kelly_frac, conviction_score: float,
+                              finrl_mult: float = 1.0, markov_mult: float = 1.0) -> tuple:
+        """Pure target-margin resolution so the floor/cap math is testable.
+
+        kelly_frac None (or any unusable value) means fail closed at 30% of the fair
+        share - the historical fail-open path silently deployed the full fair share.
+        """
+        fair_share = live_bal * (max_wallet_margin_pct / max(1, max_locks))
+        per_trade_cap = live_bal * per_trade_cap_pct
+        try:
+            kf = float(kelly_frac)
+            if not (0.0 < kf <= 0.25):
+                raise ValueError(f"kelly fraction out of sane range: {kelly_frac}")
+        except Exception:
+            return round(fair_share * 0.30, 2), "fail-closed at 30% fair share (kelly unusable)"
+        conv_mult = max(0.6, min(1.2, float(conviction_score or 0.7)))
+        kelly_margin = live_bal * kf * conv_mult * finrl_mult * markov_mult
+        return SwingArchitectTrader._compute_target_margin(fair_share, kelly_margin, per_trade_cap), "kelly"
+
+    @staticmethod
+    def _collateral_for(target: float, available_buffer: float) -> float:
+        """Fix #5: headroom binds with no max(6.0, ...) inflation - callers veto below $6."""
+        return round(min(target, available_buffer), 2)
+
+    @staticmethod
+    def _floor_to_step(value: float, step: float) -> float:
+        """Round qty DOWN to the contract step; round() could inflate size into over-margin."""
+        if step <= 0:
+            return value
+        units = float(value) / float(step)
+        floored = int(units + 1e-9)
+        return round(floored * step, 10)
+
     async def open_swing_position(self, symbol: str, ind_4h: dict, direction: str = "LONG", conviction_score: float = 0.70, gates_snapshot: dict = None):
         """Executes market entry, acquires asset lock, and records position."""
         # P0-4 DEFENSE: Check if Portfolio Risk Agent or Operator has activated RISK_HALT / OPERATOR_HALT (offloaded via to_thread, Fail-Closed)
@@ -1286,14 +1328,15 @@ class SwingArchitectTrader:
             return
 
         # Target fair share (e.g. 70% / 4 locks = 17.5% of wallet), bounded by remaining headroom and per-trade clamp
-        target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
-        
-        # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Sizing
+        per_trade_cap_pct = float(getattr(config, "MAX_MARGIN_PER_TRADE_PCT", 0.20))
+        fair_share_margin = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+        # Fix #5: the old lower clamp (0.7 x fair = 12.25%) sat above the per-trade cap
+        # (.env 14%), so every multiplier collapsed to the same number and Kelly sized
+        # nothing. Fair share is now the ceiling and Kelly only ever shrinks.
         try:
             from risk_manager import RiskManager
             rm = RiskManager()
             kelly_frac = await asyncio.to_thread(rm.calculate_empirical_kelly_fraction)
-            conv_mult = max(0.6, min(1.2, float(conviction_score or 0.7)))
             finrl_mult = 1.0
             try:
                 rep_path = os.path.join("cache", "quant_validation_report.json")
@@ -1317,19 +1360,28 @@ class SwingArchitectTrader:
                 markov_mult = await asyncio.to_thread(_read_markov_mult)
             except Exception:
                 markov_mult = 1.0
-            target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
-            target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
-            log.info(f"[SWING-KELLY-SIZING] Empirical Kelly: {kelly_frac:.2%} | FinRL Mult: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
+            target_per_trade, sizing_note = self._resolve_swing_target(
+                live_bal, max_wallet_margin_pct, max(1, self.max_locks), per_trade_cap_pct,
+                float(kelly_frac), float(conviction_score or 0.7), finrl_mult, markov_mult,
+            )
+            log.info(
+                f"[SWING-KELLY-SIZING] Kelly {float(kelly_frac):.2%} x conv/finrl/markov "
+                f"{float(conviction_score or 0.7):.2f}/{finrl_mult:.2f}/{markov_mult:.2f} -> {sizing_note} "
+                f"| Target Margin: ${target_per_trade:.2f}"
+            )
         except Exception as ke:
-            log.debug(f"[SWING-KELLY-NOTE] {ke}")
+            # Fail closed: if Kelly can't be read, size at the minimum viable above the
+            # exchange floor instead of silently deploying the full fair share.
+            target_per_trade = fair_share_margin * 0.30
+            log.warning(f"[SWING-KELLY-SIZING] Kelly unavailable ({ke}) - fail-closed at 30% fair share (${target_per_trade:.2f}).")
 
-        # Q-10 FIX: Clamp target margin per trade to MAX_MARGIN_PER_TRADE_PCT ceiling (e.g. 14% or 20% of equity)
-        max_trade_margin_cap = live_bal * max_margin_per_trade_pct
-        if target_per_trade > max_trade_margin_cap:
-            log.info(f"[SWING-TRADE-MARGIN-CLAMP] Clamping target margin ${target_per_trade:.2f} to {max_margin_per_trade_pct:.0%} per-trade cap (${max_trade_margin_cap:.2f}).")
-            target_per_trade = max_trade_margin_cap
-
-        margin_collateral = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
+        margin_collateral = self._collateral_for(target_per_trade, available_margin_buffer)
+        if margin_collateral < 6.0:
+            log.warning(
+                f"[SWING-MIN-MARGIN-VETO] 🛑 {symbol}: collateral ${margin_collateral:.2f} is below the $6.00 exchange "
+                f"minimum (headroom ${available_margin_buffer:.2f}). Vetoing entry instead of inflating size."
+            )
+            return
 
         # Hard Per-Trade Dollar Risk Cap (default 2.0% of account equity)
         sl_pct_actual = abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0.015
@@ -1383,21 +1435,22 @@ class SwingArchitectTrader:
         raw_qty = target_notional / entry_price
 
         # F-14 FIX: Sizing step formatting & minimum lot verification (VETO on sub-minimum instead of inflating)
+        # Fix #5: floor to the step everywhere - round() could size up into over-margin.
         if "BTC" in symbol:
             min_lot = 0.0001
-            qty = round(raw_qty, 4)
+            qty = self._floor_to_step(raw_qty, min_lot)
         elif "ETH" in symbol or "BNB" in symbol:
             min_lot = 0.01
-            qty = round(raw_qty, 2)
+            qty = self._floor_to_step(raw_qty, min_lot)
         elif "SOL" in symbol or "AVAX" in symbol:
             min_lot = 0.1
-            qty = round(raw_qty, 1)
+            qty = self._floor_to_step(raw_qty, min_lot)
         elif any(c in symbol for c in ["LINK", "ADA", "XRP", "DOGE", "NEAR"]):
             min_lot = 1.0
-            qty = float(round(raw_qty))
+            qty = self._floor_to_step(raw_qty, min_lot)
         else:
             min_lot = 0.1
-            qty = round(raw_qty, 2)
+            qty = self._floor_to_step(raw_qty, min_lot)
 
         if qty < min_lot:
             log.warning(
