@@ -187,6 +187,98 @@ class TestChecklistRejectShadowRow(unittest.TestCase):
         self.assertTrue(callable(trader._compute_1d_trend))
 
 
+class TestShadowSettlement(unittest.TestCase):
+    HOUR_MS = 3_600_000
+    DAY_MS = 86_400_000
+
+    def setUp(self):
+        self.old_cwd = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="shadow_settle_")
+        os.chdir(self.tmp)
+        self.trader = SwingTrader.__new__(SwingTrader)
+        self.trader.uta_client = MagicMock()
+        self.trader._last_shadow_settle_ts = 0.0
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _insert(self, ts_iso, symbol, direction, entry, status="OPEN", candle_key=None):
+        ck = candle_key or f"{symbol}|{direction}|{ts_iso}"
+        with sqlite3.connect("trading_data.db") as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS shadow_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, strategy TEXT NOT NULL,
+                symbol TEXT NOT NULL, direction TEXT NOT NULL, entry_price REAL NOT NULL,
+                stop_loss REAL, take_profit REAL, veto_reason TEXT, exit_price REAL, pnl_pct REAL,
+                status TEXT DEFAULT 'OPEN', candle_key TEXT)""")
+            conn.execute("INSERT INTO shadow_signals (timestamp, strategy, symbol, direction, entry_price, veto_reason, status, candle_key) VALUES (?,?,?,?,?,?,?,?)",
+                         (ts_iso, "SWING_4H", symbol, direction, entry, "test", status, ck))
+            conn.commit()
+
+    def _rows(self):
+        with sqlite3.connect("trading_data.db") as conn:
+            return conn.execute("SELECT symbol, direction, entry_price, exit_price, pnl_pct, status FROM shadow_signals").fetchall()
+
+    def test_settles_open_row_at_48h_forward_close(self):
+        from datetime import datetime, UTC, timedelta
+        signal_ts = datetime.now(UTC) - timedelta(hours=60)
+        self._insert(signal_ts.isoformat(), "BTC/USDT", "LONG", 100.0)
+        day0 = int(signal_ts.timestamp() * 1000) // self.DAY_MS * self.DAY_MS
+
+        async def fake_fetch(symbol, timeframe="4h", since=None, limit=None, params=None):
+            return [[day0 + i * 4 * self.HOUR_MS, 100.0, 101.0, 99.0, 100.0 + i * 0.5, 10.0]
+                    for i in range(30)]
+        self.trader.uta_client.exchange.fetch_ohlcv = AsyncMock(side_effect=fake_fetch)
+        n = asyncio.run(self.trader._settle_shadow_signals())
+        self.assertEqual(n, 1)
+        sym, direction, entry, exit_price, pnl, status = self._rows()[0]
+        self.assertEqual(status, "SETTLED")
+        self.assertIsNotNone(exit_price)
+        self.assertGreater(pnl, 0.0, "long price rise must settle green")
+
+    def test_short_direction_signs_pnl(self):
+        from datetime import datetime, UTC, timedelta
+        signal_ts = datetime.now(UTC) - timedelta(hours=60)
+        self._insert(signal_ts.isoformat(), "ETH/USDT", "SHORT", 100.0)
+        day0 = int(signal_ts.timestamp() * 1000) // self.DAY_MS * self.DAY_MS
+
+        async def fake_fetch(symbol, timeframe="4h", since=None, limit=None, params=None):
+            return [[day0 + i * 4 * self.HOUR_MS, 100.0, 101.0, 99.0, 100.0 + i * 1.0, 10.0]
+                    for i in range(30)]
+        self.trader.uta_client.exchange.fetch_ohlcv = AsyncMock(side_effect=fake_fetch)
+        asyncio.run(self.trader._settle_shadow_signals())
+        _, _, _, _, pnl, status = self._rows()[0]
+        self.assertEqual(status, "SETTLED")
+        self.assertLess(pnl, 0.0, "short against a rising market settles red")
+
+    def test_too_recent_rows_left_open(self):
+        from datetime import datetime, UTC, timedelta
+        self._insert(datetime.now(UTC) - timedelta(hours=10), "XRP/USDT", "LONG", 1.0)
+        self.trader.uta_client.exchange.fetch_ohlcv = AsyncMock(side_effect=AssertionError("must not fetch"))
+        n = asyncio.run(self.trader._settle_shadow_signals())
+        self.assertEqual(n, 0)
+        self.assertEqual(self._rows()[0][5], "OPEN")
+
+    def test_already_settled_not_touched(self):
+        from datetime import datetime, UTC, timedelta
+        self._insert(datetime.now(UTC) - timedelta(days=5), "ADA/USDT", "LONG", 0.5,
+                     status="SETTLED", candle_key="ada-settled")
+        n = asyncio.run(self.trader._settle_shadow_signals())
+        self.assertEqual(n, 0)
+
+    def test_throttle_skips_second_call_in_same_window(self):
+        from datetime import datetime, UTC, timedelta
+        self._insert(datetime.now(UTC) - timedelta(hours=60), "BTC/USDT", "LONG", 100.0)
+        self.trader.uta_client.exchange.fetch_ohlcv = AsyncMock(return_value=[])
+        self.trader._last_shadow_settle_ts = time.time() - 3700
+        asyncio.run(self.trader._settle_shadow_signals())
+        self.assertTrue(self.trader.uta_client.exchange.fetch_ohlcv.called)
+        self.trader.uta_client.exchange.fetch_ohlcv.reset_mock()
+        asyncio.run(self.trader._settle_shadow_signals())
+        self.assertFalse(self.trader.uta_client.exchange.fetch_ohlcv.called)
+
+
 class TestOneDTrendFailClosed(unittest.TestCase):
     def test_insufficient_history_fails_closed(self):
         df = pd.DataFrame(_rows(0, 90), columns=["timestamp", "open", "high", "low", "close", "volume"])

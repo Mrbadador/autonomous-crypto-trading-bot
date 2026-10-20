@@ -85,6 +85,7 @@ class SwingArchitectTrader:
         self._trap_pass_cache = {}  # (symbol, direction) -> dict(ts, candle_ts, price, score, reason)
         self._close_retry_counts = {}  # symbol -> int (close attempt counter)
         self._close_retry_next_ts = {}  # symbol -> float (next timestamp allowed for close retry)
+        self._last_shadow_settle_ts = 0.0  # +48h shadow ledger settlement throttle
 
         self._init_database()
         self._load_active_positions_sync()
@@ -318,6 +319,84 @@ class SwingArchitectTrader:
                 conn.commit()
         except Exception as se:
             log.debug(f"[SHADOW-SIGNAL-NOTE] Failed to log shadow signal: {se}")
+
+    async def _settle_shadow_signals(self):
+        """Hourly-capped job: settle OPEN shadow signals at the first 4H close
+        >= signal_ts + 48h, so vetoed/near-miss setups accrue measurable forward
+        returns instead of rotting as unpriced 'OPEN' rows."""
+        now = time.time()
+        if now - getattr(self, "_last_shadow_settle_ts", 0.0) < 3600:
+            return 0
+        self._last_shadow_settle_ts = now
+
+        def _read_open():
+            try:
+                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute("""
+                        SELECT id, timestamp, symbol, direction, entry_price
+                        FROM shadow_signals WHERE status = 'OPEN'
+                    """).fetchall()
+                    return [dict(r) for r in rows]
+            except Exception as e:
+                log.debug(f"[SHADOW-SETTLE] read failed: {e}")
+                return []
+
+        rows = await asyncio.to_thread(_read_open)
+        min_age_ts = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+        settled = 0
+        for row in rows:
+            ts_raw = row.get("timestamp") or ""
+            try:
+                signal_dt = datetime.fromisoformat(ts_raw)
+                if signal_dt.tzinfo is None:
+                    signal_dt = signal_dt.replace(tzinfo=UTC)
+            except Exception:
+                continue
+            if ts_raw > min_age_ts:
+                continue
+            signal_ms = int(signal_dt.timestamp() * 1000)
+            exit_price = None
+            try:
+                clean_sym = self.uta_client._normalize_symbol(row["symbol"])
+                four_h_ms = 4 * 3600 * 1000
+                for page in range(3):
+                    batch = await self.uta_client.exchange.fetch_ohlcv(
+                        clean_sym, timeframe="4h", since=signal_ms + page * 90 * four_h_ms, limit=90)
+                    batch = [b for b in (batch or []) if int(b[0]) >= signal_ms]
+                    candidate = next((b for b in batch if int(b[0]) + four_h_ms >= signal_ms + 48 * 3600 * 1000), None)
+                    if candidate is not None:
+                        exit_price = float(candidate[4])
+                        break
+                    if not batch or len(batch) < 90:
+                        break
+            except Exception as fetch_err:
+                log.debug(f"[SHADOW-SETTLE] {row['symbol']}: fetch failed: {fetch_err}")
+                continue
+            if exit_price is None:
+                continue
+            entry = float(row["entry_price"])
+            if entry <= 0:
+                continue
+            pnl_pct = (exit_price - entry) / entry * 100.0
+            if str(row["direction"]).upper() == "SHORT":
+                pnl_pct = -pnl_pct
+
+            def _write(rid=exit_price, pnl=pnl_pct, sid=row["id"]):
+                try:
+                    with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                        conn.execute(
+                            "UPDATE shadow_signals SET exit_price = ?, pnl_pct = ?, status = 'SETTLED' WHERE id = ? AND status = 'OPEN'",
+                            (rid, pnl, sid))
+                        conn.commit()
+                except Exception as e:
+                    log.debug(f"[SHADOW-SETTLE] update failed for id {sid}: {e}")
+
+            await asyncio.to_thread(_write)
+            settled += 1
+        if settled:
+            log.info(f"[SHADOW-SETTLE] Settled {settled} shadow signal(s) at +48h forward close.")
+        return settled
 
     def _load_active_positions_sync(self):
         """Synchronizes in-memory positions with swing_open_positions."""
@@ -2829,6 +2908,13 @@ class SwingArchitectTrader:
         """Evaluates 4H setups across the 10 fleet coins (Long & Short)."""
         # Refresh heartbeats for existing locks
         await asyncio.to_thread(self._refresh_heartbeats_sync)
+
+        # Settle +48h-old shadow signals (throttled internally to ~1/hour);
+        # runs before capacity gates so the ledger settles even when flat.
+        try:
+            await self._settle_shadow_signals()
+        except Exception as settle_err:
+            log.debug(f"[SHADOW-SETTLE] scan trigger failed: {settle_err}")
 
         # Check lock capacity and parameters (dynamically refreshed from config)
         self.max_locks = getattr(config, "SWING_MAX_CONCURRENT_LOCKS", 4)
