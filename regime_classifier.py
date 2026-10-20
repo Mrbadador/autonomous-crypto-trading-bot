@@ -46,6 +46,14 @@ AI_TRAP_RISK_DEFAULT = 0.50
 AI_LEVERAGE_DEFAULT = 3
 AI_OFFLINE_BIAS = "MATH_DEFAULT"
 
+# Turbulence circuit breaker (Fix #4): quantiles are only trusted once the persisted
+# history is large enough that the 99th percentile is not just interpolating the top
+# two fresh values; tiers need consecutive passes before they flip.
+TURB_POOL_TRUST_MIN = 100
+TURB_HISTORY_RETENTION_DAYS = 30
+TURB_ENGAGE_BREACHES = 2
+TURB_DISENGAGE_CALMS = 3
+
 # ENV INTEGRITY CHECK
 _api_key = os.getenv("BITGET_API_KEY", "")
 if _api_key:
@@ -80,6 +88,10 @@ class RegimeClassifier:
         self.ai_bias_dwell_ts = 0.0
         self.last_counted_ai_eval_epoch = None
         self.min_ai_bias_dwell_sec = 2700.0  # 45 minutes minimum dwell time or 2 consecutive matches
+        # Turbulence tier hysteresis state (persisted across restarts via system_state)
+        self.turbulence_tier = "CALM_NORMAL"
+        self._turb_breach_streak = 0
+        self._turb_calm_streak = 0
         try:
             from markov_regime import MarkovRegimeEngine
             self.markov_engine = MarkovRegimeEngine()
@@ -119,6 +131,29 @@ class RegimeClassifier:
                     try:
                         conn.execute(f"ALTER TABLE market_regime ADD COLUMN {col} {col_type}")
                     except sqlite3.OperationalError:
+                        pass
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS turbulence_history (
+                        ts REAL NOT NULL,
+                        value REAL NOT NULL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_turbulence_history_ts ON turbulence_history (ts)")
+                row_tier = None
+                try:
+                    row_tier = conn.execute(
+                        "SELECT value FROM system_state WHERE key = 'turbulence_tier_state'"
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    pass
+                if row_tier and row_tier[0]:
+                    try:
+                        import json as _json
+                        tstate = _json.loads(row_tier[0])
+                        self.turbulence_tier = str(tstate.get("tier") or "CALM_NORMAL")
+                        self._turb_breach_streak = int(tstate.get("breach_streak") or 0)
+                        self._turb_calm_streak = int(tstate.get("calm_streak") or 0)
+                    except Exception:
                         pass
         except Exception as e:
             log.critical(f"Failed to initialize database table: {e}")
@@ -454,11 +489,24 @@ class RegimeClassifier:
 
             turb_arr = np.array(turbulence_history, dtype=float)
             current_d = float(turb_arr[-1])
-            hist_pool = turb_arr[:-1] if len(turb_arr) > 5 else turb_arr
 
-            tau_90 = float(np.percentile(hist_pool, 90))
-            tau_99 = float(np.percentile(hist_pool, 99))
-            trailing_12 = float(np.mean(turb_arr[-min(12, len(turb_arr)):]))
+            # Fix #4: quantiles come from a persisted 30-day pool. The freshly computed
+            # window is ~55 points, where a 99th percentile is just interpolation of the
+            # top two values - one spike could swing the active threshold 15 -> 146.
+            pool_values, persisted_count, bootstrap_active = self._record_and_load_turbulence_pool(
+                current_d, turb_arr
+            )
+            if bootstrap_active:
+                log.info(
+                    f"[TURB-BOOTSTRAP] Persisted d_t history {persisted_count}/{TURB_POOL_TRUST_MIN} "
+                    f"- quantiles seeded from {len(pool_values)} computed points; breaker stays armed."
+                )
+            pool_arr = np.asarray(pool_values, dtype=float)
+
+            tau_90 = float(np.percentile(pool_arr, 90))
+            tau_99 = float(np.percentile(pool_arr, 99))
+            # Median, not mean: one spike in the last 12 bars must not drop the tier.
+            trailing_12 = float(np.median(turb_arr[-min(12, len(turb_arr)):]))
 
             # FinRL Two-Tier Dynamic Quantile Rule:
             # When trailing turbulence exceeds the 90th percentile, tighten active circuit-breaker to tau_90
@@ -468,15 +516,15 @@ class RegimeClassifier:
             # FinRL bounded sigmoid compression
             raw_sig = 1.0 / (1.0 + float(np.exp(-current_d * np.e / active_thresh)))
             sigmoid_score = round(max(0.0, min(1.0, (raw_sig - 0.5) * 2.0)), 4)
-            pct_rank = round(float(np.mean(hist_pool <= current_d) * 100.0), 1)
+            pct_rank = round(float(np.mean(pool_arr <= current_d) * 100.0), 1)
 
             breach = bool(current_d > active_thresh)
-            if breach:
-                state_str = "EXTREME_SHOCK"
-            elif current_d > tau_90:
+            self.turbulence_tier = self._advance_turbulence_tier(breach)
+            self._persist_turbulence_tier()
+            if self.turbulence_tier != "EXTREME_SHOCK" and current_d > tau_90:
                 state_str = "ELEVATED_STRESS"
             else:
-                state_str = "CALM_NORMAL"
+                state_str = self.turbulence_tier
 
             return {
                 "turbulence_index": round(current_d, 3),
@@ -489,10 +537,108 @@ class RegimeClassifier:
                 "turbulence_breach": breach,
                 "turbulence_state": state_str,
                 "assets_sampled": int(n_assets),
+                "history_pool_size": int(persisted_count),
+                "bootstrap_active": bool(bootstrap_active),
             }
         except Exception as e:
             log.warning(f"[FINRL-TURBULENCE-NOTE] Error calculating Mahalanobis turbulence: {e}")
             return default_res
+
+    def _record_and_load_turbulence_pool(self, current_d: float, local_arr) -> tuple:
+        """Persists this pass's d_t and returns (pool_values, persisted_count, bootstrap_active).
+
+        Below TURB_POOL_TRUST_MIN persisted points the freshly computed window seeds the
+        pool instead, so the breaker is armed (conservative) from the first pass and
+        never defines its own ceiling from two interpolated points.
+        """
+        persisted = []
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            try:
+                with conn:
+                    conn.execute(
+                        "INSERT INTO turbulence_history (ts, value) VALUES (?, ?)",
+                        (time.time(), max(0.0, float(current_d))),
+                    )
+                    conn.execute(
+                        "DELETE FROM turbulence_history WHERE ts < ?",
+                        (time.time() - TURB_HISTORY_RETENTION_DAYS * 86400.0,),
+                    )
+                rows = conn.execute(
+                    "SELECT value FROM turbulence_history WHERE ts >= ? ORDER BY ts DESC LIMIT 5000",
+                    (time.time() - TURB_HISTORY_RETENTION_DAYS * 86400.0,),
+                ).fetchall()
+                persisted = [float(r[0]) for r in rows]
+            finally:
+                conn.close()
+        except Exception as pool_err:
+            log.warning(f"[TURB-POOL-NOTE] Persisted pool unavailable ({pool_err}); using seeded window.")
+        if len(persisted) >= TURB_POOL_TRUST_MIN:
+            return persisted, len(persisted), False
+        seeded = list(persisted) + [float(v) for v in local_arr]
+        return seeded, len(persisted), True
+
+    def _advance_turbulence_tier(self, breach: bool) -> str:
+        """Two-pass engage / three-pass disengage hysteresis for EXTREME_SHOCK (Fix #4).
+
+        Once engaged, the tier stays EXTREME_SHOCK until TURB_DISENGAGE_CALMS consecutive
+        calm passes clear it; a single breaching bar cannot flip the breaker on or off.
+        """
+        if breach:
+            self._turb_calm_streak = 0
+            if self.turbulence_tier == "EXTREME_SHOCK":
+                self._turb_breach_streak = 0
+            else:
+                self._turb_breach_streak += 1
+                if self._turb_breach_streak >= TURB_ENGAGE_BREACHES:
+                    self.turbulence_tier = "EXTREME_SHOCK"
+                    self._turb_breach_streak = 0
+                    log.warning(
+                        f"[FINRL-TURBULENCE-TIER] EXTREME_SHOCK engaged after "
+                        f"{TURB_ENGAGE_BREACHES} consecutive breaches."
+                    )
+        else:
+            self._turb_breach_streak = 0
+            self._turb_calm_streak += 1
+            if self.turbulence_tier == "EXTREME_SHOCK" and self._turb_calm_streak >= TURB_DISENGAGE_CALMS - 1:
+                # TURB_DISENGAGE_CALMS calm observations total (the pass that engaged the
+                # tier last, then this streak) must land before the breaker releases.
+                self.turbulence_tier = "CALM_NORMAL"
+                log.info(
+                    f"[FINRL-TURBULENCE-TIER] EXTREME_SHOCK disengaged after "
+                    f"{TURB_DISENGAGE_CALMS} consecutive calm passes."
+                )
+        return self.turbulence_tier
+
+    def _persist_turbulence_tier(self):
+        try:
+            conn = None
+            try:
+                import json as _json
+                conn = sqlite3.connect(self.db_path, timeout=10.0)
+                payload = _json.dumps({
+                    "tier": self.turbulence_tier,
+                    "breach_streak": self._turb_breach_streak,
+                    "calm_streak": self._turb_calm_streak,
+                })
+                with conn:
+                    try:
+                        conn.execute(
+                            "UPDATE system_state SET value = ?, updated_at = ? WHERE key = 'turbulence_tier_state'",
+                            (payload, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+                        )
+                        if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                            conn.execute(
+                                "INSERT INTO system_state (key, value, updated_at) VALUES ('turbulence_tier_state', ?, ?)",
+                                (payload, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+                            )
+                    except sqlite3.OperationalError:
+                        pass
+            finally:
+                if conn:
+                    conn.close()
+        except Exception as tier_err:
+            log.debug(f"[TURB-TIER-PERSIST-NOTE] {tier_err}")
 
     def fetch_funding_rate(self, symbol="BTCUSDT"):
         """Pulls current funding rate from Bitget public API."""
