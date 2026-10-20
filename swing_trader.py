@@ -674,6 +674,44 @@ class SwingArchitectTrader:
         }
 
     @staticmethod
+    def _evaluate_swing_candidate(ind_4h: dict, ind_1d: dict, live_4h_o: float, live_4h_c: float,
+                                  adx: float, rsi: float, min_adx: float) -> dict:
+        """Same AND-ed checklist as scan_fleet, but reports which conditions failed.
+        A 'near miss' = pattern side present but secondary gates failed; used to
+        measure the checklist without changing which trades get taken."""
+        close_4h = float(ind_4h["close"])
+        long_checks = [
+            ("no_bullish_kumo", not bool(ind_4h.get("bullish_kumo", False))),
+            ("no_bullish_candle", not bool(ind_4h.get("bullish_candle_4h", False))),
+            ("live_bar_dumping", bool(live_4h_c < live_4h_o * 0.9985)),
+            ("live_break_below_closed", bool(live_4h_c < close_4h * 0.9970)),
+            (f"adx_below_{min_adx:g}", bool(adx < min_adx)),
+            ("no_1d_bullish_alignment", not bool(ind_1d.get("bullish_alignment", False))),
+            ("rsi_overbought", bool(rsi > 70.0)),
+        ]
+        short_checks = [
+            ("no_bearish_kumo", not bool(ind_4h.get("bearish_kumo", False))),
+            ("no_bearish_candle", not bool(ind_4h.get("bearish_candle_4h", False))),
+            ("live_bar_pumping", bool(live_4h_c > live_4h_o * 1.0015)),
+            ("live_break_above_closed", bool(live_4h_c > close_4h * 1.0030)),
+            (f"adx_below_{min_adx:g}", bool(adx < min_adx)),
+            ("no_1d_bearish_alignment", not bool(ind_1d.get("bearish_alignment", False))),
+            ("rsi_oversold", bool(rsi < 35.0)),
+        ]
+        long_pattern = bool(ind_4h.get("bullish_kumo", False)) and bool(ind_4h.get("bullish_candle_4h", False))
+        short_pattern = bool(ind_4h.get("bearish_kumo", False)) and bool(ind_4h.get("bearish_candle_4h", False))
+        direction = "LONG" if not any(ok for _, ok in long_checks) else \
+                    "SHORT" if not any(ok for _, ok in short_checks) else None
+        long_failed = [name for name, ok in long_checks if ok]
+        short_failed = [name for name, ok in short_checks if ok]
+        return {
+            "direction": direction,
+            "long_failed": long_failed,
+            "short_failed": short_failed,
+            "near_miss": bool((long_pattern and long_failed) or (short_pattern and short_failed)),
+        }
+
+    @staticmethod
     def _merge_ohlcv_pages(pages):
         merged = {}
         for page in pages:
@@ -2858,44 +2896,31 @@ class SwingArchitectTrader:
                 ind_4h = self._compute_4h_indicators(df_4h_eval)
                 ind_1d = self._compute_1d_trend(df_1d_eval)
 
-                # Determine candidate direction
-                cand_direction = None
                 rsi = ind_4h.get("rsi", 50.0)
                 adx = ind_4h.get("adx", 0.0)
                 live_4h_o = float(df_4h["open"].iloc[-1])
                 live_4h_c = float(df_4h["close"].iloc[-1])
 
-                # LONG Checklist:
-                # 1) 4H Bullish Kumo breakout + Bullish Closed 4H Expansion Candle (Close > Open & Close >= Prior Close)
-                # 2) Live forming 4H bar not actively dumping (live_close >= live_open * 0.9985)
-                # 3) ADX >= min_adx (trending market)
-                # 4) 1D Bullish alignment (Price > 200 EMA & 50 EMA >= 0.98 * 200 EMA) -> Anti-Dead-Cat-Bounce
-                # 5) RSI <= 70.0 (Not overbought)
-                if (ind_4h.get("bullish_kumo", False) and
-                    ind_4h.get("bullish_candle_4h", False) and
-                    live_4h_c >= live_4h_o * 0.9985 and
-                    live_4h_c >= ind_4h["close"] * 0.9970 and
-                    adx >= self.min_adx and 
-                    ind_1d.get("bullish_alignment", False) and 
-                    rsi <= 70.0):
-                    cand_direction = "LONG"
-
-                # SHORT Checklist:
-                # 1) 4H Bearish Kumo breakdown + Bearish Closed 4H Breakdown Candle (Close < Open & Close <= Prior Close)
-                # 2) Live forming 4H bar not actively squeezing up (live_close <= live_open * 1.0015)
-                # 3) ADX >= self.min_adx (trending breakdown)
-                # 4) 1D Bearish alignment (Price < 200 EMA & 50 EMA <= 1.02 * 200 EMA)
-                # 5) RSI >= 35.0 (Anti-Bottom-Shorting / Not oversold)
-                elif (ind_4h.get("bearish_kumo", False) and
-                      ind_4h.get("bearish_candle_4h", False) and
-                      live_4h_c <= live_4h_o * 1.0015 and
-                      live_4h_c <= ind_4h["close"] * 1.0030 and
-                      adx >= self.min_adx and 
-                      ind_1d.get("bearish_alignment", False) and 
-                      rsi >= 35.0):
-                    cand_direction = "SHORT"
+                # Candidate direction via shared checklist (see _evaluate_swing_candidate):
+                # LONG = bullish kumo + bullish closed candle + no live dump + ADX >= min
+                #        + 1D bullish alignment + RSI <= 70; SHORT mirrors it.
+                cand_eval = self._evaluate_swing_candidate(
+                    ind_4h, ind_1d, live_4h_o, live_4h_c, adx, rsi, self.min_adx)
+                cand_direction = cand_eval["direction"]
 
                 if not cand_direction:
+                    if cand_eval["near_miss"]:
+                        long_side = bool(ind_4h.get("bullish_kumo") and ind_4h.get("bullish_candle_4h"))
+                        nm_dir = "LONG" if long_side else "SHORT"
+                        failed = cand_eval["long_failed"] if long_side else cand_eval["short_failed"]
+                        nm_key = f"{symbol}|CHECKLIST_{nm_dir[0]}|{ind_4h.get('candle_ts', 0)}"
+                        try:
+                            await asyncio.to_thread(
+                                self._record_shadow_signal_sync, "SWING_4H", symbol, nm_dir,
+                                ind_4h["close"], veto_reason="CHECKLIST-REJECT: " + ",".join(failed),
+                                candle_key=nm_key)
+                        except Exception as nm_err:
+                            log.debug(f"[CHECKLIST-REJECT] {symbol}: record failed: {nm_err}")
                     continue
 
                 if allowed_direction and cand_direction != allowed_direction.upper():
