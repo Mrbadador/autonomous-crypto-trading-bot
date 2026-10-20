@@ -33,6 +33,9 @@ from indicators import detect_momentum_divergence, compute_volume_profile, compu
 from reconciliation_engine import validate_exit_price_plausibility
 
 
+EXCHANGE_MIN_MARGIN_USD = 6.0  # Bitget USDT-FUTURES minimum order margin
+
+
 # BUG-07 FIX: Use explicit handler attachment instead of basicConfig()
 # basicConfig() is a no-op when the root logger already has handlers (set by start_system.py).
 log = logging.getLogger("swing_architect")
@@ -1284,7 +1287,10 @@ class SwingArchitectTrader:
             if not (0.0 < kf <= 0.25):
                 raise ValueError(f"kelly fraction out of sane range: {kelly_frac}")
         except Exception:
-            return round(fair_share * 0.30, 2), "fail-closed at 30% fair share (kelly unusable)"
+            # Fail closed = smallest trade that can actually be placed, not an
+            # impossible size. 30% of fair share alone is sub-$6 on a small account,
+            # which would silently halt every engine instead of de-risking it.
+            return round(max(EXCHANGE_MIN_MARGIN_USD, fair_share * 0.30), 2), "fail-closed at minimum viable size (kelly unusable)"
         conv_mult = max(0.6, min(1.2, float(conviction_score or 0.7)))
         kelly_margin = live_bal * kf * conv_mult * finrl_mult * markov_mult
         return SwingArchitectTrader._compute_target_margin(fair_share, kelly_margin, per_trade_cap), "kelly"
@@ -1522,13 +1528,14 @@ class SwingArchitectTrader:
                 f"| Target Margin: ${target_per_trade:.2f}"
             )
         except Exception as ke:
-            # Fail closed: if Kelly can't be read, size at the minimum viable above the
-            # exchange floor instead of silently deploying the full fair share.
-            target_per_trade = fair_share_margin * 0.30
-            log.warning(f"[SWING-KELLY-SIZING] Kelly unavailable ({ke}) - fail-closed at 30% fair share (${target_per_trade:.2f}).")
+            # Fail closed = smallest size that can actually be placed. 30% of fair
+            # share alone is sub-$6 on this account, which would halt the engine
+            # outright instead of de-risking it.
+            target_per_trade = max(EXCHANGE_MIN_MARGIN_USD, fair_share_margin * 0.30)
+            log.warning(f"[SWING-KELLY-SIZING] Kelly unavailable ({ke}) - fail-closed at minimum viable size (${target_per_trade:.2f}).")
 
         margin_collateral = self._collateral_for(target_per_trade, available_margin_buffer)
-        if margin_collateral < 6.0:
+        if margin_collateral < EXCHANGE_MIN_MARGIN_USD:
             log.warning(
                 f"[SWING-MIN-MARGIN-VETO] 🛑 {symbol}: collateral ${margin_collateral:.2f} is below the $6.00 exchange "
                 f"minimum (headroom ${available_margin_buffer:.2f}). Vetoing entry instead of inflating size."

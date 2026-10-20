@@ -31,8 +31,10 @@ class TestKellyTarget(unittest.TestCase):
             per_trade_cap_pct=0.14, kelly_frac=None,
             conviction_score=0.7, finrl_mult=1.0, markov_mult=1.0,
         )
-        # Minimum viable size = 30% of fair share, not the old fail-open full fair share.
-        self.assertAlmostEqual(target, 100.0 * 0.70 / 4 * 0.30)
+        # Fail-closed means the smallest size the exchange will actually accept.
+        # 30% of fair share ($5.25 here) is below the $6 Bitget minimum, which would
+        # silence the engine instead of de-risking it, so the $6 floor wins.
+        self.assertAlmostEqual(target, 6.0)
         self.assertIn("fail-closed", note)
 
     def test_normal_resolution_applies_multipliers(self):
