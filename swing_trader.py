@@ -653,7 +653,8 @@ class SwingArchitectTrader:
     def _compute_1d_trend(self, df_1d: pd.DataFrame) -> dict:
         """Computes 1D EMA 50 & 200 for macro trend alignment."""
         if len(df_1d) < 200:
-            return {"bullish_alignment": True, "bearish_alignment": True, "ema50": 0.0, "ema200": 0.0}
+            return {"bullish_alignment": False, "bearish_alignment": False,
+                    "ema50": 0.0, "ema200": 0.0, "daily_trend": "INSUFFICIENT"}
 
         close = df_1d["close"]
         ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
@@ -671,6 +672,40 @@ class SwingArchitectTrader:
             "close": float(curr_price),
             "daily_trend": daily_trend_str
         }
+
+    @staticmethod
+    def _merge_ohlcv_pages(pages):
+        merged = {}
+        for page in pages:
+            for row in page or []:
+                merged[int(row[0])] = row
+        return [merged[ts] for ts in sorted(merged)]
+
+    async def _fetch_daily_history(self, clean_sym: str, target_bars: int = 200) -> list:
+        """Paged 1D OHLCV fetch. Bitget swap caps candles at ~90 per request, so a
+        single limit=210 call silently returns ~90 bars; page forward with `since`
+        until target is reached or history runs out."""
+        day_ms = 86_400_000
+        pages = []
+        cursor = int(time.time() * 1000) // day_ms * day_ms - (target_bars + 40) * day_ms
+        for _ in range(4):
+            try:
+                batch = await self.uta_client.exchange.fetch_ohlcv(
+                    clean_sym, timeframe="1d", since=cursor, limit=target_bars)
+            except Exception as e:
+                log.warning(f"[1D-FETCH] {clean_sym}: paged fetch failed at cursor {cursor}: {e}")
+                break
+            if not batch:
+                break
+            pages.append(batch)
+            merged = self._merge_ohlcv_pages(pages)
+            if len(merged) >= target_bars:
+                return merged[-target_bars:] if target_bars else merged
+            newest = int(batch[-1][0])
+            if newest + day_ms <= cursor:
+                break
+            cursor = newest + day_ms
+        return self._merge_ohlcv_pages(pages)
 
     # ---------------------------------------------------------------------------
     # Institutional AI Defense Gates
@@ -2809,7 +2844,7 @@ class SwingArchitectTrader:
                 # 1. Fetch 4H (limit=95 for 52+26 shifted Ichimoku Kumo) and 1D data
                 clean_sym = self.uta_client._normalize_symbol(symbol)
                 candles_4h = await self.uta_client.exchange.fetch_ohlcv(clean_sym, timeframe="4h", limit=95)
-                candles_1d = await self.uta_client.exchange.fetch_ohlcv(clean_sym, timeframe="1d", limit=210)
+                candles_1d = await self._fetch_daily_history(clean_sym)
                 if len(candles_4h) < 80:
                     continue
 
