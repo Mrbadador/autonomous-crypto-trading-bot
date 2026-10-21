@@ -26,6 +26,16 @@ class TestGridBoardroomPreFiltersReal(unittest.IsolatedAsyncioTestCase):
             now_iso = datetime.now(timezone.utc).isoformat()
             conn.execute("INSERT INTO system_state (key, value, updated_at) VALUES ('ALLOWED_SYMBOLS', ?, ?)",
                          (json.dumps(["ADA/USDT"]), now_iso))
+            # Seed db_integrity as healthy so test checks subsequent stages
+            for db_name in ["trading_data.db", "trading_ledger.db", "live_paper_trades.db"]:
+                conn.execute(
+                    "INSERT INTO system_state (key, value, updated_at) VALUES (?, 'OK', ?)",
+                    (f"db_integrity_{db_name}", now_iso)
+                )
+                conn.execute(
+                    "INSERT INTO system_state (key, value, updated_at) VALUES (?, '0', ?)",
+                    (f"db_integrity_{db_name}_consecutive_errors", now_iso)
+                )
             conn.commit()
         finally:
             conn.close()
