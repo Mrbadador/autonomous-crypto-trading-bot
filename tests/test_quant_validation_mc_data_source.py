@@ -61,7 +61,8 @@ def test_roe_pct_is_the_return_series_not_pnl_sign(tmp_path, monkeypatch):
     """Every row is seeded so pnl and roe_pct disagree on sign; roe_pct must win.
 
     Seeded 5 roe-wins / 7 roe-losses rather than 4/8 because 4 wins against a 2.0 payoff is a
-    zero-edge ledger, which the engine now refuses to simulate (see test_zero_edge_ledger_raises).
+    zero-edge ledger, which the engine now refuses to simulate (see the `zero_edge` case of
+    test_book_without_an_edge_raises_instead_of_reporting_a_positive_kelly).
     """
     monkeypatch.chdir(tmp_path)
     rows = [(i, 1.0, 100.0, 1.0, -5.0) for i in range(1, 8)]
