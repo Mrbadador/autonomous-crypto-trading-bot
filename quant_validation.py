@@ -31,6 +31,10 @@ if hasattr(sys.stdout, "reconfigure"):
 REPORT_CACHE_PATH = os.path.join("cache", "quant_validation_report.json")
 
 
+class InsufficientValidationData(RuntimeError):
+    """Raised when a validation statistic cannot be computed from real recorded trades."""
+
+
 def _ensure_5m_validation_datasets(symbols: List[str] = None) -> List[str]:
     """Ensures 5m OHLCV Parquet datasets exist in data/historical for high-frequency Grid & Scalp validation."""
     if symbols is None:
@@ -582,41 +586,47 @@ def run_trade_sequence_monte_carlo(
     rng = np.random.default_rng(seed)
     initial_equity = 500.0
     trade_pct_returns: List[float] = []
+    min_trades = 10
+
+    if not os.path.exists("trading_data.db"):
+        raise InsufficientValidationData(
+            "Monte Carlo validation requires trading_data.db in the working directory; none found."
+        )
 
     try:
-        if os.path.exists("trading_data.db"):
-            with sqlite3.connect("file:trading_data.db?mode=ro", uri=True, timeout=5.0) as conn:
-                row_bal = conn.execute(
-                    "SELECT value FROM system_state WHERE key IN ('live_wallet_balance', 'wallet_balance', 'hwm_balance') LIMIT 1"
-                ).fetchone()
-                if row_bal and row_bal[0]:
-                    try:
-                        b_val = float(row_bal[0])
-                        if b_val > 50.0:
-                            initial_equity = b_val
-                    except Exception:
-                        pass
+        with sqlite3.connect("file:trading_data.db?mode=ro", uri=True, timeout=5.0) as conn:
+            row_bal = conn.execute(
+                "SELECT value FROM system_state WHERE key IN ('live_wallet_balance', 'wallet_balance', 'hwm_balance') LIMIT 1"
+            ).fetchone()
+            if row_bal and row_bal[0]:
+                try:
+                    b_val = float(row_bal[0])
+                    if b_val > 50.0:
+                        initial_equity = b_val
+                except (TypeError, ValueError):
+                    pass
 
-                rows = conn.execute(
-                    "SELECT pnl, entry_price, size, leverage FROM swing_trades WHERE pnl IS NOT NULL ORDER BY id DESC LIMIT 200"
-                ).fetchall()
-                for pnl, ep, sz, lev in rows:
-                    pnl_f = float(pnl or 0.0)
-                    ep_f = float(ep or 0.0)
-                    sz_f = float(sz or 0.0)
-                    lev_f = max(1.0, float(lev or 3.0))
-                    margin = (ep_f * sz_f) / lev_f if (ep_f > 0 and sz_f > 0) else 35.0
-                    margin = max(15.0, margin)
-                    roe = max(-0.25, min(0.40, pnl_f / margin))
-                    trade_pct_returns.append(roe)
-    except Exception:
-        pass
+            rows = conn.execute(
+                "SELECT pnl, roe_pct, entry_price, size FROM swing_trades "
+                "WHERE pnl IS NOT NULL ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise InsufficientValidationData(f"Monte Carlo validation could not read trading_data.db: {exc}") from exc
 
-    if len(trade_pct_returns) < 10:
-        trade_pct_returns = [
-            0.036, -0.024, 0.042, -0.018, 0.029, 0.005, -0.022, 0.051, -0.015, 0.033,
-            -0.021, 0.045, 0.004, -0.019, 0.038, -0.025, 0.031, 0.062, -0.017, 0.027
-        ]
+    # swing_trades has no leverage column; roe_pct is the recorded return on margin.
+    for pnl, roe_pct, entry_price, size in rows:
+        if roe_pct is not None:
+            trade_pct_returns.append(float(roe_pct) / 100.0)
+            continue
+        notional = float(entry_price or 0.0) * float(size or 0.0)
+        if notional > 0:
+            trade_pct_returns.append(float(pnl) / notional)
+
+    if len(trade_pct_returns) < min_trades:
+        raise InsufficientValidationData(
+            f"Monte Carlo validation needs at least {min_trades} closed trades with a recorded return; "
+            f"found {len(trade_pct_returns)} in swing_trades. Refusing to substitute synthetic returns."
+        )
 
     ret_arr = np.array(trade_pct_returns, dtype=float)
     wins = ret_arr[ret_arr > 0]
@@ -652,12 +662,14 @@ def run_trade_sequence_monte_carlo(
     cone_p95 = [round(float(x), 2) for x in np.percentile(equity_paths, 95, axis=0)]
 
     return {
+        "status": "ok",
+        "data_source": "swing_trades",
         "n_simulations": int(n_simulations),
         "horizon_trades": int(horizon_trades),
         "historical_sample_size": int(len(ret_arr)),
         "initial_equity_usdt": round(initial_equity, 2),
         "quarter_kelly_fraction_pct": round(quarter_kelly * 100.0, 2),
-        "empirical_win_rate_pct": round(win_rate * 100.0, 1),
+        "empirical_win_rate_pct": round(win_rate * 100.0, 2),
         "empirical_payoff_ratio": round(payoff_b, 2),
         "median_max_dd_pct": round(dd_p50, 2),
         "max_dd_95_pct": round(dd_p95, 2),
@@ -690,7 +702,10 @@ def generate_full_validation_report(force_refresh: bool = False) -> Dict[str, An
     t0 = time.time()
     bootstrap_res = run_bootstrap_entry_significance(b_iterations=2000, noise_sigma=0.15)
     ensemble_res = compute_finrl_rolling_sharpe_selector(bootstrap_res)
-    mc_res = run_trade_sequence_monte_carlo(n_simulations=5000, horizon_trades=60)
+    try:
+        mc_res = run_trade_sequence_monte_carlo(n_simulations=5000, horizon_trades=60)
+    except InsufficientValidationData as exc:
+        mc_res = {"status": "unavailable", "data_source": "none", "reason": str(exc)}
     elapsed = round(time.time() - t0, 2)
 
     report = {
@@ -711,7 +726,7 @@ def generate_full_validation_report(force_refresh: bool = False) -> Dict[str, An
     return report
 
 
-if __name__ == "__main__":
+def main() -> None:
     rep = generate_full_validation_report(force_refresh=True)
     print(f"=== QUANT VALIDATION SUITE COMPLETED IN {rep['compute_seconds']}s ===")
     for k, v in rep["bootstrap_significance"].items():
@@ -724,8 +739,15 @@ if __name__ == "__main__":
     ens = rep.get("finrl_ensemble_selector", {})
     print(f"[FINRL ENSEMBLE WINNER] {ens.get('ensemble_winner')} (Sharpe={ens.get('winner_sharpe', 0.0):+.2f}) | Weights: {ens.get('strategy_weights')}")
     mc = rep["monte_carlo"]
-    print(
-        f"[MONTE CARLO N={mc['n_simulations']}] 1/4 Kelly={mc['quarter_kelly_fraction_pct']:.1f}% | "
-        f"Median DD={mc['median_max_dd_pct']:.2f}% | MaxDD_95={mc['max_dd_95_pct']:.2f}% | "
-        f"MaxDD_99={mc['max_dd_99_pct']:.2f}% | Median Terminal Equity=${mc['terminal_equity_p50']:,.2f}"
-    )
+    if mc.get("status") == "unavailable":
+        print(f"[MONTE CARLO] UNAVAILABLE — {mc.get('reason')}")
+    else:
+        print(
+            f"[MONTE CARLO N={mc['n_simulations']}] 1/4 Kelly={mc['quarter_kelly_fraction_pct']:.1f}% | "
+            f"Median DD={mc['median_max_dd_pct']:.2f}% | MaxDD_95={mc['max_dd_95_pct']:.2f}% | "
+            f"MaxDD_99={mc['max_dd_99_pct']:.2f}% | Median Terminal Equity=${mc['terminal_equity_p50']:,.2f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
