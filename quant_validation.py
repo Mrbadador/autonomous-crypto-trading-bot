@@ -593,6 +593,7 @@ def run_trade_sequence_monte_carlo(
             "Monte Carlo validation requires trading_data.db in the working directory; none found."
         )
 
+    current_row = None
     try:
         with sqlite3.connect("file:trading_data.db?mode=ro", uri=True, timeout=5.0) as conn:
             row_bal = conn.execute(
@@ -610,17 +611,22 @@ def run_trade_sequence_monte_carlo(
                 "SELECT pnl, roe_pct, entry_price, size FROM swing_trades "
                 "WHERE pnl IS NOT NULL ORDER BY id DESC LIMIT 200"
             ).fetchall()
-    except sqlite3.Error as exc:
-        raise InsufficientValidationData(f"Monte Carlo validation could not read trading_data.db: {exc}") from exc
 
-    # swing_trades has no leverage column; roe_pct is the recorded return on margin.
-    for pnl, roe_pct, entry_price, size in rows:
-        if roe_pct is not None:
-            trade_pct_returns.append(float(roe_pct) / 100.0)
-            continue
-        notional = float(entry_price or 0.0) * float(size or 0.0)
-        if notional > 0:
-            trade_pct_returns.append(float(pnl) / notional)
+        # swing_trades has no leverage column; roe_pct is the recorded return on margin.
+        for current_row in rows:
+            pnl, roe_pct, entry_price, size = current_row
+            if roe_pct is not None:
+                trade_pct_returns.append(float(roe_pct) / 100.0)
+                continue
+            notional = float(entry_price or 0.0) * float(size or 0.0)
+            if notional > 0:
+                trade_pct_returns.append(float(pnl) / notional)
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        if current_row is None:
+            raise InsufficientValidationData(f"Monte Carlo validation could not read trading_data.db: {exc}") from exc
+        raise InsufficientValidationData(
+            f"Monte Carlo validation could not parse swing_trades row {current_row!r}: {exc}"
+        ) from exc
 
     if len(trade_pct_returns) < min_trades:
         raise InsufficientValidationData(
@@ -631,9 +637,15 @@ def run_trade_sequence_monte_carlo(
     ret_arr = np.array(trade_pct_returns, dtype=float)
     wins = ret_arr[ret_arr > 0]
     losses = np.abs(ret_arr[ret_arr < 0])
+    if len(wins) == 0 or len(losses) == 0:
+        absent_kind = "losing" if len(losses) == 0 else "winning"
+        raise InsufficientValidationData(
+            f"Monte Carlo validation cannot measure a payoff ratio from {len(ret_arr)} recorded trades "
+            f"that contain no {absent_kind} trade. Refusing to substitute a default win or loss size."
+        )
     win_rate = float(len(wins) / len(ret_arr)) if len(ret_arr) > 0 else 0.5
-    avg_win = float(np.mean(wins)) if len(wins) > 0 else 0.035
-    avg_loss = float(np.mean(losses)) if len(losses) > 0 else 0.020
+    avg_win = float(np.mean(wins))
+    avg_loss = float(np.mean(losses))
     payoff_b = avg_win / max(avg_loss, 1e-6)
 
     full_kelly = win_rate - ((1.0 - win_rate) / max(payoff_b, 1e-6))
