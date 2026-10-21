@@ -58,14 +58,18 @@ def test_reported_sample_and_win_rate_come_from_the_ledger(tmp_path, monkeypatch
 
 
 def test_roe_pct_is_the_return_series_not_pnl_sign(tmp_path, monkeypatch):
-    """Every row is seeded so pnl and roe_pct disagree on sign; roe_pct must win."""
+    """Every row is seeded so pnl and roe_pct disagree on sign; roe_pct must win.
+
+    Seeded 5 roe-wins / 7 roe-losses rather than 4/8 because 4 wins against a 2.0 payoff is a
+    zero-edge ledger, which the engine now refuses to simulate (see test_zero_edge_ledger_raises).
+    """
     monkeypatch.chdir(tmp_path)
-    rows = [(i, 1.0, 100.0, 1.0, -5.0) for i in range(1, 9)]
-    rows += [(i, -1.0, 100.0, 1.0, 10.0) for i in range(9, 13)]
+    rows = [(i, 1.0, 100.0, 1.0, -5.0) for i in range(1, 8)]
+    rows += [(i, -1.0, 100.0, 1.0, 10.0) for i in range(8, 13)]
     _seed_ledger("trading_data.db", rows)
     res = run_trade_sequence_monte_carlo(n_simulations=200, horizon_trades=12)
     assert res["historical_sample_size"] == 12
-    assert res["empirical_win_rate_pct"] == pytest.approx(33.3, abs=0.05)
+    assert res["empirical_win_rate_pct"] == pytest.approx(41.7, abs=0.05)
     assert res["empirical_payoff_ratio"] == pytest.approx(2.0, abs=0.01)
 
 
@@ -113,6 +117,67 @@ def test_unparseable_ledger_row_raises_insufficient_data_not_value_error(tmp_pat
         run_trade_sequence_monte_carlo(n_simulations=50, horizon_trades=10)
     assert isinstance(excinfo.value.__cause__, (ValueError, TypeError))
     assert "not_a_number" in str(excinfo.value)
+
+
+def _edge_ledger_rows(win_roe, n_wins, loss_roe, n_losses):
+    """A ledger with both wins and losses so a payoff ratio and a Kelly fraction can be measured."""
+    rows = [(i, 10.0, 100.0, 1.0, win_roe) for i in range(1, n_wins + 1)]
+    rows += [
+        (i, -10.0, 100.0, 1.0, loss_roe)
+        for i in range(n_wins + 1, n_wins + n_losses + 1)
+    ]
+    return rows
+
+
+def test_quarter_kelly_is_the_measured_value_not_the_8pct_floor(tmp_path, monkeypatch):
+    """9 wins at +4.0% and 11 losses at -2.5% measure a 1/4 Kelly of 2.66%; the floor reported 8.0%."""
+    monkeypatch.chdir(tmp_path)
+    _seed_ledger("trading_data.db", _edge_ledger_rows(4.0, 9, -2.5, 11))
+
+    res = run_trade_sequence_monte_carlo(n_simulations=200, horizon_trades=12)
+
+    assert res["quarter_kelly_fraction_pct"] == pytest.approx(2.66, abs=0.01)
+    assert res["quarter_kelly_fraction_pct"] != 8.0
+
+
+def test_quarter_kelly_stays_capped_at_25pct_on_a_large_edge(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _seed_ledger("trading_data.db", _edge_ledger_rows(40.0, 19, -2.0, 1))
+
+    res = run_trade_sequence_monte_carlo(n_simulations=200, horizon_trades=12)
+
+    assert res["quarter_kelly_fraction_pct"] == pytest.approx(23.69, abs=0.01)
+    assert res["quarter_kelly_fraction_pct"] <= 25.0
+
+
+@pytest.mark.parametrize(
+    ("win_roe", "n_wins", "loss_roe", "n_losses", "measured_kelly"),
+    [
+        (3.0, 8, -3.0, 12, "-0.2000"),
+        (10.0, 4, -5.0, 8, "0.0000"),
+    ],
+    ids=["negative_edge", "zero_edge"],
+)
+def test_book_without_an_edge_raises_instead_of_reporting_a_positive_kelly(
+    tmp_path, monkeypatch, win_roe, n_wins, loss_roe, n_losses, measured_kelly
+):
+    """A non-positive measured Kelly must raise naming that measurement, never return a sizing number."""
+    monkeypatch.chdir(tmp_path)
+    _seed_ledger("trading_data.db", _edge_ledger_rows(win_roe, n_wins, loss_roe, n_losses))
+
+    with pytest.raises(InsufficientValidationData) as excinfo:
+        run_trade_sequence_monte_carlo(n_simulations=200, horizon_trades=12)
+
+    assert measured_kelly in str(excinfo.value)
+    assert "no positive edge" in str(excinfo.value)
+
+
+def test_source_contains_no_quarter_kelly_floor_or_default():
+    src = pathlib.Path("quant_validation.py").read_text(encoding="utf-8")
+    assert "else 0.14" not in src
+    assert "max(0.08," not in src
+    mc_body = src[src.index("def run_trade_sequence_monte_carlo"):]
+    assert mc_body.index("full_kelly <= 0") < mc_body.index("rng.choice")
 
 
 def _stub_the_other_validation_arms(monkeypatch):

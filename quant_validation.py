@@ -649,7 +649,12 @@ def run_trade_sequence_monte_carlo(
     payoff_b = avg_win / max(avg_loss, 1e-6)
 
     full_kelly = win_rate - ((1.0 - win_rate) / max(payoff_b, 1e-6))
-    quarter_kelly = max(0.08, min(0.25, full_kelly * 0.25 if full_kelly > 0 else 0.14))
+    if full_kelly <= 0:
+        raise InsufficientValidationData(
+            f"Monte Carlo validation found no positive edge across {len(ret_arr)} recorded trades "
+            f"(measured full Kelly {full_kelly:.4f}). Refusing to simulate a bet size the ledger does not support."
+        )
+    quarter_kelly = min(0.25, full_kelly * 0.25)
 
     sampled_roes = rng.choice(ret_arr, size=(n_simulations, horizon_trades), replace=True)
     acct_step_returns = 1.0 + (quarter_kelly * sampled_roes)
