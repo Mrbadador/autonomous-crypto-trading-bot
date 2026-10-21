@@ -126,6 +126,76 @@ def validate_exit_price_plausibility(
         return False
 
 
+# Bitget USDT-M standing rates, matching the attribution close_swing_position() applies.
+MAKER_ENTRY_FEE_RATE = 0.0002
+TAKER_EXIT_FEE_RATE = 0.0006
+
+
+def resolve_close_fees(row_dict: dict, entry_p: float, exit_p: float | None, qty: float,
+                       actual_close_fee: float | None = None) -> tuple[float, float, float, bool]:
+    """
+    Round-trip fee truth for a close the exchange performed by itself.
+
+    Grid and maker-sniper entries rest a post-only limit at 0.02% but were charged the 0.06%
+    taker rate here, and fee_maker_usd was hardcoded to 0, so the fee columns were unusable.
+    Entry leg: the amount the engine recorded at entry, else the rate implied by
+    execution_type / notes. An entry of unknown type is treated as taker (conservative).
+    Exit leg: the fee the fills report, else the taker rate — on-exchange triggers fill as taker.
+    Returns (exit_fee, round_trip, entry_fee, entry_was_maker).
+    """
+    execution_type = str(row_dict.get("execution_type") or "").lower()
+    notes_lower = str(row_dict.get("notes") or "").lower()
+    is_maker_entry = (
+        execution_type in ("maker", "post_only", "post-only")
+        or "maker" in notes_lower
+        or "post-only" in notes_lower
+        or "post_only" in notes_lower
+    )
+
+    entry_fee = None
+    try:
+        recorded = row_dict.get("fee_entry_usd")
+        if recorded is not None and float(recorded) > 0:
+            entry_fee = float(recorded)
+    except (TypeError, ValueError):
+        entry_fee = None
+    if entry_fee is None:
+        entry_fee = max(entry_p, 0.0) * max(qty, 0.0) * (MAKER_ENTRY_FEE_RATE if is_maker_entry else TAKER_EXIT_FEE_RATE)
+
+    exit_fee = None
+    try:
+        if actual_close_fee is not None and float(actual_close_fee) > 0:
+            exit_fee = float(actual_close_fee)
+    except (TypeError, ValueError):
+        exit_fee = None
+    if exit_fee is None:
+        exit_fee = max(exit_p or 0.0, 0.0) * max(qty, 0.0) * TAKER_EXIT_FEE_RATE
+
+    return exit_fee, entry_fee + exit_fee, entry_fee, is_maker_entry
+
+
+def classify_close(entry_p: float, exit_p: float, qty: float, sl: float, tp: float,
+                   is_long: bool, net_pnl: float | None) -> str:
+    """
+    Attribute an on-exchange close. A stop parked a few bps past entry still nets negative once
+    the round-trip fee is charged, and that is a losing stop exit, not a scratch trade — so
+    breakeven_hit is reserved for closes that actually come out non-negative.
+    """
+    is_tp_price = tp > 0 and ((is_long and exit_p >= tp * 0.998) or (not is_long and exit_p <= tp * 1.002))
+    is_breakeven_price = (
+        sl > 0 and entry_p > 0
+        and ((is_long and abs(exit_p - entry_p * 1.0018) / entry_p < 0.003)
+             or (not is_long and abs(exit_p - entry_p * 0.9982) / entry_p < 0.003))
+    )
+    is_micro_move = net_pnl is not None and abs(net_pnl) < (entry_p * qty * 0.003)
+
+    if is_tp_price:
+        return "tp_hit"
+    if (is_breakeven_price or is_micro_move) and net_pnl is not None and net_pnl >= 0.0:
+        return "breakeven_hit"
+    return "sl_hit"
+
+
 def fetch_live_price(symbol: str) -> float | None:
     """Fetches fast live price from Bitget futures ticker (or Binance fallback) or local cache."""
     sym_clean = str(symbol).upper().replace("/", "").replace("-", "")
@@ -509,9 +579,8 @@ async def audit_live_exchange_positions():
                                         if tot_fee > 0:
                                             actual_fee = tot_fee
                                         if fill_pnls:
-                                            # Entry taker fee (0.06%) + actual close fee
-                                            entry_fee_est = entry_p * qty * 0.0006
-                                            actual_pnl = sum(fill_pnls) - (entry_fee_est + tot_fee)
+                                            # execPnl is gross — the resolved round-trip fee is netted once, below
+                                            actual_pnl = sum(fill_pnls)
                                         log.info(f"[RECONCILER-FILLS] Ground-truth fills for {s_sym}: Avg Price=${exit_p:,.4f}, Total Fees=${tot_fee:.4f}")
                                 except Exception as fill_fetch_err:
                                     log.debug(f"[RECONCILER-FILLS-NOTE] Error querying fills for {s_sym}: {fill_fetch_err}")
@@ -529,13 +598,18 @@ async def audit_live_exchange_positions():
                                     est_fee = None
                                     net_pnl = None
                                     roe_val = None
+                                    fee_maker_col = None
+                                    fee_taker_col = None
                                     close_type = "UNRECONCILED_CLOSE"
                                     notes_str = f"UNRECONCILED: Position closed on Bitget but fill history unavailable. No fabricated prices."
                                     log.warning(f"[RECONCILER-UNRECONCILED] No ground-truth fills found for {s_sym}. Recording status='UNRECONCILED' with NULL exit_price/pnl.")
                                 else:
                                     gross_pnl = (exit_p - entry_p) * qty if is_long else (entry_p - exit_p) * qty
-                                    est_fee = actual_fee if actual_fee is not None else ((entry_p * qty * 0.0006) + (exit_p * qty * 0.0006))
-                                    net_pnl = actual_pnl if actual_pnl is not None else (gross_pnl - est_fee)
+                                    exit_fee_val, est_fee, entry_fee_val, entry_was_maker = resolve_close_fees(
+                                        row_dict, entry_p, exit_p, qty, actual_fee)
+                                    fee_maker_col = entry_fee_val if entry_was_maker else 0.0
+                                    fee_taker_col = exit_fee_val + (0.0 if entry_was_maker else entry_fee_val)
+                                    net_pnl = (actual_pnl - est_fee) if actual_pnl is not None else (gross_pnl - est_fee)
                                     roe_val = ((exit_p - entry_p)/entry_p * lev * 100.0) if is_long and entry_p > 0 else (((entry_p - exit_p)/entry_p * lev * 100.0) if entry_p > 0 else 0.0)
 
                                 # Calculate Real Holding Time
@@ -558,15 +632,7 @@ async def audit_live_exchange_positions():
                                     # Attribution already assigned as UNRECONCILED_CLOSE
                                     pass
                                 else:
-                                    is_tp_price = (exit_p is not None and tp > 0 and ((is_long and exit_p >= tp * 0.998) or (not is_long and exit_p <= tp * 1.002)))
-                                    is_breakeven_price = (exit_p is not None and sl > 0 and ((is_long and abs(exit_p - entry_p * 1.0018) / entry_p < 0.003) or (not is_long and abs(exit_p - entry_p * 0.9982) / entry_p < 0.003)))
-
-                                    if is_tp_price:
-                                        close_type = "tp_hit"
-                                    elif is_breakeven_price or (net_pnl is not None and abs(net_pnl) < (entry_p * qty * 0.003)):
-                                        close_type = "breakeven_hit"
-                                    else:
-                                        close_type = "sl_hit"
+                                    close_type = classify_close(entry_p, exit_p, qty, sl, tp, is_long, net_pnl)
 
                                     pnl_str = f"${net_pnl:+.2f}" if net_pnl is not None else "N/A"
                                     fee_str = f"-${est_fee:.3f}" if est_fee is not None else "N/A"
@@ -599,7 +665,7 @@ async def audit_live_exchange_positions():
                                                 (
                                                     s_sym, norm_side, entry_p, exit_p, qty, net_pnl, roe_val,
                                                     holding_hours, close_type, notes_str, intended_entry_val, actual_fill_entry_val,
-                                                    slippage_bps_val, est_fee, 0.0, est_fee, 0.0,
+                                                    slippage_bps_val, est_fee, fee_maker_col, fee_taker_col, 0.0,
                                                     "reconciler", gates_snap_val, rec_status
                                                 )
                                             )
@@ -921,8 +987,8 @@ async def audit_live_exchange_positions():
                                         if tot_fee > 0:
                                             actual_fee = tot_fee
                                         if fill_pnls:
-                                            entry_fee_est = entry_p * qty * 0.0006
-                                            actual_pnl = sum(fill_pnls) - (entry_fee_est + tot_fee)
+                                            # execPnl is gross — the resolved round-trip fee is netted once, below
+                                            actual_pnl = sum(fill_pnls)
                                 except Exception as fill_err2:
                                     log.debug(f"[RECONCILER-FILLS-NOTE] {fill_err2}")
 
@@ -939,14 +1005,19 @@ async def audit_live_exchange_positions():
                                     est_fee = None
                                     net_pnl = None
                                     roe_val = None
+                                    fee_maker_col = None
+                                    fee_taker_col = None
                                     close_type = "UNRECONCILED_CLOSE"
                                     notes_str = "UNRECONCILED: Position closed on Bitget but fill history unavailable. No fabricated prices."
                                     log.warning(f"[RECONCILER-UNRECONCILED-STEP4] No ground-truth fills found for {sym}. Recording status='UNRECONCILED' with NULL exit_price/pnl.")
                                 else:
                                     gross_pnl = (exit_p - entry_p) * qty if is_long else (entry_p - exit_p) * qty
                                     funding_val = float(row_dict.get("total_funding", 0.0) or 0.0)
-                                    est_fee = actual_fee if actual_fee is not None else ((entry_p * qty * 0.0006) + (exit_p * qty * 0.0006))
-                                    net_pnl = actual_pnl if actual_pnl is not None else (gross_pnl + funding_val - est_fee)
+                                    exit_fee_val, est_fee, entry_fee_val, entry_was_maker = resolve_close_fees(
+                                        row_dict, entry_p, exit_p, qty, actual_fee)
+                                    fee_maker_col = entry_fee_val if entry_was_maker else 0.0
+                                    fee_taker_col = exit_fee_val + (0.0 if entry_was_maker else entry_fee_val)
+                                    net_pnl = (actual_pnl - est_fee) if actual_pnl is not None else (gross_pnl + funding_val - est_fee)
                                     roe_val = (
                                         ((exit_p - entry_p) / entry_p * lev * 100.0) if (is_long and entry_p > 0)
                                         else (((entry_p - exit_p) / entry_p * lev * 100.0) if entry_p > 0 else 0.0)
@@ -968,15 +1039,7 @@ async def audit_live_exchange_positions():
                                         pass
 
                                 if not is_unreconciled:
-                                    is_tp_price = (tp > 0 and ((is_long and exit_p >= tp * 0.998) or (not is_long and exit_p <= tp * 1.002)))
-                                    is_breakeven_price = (sl > 0 and ((is_long and abs(exit_p - entry_p * 1.0018) / entry_p < 0.003) or (not is_long and abs(exit_p - entry_p * 0.9982) / entry_p < 0.003)))
-
-                                    if is_tp_price:
-                                        close_type = "tp_hit"
-                                    elif is_breakeven_price or (net_pnl is not None and abs(net_pnl) < (entry_p * qty * 0.003)):
-                                        close_type = "breakeven_hit"
-                                    else:
-                                        close_type = "sl_hit"
+                                    close_type = classify_close(entry_p, exit_p, qty, sl, tp, is_long, net_pnl)
 
                                     pnl_str = f"${net_pnl:+.2f}" if net_pnl is not None else "N/A"
                                     fee_str = f"-${est_fee:.3f}" if est_fee is not None else "N/A"
@@ -1010,7 +1073,7 @@ async def audit_live_exchange_positions():
                                                 (
                                                     sym, side, entry_p, exit_p, qty, net_pnl, roe_val,
                                                     holding_hours, close_type, notes_str, intended_entry_val, actual_fill_entry_val,
-                                                    slippage_bps_val, est_fee, 0.0, est_fee, funding_val if not is_unreconciled else 0.0,
+                                                    slippage_bps_val, est_fee, fee_maker_col, fee_taker_col, funding_val if not is_unreconciled else 0.0,
                                                     "reconciler", gates_snap_val, rec_status
                                                 )
                                             )

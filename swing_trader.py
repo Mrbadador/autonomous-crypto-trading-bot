@@ -16,6 +16,7 @@ Key Architecture:
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import sqlite3
@@ -71,6 +72,12 @@ class SwingArchitectTrader:
         self.atr_sl_mult = getattr(config, "SWING_ATR_SL_MULT", 3.0)
         self.runner_tp_mult = getattr(config, "SWING_RUNNER_TP_MULT", 4.0)
         self.be_threshold_r = getattr(config, "SWING_BREAKEVEN_R_THRESHOLD", 2.0)
+        self.grid_partial_tp_enabled = getattr(config, "GRID_PARTIAL_TP_ENABLED", True)
+        self.grid_partial_tp_fraction = float(getattr(config, "GRID_PARTIAL_TP_FRACTION", 0.50))
+        self.grid_partial_tp_min_remaining = float(getattr(config, "GRID_PARTIAL_TP_MIN_REMAINING", 5.0))
+        self.native_exit_confirm_buffer_pct = max(float(getattr(config, "NATIVE_EXIT_CONFIRM_BUFFER_PCT", 0.0035)), 0.0)
+        self.native_exit_grace_secs = max(float(getattr(config, "NATIVE_EXIT_GRACE_SECS", 180.0)), 0.0)
+        self._native_exit_armed_ts = {}
         self.min_adx = getattr(config, "SWING_MIN_ADX", 22.0)
         self.check_interval = getattr(config, "SWING_CHECK_INTERVAL_SECS", 300)
 
@@ -145,9 +152,14 @@ class SwingArchitectTrader:
                         slippage_bps REAL,
                         fee_entry_usd REAL,
                         execution_type TEXT,
-                        gates_snapshot TEXT
+                        gates_snapshot TEXT,
+                        grid_partial_tp_harvested INTEGER DEFAULT 0
                     )
                 """)
+                try:
+                    conn.execute("ALTER TABLE swing_open_positions ADD COLUMN grid_partial_tp_harvested INTEGER DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass  # column already present on fresh creates and migrated databases
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS swing_trades (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2153,6 +2165,153 @@ class SwingArchitectTrader:
             return "GRID_MAKER"
         return "SWING_4H"
 
+    @staticmethod
+    def _initial_risk_unit(pos: dict) -> float:
+        """
+        Price distance between entry and the stop that was attached AT ENTRY.
+        pos["stop_loss"] is rewritten by every ratchet, so deriving risk from it
+        inflates the R-multiple and fires each R-gated rule far too early.
+        """
+        entry_p = float(pos.get("entry_price") or 0.0)
+        risk_usd = float(pos.get("initial_risk_usd") or 0.0)
+        size = float(pos.get("size") or 0.0)
+        if entry_p > 0 and risk_usd > 0 and size > 0:
+            return risk_usd / size
+        sl = float(pos.get("stop_loss") or 0.0)
+        if entry_p > 0 and sl > 0 and abs(sl - entry_p) / entry_p < 0.25:
+            return abs(entry_p - sl)
+        return entry_p * 0.02 if entry_p > 0 else 0.0
+
+    @staticmethod
+    def _floor_qty(symbol: str, qty: float) -> float:
+        """Round a quantity DOWN to an exchange-representable amount (never up into dust)."""
+        clean = symbol.upper().replace("/", "").replace("USDT", "")
+        if "BTC" in clean:
+            return math.floor(qty * 10000) / 10000
+        if clean in ("SOL", "AVAX"):
+            return math.floor(qty * 10) / 10
+        if any(c in clean for c in ("LINK", "ADA", "XRP", "DOGE", "NEAR")):
+            return float(math.floor(qty))
+        return math.floor(qty * 100) / 100
+
+    async def _harvest_grid_partial_tp(self, symbol: str, pos: dict, entry_p: float,
+                                       is_long: bool, curr_price: float, fee_buffer_pct: float) -> None:
+        """
+        Item #3b: at the grid micro-breakeven trigger, close GRID_PARTIAL_TP_FRACTION of the
+        position and move the stop to TRUE entry breakeven so the remainder rides to the maker TP.
+        Positions too small to halve keep the old entry+fee lock (a half-of-one-contract clip
+        would leave untradeable dust).
+        """
+        size = float(pos.get("size") or 0.0)
+        close_qty = self._floor_qty(symbol, size * self.grid_partial_tp_fraction)
+        remaining = size - close_qty
+        min_remaining_notional = self.grid_partial_tp_min_remaining
+        lock_sl = round(entry_p * (1.0 + fee_buffer_pct) if is_long else entry_p * (1.0 - fee_buffer_pct), 4)
+        lot_min = self._floor_qty(symbol, 1.0) or 1.0
+
+        if (close_qty < lot_min or remaining < lot_min
+                or remaining * entry_p < min_remaining_notional):
+            pos["grid_partial_tp_harvested"] = 1
+            self._persist_partial_tp_harvest(symbol, size)
+            pos["stop_loss"] = lock_sl
+            pos["trailing_stop"] = lock_sl
+            log.info(
+                f"[GRID-PARTIAL-TP-SKIP] {symbol} ({'LONG' if is_long else 'SHORT'}) reached the trigger but "
+                f"{close_qty}/{size} contracts cannot be halved without leaving dust — locking breakeven at ${lock_sl:,.4f} instead."
+            )
+            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=lock_sl, tp=pos.get("take_profit")),
+                             f"grid_be_{'long' if is_long else 'short'}_{symbol}")
+            return
+
+        try:
+            res = await self.uta_client.close_position_order(
+                symbol=self.uta_client._normalize_symbol(symbol),
+                side="long" if is_long else "short",
+                qty=close_qty,
+            )
+        except Exception as cl_err:
+            log.warning(f"[GRID-PARTIAL-TP-FAIL] {symbol} partial harvest failed: {cl_err}. Falling back to the breakeven lock at ${lock_sl:,.4f}; will retry next pass.")
+            pos["stop_loss"] = lock_sl
+            pos["trailing_stop"] = lock_sl
+            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=lock_sl, tp=pos.get("take_profit")),
+                             f"grid_be_{'long' if is_long else 'short'}_{symbol}")
+            return
+
+        filled_qty = float((res or {}).get("qty") or close_qty) or close_qty
+        new_size = max(self._floor_qty(symbol, size - filled_qty), 0.0)
+        pos["grid_partial_tp_harvested"] = 1
+        pos["size"] = new_size
+        pos["stop_loss"] = round(entry_p, 4)
+        pos["trailing_stop"] = round(entry_p, 4)
+        self._persist_partial_tp_harvest(symbol, new_size)
+        locked_pct = abs(curr_price - entry_p) / entry_p * 100.0
+        log.info(
+            f"[GRID-PARTIAL-TP] 💰 {symbol} ({'LONG' if is_long else 'SHORT'}) closed {filled_qty}/{size} at market "
+            f"(+{locked_pct:.2f}%), stop moved to TRUE breakeven ${entry_p:,.4f}, "
+            f"{new_size} contracts left riding to TP ${pos.get('take_profit') or 0:,.4f}."
+        )
+        self._track_task(self.uta_client.modify_strategy_order(
+            symbol, sl=round(entry_p, 4), tp=pos.get("take_profit")), f"grid_partial_be_{symbol}")
+
+    def _persist_partial_tp_harvest(self, symbol: str, size: float):
+        """Marks the harvest once-only and writes the reduced size, so a restart cannot
+        reload the pre-harvest position and clip the remaining half a second time."""
+        try:
+            with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
+                conn.execute(
+                    "UPDATE swing_open_positions SET grid_partial_tp_harvested = 1, size = ?, updated_at = ? WHERE symbol = ?",
+                    (size, datetime.now(UTC).isoformat(), symbol))
+                conn.commit()
+        except Exception as e:
+            log.debug(f"[GRID-PARTIAL-TP] once-only marker persist failed for {symbol}: {e}")
+
+    async def _native_plan_decision(self, symbol: str, family: str, breach_pct: float) -> str:
+        """
+        Item #2: the exchange-side plan owns this leg's exit and the software close is a
+        verified fallback. Returns "defer" (plan resting, breach shallow, grace window open),
+        "close" (no coverage, breach past the confirm buffer, or coverage unreadable) or
+        "fallback" (the plan kept its window without firing).
+
+        Coverage failure always resolves toward closing: an unconfirmed shield is worse
+        than a taker fill.
+        """
+        key = f"{symbol}:{family}"
+        try:
+            families = await self.uta_client.get_resting_plan_families(symbol)
+        except Exception as e:
+            log.warning(f"[NATIVE-EXIT] {symbol} cannot confirm the {family} plan ({e}). Software exit stays armed.")
+            families = None
+
+        if families is None or not (family in families or (family == "loss" and "trailing" in families)):
+            if families is not None:
+                log.warning(f"[NATIVE-EXIT] 🚨 {symbol} has no resting {family} plan — software exit takes over.")
+            self._native_exit_armed_ts.pop(key, None)
+            return "close"
+
+        if breach_pct >= self.native_exit_confirm_buffer_pct * 100.0:
+            log.warning(f"[NATIVE-EXIT] {symbol} is {breach_pct:.2f}% past the {family} level "
+                        f"(>= {self.native_exit_confirm_buffer_pct * 100:.2f}% confirm buffer) with the plan still resting.")
+            self._native_exit_armed_ts.pop(key, None)
+            return "close"
+
+        armed_ts = self._native_exit_armed_ts.get(key)
+        if armed_ts is None:
+            self._native_exit_armed_ts[key] = time.time()
+            log.info(f"[NATIVE-EXIT] 🛡️ {symbol} {family} plan is resting and the breach is only "
+                     f"{breach_pct:.2f}% — letting the exchange-side trigger take the fill.")
+            return "defer"
+
+        waited = time.time() - armed_ts
+        if waited < self.native_exit_grace_secs:
+            log.info(f"[NATIVE-EXIT] {symbol} holding {waited:.0f}s of {self.native_exit_grace_secs:.0f}s grace "
+                     f"for the resting {family} plan to fire.")
+            return "defer"
+
+        self._native_exit_armed_ts.pop(key, None)
+        log.warning(f"[NATIVE-EXIT] ⏱️ {symbol} {family} plan still resting after {waited:.0f}s grace "
+                    f"without firing — closing in software.")
+        return "fallback"
+
     async def manage_active_positions(self):
         """Monitors open positions in swing_open_positions, dispatching lifecycle rules by engine_type (SWING_4H, GRID_MAKER, SCALP_SHORT)."""
         await asyncio.to_thread(self._load_active_positions_sync)
@@ -2196,13 +2355,13 @@ class SwingArchitectTrader:
                 if is_long:
                     peak_p = max(pos.get("peak_price", entry_p), curr_price)
                     pos["peak_price"] = peak_p
-                    initial_risk_unit = (entry_p - sl) if entry_p > sl else (entry_p * 0.02)
+                    initial_risk_unit = self._initial_risk_unit(pos)
                     r_multiple = (curr_price - entry_p) / initial_risk_unit if initial_risk_unit > 0 else 0.0
                     pos["r_multiple"] = round(r_multiple, 2)
                 else:
                     peak_p = min(pos.get("peak_price", entry_p), curr_price)
                     pos["peak_price"] = peak_p
-                    initial_risk_unit = (sl - entry_p) if sl > entry_p else (entry_p * 0.02)
+                    initial_risk_unit = self._initial_risk_unit(pos)
                     r_multiple = (entry_p - curr_price) / initial_risk_unit if initial_risk_unit > 0 else 0.0
                     pos["r_multiple"] = round(r_multiple, 2)
 
@@ -2214,29 +2373,31 @@ class SwingArchitectTrader:
                 tenkan = ind_4h.get("tenkan")
 
                 if is_long:
-                    # Ratchet 0: Dedicated Micro-Breakeven Ratchet for Chop Grid (GRID_MAKER) positions
-                    # Protects winning trades by ratcheting stop to Entry * (1 + fee_buffer) when Peak Profit >= +0.50% (covering 2x taker fees + slippage)
+                    # Ratchet 0: Grid partial take-profit at the micro trigger (item #3b)
+                    # Close ~half at market and move the stop to TRUE entry breakeven, so the
+                    # remaining half rides to the maker TP instead of being clipped at +0.35%.
                     peak_profit_pct = (peak_p - entry_p) / entry_p
                     grid_be_trigger = max(float(getattr(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0050)), 0.0050)
                     grid_fee_buffer = max(float(getattr(config, "GRID_BREAKEVEN_FEE_BUFFER_PCT", 0.0035)), 0.0035)
 
-                    # Only ratchet if peak profit has cleanly cleared the hurdle (minimum peak ROE >= +0.50%)
-                    if is_grid_pos and peak_profit_pct >= grid_be_trigger and sl < (entry_p * (1.0 + grid_fee_buffer)):
-                        new_sl = entry_p * (1.0 + grid_fee_buffer)
-                        pos["stop_loss"] = round(new_sl, 4)
-                        pos["trailing_stop"] = round(new_sl, 4)
-                        log.info(f"[GRID-RATCHET-BE] 🛡️ {symbol} (LONG) reached peak +{peak_profit_pct*100:.2f}% gain! Ratcheted SL to Breakeven (+{grid_fee_buffer*100:.2f}% fee hurdle): ${new_sl:,.4f}")
-                        self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"grid_be_long_{symbol}")
+                    if (self.grid_partial_tp_enabled and is_grid_pos
+                            and peak_profit_pct >= grid_be_trigger
+                            and int(pos.get("grid_partial_tp_harvested") or 0) == 0
+                            and curr_price > entry_p and sl < entry_p):
+                        await self._harvest_grid_partial_tp(symbol, pos, entry_p, is_long, curr_price, grid_fee_buffer)
 
                     # Ratchet 1: Breakeven at +1.5R (LONG)
                     long_be_buffer_pct = max(float(getattr(config, "BREAKEVEN_FEE_BUFFER_PCT", 0.0035)), 0.0035)
                     if r_multiple >= self.be_threshold_r and sl < (entry_p * (1.0 + long_be_buffer_pct)):
                         fee_buffer = max(entry_p * long_be_buffer_pct, 0.05 * initial_risk_unit)
-                        new_sl = entry_p + fee_buffer  # Lock in guaranteed positive net exit after round-trip fees
-                        pos["stop_loss"] = round(new_sl, 4)
-                        pos["trailing_stop"] = round(new_sl, 4)
-                        log.info(f"[RATCHET-BE] {symbol} (LONG) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (+${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
-                        self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"ratchet_be_long_{symbol}")
+                        new_sl = entry_p + fee_buffer  # Lock in guaranteed positive net exit above entry after round-trip fees
+                        if new_sl >= curr_price:
+                            log.warning(f"[RATCHET-SKIP] {symbol} (LONG) breakeven stop ${new_sl:,.4f} would sit at/above the last price ${curr_price:,.4f} — a long stop above spot fires instantly, refusing the move.")
+                        else:
+                            pos["stop_loss"] = round(new_sl, 4)
+                            pos["trailing_stop"] = round(new_sl, 4)
+                            log.info(f"[RATCHET-BE] {symbol} (LONG) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (+${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
+                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"ratchet_be_long_{symbol}")
 
                     # Ratchet 1.5: High-Water Mark Dynamic Profit Protection (Rule #154, #155, #156)
                     # Prevents winning runners from round-tripping peak paper gains back into breakeven
@@ -2292,28 +2453,35 @@ class SwingArchitectTrader:
                                 except Exception as trail_mail_err:
                                     log.debug(f"[TRAIL-ALERT-NOTE] {trail_mail_err}")
                 else:
-                    # Ratchet 0A: Fast Micro-Breakeven Ratchet for Quick Scalp Short & Short Grid positions
+                    # Ratchet 0A: Fast Micro-Breakeven Ratchet for Quick Scalp Short (deliberate fast-harvest design)
                     peak_profit_pct = (entry_p - peak_p) / entry_p
                     short_be_trigger = max(float(getattr(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0050)), 0.0050)
                     short_fee_buffer = max(float(getattr(config, "SCALP_SHORT_BE_FEE_BUFFER_PCT", 0.0035)), 0.0035)
 
-                    if (is_scalp_short or is_grid_pos) and peak_profit_pct >= short_be_trigger and sl > (entry_p * (1.0 - short_fee_buffer)):
+                    if is_scalp_short and peak_profit_pct >= short_be_trigger and sl > (entry_p * (1.0 - short_fee_buffer)):
                         new_sl = entry_p * (1.0 - short_fee_buffer)
                         pos["stop_loss"] = round(new_sl, 4)
                         pos["trailing_stop"] = round(new_sl, 4)
-                        tag = "QUICK SCALP SHORT" if is_scalp_short else "SHORT GRID"
-                        log.info(f"[SCALP-SHORT-BE] 🛡️ {symbol} ({tag}) reached peak +{peak_profit_pct*100:.2f}% gain! Ratcheted SL to Breakeven (-{short_fee_buffer*100:.2f}% fee hurdle): ${new_sl:,.4f}")
+                        log.info(f"[SCALP-SHORT-BE] 🛡️ {symbol} (QUICK SCALP SHORT) reached peak +{peak_profit_pct*100:.2f}% gain! Ratcheted SL to Breakeven (-{short_fee_buffer*100:.2f}% fee hurdle): ${new_sl:,.4f}")
                         self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"scalp_be_short_{symbol}")
+
+                    # Ratchet 0B: Grid SHORT partial take-profit (item #3b)
+                    elif is_grid_pos and peak_profit_pct >= short_be_trigger and int(pos.get("grid_partial_tp_harvested") or 0) == 0:
+                        if curr_price < entry_p and sl > entry_p:
+                            await self._harvest_grid_partial_tp(symbol, pos, entry_p, is_long, curr_price, short_fee_buffer)
 
                     # Ratchet 1: Breakeven at +1.5R (SHORT)
                     short_be_buffer_pct = max(float(getattr(config, "BREAKEVEN_FEE_BUFFER_PCT", 0.0035)), 0.0035)
                     if r_multiple >= self.be_threshold_r and sl > (entry_p * (1.0 - short_be_buffer_pct)):
                         fee_buffer = max(entry_p * short_be_buffer_pct, 0.05 * initial_risk_unit)
                         new_sl = entry_p - fee_buffer  # Lock in guaranteed positive net exit below entry after round-trip fees
-                        pos["stop_loss"] = round(new_sl, 4)
-                        pos["trailing_stop"] = round(new_sl, 4)
-                        log.info(f"[RATCHET-BE] {symbol} (SHORT) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (-${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
-                        self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"ratchet_be_short_{symbol}")
+                        if new_sl <= curr_price:
+                            log.warning(f"[RATCHET-SKIP] {symbol} (SHORT) breakeven stop ${new_sl:,.4f} would sit at/below the last price ${curr_price:,.4f} — a short stop below spot fires instantly, refusing the move.")
+                        else:
+                            pos["stop_loss"] = round(new_sl, 4)
+                            pos["trailing_stop"] = round(new_sl, 4)
+                            log.info(f"[RATCHET-BE] {symbol} (SHORT) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (-${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
+                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"ratchet_be_short_{symbol}")
 
                     # Ratchet 1.5: High-Water Mark Dynamic Profit Protection (Rule #154, #155, #156)
                     peak_roe = ((entry_p - peak_p) / entry_p) * pos.get("leverage", self.leverage) * 100.0
@@ -2457,10 +2625,20 @@ class SwingArchitectTrader:
                         h_diag = health_res.get("diagnosis", "")
 
                         # Execute Shepherding Actions
+                        # Item #3c: the AI is a VETO on the stop, never a mover. A suggestion may
+                        # only travel in the risk-REDUCING direction (down for longs, up for
+                        # shorts) and may never cross the entry (true breakeven) into price, which
+                        # is what was clipping winners at -0.1% to -0.4% before the planned stop
+                        # could earn its R.
+                        be_cap = round(entry_p, 4)
                         if h_verdict == "TIGHTEN_SL" and h_sl is not None:
                             # Rule #173 & Rule #175 Invariant: Check Breathing Room
                             if not allow_tightening:
                                 log.info(f"[BREATHING-ROOM] 🛡️ Rule #173/175 Active: Muting micro-tightening for {symbol} (holding {holding_mins:.1f}m < 60m & advance < 1.0 ATR). Giving trade room to expand.")
+                            elif is_long and h_sl >= be_cap:
+                                log.info(f"[AI-SHEPHERD-VETO] 🛑 {symbol} AI suggested stop ${h_sl:.4f} sits at/above breakeven ${be_cap:.4f}. Refusing to move the stop up into price — letting the position earn its R.")
+                            elif (not is_long) and h_sl <= be_cap:
+                                log.info(f"[AI-SHEPHERD-VETO] 🛑 {symbol} AI suggested stop ${h_sl:.4f} sits at/below breakeven ${be_cap:.4f}. Refusing to move the stop down into price — letting the position earn its R.")
                             else:
                                 min_delta = entry_p * 0.002
                                 if (is_long and (h_sl - pos["stop_loss"]) >= min_delta and h_sl < curr_price) or \
@@ -2474,10 +2652,15 @@ class SwingArchitectTrader:
                                         f"ai_tighten_sl_{symbol}"
                                     )
 
-                        elif (h_verdict == "TAKE_PROFIT_EARLY" or (runner_decision and runner_decision.get("action") == "HARVEST_MODE")) and unr_pnl_pct > 1.0:
+                        elif (not is_grid_pos) and (h_verdict == "TAKE_PROFIT_EARLY" or (runner_decision and runner_decision.get("action") == "HARVEST_MODE")) and unr_pnl_pct > 1.0:
+                            # Item #3d: grid exits at +1.0% through the taker fee to forgo the maker
+                            # TP limit still above it — the clip is left to the TP order.
                             log.info(f"[AI-SHEPHERD] 🎯 {symbol} AI Early Profit Harvest (+{unr_pnl_pct:.2f}%): {h_diag or 'Momentum stalling at major resistance'}")
                             await self.close_swing_position(symbol, exit_price=curr_price, reason="AI_EARLY_TP")
                             continue
+
+                        elif is_grid_pos and h_verdict == "TAKE_PROFIT_EARLY" and unr_pnl_pct > 1.0:
+                            log.info(f"[AI-SHEPHERD-VETO] 🛑 {symbol} AI Early Profit Harvest skipped for grid (+{unr_pnl_pct:.2f}% < maker TP {float(getattr(config, 'GRID_TP_PCT', 0.0135))*100:.2f}%): taker clip would pay 8bps to forgo the remaining edge.")
 
                         elif h_verdict == "CLOSE_NOW":
                             # Refactored: Demote instant market exit to an aggressive stop tighten.
@@ -2485,10 +2668,11 @@ class SwingArchitectTrader:
                             tight_sl = h_sl if h_sl is not None else (curr_price * 0.997 if is_long else curr_price * 1.003)
                             min_delta = entry_p * 0.001
                             is_valid_direction = (is_long and tight_sl < curr_price) or (not is_long and tight_sl > curr_price)
+                            crosses_breakeven = (is_long and tight_sl >= be_cap) or ((not is_long) and tight_sl <= be_cap)
                             is_tighter = (is_long and (tight_sl - pos["stop_loss"]) >= min_delta) or \
                                          (not is_long and (pos["stop_loss"] - tight_sl) >= min_delta)
 
-                            if is_valid_direction and is_tighter:
+                            if is_valid_direction and is_tighter and not crosses_breakeven:
                                 old_sl_val = pos["stop_loss"]
                                 pos["stop_loss"] = round(tight_sl, 4)
                                 pos["trailing_stop"] = round(tight_sl, 4)
@@ -2497,6 +2681,8 @@ class SwingArchitectTrader:
                                     self.uta_client.modify_strategy_order(symbol, sl=round(tight_sl, 4), tp=pos.get("take_profit")),
                                     f"ai_tighten_sl_{symbol}"
                                 )
+                            elif is_valid_direction and crosses_breakeven:
+                                log.warning(f"[AI-SHEPHERD-VETO] 🛑 {symbol} AI CLOSE_NOW demotion refused: proposed stop ${tight_sl:.4f} would be pushed across breakeven ${be_cap:.4f} into price. Retaining SL (${pos['stop_loss']:.4f}).")
                             elif not is_valid_direction:
                                 log.warning(f"[AI-SHEPHERD] ⚠️ {symbol} AI suggested stop (${tight_sl:.4f}) is on wrong side of current market (${curr_price:.4f}). Retaining valid SL (${pos['stop_loss']:.4f}).")
                             else:
@@ -2562,16 +2748,35 @@ class SwingArchitectTrader:
                     await self.close_swing_position(symbol, exit_price=curr_price, reason="MACRO_KILLSWITCH")
                     continue
 
-                # Exit Condition 1: Take Profit Reached
+                # Exit Condition 1: Take Profit Reached (exchange-side pos_profit plan is primary)
                 if tp and tp > 0.0:
                     if (is_long and curr_price >= tp) or (not is_long and curr_price <= tp):
-                        await self.close_swing_position(symbol, exit_price=curr_price, reason="TAKE_PROFIT")
+                        overshoot_pct = abs(curr_price - tp) / tp * 100.0
+                        tp_decision = await self._native_plan_decision(symbol, "profit", overshoot_pct)
+                        if tp_decision == "close":
+                            await self.close_swing_position(symbol, exit_price=curr_price, reason="TAKE_PROFIT")
+                            continue
+                        if tp_decision == "fallback":
+                            await self.close_swing_position(symbol, exit_price=curr_price, reason="TAKE_PROFIT_FALLBACK")
+                            continue
+
+                # Exit Condition 2: Stop Loss Breached (exchange-side pos_loss plan is primary)
+                if (is_long and curr_price <= pos["stop_loss"]) or (not is_long and curr_price >= pos["stop_loss"]):
+                    breach_pct = abs(curr_price - pos["stop_loss"]) / pos["stop_loss"] * 100.0
+                    sl_decision = await self._native_plan_decision(symbol, "loss", breach_pct)
+                    if sl_decision == "close":
+                        await self.close_swing_position(symbol, exit_price=curr_price, reason="STOP_LOSS")
+                        continue
+                    if sl_decision == "fallback":
+                        await self.close_swing_position(symbol, exit_price=curr_price, reason="STOP_LOSS_FALLBACK")
                         continue
 
-                # Exit Condition 2: Stop Loss Breached
-                if (is_long and curr_price <= pos["stop_loss"]) or (not is_long and curr_price >= pos["stop_loss"]):
-                    await self.close_swing_position(symbol, exit_price=curr_price, reason="STOP_LOSS")
-                    continue
+                # Grace windows only mean something while the breach is live. Price back inside the
+                # levels clears the arm so a later breach gets its own full window.
+                if not ((is_long and curr_price <= pos["stop_loss"]) or (not is_long and curr_price >= pos["stop_loss"])):
+                    self._native_exit_armed_ts.pop(f"{symbol}:loss", None)
+                if not (tp and tp > 0.0 and ((is_long and curr_price >= tp) or (not is_long and curr_price <= tp))):
+                    self._native_exit_armed_ts.pop(f"{symbol}:profit", None)
 
                 # Update state in DB
                 now_iso = datetime.now(UTC).isoformat()

@@ -183,8 +183,16 @@ TRADFI_FAIL_CLOSED                = os.getenv("TRADFI_FAIL_CLOSED", "true").lowe
 # Chop Grid Hyperparameters (V36.5 Quantitative Calibration)
 
 GRID_MAX_5M_ADX                 = float(os.getenv("GRID_MAX_5M_ADX", "36.0"))           # Raised from 32.0 to 36.0 to allow moderate volatility dips
-GRID_BREAKEVEN_TRIGGER_PCT      = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0075")) # +0.75% profit triggers micro-breakeven (gives breathing room before ratcheting to +0.35%)
-GRID_BREAKEVEN_FEE_BUFFER_PCT   = float(os.getenv("GRID_BREAKEVEN_FEE_BUFFER_PCT", "0.0035")) # +0.35% above entry price (locks in net profit after fees + slippage)
+GRID_BREAKEVEN_TRIGGER_PCT      = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0075")) # +0.75% profit triggers the partial take-profit
+GRID_BREAKEVEN_FEE_BUFFER_PCT   = float(os.getenv("GRID_BREAKEVEN_FEE_BUFFER_PCT", "0.0035")) # fallback lock when the position is too small to halve
+GRID_PARTIAL_TP_ENABLED         = os.getenv("GRID_PARTIAL_TP_ENABLED", "true").lower() in ("true", "1")
+GRID_PARTIAL_TP_FRACTION        = float(os.getenv("GRID_PARTIAL_TP_FRACTION", "0.50"))  # close half at the trigger, let the rest ride to the maker TP
+GRID_PARTIAL_TP_MIN_REMAINING   = float(os.getenv("GRID_PARTIAL_TP_MIN_REMAINING", "5.0"))  # min notional (USD) to keep running after the harvest
+
+# Native exit priority (swing_trader.manage_active_positions)
+# The on-exchange mark-price plans own the TP/SL fills; the software close is a verified fallback.
+NATIVE_EXIT_CONFIRM_BUFFER_PCT  = float(os.getenv("NATIVE_EXIT_CONFIRM_BUFFER_PCT", "0.0035"))  # breach this deep past the level -> the resting plan is clearly not firing, exit now
+NATIVE_EXIT_GRACE_SECS          = float(os.getenv("NATIVE_EXIT_GRACE_SECS", "180.0"))            # how long a shallow breach waits for the exchange leg before software takes over
 
 # ---------------------------------------------------------------------------
 # Strategy Timeframe & Data

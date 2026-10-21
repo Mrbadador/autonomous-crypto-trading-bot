@@ -826,52 +826,194 @@ class BitgetUTAClient:
             log.warning(f"[BITGET-UTA] get_recent_fills note for {clean_sym}: {e}")
             return []
 
+    @staticmethod
+    def _plan_family(order: dict) -> str:
+        """Bitget rests each leg as its own plan; classify it so a leg is only ever
+        rewritten by the caller that owns it."""
+        blob = f"{order.get('planType', '')} {order.get('orderType', '')}".lower()
+        if "profit" in blob:
+            return "profit"
+        if "track" in blob or "moving" in blob:
+            return "trailing"
+        if "loss" in blob:
+            return "loss"
+        return "other"
+
+    async def _safe_cancel(self, clean_sym: str, order_id: str) -> None:
+        try:
+            await self.exchange.private_uta_post_v3_trade_cancel_order({
+                "category": "USDT-FUTURES", "symbol": clean_sym, "orderId": str(order_id)})
+            log.warning(f"[BITGET-UTA] Dropped stale plan {order_id} on {clean_sym} before re-registering")
+        except Exception as e:
+            log.error(f"[BITGET-UTA] Could not cancel stale plan {order_id} on {clean_sym}: {e}")
+
+    async def _rebuild_strategy_leg(self, symbol: str, clean_sym: str, family: str,
+                                    field: str, priced: str, plans: list) -> bool:
+        """Re-register a leg that is no longer resting, sizing it against the LIVE
+        position so a partial take-profit is reflected rather than the entry size."""
+        import config
+        sibling = next((o for o in plans if isinstance(o, dict) and o.get("posSide")), None)
+        pos_side = str(sibling.get("posSide")).lower() if sibling else None
+        size = 0.0
+        try:
+            positions = await self.fetch_positions(symbol=clean_sym)
+            live = [p for p in (positions or [])
+                    if float(p.get("total", 0.0) or p.get("contracts", 0.0) or 0.0) > 0]
+            if pos_side:
+                matching = [p for p in live if str(p.get("posSide", "")).lower() == pos_side]
+                if matching:
+                    live = matching
+            if live:
+                pos_side = str(live[0].get("posSide", pos_side or "long")).lower()
+                size = float(live[0].get("total", 0.0) or live[0].get("contracts", 0.0) or 0.0)
+        except Exception as e:
+            log.warning(f"[BITGET-UTA] Live position lookup failed for {clean_sym}: {e}")
+        if size <= 0 and sibling:
+            try:
+                size = float(sibling.get("size", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                size = 0.0
+
+        if not pos_side or size <= 0:
+            log.critical(f"[BITGET-UTA] 🚨 [STOP-COVERAGE] {clean_sym} has no resting {family} plan "
+                         f"and no live position to re-register one against. The {family} leg at "
+                         f"${priced} is NOT protected on-exchange — manual check required.")
+            return False
+
+        params = {
+            "category": "USDT-FUTURES",
+            "symbol": clean_sym,
+            "marginMode": getattr(config, "MARGIN_MODE", "isolated"),
+            "marginCoin": "USDT",
+            "planType": "pos_loss" if family == "loss" else "pos_profit",
+            "posSide": pos_side,
+            "side": "sell" if pos_side == "long" else "buy",
+            "triggerPrice": priced,
+            field: priced,
+            "triggerType": "mark_price",
+            "size": self.format_quantity_precision(clean_sym, size)
+        }
+        try:
+            res = await self.exchange.private_uta_post_v3_trade_place_strategy_order(params)
+            code = str(res.get("code", ""))
+        except Exception as exc:
+            code, res = str(exc), {"error": str(exc)}
+
+        if code in ("00000", "25600"):
+            new_id = (res.get("data") or {}).get("orderId") if isinstance(res.get("data"), dict) else None
+            log.warning(f"[BITGET-UTA] [REBUILD] {clean_sym} {family} plan was missing — "
+                        f"re-registered at ${priced} (OrderId: {new_id})")
+            return True
+
+        log.critical(f"[BITGET-UTA] 🚨 [STOP-COVERAGE] {clean_sym} could not re-register the "
+                     f"{family} plan at ${priced} (code {code}): {res}")
+        return False
+
+    async def _sync_strategy_leg(self, symbol: str, clean_sym: str, family: str,
+                                 field: str, price: float, plans: list) -> bool:
+        """Move one leg of the shield. Only plans of the same family are touched, and
+        triggerPrice travels with the leg value because that is what the engine fires on."""
+        priced = self.format_price_precision(symbol, price)
+        targets = [o for o in plans if self._plan_family(o) == family]
+
+        if not targets:
+            if family == "loss" and any(self._plan_family(o) == "trailing" for o in plans):
+                log.warning(f"[BITGET-UTA] {clean_sym} stop leg is held by a TRAILING plan; "
+                            f"not overwriting it with a flat stop (${priced}).")
+                return False
+            return await self._rebuild_strategy_leg(symbol, clean_sym, family, field, priced, plans)
+
+        synced = False
+        rejected = []
+        for o in targets:
+            order_id = o.get("orderId")
+            mod_params = {
+                "category": "USDT-FUTURES",
+                "symbol": clean_sym,
+                "orderId": order_id,
+                "triggerPrice": priced,
+                field: priced
+            }
+            try:
+                res = await self.exchange.private_uta_post_v3_trade_modify_strategy_order(mod_params)
+                code = str(res.get("code", ""))
+            except Exception as exc:
+                code, res = str(exc), {"error": str(exc)}
+
+            if code == "00000":
+                log.info(f"[BITGET-UTA] [SHIELD-SYNC] {family} plan {order_id} on {clean_sym} moved to ${priced}")
+                synced = True
+            elif code == "25600":
+                log.debug(f"[BITGET-UTA] [SHIELD-SYNC] {family} plan {order_id} on {clean_sym} already at ${priced}")
+                synced = True
+            else:
+                log.warning(f"[BITGET-UTA] {family} plan modify rejected on {clean_sym} "
+                            f"(OrderId {order_id}, code {code}): {res}")
+                rejected.append(order_id)
+
+        for order_id in rejected:
+            await self._safe_cancel(clean_sym, order_id)
+
+        if synced:
+            return True
+        return await self._rebuild_strategy_leg(symbol, clean_sym, family, field, priced, plans)
+
+    async def get_resting_plan_families(self, symbol: str) -> set:
+        """
+        Returns which TP/SL plan families are currently resting on the exchange for a
+        symbol — e.g. {"loss", "profit"}. Callers use this to confirm the on-exchange
+        shield is actually live before relying on it. Raises if the book cannot be read.
+        """
+        clean_sym = self._normalize_symbol(symbol)
+        unfilled = await self.exchange.private_uta_get_v3_trade_unfilled_strategy_orders(
+            {"category": "USDT-FUTURES", "symbol": clean_sym})
+        raw = unfilled.get("data", []) if isinstance(unfilled, dict) else []
+        if isinstance(raw, dict):
+            raw = raw.get("list") or raw.get("orders") or []
+        return {self._plan_family(o) for o in (raw or [])
+                if isinstance(o, dict) and o.get("symbol") == clean_sym}
+
     async def modify_strategy_order(self, symbol: str, sl: float = None, tp: float = None) -> bool:
         """
-        Updates native exchange-side strategy order (TP/SL) on Bitget UTA matching engine.
-        Ensures ratcheted trailing stops are active directly on-exchange, eliminating polling lag.
+        Syncs the native exchange-side TP/SL plans for a symbol so ratcheted stops and
+        moved targets are live on the Bitget matching engine, eliminating polling lag.
+
+        The two legs rest as separate plans (pos_loss / pos_profit), so each requested
+        leg is routed only to its own family. A leg with no resting plan is rebuilt from
+        the live position; a leg that cannot be rebuilt is reported as stop-coverage loss.
         """
         await self.ensure_time_sync()
         clean_sym = self._normalize_symbol(symbol)
-        try:
-            params = {"category": "USDT-FUTURES", "symbol": clean_sym}
-            unfilled = await self.exchange.private_uta_get_v3_trade_unfilled_strategy_orders(params)
-            orders = unfilled.get("data", [])
-            matching_orders = [o for o in orders if o.get("symbol") == clean_sym]
-            if not matching_orders:
-                log.debug(f"[BITGET-UTA] No unfilled strategy order found to modify for {clean_sym}")
-                return False
 
-            success = False
-            for o in matching_orders:
-                order_id = o.get("orderId")
-                mod_params = {
-                    "category": "USDT-FUTURES",
-                    "symbol": clean_sym,
-                    "orderId": order_id
-                }
-                if sl is not None and sl > 0:
-                    mod_params["stopLoss"] = self.format_price_precision(symbol, sl)
-                if tp is not None and tp > 0:
-                    mod_params["takeProfit"] = self.format_price_precision(symbol, tp)
-
-                res = await self.exchange.private_uta_post_v3_trade_modify_strategy_order(mod_params)
-                code = str(res.get("code", ""))
-                if code == "00000":
-                    log.info(f"[BITGET-UTA] [SHIELD-SYNC] Successfully synced exchange-side Stop Loss to ${sl} for {clean_sym} (OrderId: {order_id})")
-                    success = True
-                elif code == "25600":
-                    log.debug(f"[BITGET-UTA] [SHIELD-SYNC] Exchange-side TP/SL already up to date on Bitget for {clean_sym}")
-                    success = True
-                else:
-                    log.warning(f"[BITGET-UTA] Strategy order modify response for {clean_sym}: {res}")
-            return success
-        except Exception as e:
-            if "25600" in str(e):
-                log.debug(f"[BITGET-UTA] [SHIELD-SYNC] Exchange-side TP/SL already up to date on Bitget for {clean_sym}")
-                return True
-            log.error(f"[BITGET-UTA] Error modifying strategy order for {clean_sym}: {e}")
+        legs = []
+        if sl is not None and sl > 0:
+            legs.append(("loss", "stopLoss", float(sl)))
+        if tp is not None and tp > 0:
+            legs.append(("profit", "takeProfit", float(tp)))
+        if not legs:
             return False
+
+        try:
+            unfilled = await self.exchange.private_uta_get_v3_trade_unfilled_strategy_orders(
+                {"category": "USDT-FUTURES", "symbol": clean_sym})
+        except Exception as e:
+            log.error(f"[BITGET-UTA] Cannot read strategy plans for {clean_sym}: {e}")
+            return False
+
+        raw = unfilled.get("data", []) if isinstance(unfilled, dict) else []
+        if isinstance(raw, dict):
+            raw = raw.get("list") or raw.get("orders") or []
+        plans = [o for o in (raw or []) if isinstance(o, dict) and o.get("symbol") == clean_sym]
+
+        if not plans:
+            log.debug(f"[BITGET-UTA] No unfilled strategy plans listed for {clean_sym}; "
+                      f"re-registering the requested legs.")
+
+        all_synced = True
+        for family, field, price in legs:
+            if not await self._sync_strategy_leg(symbol, clean_sym, family, field, price, plans):
+                all_synced = False
+        return all_synced
 
     async def get_funding_history(self, symbol: str, since_ms: int = None, limit: int = 50) -> list[dict]:
         """

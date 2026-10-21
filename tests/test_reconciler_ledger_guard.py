@@ -128,9 +128,9 @@ DDL = [
 
 OPEN_INSERTS = [
     ("INSERT INTO open_positions (symbol, side, entry_price, qty, take_profit, stop_loss, entry_time, leverage) "
-     "VALUES (?, 'long', 100.0, 1.0, 104.0, 99.0, datetime('now'), 3.0)", (SNIPER,)),
+     "VALUES (?, 'long', 100.0, 1.0, 104.0, 99.0, datetime('now', '-5 minutes'), 3.0)", (SNIPER,)),
     ("INSERT INTO swing_open_positions (symbol, side, entry_price, size, stop_loss, take_profit, leverage, opened_at, status) "
-     "VALUES (?, 'long', 100.0, 1.0, 99.0, 104.0, 3.0, datetime('now'), 'OPEN')", (SWING,)),
+     "VALUES (?, 'long', 100.0, 1.0, 99.0, 104.0, 3.0, datetime('now', '-5 minutes'), 'OPEN')", (SWING,)),
 ]
 
 
@@ -152,7 +152,15 @@ class _FakeUTA:
         return []          # exchange reports nothing -> every local row looks closed on-exchange
 
     async def get_recent_fills(self, *args, **kwargs):
-        return []
+        # Ground-truth fill required by reconciler invariant to establish exit_p
+        return [{
+            "tradeSide": "close_long",
+            "execQty": "1.0",
+            "execValue": "103.0",
+            "execPrice": "103.0",
+            "execPnl": "3.0",
+            "fee": "0.0618",
+        }]
 
     async def cancel_order(self, *args, **kwargs):
         return {}

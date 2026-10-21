@@ -30,7 +30,7 @@ import config
 from bitget_uta_client import BitgetUTAClient
 from conviction_filter import ConvictionBoardroom
 from db_manager import DBWriteQueue
-from swing_trader import SwingArchitectTrader
+from swing_trader import SwingArchitectTrader, EXCHANGE_MIN_MARGIN_USD
 from indicators import detect_momentum_divergence, compute_volume_profile, compute_td_sequential
 from microstructure_guard import MicrostructureStateCache
 from strategy_base import SwingKumoStrategy, ChopGridMakerStrategy, BearScalpShortStrategy
@@ -900,7 +900,6 @@ class SuperBotTrader:
                     from risk_manager import RiskManager
                     rm = RiskManager()
                     kelly_frac = await asyncio.to_thread(rm.calculate_empirical_kelly_fraction)
-                    conv_mult = max(0.5, min(1.2, conv_score))
                     finrl_mult = self._get_finrl_strategy_weight(engine_tag)
                     
                     # Continuous Markov Risk Multiplier (Playbook Step 8)
@@ -930,12 +929,25 @@ class SuperBotTrader:
                         log.warning(f"[{engine_tag}-MARKOV-DEFENSIVE] ⚠️ Unable to load Markov telemetry. Applying defensive 0.50x multiplier.")
                         return 0.50
                     markov_mult = await asyncio.to_thread(_get_markov_mult)
-                    
-                    target_kelly_margin = live_bal * kelly_frac * conv_mult * finrl_mult * markov_mult
-                    target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.35, target_kelly_margin))
-                    log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f}")
+
+                    # Fix #5 (same semantics as the swing engine): Kelly only SHRINKS
+                    # from the fair-share ceiling. The old max(0.7x, min(1.35x, kelly))
+                    # floor collided with the per-trade cap, so Kelly never sized anything.
+                    target_per_trade, sizing_note = SwingArchitectTrader._resolve_swing_target(
+                        live_bal=live_bal,
+                        max_wallet_margin_pct=max_wallet_margin_pct,
+                        max_locks=self.max_locks,
+                        per_trade_cap_pct=max_margin_per_trade_pct,
+                        kelly_frac=kelly_frac,
+                        conviction_score=conv_score,
+                        finrl_mult=finrl_mult,
+                        markov_mult=markov_mult,
+                    )
+                    log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f} ({sizing_note})")
                 except Exception as ke:
-                    log.debug(f"[{engine_tag}-KELLY-NOTE] {ke}")
+                    fair_share = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+                    target_per_trade = max(EXCHANGE_MIN_MARGIN_USD, fair_share * 0.30)
+                    log.warning(f"[{engine_tag}-KELLY-SIZING-FAILCLOSED] {ke}. Sizing at minimum viable (${target_per_trade:.2f}) instead of the unclamped ceiling.")
 
                 # Q-10 FIX: Clamp target margin per trade to MAX_MARGIN_PER_TRADE_PCT ceiling (e.g. 14% or 20% of equity)
                 max_trade_margin_cap = live_bal * max_margin_per_trade_pct
@@ -943,7 +955,15 @@ class SuperBotTrader:
                     log.info(f"[{engine_tag}-MARGIN-CLAMP] Clamping target margin ${target_per_trade:.2f} to {max_margin_per_trade_pct:.0%} per-trade cap (${max_trade_margin_cap:.2f}).")
                     target_per_trade = max_trade_margin_cap
 
-                margin = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
+                # Headroom binds absolutely: the old six-dollar floor could push margin
+                # above the remaining buffer (and above the minimum it was meant to satisfy).
+                margin = SwingArchitectTrader._collateral_for(target_per_trade, available_margin_buffer)
+                if margin < EXCHANGE_MIN_MARGIN_USD:
+                    log.warning(
+                        f"[{engine_tag}-MIN-MARGIN-VETO] 🛑 ${margin:.2f} is below the $6.00 Bitget minimum "
+                        f"(target ${target_per_trade:.2f}, headroom ${available_margin_buffer:.2f}). Vetoing {symbol} entry."
+                    )
+                    return
 
                 # Enforce Hard Equity Risk Cap per Trade (Strict 2.0% Dollar Risk Ceiling)
                 max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0  # 0.02
@@ -971,14 +991,20 @@ class SuperBotTrader:
             news_mult = float(getattr(self.swing_engine, "_news_size_multipliers", {}).get(symbol, 1.0))
             if 0.0 < news_mult < 1.0:
                 prev_margin = margin
-                margin = max(6.0, round(margin * news_mult, 2))
+                margin = SwingArchitectTrader._floor_to_step(margin * news_mult, 0.01)
                 log.warning(f"[{engine_tag}-NEWS-SIZE-DOWN] {symbol} WARNING tier active -> scaling margin ${prev_margin:.2f} -> ${margin:.2f} ({news_mult:.2f}x)")
+                if margin < EXCHANGE_MIN_MARGIN_USD:
+                    log.warning(f"[{engine_tag}-NEWS-SIZE-VETO] 🛑 Size-down pushed margin ${margin:.2f} under the $6.00 exchange minimum. Vetoing {symbol}.")
+                    return
 
             # P0-4 DEFENSE: Apply 50% margin haircut if microstructure state is missing or stale
             if ms_is_degraded:
                 prev_margin = margin
-                margin = max(6.0, round(margin * 0.50, 2))
+                margin = SwingArchitectTrader._floor_to_step(margin * 0.50, 0.01)
                 log.warning(f"[{engine_tag}-MS-DEGRADED-SIZING] {symbol} Microstructure degraded -> scaling margin ${prev_margin:.2f} -> ${margin:.2f} (0.50x)")
+                if margin < EXCHANGE_MIN_MARGIN_USD:
+                    log.warning(f"[{engine_tag}-MS-DEGRADED-VETO] 🛑 0.50x haircut puts margin ${margin:.2f} under the $6.00 exchange minimum. Vetoing {symbol}.")
+                    return
 
             notional = margin * self.grid_leverage
             qty = self.uta_client.format_qty_precision(symbol, notional / current_price)
@@ -1138,9 +1164,6 @@ class SuperBotTrader:
                 # F-07 REMEDIATION: Write emergency state row when BOTH SL and close fail
                 if not close_success:
                     try:
-                        import sqlite3
-                        import json
-                        from datetime import datetime, timezone
                         now_iso = datetime.now(timezone.utc).isoformat()
                         clean_sym = symbol.replace("/", "")
                         

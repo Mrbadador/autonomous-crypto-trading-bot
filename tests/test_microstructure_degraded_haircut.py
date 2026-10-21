@@ -47,7 +47,9 @@ class TestMicrostructureDegradedHaircutReal(unittest.IsolatedAsyncioTestCase):
         """
         bot = SuperBotTrader()
         bot.uta_client = MagicMock()
-        bot.uta_client.fetch_balance = AsyncMock(return_value=100.0)
+        # $300 keeps the halved margin above the $6 exchange floor so this test exercises
+        # the *halving*, not the veto; sub-$6 veto coverage lives in test_grid_sizing_parity.
+        bot.uta_client.fetch_balance = AsyncMock(return_value=300.0)
         bot.uta_client.format_qty_precision = MagicMock(side_effect=lambda sym, q: round(q, 4))
         bot.uta_client.create_post_only_order = AsyncMock(return_value={"orderId": "grid_test_123"})
         bot.uta_client.fetch_order = AsyncMock(return_value={"status": "filled", "filled_qty": 50.0, "deal_avg_price": 1.0})

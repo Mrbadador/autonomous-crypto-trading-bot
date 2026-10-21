@@ -14,11 +14,19 @@ Quarantine & Isolation Fixture for Test Suite (D-11 / P2-9).
 
 import builtins
 import importlib.abc
+import logging
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+
+# A bare logging.StreamHandler() inherits the Windows console codepage (cp1252), so
+# emitting one of this fleet's emoji log prefixes raises UnicodeEncodeError inside the
+# caller's own try/except and silently skips the code path under test. The fleet's own
+# log files are opened with encoding="utf-8" (start_system.py), so console encoding is a
+# test-harness artifact only — mute it rather than let it mask real branch coverage.
+logging.raiseExceptions = False
 
 PROJECT_ROOT = os.path.normcase(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 PROJECT_ROOT_RAW = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))

@@ -69,7 +69,10 @@ class TestGridMakerGuardsHarness(unittest.TestCase):
     def test_04_rounding_risk_veto(self):
         """When contract rounding forces risk > max_allowed_post_round_risk, triggers [GRID_MAKER-ROUNDING-RISK-VETO]."""
         async def run():
-            self.bot.uta_client.fetch_balance = AsyncMock(return_value=50.0)  # low balance, 2% = $1.00 max risk
+            # Real account size: with the defensive markov 0.5x the 2% risk cap would
+            # push sizing under the $6 exchange floor at small balances, so the entry
+            # vetoes before the rounding check is reached.
+            self.bot.uta_client.fetch_balance = AsyncMock(return_value=339.0)
             self.bot.boardroom.get_conviction = AsyncMock(return_value={"execute": True, "conviction_score": 0.9})
             # Mock format_qty_precision to force huge minimum contract (e.g. 50 units @ $100 = $5000 notional, risk $57.50 >> $1.15)
             self.bot.uta_client.format_qty_precision = lambda s, q: 50.0
