@@ -4409,7 +4409,8 @@ with tab_risk:
                 )
 
         # 2. Monte Carlo Sequence Risk & Equity Cone Fan
-        if mc_data:
+        mc_unavailable = bool(mc_data) and mc_data.get("status") == "unavailable"
+        if mc_data and not mc_unavailable:
             st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
             st.markdown(f"##### 📈 Candle-Shuffling & Sequence Monte Carlo Fan ($N = {mc_data.get('n_simulations', 5000):,}$ Simulated Paths)")
             mc_c1, mc_c2, mc_c3, mc_c4 = st.columns(4)
@@ -4476,6 +4477,12 @@ with tab_risk:
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
                 st.plotly_chart(fig_mc, width="stretch")
+        elif mc_unavailable:
+            st.warning(
+                "Monte Carlo sequence-risk validation is unavailable — "
+                f"{mc_data.get('reason', 'no recorded trades with a return')}. "
+                "The figures below are not shown because they cannot be measured."
+            )
     except Exception as jv_err:
         st.caption(f"Validation telemetry note: {jv_err}")
 

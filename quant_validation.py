@@ -669,7 +669,7 @@ def run_trade_sequence_monte_carlo(
         "historical_sample_size": int(len(ret_arr)),
         "initial_equity_usdt": round(initial_equity, 2),
         "quarter_kelly_fraction_pct": round(quarter_kelly * 100.0, 2),
-        "empirical_win_rate_pct": round(win_rate * 100.0, 2),
+        "empirical_win_rate_pct": round(win_rate * 100.0, 1),
         "empirical_payoff_ratio": round(payoff_b, 2),
         "median_max_dd_pct": round(dd_p50, 2),
         "max_dd_95_pct": round(dd_p95, 2),

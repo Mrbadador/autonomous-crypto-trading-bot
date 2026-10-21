@@ -49,7 +49,7 @@ def test_reported_sample_and_win_rate_come_from_the_ledger(tmp_path, monkeypatch
     res = run_trade_sequence_monte_carlo(n_simulations=200, horizon_trades=12)
     assert res["data_source"] == "swing_trades"
     assert res["historical_sample_size"] == 12
-    assert res["empirical_win_rate_pct"] == pytest.approx(66.6667, abs=0.01)
+    assert res["empirical_win_rate_pct"] == pytest.approx(66.7, abs=0.05)
     assert res["initial_equity_usdt"] == pytest.approx(545.24)
 
 
@@ -61,7 +61,7 @@ def test_roe_pct_is_the_return_series_not_pnl_sign(tmp_path, monkeypatch):
     _seed_ledger("trading_data.db", rows)
     res = run_trade_sequence_monte_carlo(n_simulations=200, horizon_trades=12)
     assert res["historical_sample_size"] == 12
-    assert res["empirical_win_rate_pct"] == pytest.approx(33.3333, abs=0.01)
+    assert res["empirical_win_rate_pct"] == pytest.approx(33.3, abs=0.05)
     assert res["empirical_payoff_ratio"] == pytest.approx(2.0, abs=0.01)
 
 
