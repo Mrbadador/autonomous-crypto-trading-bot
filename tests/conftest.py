@@ -218,3 +218,16 @@ def _quarantined_copyfile(src, dst, *args, **kwargs):
 
 
 shutil.copyfile = _quarantined_copyfile
+
+# Hermetic test isolation: Mock out SMTP email dispatching so tests never trigger real emails
+try:
+    import email_dispatcher
+    email_dispatcher.send_alert = lambda *args, **kwargs: True
+    email_dispatcher.send_html_alert = lambda *args, **kwargs: True
+    email_dispatcher.send_trade_log = lambda *args, **kwargs: True
+    email_dispatcher.send_trade_email = lambda *args, **kwargs: True
+    email_dispatcher.send_hourly_heartbeat_report = lambda *args, **kwargs: True
+    email_dispatcher.send_hourly_report = lambda *args, **kwargs: True
+except Exception:
+    pass
+
