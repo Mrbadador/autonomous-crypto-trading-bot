@@ -939,8 +939,14 @@ Before writing any of those numbers, open the two named artefacts and confirm th
 
 - [ ] **Step 5: Verify no fabricated metric survives, and commit**
 
-Run: `grep -n "walk-forward\|Walk-Forward\|180-day\|1.47\|1.82\|2.14\|3.40\|100% on target\|winners > losers\|Alpha Saving\|0.89\|1.55\|saves 42%" README.md`
+Run: `grep -n "walk-forward\|Walk-Forward\|180-day\|1.47\|1.82\|2.14\|3.40\|100% on target\|winners > losers\|Alpha Saving\|-\$0\.89\|vs -\$1\.55\|saves 42%" README.md`
 Expected: no matches other than deliberately-labelled historical notes saying a figure was superseded.
+
+**(Controller correction after Task 6's review:)** this pattern previously carried bare `0.89` and `1.55`, built
+from the bogus `-$0.89 / -$1.55` pair at old `:78`. Unanchored, it also forbids the legitimate
+**PF 0.89** that is genuinely published at `audits/gate_ablation_report_2026-10-13.md:12`, and an implementer
+ dutifully dropped that verified figure to keep the gate clean. A gate that deletes true numbers is a defect in
+the gate. Anchor the dollar amounts; do not widen the pattern back out.
 
 ```bash
 git add README.md
