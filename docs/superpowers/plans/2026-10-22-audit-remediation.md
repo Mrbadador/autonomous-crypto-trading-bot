@@ -854,20 +854,21 @@ Apply the mirror to the short branch at `:216-221` (`if high >= sl_px:` first, t
 
 - [ ] **Step 6: Make the validator's cloud match the live engine's**
 
-`quant_validation.py:80-83` compares today's close against a cloud built from today's highs and lows. The live engine (`swing_trader.py:627-635`) projects the spans 26 bars forward, so the cloud at the current bar was drawn 26 bars ago. Mirror the live guard:
+`quant_validation.py:80-83` compares today's close against a cloud built from today's highs and lows. The live engine (`swing_trader.py:627-635`) projects the spans 26 bars forward, so the cloud at the current bar was drawn 26 bars ago. Match the live engine — always project, and let a frame too short to know the cloud say so:
 
 ```python
     span_a_raw = (df["tenkan"] + df["kijun"]) / 2.0
     span_b_raw = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
-    if len(df) >= 78:
-        span_a = span_a_raw.shift(26)
-        span_b = span_b_raw.shift(26)
-    else:
-        span_a = span_a_raw
-        span_b = span_b_raw
+    span_a = span_a_raw.shift(26)
+    span_b = span_b_raw.shift(26)
     df["cloud_top"] = np.maximum(span_a, span_b)
     df["cloud_bottom"] = np.minimum(span_a, span_b)
 ```
+
+The `if len(df) >= 78 / else` guard this step originally prescribed was **wrong**: its `else` published the cloud at
+the same bar it was computed from — the same lookahead, reached through a different branch. A frame that cannot
+know a 26-bar-projected cloud must show no cloud, not the unprojected one. (The live engine reached the same
+conclusion later, in `46ce3f4`: it always shifts and refuses a 4H frame too short to know the cloud.)
 
 And at `:88`, drop the back-fill so early bars stay NaN instead of being assigned a fabricated ATR:
 
