@@ -59,6 +59,23 @@ written, and is not in this plan's task numbering.** It repairs the same "label 
 measurement supports" pattern in the dashboard and the remaining analytics surfaces. Read the ledger for
 it; nothing in this plan describes it.
 
+G-series state as of 2026-10-23, so a fresh session cannot re-derive or mis-rank it: **G-1 … G-5a landed**.
+Still queued, one implementation dispatch at a time, in this order —
+
+| Task | What it owns | Severity, verified |
+|---|---|---|
+| G-5b | Markov regime deck: stale telemetry labelled live, untrained-engine fallback | display/authority |
+| G-5c | position deck: fabricated hard SL, leverage-fed margin/liquidation, flat-green PnL, funding `(Neutral)` | display |
+| G-5d | ghost/spoof all-clear fabricated by the producer and consumed by the **live** in-flight shepherd, which can `modify_strategy_order` | **P0 live exit path** |
+| G-5f | shepherd's invented RSI/ADX/ATR feeding the same ratchet's mute guard | live exit path |
+| G-5e | MTF confluence `or 50.0`, hedge `GREEN_SHIELD`, POC/VAH/VAL priced from `curr_p` | display |
+
+G-5d's ranking is the one worth not losing: the programmatic veto consumer
+(`microstructure_guard.evaluate_pre_trade_veto`) is **dead** — the guard is instantiated only under
+`archive/` — while `inflight_shepherd.py` reads the same verdict into an LLM prompt and executes its stop
+suggestion on the exchange. The realised harm is a **looser live stop than the operator believes they hold**,
+not an entry green-light. G-5f is deliberately split out of G-5d so each stays reviewable.
+
 ---
 
 ## Task 1: Make the Monte Carlo validator report only what it actually measured
