@@ -10,7 +10,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 scenarios = [
     {
-        "name": "1. Live Baseline (Current Code)",
+        # The unshifted arm reads the Ichimoku cloud on the bar that computed it. The live engine
+        # does not use it: it always projects the cloud 26 bars forward (swing_trader.py:642-643,
+        # quant_validation.py:89-90). It is kept as the A/B comparison against that treatment, so
+        # it is named for what it is and not as a "live baseline" it never was.
+        "name": "1. Unshifted Cloud Comparison Arm (not the live engine)",
         "params": {"use_shifted_cloud": False, "allow_shorts": True, "t1_roe": 15.0, "t2_roe": 30.0, "atr_sl_mult": 2.5, "runner_tp_mult": 4.0}
     },
     {
