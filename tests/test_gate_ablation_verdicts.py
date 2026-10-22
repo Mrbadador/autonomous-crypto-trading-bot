@@ -6,10 +6,12 @@ verdict strings the report writer used to emit as literals ("KEEP (CRITICAL ALPH
 "KEEP (POSITIVE STATISTICAL FILTER)", "RETAIN AS STRUCTURAL TAIL-RISK BRAKES", "KEEP") no matter
 what the harness's bootstrap found.
 
-Arms are built here as plain dicts with the same keys ``run_ablation_simulation`` returns
-(n_trades, win_rate, total_return, profit_factor, sharpe, ev_mean, ev_ci_90, gate_fires, trades;
-``trades`` a list of dicts carrying ``net_pnl``), so nothing in this file runs the multi-minute
-historical sweep, reads ``data/historical/*.csv``, or touches a ``.db``.
+Arms are built here as plain dicts, not by running the sweep. ``_arm`` carries the measurement-bearing
+keys a published arm has (n_trades, trades with ``net_pnl``, ev_mean, ev_ci_90, sharpe,
+sharpe_trades_per_year) using the producer's absence conventions — ``ev_ci_90`` is None unless an
+interval was actually estimated — and ``_row`` completes them into a table row (win_rate,
+total_return, profit_factor, gate_fires, name). Nothing in this file runs the multi-minute historical
+sweep, reads ``data/historical/*.csv``, or touches a ``.db``.
 """
 
 from pathlib import Path
@@ -18,8 +20,25 @@ import pytest
 
 
 def _arm(pnls, ci=None):
+    """A populated arm, shaped like the producer's output: no interval and no ratio are invented.
+
+    ``ci`` stays opt-in because every verdict in this file is computed from the per-trade PnL series,
+    not from the stored interval; the default is the ``None`` the harness writes when there was
+    nothing to bootstrap, never a fabricated zero-width pair. ``sharpe``/``sharpe_trades_per_year``
+    are published as absence here — the fixture has no measured Sharpe to report — and only ``_row``
+    supplies the numbers the table renderer needs.
+    """
     return {"n_trades": len(pnls), "trades": [{"net_pnl": p} for p in pnls],
-            "ev_mean": 0.0, "ev_ci_90": ci or (0.0, 0.0)}
+            "ev_mean": 0.0, "ev_ci_90": ci,
+            "sharpe": None, "sharpe_trades_per_year": None}
+
+
+def test_arm_fixture_matches_the_shape_the_producer_emits():
+    """Guard for Task 4's fixture: the producer stopped emitting (0.0, 0.0), so must the fixture."""
+    arm = _arm([0.1] * 6)
+    assert arm["ev_ci_90"] is None
+    assert "sharpe_trades_per_year" in arm, "the fixture omits a key the published arm carries"
+    assert arm["sharpe"] is None, "the fixture must not default a ratio it never measured to 0.0"
 
 
 # The brief's KEEP/RETHINK fixtures were [0.5]*40+[-0.4]*40 vs its mirror: a +10%/trade point
@@ -208,6 +227,7 @@ def _row(name, pnls, fires):
         "total_return": round(sum(pnls) * 100.0, 2),
         "profit_factor": 1.2,
         "sharpe": 1.0,
+        "sharpe_trades_per_year": 40.0,
         "gate_fires": fires,
     })
     return row
@@ -294,6 +314,61 @@ def test_report_writer_reports_no_interval_for_missing_and_underpowered_sections
     iid_footer = ("- Confidence intervals are an iid bootstrap over closed trades and do not "
                   "correct for serial dependence between consecutive entries.")
     assert iid_footer in text
+
+
+# ---------------------------------------------------------------------------
+# Review findings M-1 + I-1: the table names the trades/year the Sharpe was annualized by, and an
+# arm whose Sharpe was never measurable renders as absence instead of raising or printing 0.00.
+# ---------------------------------------------------------------------------
+
+def test_report_table_shows_the_sharpe_basis_next_to_the_sharpe(monkeypatch, tmp_path):
+    _, _, text = _render_report(monkeypatch, tmp_path)
+    table = [ln for ln in text.splitlines() if ln.startswith("| ")]
+    assert "Sharpe Basis (trades/yr)" in table[0]
+    assert "40.0 trades/yr" in text
+    # every synthetic arm here has 80/3/... trades and a measured Sharpe of 1.00, so no absence leaks in
+    assert all(row.split("|")[6].strip() == "1.00" for row in table[2:]), table[2:]
+
+
+def test_unmeasurable_sharpe_renders_as_absence_and_does_not_raise(monkeypatch, tmp_path):
+    import scripts.run_gate_ablation as rga
+    from scripts.run_gate_ablation import FULL_STACK_NAME
+
+    rows = _synthetic_rows()
+    for row in rows:
+        if row["name"] == FULL_STACK_NAME:
+            row.update({"n_trades": 0, "trades": [], "sharpe": None,
+                        "sharpe_trades_per_year": None, "ev_mean": None, "ev_ci_90": None})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(rga, "SYMBOLS", ["TESTUSDT"])
+    path = rga.write_report({"TESTUSDT": rows})
+    table = [ln for ln in Path(path).read_text(encoding="utf-8").splitlines() if ln.startswith("| ")]
+    zero_row = next(ln for ln in table if FULL_STACK_NAME in ln)
+    cells = [c.strip() for c in zero_row.strip("|").split("|")]
+    assert cells[5].startswith("n/a"), zero_row
+    assert cells[5] != "0.00"
+    assert cells[6] == "n/a (no closed trades)", zero_row
+
+
+# ---------------------------------------------------------------------------
+# Review finding M-2: the minimum sample size is one constant, and both sentences interpolate it.
+# ---------------------------------------------------------------------------
+
+def test_underpowered_prose_follows_the_imported_minimum(monkeypatch):
+    from scripts.run_gate_ablation import verdict_for_gate
+
+    monkeypatch.setattr("scripts.run_gate_ablation.MIN_BOOTSTRAP_TRADES", 9, raising=False)
+    _, evidence = verdict_for_gate(_arm([0.2] * 8), _arm([-0.2] * 8))
+    assert "below the 9-per-arm minimum" in evidence, evidence
+    assert "5-per-arm" not in evidence
+
+
+def test_ev_ci_prose_follows_the_harness_minimum(monkeypatch):
+    from backtests.backtest_ablation_harness import format_ev_ci
+
+    monkeypatch.setattr("backtests.backtest_ablation_harness.MIN_BOOTSTRAP_TRADES", 9, raising=False)
+    text = format_ev_ci(1.25, None)
+    assert "fewer than 9 trades" in text, text
 
 
 # ---------------------------------------------------------------------------

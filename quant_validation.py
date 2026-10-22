@@ -384,8 +384,11 @@ def run_bootstrap_entry_significance(
       2. 5m Chop Grid Dip-Buy (ChopGridMakerStrategy)
       3. 5m Quick Scalp Short (BearScalpShortStrategy)
     Also performs Gaussian ATR Candle-Path Perturbation (±0.15 * ATR) to measure ratchet survival.
-    `missing_datasets`, when a dict is passed in, is filled with the dataset file names each arm
-    asked for and did not find, including for arms that therefore produced no result at all.
+    `missing_datasets`, when a dict is passed in, is filled with the datasets each arm asked for and
+    did not get, including for arms that therefore produced no result at all. A dataset that is
+    absent from ``data/historical`` is recorded as its bare file name; a dataset that is present but
+    unusable is recorded as ``"<name> (unusable: <reason>)"``, because an empty list otherwise reads
+    as "this arm got everything" when it silently dropped a file.
     """
     rng = np.random.default_rng(seed)
     files_5m = _ensure_5m_validation_datasets()
@@ -432,6 +435,12 @@ def run_bootstrap_entry_significance(
                     df_raw = pd.read_csv(fpath).tail(2500)
                 df = _prepare_indicator_dataframe(df_raw)
                 if len(df) < 120:
+                    # Present but unusable: a reader who only learns "missing_datasets: []" would
+                    # conclude this arm got everything, which is false. Record the reason too.
+                    arm_missing_datasets.append(
+                        f"{fname} (unusable: {len(df)} bars after indicator preparation, "
+                        f"below the 120-bar minimum this arm needs)"
+                    )
                     continue
 
                 sym = fname.split("_")[0]
@@ -475,7 +484,12 @@ def run_bootstrap_entry_significance(
                         int(r_idx), default_side, strat.name, open_a, close_a, high_a, low_a, atr_a, max_horizon=horizon
                     )
                     random_pool_rets.append(r_ret * lev * 100.0)
-            except Exception:
+            except Exception as exc:
+                # The file exists but this arm could not use it: same reporting duty as the
+                # not-found case, with the failure named so the gap is diagnosable.
+                arm_missing_datasets.append(
+                    f"{fname} (unusable: {type(exc).__name__}: {str(exc)[:160]})"
+                )
                 continue
 
         if missing_datasets is not None and arm_missing_datasets:
@@ -774,7 +788,9 @@ def main() -> None:
         )
     for k, v in rep.get("missing_datasets", {}).items():
         if v:
-            print(f"   [DATA GAP] {k}: no dataset found for {v}")
+            # Wording has to cover both kinds of gap the map now carries: files that are absent and
+            # files that exist but could not be used. The old sentence asserted the first for both.
+            print(f"   [DATA GAP] {k}: requested datasets missing or unusable — {', '.join(v)}")
     ens = rep.get("finrl_ensemble_selector", {})
     print(f"[FINRL ENSEMBLE WINNER] {ens.get('ensemble_winner')} (Sharpe={ens.get('winner_sharpe', 0.0):+.2f}) | Weights: {ens.get('strategy_weights')}")
     mc = rep["monte_carlo"]

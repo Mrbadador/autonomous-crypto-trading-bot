@@ -25,16 +25,64 @@ from indicators import compute_indicators, compute_td_sequential, compute_volume
 
 MIN_BOOTSTRAP_TRADES = 5
 
+# One copy of the annual-hours window: annualized_sharpe and the published basis both read it from
+# measured_trades_per_year, so the figure a reader sees can never drift from the factor applied.
+HOURS_PER_YEAR = 365.0 * 24.0
+
+
+def measured_trades_per_year(n_trades, bars, hours_per_bar):
+    """The trade frequency a run actually produced, or None when the elapsed window measures none.
+
+    Single source of truth for the annualization basis: the sqrt factor inside annualized_sharpe and
+    the ``sharpe_trades_per_year`` value the arm publishes are both computed here.
+    """
+    if n_trades <= 0 or bars <= 0:
+        return None
+    years = (bars * hours_per_bar) / HOURS_PER_YEAR
+    if years <= 0:
+        return None
+    return n_trades / years
+
 
 def annualized_sharpe(pnls, bars, hours_per_bar):
-    """Annualize a per-trade Sharpe by the trade frequency the run actually produced."""
+    """Annualize a per-trade Sharpe by the trade frequency the run actually produced.
+
+    Returns None when no Sharpe is measurable for the sample: a variance-free trade series (every
+    per-trade PnL identical) has no dispersion to divide by, and dividing by the 1e-9 epsilon instead
+    publishes a ~1e11 number that a reader would take for a measurement.
+    """
     if len(pnls) < 2 or bars <= 0:
         return 0.0
-    years = (bars * hours_per_bar) / (365.0 * 24.0)
-    if years <= 0:
+    mean = float(np.mean(pnls))
+    std = float(np.std(pnls))
+    # A variance-free series — every per-trade PnL the same number — has no dispersion to divide by.
+    # np.std leaves floating-point noise (~1e-18) on such a series rather than an exact 0.0, so the
+    # floor is scaled to the sample: below it the only thing under the fraction line is the 1e-9
+    # epsilon, and the quotient is a ~1e8 artefact a reader would take for a measured Sharpe.
+    if std <= np.finfo(float).eps * max(abs(mean), 1.0):
+        return None
+    trades_per_year = measured_trades_per_year(len(pnls), bars, hours_per_bar)
+    if trades_per_year is None:
         return 0.0
-    trades_per_year = len(pnls) / years
-    return float(np.mean(pnls) / (np.std(pnls) + 1e-9) * np.sqrt(trades_per_year))
+    return float(mean / (std + 1e-9) * np.sqrt(trades_per_year))
+
+
+def format_sharpe(sharpe, n_trades):
+    """Render an arm's annualized Sharpe, printing absence where no Sharpe was measurable."""
+    if sharpe is not None:
+        return f"{sharpe:.2f}"
+    if n_trades == 0:
+        return "n/a (no closed trades, Sharpe not measured)"
+    if n_trades == 1:
+        return "n/a (single closed trade, dispersion not measurable)"
+    return "n/a (variance-free trade series, Sharpe has no denominator)"
+
+
+def format_sharpe_basis(trades_per_year, n_trades):
+    """Render the trade frequency the Sharpe beside it was annualized by, or why there is none."""
+    if trades_per_year is None:
+        return "n/a (no closed trades)" if not n_trades else "n/a (no elapsed window)"
+    return f"{trades_per_year:.1f} trades/yr"
 
 
 def format_ev_ci(ev_mean, ev_ci_90):
@@ -328,8 +376,8 @@ def run_ablation_simulation(
             "win_rate": 0.0,
             "total_return": 0.0,
             "profit_factor": 0.0,
-            "sharpe": 0.0,
-            "sharpe_trades_per_year": 0.0,
+            "sharpe": None,
+            "sharpe_trades_per_year": None,
             "ev_mean": None,
             "ev_ci_90": None,
             "gate_fires": gate_fires,
@@ -345,6 +393,12 @@ def run_ablation_simulation(
     gross_loss = abs(sum(losses)) if losses else 1e-6
     pf = gross_win / gross_loss if gross_loss > 0 else 999.0
     sharpe = annualized_sharpe(pnls, bars=total_bars, hours_per_bar=4.0)
+    if len(pnls) < 2:
+        # The pure function returns its degenerate 0.0 here (the brief's pinned contract), but one
+        # closed trade has no dispersion: publishing that 0.0 would print a measured zero for a
+        # statistic this arm never measured.
+        sharpe = None
+    trades_per_year = measured_trades_per_year(len(pnls), total_bars, 4.0)
 
     # Bootstrap 90% Confidence Interval for Expected Value (EV) per trade
     ev_mean = float(np.mean(pnls))
@@ -361,8 +415,8 @@ def run_ablation_simulation(
         "win_rate": round(wr, 1),
         "total_return": round(tot_ret, 2),
         "profit_factor": round(pf, 2),
-        "sharpe": round(sharpe, 2),
-        "sharpe_trades_per_year": round(len(pnls) / max((total_bars * 4.0) / 8760.0, 1e-9), 2),
+        "sharpe": None if sharpe is None else round(sharpe, 2),
+        "sharpe_trades_per_year": None if trades_per_year is None else round(trades_per_year, 2),
         "ev_mean": round(ev_mean * 100.0, 3),
         "ev_ci_90": None if ev_ci_lo is None else (round(ev_ci_lo * 100.0, 3), round(ev_ci_hi * 100.0, 3)),
         "gate_fires": gate_fires,
@@ -434,8 +488,8 @@ def main():
     df_4h_vec = precompute_4h_indicators_vectorized(df_4h)
     df_1d_vec = precompute_1d_trend_vectorized(df_1d)
 
-    print(f"\n{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'PF':<6} | {'Sharpe':<6} | {'EV / Trade (90% CI)':<22} | {'Active Gate Fires'}")
-    print("-" * 135)
+    print(f"\n{'Configuration':<38} | {'Trades':<6} | {'Win Rate':<8} | {'Return':<9} | {'PF':<6} | {'Sharpe':<20} | {'Sharpe Basis (trades/yr)':<24} | {'EV / Trade (90% CI)':<22} | {'Active Gate Fires'}")
+    print("-" * 160)
 
     matrix_rows = []
     for name, config_dict in experiments:
@@ -446,9 +500,11 @@ def main():
             df_1d_vec=df_1d_vec
         )
         ci_str = format_ev_ci(res["ev_mean"], res["ev_ci_90"])
+        sharpe_str = format_sharpe(res["sharpe"], res["n_trades"])
+        basis_str = format_sharpe_basis(res["sharpe_trades_per_year"], res["n_trades"])
         gf = res.get("gate_fires", {})
         gf_str = ", ".join(f"{k.replace('gate_', '')}:{v}" for k, v in gf.items() if v > 0) or "none"
-        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>6.2f} | {res['sharpe']:>6.2f} | {ci_str:<22} | {gf_str}")
+        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>6.2f} | {sharpe_str:>20} | {basis_str:<24} | {ci_str:<22} | {gf_str}")
         matrix_rows.append((name, res))
 
     print("\n[SUCCESS] Ablation comparison matrix successfully evaluated against real data.\n")

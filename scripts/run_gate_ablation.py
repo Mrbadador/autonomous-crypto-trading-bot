@@ -7,7 +7,10 @@ import pandas as pd
 from datetime import datetime
 
 from backtests.backtest_ablation_harness import (
+    MIN_BOOTSTRAP_TRADES,
     format_ev_ci,
+    format_sharpe,
+    format_sharpe_basis,
     precompute_4h_indicators_vectorized,
     precompute_1d_trend_vectorized,
     run_ablation_simulation,
@@ -47,7 +50,9 @@ GATE_SECTIONS = [
      "Ablate Gate E (Volume Profile OFF)"),
 ]
 
-MIN_BOOTSTRAP_TRADES = 5
+# MIN_BOOTSTRAP_TRADES is imported from the harness rather than restated here: the EV sentence in
+# format_ev_ci and the ΔEV sentence in verdict_for_gate must quote the same threshold, because two
+# copies silently produce two contradictory sentences in one report once either is moved.
 
 # Single source of truth for the bootstrap: the report's method description is generated from these,
 # so changing a constant cannot leave the prose describing a run that did not happen.
@@ -179,6 +184,9 @@ def evaluate_all():
                 "total_return": res["total_return"],
                 "profit_factor": res["profit_factor"],
                 "sharpe": res["sharpe"],
+                # The basis travels with the ratio: a Sharpe without its trades/year is a number a
+                # reader cannot check, and the sweep's whole point was that the factor is 7.4x off.
+                "sharpe_trades_per_year": res["sharpe_trades_per_year"],
                 "ev_mean": res["ev_mean"],
                 "ev_ci_90": res["ev_ci_90"],
                 # Kept for the ΔEV bootstrap: the verdicts need each arm's per-trade PnL series and
@@ -208,11 +216,13 @@ def write_report(all_results, report_path=None):
         
         for sym, rows in all_results.items():
             f.write(f"## Asset: {sym}\n\n")
-            f.write("| Gate Configuration | Trades (N) | Win Rate (%) | Cumulative Return (%) | Profit Factor | Sharpe | EV / Trade (90% CI) |\n")
-            f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n")
+            f.write("| Gate Configuration | Trades (N) | Win Rate (%) | Cumulative Return (%) | Profit Factor | Sharpe | Sharpe Basis (trades/yr) | EV / Trade (90% CI) |\n")
+            f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
             for r in rows:
                 ci = format_ev_ci(r["ev_mean"], r["ev_ci_90"])
-                f.write(f"| {r['name']} | {r['n_trades']} | {r['win_rate']:.1f}% | {r['total_return']:+.2f}% | {r['profit_factor']:.2f} | {r['sharpe']:.2f} | {ci} |\n")
+                sharpe_str = format_sharpe(r.get("sharpe"), r.get("n_trades", 0))
+                basis_str = format_sharpe_basis(r.get("sharpe_trades_per_year"), r.get("n_trades", 0))
+                f.write(f"| {r['name']} | {r['n_trades']} | {r['win_rate']:.1f}% | {r['total_return']:+.2f}% | {r['profit_factor']:.2f} | {sharpe_str} | {basis_str} | {ci} |\n")
             f.write("\n")
             
         # One row lookup per asset: each gate section below reads its OWN ablation arm.
