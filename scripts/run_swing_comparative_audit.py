@@ -1,9 +1,23 @@
 """
 run_swing_comparative_audit.py — Runs parametric backtests to identify what needs work in the Swing Architect.
+
+Run it by hand from the repo root: `python scripts/run_swing_comparative_audit.py`. The backtester
+replays the local history in data/historical/, so the repo root is also the working directory.
+That invocation puts <repo>/scripts on sys.path, not the repo root, so this module puts the repo
+root there itself before it imports the backtester that lives in backtests/.
 """
+import os
 import sys
 import pandas as pd
-from backtest_swing_architect import (
+
+# The backtester lives in backtests/ (a namespace package: it has no __init__.py), so the repo root
+# has to be on sys.path before it can be imported. `python scripts/run_swing_comparative_audit.py`
+# puts <repo>/scripts on sys.path[0] instead, so this module puts the repo root there itself --
+# the same spelling the repo's other hand-run scripts use (scripts/quant_validation.py,
+# scripts/run_grid_ablation.py, scripts/reconcile_d4_corrupt_exits.py).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from backtests.backtest_swing_architect import (
     SwingArchitectBacktester,
     format_profit_factor,
     format_win_loss_ratio,

@@ -1317,3 +1317,107 @@ def test_the_audit_matrix_routes_through_the_swing_renderers():
     assert '{res[\'win_loss_ratio\']:.2f}x' not in src
 
 
+# ---------------------------------------------------------------------------
+# Final fix E-2 — the comparative audit script can be run the way it looks runnable
+# ---------------------------------------------------------------------------
+# `python scripts/run_swing_comparative_audit.py` puts <repo>/scripts on sys.path[0] and NOT the
+# repo root, so `backtests/` (a namespace package: it has no __init__.py) is not importable and
+# nothing put the root there. The script's bare `from backtest_swing_architect import ...` therefore
+# failed under the invocation the script is written for. This is the same failure part D fixed in
+# scripts/lesson_distillation_pipeline.py (2ff8045), with the same spelling.
+
+def test_the_audit_script_puts_the_repo_root_on_sys_path_the_way_the_repo_does():
+    src = SWING_AUDIT_SCRIPT.read_text(encoding="utf-8")
+    assert ("sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))"
+            in src), (
+        "the repo root has to reach sys.path the way the repo's other hand-run scripts spell it "
+        "(scripts/quant_validation.py, scripts/run_grid_ablation.py, "
+        "scripts/reconcile_d4_corrupt_exits.py)")
+    assert "from backtests.backtest_swing_architect import" in src
+    assert "from backtest_swing_architect import" not in src, (
+        "the backtester lives in backtests/, so the import has to name it")
+    assert "python scripts/run_swing_comparative_audit.py" in src, (
+        "the script's own docstring has to document the invocation it can actually run")
+
+
+def test_the_audit_script_import_resolves_under_its_documented_invocation():
+    """The import is driven for real, in a clean interpreter, under the documented invocation.
+
+    The probe rebuilds the sys.path that `python scripts/run_swing_comparative_audit.py` produces
+    (sys.path[0] = <repo>/scripts, the repo root NOT on the path) and then executes the script's
+    module header -- the docstring, the path setup and the imports -- and nothing else. No backtest
+    runs and nothing is written.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import ast, os, sys\n"
+        "repo = os.path.abspath(sys.argv[1])\n"
+        "script = os.path.join(repo, 'scripts', 'run_swing_comparative_audit.py')\n"
+        "kept = [p for p in sys.path if p and os.path.abspath(p) != repo]\n"
+        "sys.path = [os.path.join(repo, 'scripts')] + kept\n"
+        "tree = ast.parse(open(script, encoding='utf-8').read(), filename=script)\n"
+        "nodes = []\n"
+        "for node in tree.body:\n"
+        "    if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == 'scenarios' for t in node.targets):\n"
+        "        break\n"
+        "    nodes.append(node)\n"
+        "ns = {'__file__': script, '__name__': 'e2_probe'}\n"
+        "exec(compile(ast.Module(body=nodes, type_ignores=[]), script, 'exec'), ns)\n"
+        "print(ns['SwingArchitectBacktester'].__module__)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", probe, str(REPO_ROOT)],
+                          capture_output=True, text=True, cwd=str(REPO_ROOT))
+    assert proc.returncode == 0, (
+        f"the documented hand-run cannot import the backtester:\n{proc.stdout}\n{proc.stderr}")
+    assert proc.stdout.strip() == "backtests.backtest_swing_architect", proc.stdout
+
+
+def test_the_audit_matrix_renders_the_absence_instead_of_the_fabricated_ratio():
+    """The consumer, driven for real: a run with no losing trade has no ratio, and the matrix says
+    so instead of printing 99.00 next to rows that had been measured."""
+    from scripts.run_swing_comparative_audit import arm_row
+
+    lossless = {
+        "total_trades": 12, "win_count": 12, "loss_count": 0,
+        "win_rate": 100.0, "profit_factor": None, "win_loss_ratio": None,
+        "total_return_pct": 4.2, "net_profit": 5.1, "max_drawdown_pct": 1.1,
+        "sharpe_ratio": 1.4, "sortino_ratio": 2.0, "total_fees_paid": 1.2,
+    }
+    row = arm_row("1. arm", lossless)
+    assert row["Profit Factor"] == "n/a (no losing trade, profit factor has no denominator)"
+    assert row["Win/Loss"] == "n/a (no losing trade, win/loss ratio has no denominator)"
+    assert "99" not in row["Profit Factor"]
+    assert "0.00x" not in row["Win/Loss"]
+    # The cells that were measured are still published as numbers.
+    assert row["Win Rate"] == "100.0%"
+    assert row["Return %"] == "+4.2%"
+    assert row["Trades"] == 12
+
+
+def test_the_audit_matrix_says_when_a_run_measured_nothing():
+    """Two different absences, told apart: a run that closed no trade, and a run with no history."""
+    from scripts.run_swing_comparative_audit import arm_row
+
+    no_trades = {
+        "total_trades": 0, "win_count": 0, "loss_count": 0,
+        "win_rate": None, "profit_factor": None, "win_loss_ratio": None,
+        "total_return_pct": 0.0, "net_profit": 0.0, "max_drawdown_pct": 0.0,
+        "sharpe_ratio": None, "sortino_ratio": None, "total_fees_paid": 0.0,
+    }
+    row = arm_row("2. arm", no_trades)
+    assert "no closed trades" in row["Win Rate"]
+    assert "no closed trades" in row["Profit Factor"]
+    assert "no closed trades" in row["Win/Loss"]
+    assert "0.0%" not in row["Win Rate"], (
+        f"a win rate with no closed trades is not a measured zero: {row['Win Rate']}")
+    # The sums and the counts of an empty population are honest zeros; the rate is not.
+    assert row["Trades"] == 0
+    assert row["Return %"] == "+0.0%"
+
+    no_data = arm_row("3. arm", {"error": "No historical data found"})
+    assert "no historical data" in no_data["Profit Factor"]
+    assert "no historical data" in no_data["Win Rate"]
+
+
