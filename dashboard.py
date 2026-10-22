@@ -1376,10 +1376,14 @@ def _basis_readings(basis_data, now=None) -> dict:
         "unwind_hurdle_pct": _number("unwind_hurdle_pct"),
         "capital_allocated_usd": _number("capital_allocated_usd"),
         "cumulative_funding_harvested": _number("cumulative_funding_harvested"),
-        # The engine publishes `net_delta`. The panel used to read a USD-suffixed variant of that
-        # key, which the payload has never carried, so a measured zero was being rendered off a
-        # stand-in default and the real reading was never looked at.
-        "net_delta": _number("net_delta"),
+        # Two writers, two key names. The active engine publishes `net_delta_usd`
+        # (basis_trader.py:823); the DISABLED parking path publishes `net_delta`
+        # (basis_trader.py:920). Prefer the engine's own computed key and fall back to the parked
+        # placeholder. Membership decides, never truthiness: `or` and `.get(k, default)` silently
+        # drop a measured 0.0, which is the defect class this panel was built to end.
+        "net_delta": _published_number(
+            data["net_delta_usd"] if "net_delta_usd" in data else data.get("net_delta"),
+            "no net delta in basis trader telemetry"),
         "holding_days": _number("holding_days"),
         "min_holding_days": _number("min_holding_days"),
         "fee_hurdle_target_usd": _number("fee_hurdle_target_usd"),

@@ -3813,6 +3813,74 @@ _G5_LIVE_PAYLOAD = {
 # 2026-09-17T22:45:48Z published, this instant reading: 35 days.
 _G5_FIX_NOW = datetime(2026, 10, 22, 20, 0, tzinfo=timezone.utc)
 
+# The producer of the row above. `dashboard.py` has one reader and this file has two writers, so the
+# fixtures below are built from its syntax tree rather than transcribed: a hand-written "active
+# engine" payload is a claim about the producer, and the last three rounds of this branch were paid
+# for by exactly that kind of claim.
+BASIS_TRADER = REPO_ROOT / "archive" / "experimental_traders" / "basis_trader.py"
+
+
+def _g5_producer_payload_keys(shape):
+    """The keys one basis-trader writer actually publishes, read out of the producer's AST.
+
+    `shape` is "active" — the heartbeat `publish_telemetry` enqueues into `system_state` — or
+    "parked" — the payload `main()` writes when `config.BASIS_TRADER_ENABLED` is false. Each is a
+    dict literal of constant string keys and the two are told apart by the keys themselves (only
+    one carries the computed `net_delta_usd`), so a rename or a reordering moves this test instead
+    of silently pointing it at the wrong writer.
+    """
+    import ast
+
+    src = BASIS_TRADER.read_text(encoding="utf-8")
+    dicts = []
+    for node in ast.walk(ast.parse(src, filename=str(BASIS_TRADER))):
+        if isinstance(node, ast.Dict) and all(isinstance(key, ast.Constant)
+                                              and isinstance(key.value, str)
+                                              for key in node.keys):
+            dicts.append(frozenset(key.value for key in node.keys))
+    if shape == "active":
+        found = [keys for keys in dicts if "net_delta_usd" in keys]
+    elif shape == "parked":
+        found = [keys for keys in dicts
+                 if "net_delta" in keys and "net_delta_usd" not in keys]
+    else:
+        raise AssertionError(f"no such basis trader shape: {shape!r}")
+    assert len(found) == 1, (
+        f"expected exactly one basis trader {shape} payload, found {len(found)}: {found}")
+    return found[0]
+
+
+# A running engine's book, at figures the panel formats distinctly, so a field that stopped being
+# read shows up as a missing number rather than as another zero.
+_G5_ENGINE_VALUES = {
+    "engine": "basis_trader", "state": "ACTIVE_DELTA_NEUTRAL",
+    "status": "ACTIVE_DELTA_NEUTRAL", "symbol": "BTC/USDT",
+    "spot_price": 110000.0, "perp_price": 110200.0, "basis_spread_usd": -350.25,
+    "basis_dislocation_pct": 0.42, "funding_rate_8h": 0.00012,
+    "annualized_yield_pct": 11.25, "hurdle_rate_pct": 8.0, "unwind_hurdle_pct": 1.5,
+    "capital_allocated_usd": 2500.0, "net_delta_usd": -0.75, "market_neutral": True,
+    "has_active_position": True, "cumulative_funding_harvested": 1.8675,
+    "unrealized_pnl_usd": 12.5, "holding_days": 3.5, "min_holding_days": 7.0,
+    "roundtrip_fee_usd": 2.4, "fee_hurdle_target_usd": 3.0, "fee_amortized_pct": 118.4,
+    "margin_mode": "isolated", "liquidation_price": 91000.0, "distance_to_liq_pct": 24.5,
+    "min_liq_distance_pct": 20.0, "position": {"spot_qty": 0.0227},
+    "timestamp": _G5_FIX_NOW.isoformat(),
+}
+
+
+def _g5_active_engine_payload():
+    """One payload with every key the ACTIVE heartbeat publishes, and no key it does not.
+
+    The key set comes from the producer, not from this file, which is the whole point: the active
+    engine publishes `net_delta_usd` and there is no `net_delta` and no `reason` in its dict
+    literal, so a fixture that said otherwise would be the same invention the panel was rebuilt to
+    stop making. A key the producer adds later takes `0.0` and the panel's own coverage line
+    reports it.
+    """
+    keys = _g5_producer_payload_keys("active")
+    return {key: _G5_ENGINE_VALUES.get(key, 0.0) for key in sorted(keys)}
+
+
 # The fields the panel used to invent and that the live five-key payload does not carry.
 _G5_ABSENT_IN_LIVE = ("capital_allocated_usd", "hurdle_rate_pct", "distance_to_liq_pct",
                       "margin_mode", "annualized_yield_pct", "unwind_hurdle_pct",
@@ -4057,20 +4125,84 @@ def test_g5a_the_live_payload_leaves_the_carry_economics_unmeasured(field):
     assert field in state["reason"], f"the absence for {field} does not name itself: {state}"
 
 
+def _g5_positional_get_defaults(src):
+    """Every two-argument `.get(key, default)` in `src`, read out of its syntax tree.
+
+    A defaulted `.get()` cannot tell "the engine recorded nothing" from "the engine recorded X", so
+    in a reader that is supposed to publish measurements-or-absences it publishes the default as if
+    it were a reading. Truthiness is the same trap one step on: `a or b` drops a measured 0.0.
+    """
+    import ast
+
+    hits = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "get" and len(node.args) >= 2:
+            hits.append(ast.get_source_segment(src, node) or "")
+    return hits
+
+
 def test_g5a_the_live_payload_keeps_net_delta_a_measured_zero():
     """`net_delta = 0.0` is the one number in the live payload. It must stay a reading.
 
     This is the regression the round is judged on: an absence is not a zero and a zero is not an
-    absence. The panel also used to read a USD-suffixed key the payload has never carried, so the
-    reading it printed came from a default rather than from the engine.
+    absence. The producer is one file with two writers and two key names for the same figure — the
+    active heartbeat publishes `net_delta_usd` (`basis_trader.py:823`, computed at `:793`), the
+    DISABLED parking path publishes `net_delta` (`:920`) — so the reader must name both, and it may
+    not reach either through a default that answers for a key the engine never sent.
     """
     readings = _g5_readings(dict(_G5_LIVE_PAYLOAD))
     assert readings["net_delta"] == {"value": 0.0, "measured": True, "reason": ""}, readings["net_delta"]
-    src = _function_source(DASHBOARD, "_basis_readings")
-    assert '"net_delta": _number("net_delta")' in src, (
-        "the carry readings do not read the key the engine publishes")
-    assert "net_delta_usd" not in DASHBOARD.read_text(encoding="utf-8"), (
-        "the panel still reads the USD-suffixed delta key the payload never carried")
+    # I-2: both guards are scoped to the helper's own source. The whole-file ban this replaces
+    # forbade `net_delta_usd`, which is the key the ACTIVE engine publishes, so it pinned the
+    # stub-only read as the contract and made the correct fix fail.
+    code = _g5_helper_code()
+    assert '"net_delta_usd"' in code, (
+        "the carry reader no longer names the net-delta key the active engine publishes")
+    assert '"net_delta"' in code, (
+        "the carry reader no longer names the net-delta key the parked engine publishes")
+    assert _g5_positional_get_defaults(code) == [], (
+        f"the carry reader defaults a `.get()` and so publishes a stand-in for a key it never "
+        f"measured: {_g5_positional_get_defaults(code)}")
+
+
+# I-1 — the dual-key read, stated as behaviour. Each case is one arm of the real two-writer
+# contract; none of them is satisfiable by a reader that looks at only one key.
+def test_g5a_the_active_engine_loses_nothing_when_its_delta_is_a_measured_zero():
+    """`{"net_delta_usd": 0.0}` is what a running engine publishes for a flat twin book."""
+    state = _g5_readings({"net_delta_usd": 0.0})["net_delta"]
+    assert state == {"value": 0.0, "measured": True, "reason": ""}, state
+
+
+def test_g5a_the_engine_key_wins_when_both_shapes_are_published():
+    """Precedence is stated, not incidental: the computed reading beats the parked placeholder."""
+    state = _g5_readings({"net_delta_usd": -0.75, "net_delta": 99.0})["net_delta"]
+    assert state["measured"] is True, state
+    assert state["value"] == -0.75, state
+
+
+def test_g5a_the_parked_placeholder_is_read_when_the_engine_key_is_absent():
+    state = _g5_readings({"net_delta": 99.0})["net_delta"]
+    assert state["measured"] is True, state
+    assert state["value"] == 99.0, state
+
+
+def test_g5a_a_payload_with_neither_delta_key_reports_the_absence_in_its_own_words():
+    state = _g5_readings({})["net_delta"]
+    assert state == {"value": None, "measured": False,
+                     "reason": "no net delta in basis trader telemetry"}, state
+
+
+def test_g5a_a_measured_zero_under_the_engine_key_renders_as_a_reading(tmp_path):
+    """The panel half of I-1: a live engine's measured zero must not print as an absence beside a
+    badge that asserts delta-neutrality."""
+    html, _fake = _g5_render_carry_panel(
+        tmp_path, payload={"state": "ACTIVE_DELTA_NEUTRAL", "net_delta_usd": 0.0})
+    assert "$+0.00" in html, html[:2500]
+    assert "Neutral" in html, html[:2500]
+    assert "posture not measured" not in html, "the engine's own delta lost its posture"
+    assert "(no net delta in basis trader telemetry)" not in html, \
+        "a measured net delta is still published as an absence"
 
 
 @pytest.mark.parametrize("field,expected", [("state", "DISABLED"),
@@ -4189,11 +4321,24 @@ def test_g5a_the_carry_panel_reads_through_the_publishers_and_the_scan_is_not_va
 
 
 def test_g5a_the_dead_stand_in_reads_are_gone():
-    """Five fields were assigned and never used. A stand-in feeding nothing is still a stand-in."""
-    src = DASHBOARD.read_text(encoding="utf-8")
+    """Five fields were assigned and never used. A stand-in feeding nothing is still a stand-in.
+
+    I-2: the scope of this ban is the panel and its reader, not the file. All five are keys the
+    ACTIVE heartbeat publishes (`basis_trader.py:814-815` for the two prices, `:825`
+    `has_active_position`, `:827` `unrealized_pnl_usd`, `:830` `roundtrip_fee_usd`), so a whole-file
+    ban would block a later round from showing a real figure and its message claimed those keys
+    exist nowhere. What is banned here is exactly what was wrong: this panel reading a published key
+    into a variable that renders nowhere. Same subtraction the key scan above already uses.
+    """
+    src = _g5_code_only(DASHBOARD.read_text(encoding="utf-8"))
+    block = _g5_block_code()
+    helper = _g5_helper_code()
     for key in ("unrealized_pnl_usd", "has_active_position", "spot_price", "perp_price",
                 "roundtrip_fee_usd"):
-        assert f'"{key}"' not in src, f"the carry panel still reads {key}, which renders nowhere"
+        outside = src.count(f'"{key}"') - block.count(f'"{key}"') - helper.count(f'"{key}"')
+        assert outside == 0, (
+            f"{key} is read {outside} time(s) outside the carry panel and its reader helper — a "
+            "dead stand-in read in this panel, or a second reader this test never scanned")
 
 
 # Group 4 — an absence never wears a measured colour.
@@ -4444,19 +4589,29 @@ def test_g5a_an_empty_payload_still_publishes_the_standing_by_message(tmp_path):
 
 
 def test_g5a_an_active_engine_still_publishes_its_real_book():
-    """The other half of the crash hazard: with every field present, the panel must show the
-    readings and stop claiming absences — and a full book must still format."""
-    payload = {
-        "state": "ACTIVE_DELTA_NEUTRAL", "reason": "carry captured", "margin_mode": "isolated",
-        "capital_allocated_usd": 2500.0, "hurdle_rate_pct": 8.0, "unwind_hurdle_pct": 1.5,
-        "annualized_yield_pct": 11.25, "funding_rate_8h": 0.00012, "basis_spread_usd": -350.25,
-        "basis_dislocation_pct": 0.42, "cumulative_funding_harvested": 1.8675, "net_delta": -0.75,
-        "holding_days": 3.5, "min_holding_days": 7.0, "fee_hurdle_target_usd": 3.0,
-        "fee_amortized_pct": 118.4, "liquidation_price": 91000.0, "distance_to_liq_pct": 24.5,
-        "timestamp": _G5_FIX_NOW.isoformat(),
-    }
+    """The other half of the crash hazard: a full book must still format, and the readings must
+    stop claiming absences.
+
+    I-2: this fixture is the producer's active payload, not a transcription of it — 29 keys taken
+    out of the `ast.Dict` literal in `publish_telemetry` (`basis_trader.py:808-838`), which is why
+    the delta below arrives as `net_delta_usd`. The hand-written version of this test omitted that
+    key and invented `net_delta` and `reason`, and a reader wired to the parked stub alone passed it.
+    """
+    payload = _g5_active_engine_payload()
+    active_keys = _g5_producer_payload_keys("active")
+    assert set(payload) <= active_keys, (
+        f"the 'active engine' fixture publishes {sorted(set(payload) - active_keys)}, which the "
+        "active heartbeat does not")
+    assert "net_delta_usd" in active_keys and "net_delta" not in active_keys, (
+        "the active payload no longer carries the engine's computed delta, so this test is "
+        "describing a different producer")
     html, _fake = _g5_render_carry_panel(None, payload=payload)
-    assert "not measured" not in html, html[:2500]
+    # The live engine publishes no `reason` — only the parked path does (`basis_trader.py:919`) —
+    # so exactly one card is entitled to say it measured nothing, and it must name itself. An
+    # "all measured" claim here would be this test inventing a key the producer never writes.
+    notes = re.findall(r"\(no ([a-z_]+) in basis trader telemetry\)", html)
+    assert notes == ["reason"], (notes, html[:2500])
+    assert "posture not measured" not in html, "the engine's own delta lost its posture"
     assert "$2,500 USDT" in html, html
     assert "+11.25%" in html and "(Hurdle: 8.0%)" in html, html
     assert "+0.0120%" in html, html
@@ -4466,6 +4621,24 @@ def test_g5a_an_active_engine_still_publishes_its_real_book():
     assert "ISOLATED" in html, html
     assert "🟢 ACTIVE 1:1 DELTA-NEUTRAL TWIN" in html, html
     assert "3.5d / 7d" in html, html
+
+
+def test_g5a_the_two_producer_shapes_are_the_two_fixtures_this_suite_runs():
+    """The contract I-1 reads against, pinned to the producer rather than to a comment.
+
+    One file, two writers: the heartbeat publishes 29 keys and the DISABLED parking path publishes
+    five. If either literal changes shape, the panel's dual-key read and these fixtures have to be
+    re-reasoned together, so this fails first rather than letting a reader quietly narrow again.
+    """
+    active_keys = _g5_producer_payload_keys("active")
+    parked_keys = _g5_producer_payload_keys("parked")
+    assert parked_keys == frozenset(_G5_LIVE_PAYLOAD), (
+        f"the parked payload is no longer the five keys this suite seeds: {sorted(parked_keys)}")
+    assert "net_delta" in parked_keys and "net_delta_usd" not in parked_keys
+    assert sorted(active_keys) != sorted(parked_keys)
+    readings = _g5_readings(_g5_active_engine_payload())
+    assert readings["net_delta"] == {"value": -0.75, "measured": True, "reason": ""}, readings
+    assert readings["reason"]["measured"] is False, readings["reason"]
 
 
 def test_g5a_a_negative_harvest_is_not_printed_as_a_gain():
