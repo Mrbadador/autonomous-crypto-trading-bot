@@ -852,9 +852,29 @@ git commit -m "fix(backtests): annualize Sharpe by measured frequency and remove
 ## Task 6: Correct the README's metrics and remove the methodology claims nothing implements
 
 **Files:**
-- Modify: `README.md:28-29, 64, 66, 77, 81, 85-87`
+- Modify: `README.md:28-29, 64, 66, 71-78, 81, 85-87` (widened 2026-10-22: `:74`, `:76` and `:78` were missing
+  from the original list — see the correction block below and Step 3b in `task-6-brief.md`)
 
-**What was verified about the README, and why the fix is narrow:** every number in the live-telemetry table reproduces to the cent from the first 149 rows of `swing_trades` (2026-09-20 → 2026-10-12): 149 trades, +$77.64 / −$112.08, net −$34.44, 40.3% (60W/89L), 3.59h average hold, max drawdown −$64.56. The table is an honest snapshot that was never refreshed, not an invention. Only two cells are wrong, and they are overstated: the payoff ratio is **1.027** in that window (avgWin $1.294 / avgLoss $1.259), not 1.47, and **0.942** over the current 181 trades; take-profit efficiency is **88.4%** — 5 of 43 `tp_hit`-labelled exits closed negative — not 100%. Separately, four methodology claims have no implementation anywhere in the repository: `walk_forward`, `TimeSeriesSplit`, `train_test_split` and `embargo` each return zero hits across all `.py` files, and "180-day market regimes" appears only in README.md.
+**Correction (2026-10-22, verified before Task 6 was dispatched — this paragraph's own claims were partly
+wrong; `.superpowers/sdd/2026-10-22-audit-remediation/task-6-verified-metrics.md` is the authority):** the
+count of wrong cells is four, not two. Take-profit efficiency is **83.9%** over the 31 rows matched by the
+substring `"tp" in exit_reason.lower()` or **88.4%** over the 43 rows matched by the inclusive vocabulary
+`{TAKE_PROFIT, tp_hit, AI_EARLY_TP}` — same numerator (5 negative closes), so the sentence below's "5 of 43
+`tp_hit`-labelled exits" mislabels 12 `TAKE_PROFIT` rows, and whichever figure is published must name its
+vocabulary. `README.md:78` (AI Structural Exit Alpha) also fails verification and was missing from this task:
+its printed −$0.89 / −$1.55 / "saves 42%" reproduce under none of the four comparators, and its sign flips —
+AI structural exits average −$1.087 (n=22) versus −$1.675 for native `sl_hit` fills (AI better) but −$0.769 for
+`STOP_LOSS`+`sl_hit` combined (AI 41% WORSE). `:74`'s "(winners > losers)" is false at the measured payoff, and
+`:76`'s `11.8%` drawdown denominator is unverifiable from `swing_trades` (the −$64.56 dollar figure reproduces
+exactly: cumulative peak +$23.94 → trough −$40.62).
+
+**What was verified about the README, and why the fix is narrow:** every number in the live-telemetry table reproduces to the cent from the first 149 rows of `swing_trades` (2026-09-20 → 2026-10-12): 149 trades, +$77.64 / −$112.08, net −$34.44, 40.3% (60W/89L), 3.59h average hold, max drawdown −$64.56. The table is an honest snapshot that was never refreshed, not an invention. The payoff ratio is **1.027** in that window (avgWin $1.294 / avgLoss $1.259), not 1.47, and **0.942** over the current 181 trades; take-profit efficiency is **88.4%** — 5 of 43 `tp_hit`-labelled exits closed negative — not 100%. Separately, four methodology claims have no implementation anywhere in the repository: `walk_forward`, `TimeSeriesSplit`, `train_test_split` and `embargo` each return zero hits across all `.py` files, and "180-day market regimes" appears only in README.md.
+
+**Re-verified 2026-10-22:** `walk_forward`, `Walk-Forward`, `TimeSeriesSplit`, `embargo` and `180-day` are
+indeed zero-hit in all project `.py` outside the vendored `Python/` tree. `train_test_split` is **not** zero-hit
+— it appears in `.agent/skills/hugging-face-model-trainer/scripts/*` and `.agent/skills/hugging-face-vision-trainer/scripts/*`,
+which are third-party skill scripts, not this bot. The claim "no implementation anywhere in the repository"
+must be read as "none in the trading code"; do not cite those scripts as evidence of a hold-out.
 
 - [ ] **Step 1: Re-measure before writing, do not copy this plan's numbers blind**
 
@@ -904,7 +924,14 @@ Delete or rewrite so nothing claims an experiment that does not exist:
 - [ ] **Step 4: Replace the benchmark Sharpe table with audited numbers**
 
 The Sharpe values 1.82 / 2.14 / 3.40 appear **only** in README.md — no code emits them. Replace that block with the audited swing-4H result and label every figure with the artefact it came from:
-- win rate 46.2%, EV per trade −$0.230 with 90% CI [−0.373, −0.087], from `audits/boardroom_counterfactual_report_2026-10-13.md`
+- **SUPERSEDED — this bullet cited the wrong file and the wrong engine.** It read "win rate 46.2%, EV per trade
+  −$0.230 with 90% CI [−0.373, −0.087], from `audits/boardroom_counterfactual_report_2026-10-13.md`". Those
+  figures are not in that file. They are `audits/grid_ablation_report_2026-10-13.md:44` (repeated at `:56`,
+  `:70`): **Chop Grid / Fleet-Capped Longs, N=1497, WR 45.2%**, PF 0.87, EV $-0.230 [−0.373, −0.087], total
+  −$344.18 — and the 46.2% is a different row again (pooled Deep-Chop ADX<20, N=892, `:151`). Use them only if
+  labelled as the **grid** engine with that file and that N. The audited **swing-4H** row is
+  `audits/gate_ablation_report_2026-10-13.md:12`: 81 trades, WR 40.7%, cumulative −14.01%, PF 0.89, EV −0.17%
+  [−0.73%, +0.40%]. See `task-6-verified-metrics.md` §7.
 - Sharpe ≈ −0.34 for the BTC full-stack arm, with the arithmetic shown: the ablation harness reported −2.49 using an assumed 2,190 trades/year, against roughly 40 trades/year in a 2-year arm with 81 trades, so the correctly annualized figure is −2.49 × √(40/2190). Add that the harness annualization was corrected on this branch and that arm-level numbers should be re-run before being quoted again.
 - The gates' contribution is `INCONCLUSIVE`: the ΔEV confidence intervals straddle zero.
 
@@ -912,7 +939,7 @@ Before writing any of those numbers, open the two named artefacts and confirm th
 
 - [ ] **Step 5: Verify no fabricated metric survives, and commit**
 
-Run: `grep -n "walk-forward\|Walk-Forward\|180-day\|1.47\|1.82\|2.14\|3.40\|100% on target" README.md`
+Run: `grep -n "walk-forward\|Walk-Forward\|180-day\|1.47\|1.82\|2.14\|3.40\|100% on target\|winners > losers\|Alpha Saving\|0.89\|1.55\|saves 42%" README.md`
 Expected: no matches other than deliberately-labelled historical notes saying a figure was superseded.
 
 ```bash
