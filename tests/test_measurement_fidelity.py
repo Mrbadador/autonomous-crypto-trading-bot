@@ -2974,13 +2974,20 @@ def test_g3_the_default_guard_cannot_pass_vacuously():
 
 def test_g3_the_unused_state_reads_are_gone():
     """`news_event_reason` and `ai_regime_updated_at` were read and read nowhere. Their defaults
-    ("No active events") were stand-ins in their own right."""
+    ("No active events") were stand-ins in their own right.
+
+    G-4 put the news half of this guard back to work: the gate line now publishes the reason the
+    calendar wrote, so `news_event_reason` is no longer a dead read and banning the key would
+    only ban fixing it. What this guard still pins is the thing G-3 was actually about — no dead
+    local (`news_reason`), and no stand-in default on the read. `test_g4_the_news_gate_reason_
+    reaches_a_published_line` is the other half: the key must be read *and* published.
+    """
     for path in (DASHBOARD, LEGACY_DASHBOARD):
         src = path.read_text(encoding="utf-8")
         assert "news_reason" not in src, (
-            f"{path.name} still reads the unused news_event_reason")
-        assert "news_event_reason" not in src, (
-            f"{path.name} still reads the unused news_event_reason")
+            f"{path.name} still binds the unused news_reason local")
+        assert 'query_system_state("news_event_reason", "No active events")' not in src, (
+            f"{path.name} gives news_event_reason a stand-in default")
     assert "arb_upd" not in DASHBOARD.read_text(encoding="utf-8"), (
         "dashboard.py still reads the unused ai_regime_updated_at")
 
@@ -3100,3 +3107,590 @@ def test_g3_the_banner_publishes_an_unmeasured_leverage_cap_and_fear_greed_as_ab
             f"{path.name} does not publish the leverage cap through the publisher")
         assert 'fg_text = f"{fg_num:.0f}/100" if fg_num is not None else "not measured"' in src, (
             f"{path.name} does not publish the Fear & Greed as an absence when it is missing")
+
+
+# ---------------------------------------------------------------------------
+# G-4 — the number-shaped stand-ins in the two Streamlit dashboards
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: the two dashboards are Streamlit scripts with module-level
+# DB reads, HTTP fetches and chart rendering, so no test imports them. The publishers they call are
+# pure, so `_published_number` and `_published_boolean` are compiled out of their own source and
+# called for real — that decides every behaviour claim here. The panels themselves are checked as
+# source text and as syntax trees: a stand-in reading that survives inside a panel is a reading the
+# panel publishes. Before/after render parity on this box (every measured digit unchanged, only the
+# `mlofi` -0.0 sign moving) was measured by hand against the read-only databases and is recorded in
+# the G-4 report; the committed suite cannot boot Streamlit, so it pins the source instead.
+#
+# The convention is the one G-1 and G-3 landed: a figure that was never recorded publishes an
+# absence — "not measured" plus the reason, a NOT MEASURED badge, neutral grey #94a3b8 — and never a
+# number. A recorded zero is a fact and stays a number, and a measured -0.0 keeps its sign.
+
+_G4_PUBLISHED = {}
+
+
+def _g4_helper(name, path=None):
+    """One of the G-4 publishers, extracted once per (file, name) and cached.
+
+    Lazy on purpose, as `_g3_helper` is: a helper that does not exist yet must fail the test that
+    asks for it, not the whole module at collection time.
+
+    `path` is resolved when the helper is called, not when it is defined, so the pre-fix re-run
+    can point the whole G-4 group at `git show HEAD:` extracts. A default argument would have
+    frozen the live path into the signature and the re-run would have proved nothing.
+    """
+    target = DASHBOARD if path is None else path
+    key = (str(target), name)
+    if key not in _G4_PUBLISHED:
+        _G4_PUBLISHED[key] = _dashboard_helper(name, target)
+    return _G4_PUBLISHED[key]
+
+
+# Every marker is ASCII-anchored so no emoji from either file enters a regex.
+_G4_BLOCKS = {
+    "macro": (r"^.*Macro & News Event Gating",
+              (r"\n[ \t]*st\.markdown\(\s*[\"']#### .*Microstructure Veto Pulse",)),
+    "ofi": (r"^.*Real-Time Order Flow Imbalance",
+            (r"\n[ \t]*# .*Quantitative Microstructure & Sizing Telemetry",
+             r"\n[ \t]*# Quantitative Regime Deck Gauges")),
+    "micro": (r"^[ \t]*# .*Quantitative Microstructure & Sizing Telemetry",
+              (r"\n[ \t]*# .*Bayesian Markov Chain",)),
+    "radar": (r"^[ \t]*# .*Live Microstructure & Alpha Telemetry Banner",
+              (r"\n[ \t]*fig_radar = build_position_candlestick_chart",)),
+    "fleet": (r"^.*Fleet Multi-Level Microstructure & Toxicity Matrix",
+              (r"\n[ \t]*# .*AI Order Flow Tape Whisperer",)),
+}
+
+_G4_DASHBOARD_BLOCKS = ("macro", "ofi", "micro", "radar", "fleet")
+_G4_LEGACY_BLOCKS = ("macro", "ofi")
+
+
+def _section_block(path, start_pattern, end_patterns):
+    """The source of one panel, so a stand-in reading inside it can be looked for.
+
+    The extraction stops at the first terminator, and also at the first line that dedents back
+    past the opening line — a panel is only the panel, and a fragment that ran on to the next
+    section would let a guard scan code it was never meant to speak about. The dedented fragment
+    is valid Python on its own, so the same text can be searched and parsed.
+    """
+    import textwrap
+
+    src = path.read_text(encoding="utf-8")
+    match = re.search(start_pattern, src, re.M)
+    assert match is not None, f"{path.name} has no block starting {start_pattern!r}"
+    lines = src[match.start():].split("\n")
+    start_indent = len(lines[0]) - len(lines[0].lstrip())
+    keep = []
+    for index, line in enumerate(lines):
+        if index and line.strip():
+            if len(line) - len(line.lstrip()) < start_indent:
+                break
+            if any(re.search(pattern, "\n" + line) for pattern in end_patterns):
+                break
+        keep.append(line)
+    block = textwrap.dedent("\n".join(keep))
+    assert block.strip(), f"{path.name}'s {start_pattern!r} block extracted empty"
+    return block
+
+
+def _g4_block(name, path):
+    start, ends = _G4_BLOCKS[name]
+    return _section_block(path, start, ends)
+
+
+def _g4_oracle_queries(path):
+    """Every literal SELECT a dashboard runs against oracle_microstructure.
+
+    Read out of the file's own syntax tree, so the test runs the query the shipped panel runs and
+    not a transcription of it.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    queries = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "query_db" and len(node.args) >= 2):
+            continue
+        sql = node.args[1]
+        if isinstance(sql, ast.Constant) and isinstance(sql.value, str) \
+                and "oracle_microstructure" in sql.value:
+            queries.append(sql.value)
+    assert queries, f"{path.name} runs no literal query against oracle_microstructure"
+    return queries
+
+
+def _g4_shipped_oracle_schema():
+    """The CREATE TABLE for oracle_microstructure that live_oracle.py actually ships."""
+    import ast
+
+    text = (REPO_ROOT / "live_oracle.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(text, filename="live_oracle.py")):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and "CREATE TABLE IF NOT EXISTS oracle_microstructure" in node.value:
+            return node.value
+    raise AssertionError("live_oracle.py does not create oracle_microstructure with a literal schema")
+
+
+def _g4_parent_map(tree):
+    import ast
+
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return parents
+
+
+def _g4_enclosing_measured_guard(node, parents, source):
+    import ast
+
+    ancestor = parents.get(id(node))
+    while ancestor is not None:
+        if isinstance(ancestor, ast.If):
+            test = ast.get_source_segment(source, ancestor.test) or ""
+            if "measured" in test:
+                return True
+        ancestor = parents.get(id(ancestor))
+    return False
+
+
+_G4_DERIVED_NAMES = frozenset({
+    "marker_pct", "imb_color", "bias_label", "micro_str", "vpin_color", "vpin_badge",
+    "mlofi_color", "micro_color", "hawkes_color", "hawkes_badge", "kyle_color", "kyle_badge",
+    "r_v_col", "r_v_lbl", "r_m_col", "r_h_col", "r_h_lbl", "r_kyle_col", "r_lvr_badge",
+    "v_stat", "flow_posture", "h_stat", "tox_stat",
+})
+
+# The colours a *measured* reading wears. None of them may be worn by an absence.
+_G4_MEASURED_COLOURS = ("#00ff66", "#ff003c", "#f59e0b", "#38bdf8", "#00e5ff")
+_G4_ABSENT_COLOUR = "#94a3b8"
+
+_G4_RETIRED_DASHBOARD = (
+    "imb", "bid_wall", "ask_wall", "micro_p", "micro_bps", "mlofi_val", "vpin_val",
+    "hawkes_spoof_val", "hawkes_rho_val", "kyle_lambda_val", "kyle_pctile_val",
+    "lvr_tax_bps_val", "tox_halt_val", "hawkes_veto_val", "live_kelly_pct",
+    "r_mlofi", "r_mp", "r_bps", "r_vpin", "r_h_spoof", "r_h_rho", "r_h_veto", "r_kyle",
+    "r_kyle_pct", "r_lvr", "r_tox_halt",
+    "s_mlofi", "s_mp", "s_bps", "s_vpin", "s_bbid", "s_bask", "s_h_spoof", "s_h_rho",
+    "s_h_veto", "s_kyle_pct", "s_lvr_tax", "s_tox_halt",
+)
+_G4_RETIRED_LEGACY = ("imb", "bid_wall", "ask_wall")
+
+
+# Group 1 — `_published_number`: a reading that was taken, or an absence that names itself.
+@pytest.mark.parametrize("value", [None, "", "   ", "n/a", "--", "None", "null", "nan",
+                                   float("nan"), True, False])
+def test_g4_published_number_reports_an_absence_for_an_unpublished_reading(value):
+    """There is no number to show, so there is no number shown, and the reason says why."""
+    out = _g4_helper("_published_number")(value, "no mlofi in microstructure telemetry")
+    assert out == {"value": None, "measured": False,
+                   "reason": "no mlofi in microstructure telemetry"}, out
+
+
+def test_g4_published_number_keeps_a_measured_zero_as_a_reading():
+    """A measured 0.0 is a fact. `float(0.0 or 0.5)` collapsed it into a stand-in."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        out = _g4_helper("_published_number", path)(0.0, "r")
+        assert out == {"value": 0.0, "measured": True, "reason": ""}, (path.name, out)
+        assert not (out["value"] is None or out["value"] is False), (path.name, out)
+
+
+def test_g4_published_number_reads_a_recorded_number_and_a_numeric_string():
+    for value, expected in ((0, 0.0), ("2.5", 2.5), (2.5, 2.5), ("  42  ", 42.0),
+                            (-0.0, -0.0), ("-1.86", -1.86)):
+        out = _g4_helper("_published_number")(value, "r")
+        assert out["measured"] is True, (value, out)
+        assert out["value"] == expected, (value, out)
+        assert out["reason"] == "", (value, out)
+
+
+def test_g4_published_number_keeps_the_sign_of_a_measured_negative_zero():
+    """The one sanctioned digit change G-4 makes: mlofi is measured as -0.0 and used to render
+    +0.000. A sign that a formatting choice erased is a reading that was overwritten."""
+    import math
+
+    out = _g4_helper("_published_number")(-0.0, "r")
+    assert out["measured"] is True, out
+    assert math.copysign(1.0, out["value"]) == -1.0, out
+    assert f"{out['value']:+.3f}" == "-0.000", out
+    assert f"{out['value']:+.2f}" == "-0.00", out
+
+
+def test_g4_the_two_dashboards_publish_the_same_numeric_readings():
+    cases = (0.0, -0.0, 0, 1, 2.5, "2.5", "", "n/a", None, True, False, "--", "1e3")
+    main = _g4_helper("_published_number", DASHBOARD)
+    legacy = _g4_helper("_published_number", LEGACY_DASHBOARD)
+    for value in cases:
+        assert main(value, "r") == legacy(value, "r"), (
+            f"the two dashboards disagree about {value!r}: {main(value, 'r')} != "
+            f"{legacy(value, 'r')}")
+
+
+# Group 2 — `_published_boolean`: a flag the daemon never computed is NOT "measured false".
+@pytest.mark.parametrize("value, expected", [
+    (True, True), (False, False), ("true", True), ("1", True), ("yes", True), ("on", True),
+    ("false", False), ("0", False), ("no", False), ("off", False), (1, True), (0, False),
+])
+def test_g4_published_boolean_reads_every_published_flag_spelling(value, expected):
+    """A JSON `false` is a measurement: the daemon computed the flag and the answer was no."""
+    out = _g4_helper("_published_boolean")(value, "no toxicity_halt in microstructure telemetry")
+    assert out == {"value": expected, "measured": True, "reason": ""}, out
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "maybe", "HALTED", "2", "1.0", {}, []])
+def test_g4_published_boolean_reports_an_absence_for_a_flag_that_was_never_computed(value):
+    """`bool(None)` is False, so the plain cast turned "never measured" into a measured no and
+    painted a green badge for it. An unrecognised spelling is not evidence of either state."""
+    out = _g4_helper("_published_boolean")(value, "no hawkes_veto in microstructure telemetry")
+    assert out == {"value": None, "measured": False,
+                   "reason": "no hawkes_veto in microstructure telemetry"}, out
+
+
+def test_g4_published_boolean_is_a_dashboard_only_helper():
+    """The legacy app renders no JSON boolean, so it gets no publisher for one. Pinning which
+    file owns which helper stops the two apps drifting into different vocabularies."""
+    assert "_published_boolean" in DASHBOARD.read_text(encoding="utf-8")
+    assert "_published_boolean" not in LEGACY_DASHBOARD.read_text(encoding="utf-8")
+
+
+# Group 3 — the duplicated copies are pinned to the same source, not merely to the same output.
+def test_g4_the_two_dashboards_carry_byte_identical_copies_of_published_number():
+    import ast
+
+    sources = []
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        text = path.read_text(encoding="utf-8")
+        node = next((n for n in ast.parse(text, filename=str(path)).body
+                     if isinstance(n, ast.FunctionDef) and n.name == "_published_number"), None)
+        assert node is not None, f"{path.name} has no module-level _published_number"
+        sources.append(ast.get_source_segment(text, node))
+    assert sources[0] == sources[1], (
+        "_published_number differs between the two dashboards, so the same fleet would be shown "
+        "two different readings")
+
+
+# Group 4 — the legacy OFI deck's query is a query that can run.
+def test_g4_the_microstructure_query_runs_against_the_shipped_oracle_schema(tmp_path):
+    """`scripts/live_dashboard.py` selected `updated_at` from a table whose column is
+    `timestamp`. The read-only app never raised into a visible panel — `query_db` swallows the
+    error into an empty frame — so the deck silently published its stand-in zeros forever.
+
+    The schema is the one live_oracle.py ships, lifted out of its source so this cannot drift,
+    and the query is the one the panel runs, lifted out of the panel the same way.
+    """
+    import sqlite3
+
+    db = tmp_path / "oracle_schema.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(_g4_shipped_oracle_schema())
+        conn.execute(
+            "INSERT INTO oracle_microstructure (timestamp, symbol, liquidity_imbalance, "
+            "vacuum_detected, bid_wall_price, bid_wall_size, ask_wall_price, ask_wall_size, "
+            "signal_multiplier) VALUES ('2026-10-22T00:00:00Z', 'BTC/USDT', 0.634, 0, "
+            "83865.70, 12.0, 83865.80, 9.0, 1.25)")
+        for path in (DASHBOARD, LEGACY_DASHBOARD):
+            for sql in _g4_oracle_queries(path):
+                assert "updated_at" not in sql, (
+                    f"{path.name} selects updated_at, which oracle_microstructure does not have: "
+                    f"{sql}")
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(sql).fetchone()
+                assert row is not None, (
+                    f"{path.name}'s query returns nothing against the shipped schema: {sql}")
+                assert dict(row) == {
+                    "symbol": "BTC/USDT", "liquidity_imbalance": 0.634,
+                    "bid_wall_price": 83865.70, "ask_wall_price": 83865.80,
+                    "timestamp": "2026-10-22T00:00:00Z"}, dict(row)
+
+
+# Group 5 — the macro gating column publishes no stand-in.
+def test_g4_the_macro_column_invents_no_regime_and_no_price():
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        block = _g4_block("macro", path)
+        src = path.read_text(encoding="utf-8")
+        for gone in ("get('macro_regime', 'NEUTRAL')", '"macro_regime", "NEUTRAL"',
+                     "num(df_macro.iloc[0].get(", "float(df_macro.iloc[0].get("):
+            assert gone not in block, (
+                f"{path.name}'s macro column still invents a reading with {gone!r}")
+        # The two shapes are the same defect in two different clothes: `num(x, 0.0)` in the main
+        # app and `float(x or 0.0)` in the legacy one both print a number for a row that has none.
+        # Only the *numeric* fallback is banned here: `str(.get("macro_regime") or "")` is the
+        # correct shape for a text reading, because the empty string it falls back on is what
+        # `_published_state` reports as an absence rather than dressing as a regime.
+        assert not re.search(r"\.get\([^)]*\)\s*or\s+[\d.]", block), (
+            f"{path.name}'s macro column still falls back on a numeric stand-in reading")
+        assert "±30m" not in src, (
+            f"{path.name} still claims a ±30m news window the code does not use")
+        assert '"Hurst >= 0.52 for Trend Breakouts"' not in src, (
+            f"{path.name} still hardcodes the Hurst floor instead of reading config")
+        assert "config.HURST_TREND_FLOOR" in block, (
+            f"{path.name} does not source the Hurst floor from the config that owns it")
+        assert "config.PRE_NEWS_MINUTES" in block and "config.POST_NEWS_MINUTES" in block, (
+            f"{path.name} does not source the news window from the config that owns it")
+        assert 'getattr(config' not in block, (
+            f"{path.name} reads config through a getattr fallback, which is itself a stand-in")
+
+
+def test_g4_the_macro_regime_has_three_states_and_never_collapses_them():
+    """A real regime is a reading; UNKNOWN is the sentinel recording that it could not resolve
+    one; a missing value is an absence. Dressed as NEUTRAL, all three read as an all-clear."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        block = _g4_block("macro", path)
+        assert 'no macro telemetry row recorded' in block, (
+            f"{path.name} does not name why the macro column is empty")
+        assert 'UNKNOWN (macro telemetry unresolved)' in block, (
+            f"{path.name} dresses an unresolved regime as a resolved one")
+        assert 'regime_state = _published_state(raw_regime, no_row)' in block, (
+            f"{path.name} does not read the macro regime through the publisher")
+        assert '#94a3b8' in block, f"{path.name} paints an unmeasured regime in a measured colour"
+
+
+def test_g4_the_news_gate_reason_reaches_a_published_line():
+    """G-3 banned this read because it was dead. G-4 puts it to work: the gate line now says
+    which event the gate is looking at, so the key must reach a rendered string."""
+    import ast
+
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        block = _g4_block("macro", path)
+        assert 'query_system_state("news_event_reason", "")' in block, (
+            f"{path.name} gives the news reason a default or does not read it")
+        tree = ast.parse(block, filename=str(path))
+        published = [ast.get_source_segment(block, node) for node in ast.walk(tree)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and node.func.attr == "write"]
+        assert any(seg and "gate_detail" in seg for seg in published), (
+            f"{path.name} reads the news gate reason and publishes nowhere")
+        assert '" — {html.escape(gate_reason)}"' in block, (
+            f"{path.name} interpolates the news gate reason into unsafe_allow_html unescaped")
+        assert 'gate_detail = ' in block and 'news_state["measured"] and gate_reason' in block, (
+            f"{path.name} publishes the gate reason even when the gate state was never measured")
+
+
+# Group 6 — no hardcoded leverage policy.
+def test_g4_the_leverage_line_publishes_the_published_leverage():
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert "3.0x CHOP / 5.0x TREND" not in src, (
+            f"{path.name} still prints a leverage policy nobody published")
+        assert 'lev_state = _published_number(query_system_state("recommended_leverage", "")' \
+            in src, f"{path.name} does not read the leverage through the number publisher"
+
+
+# Group 7 — the microstructure deck publishes no stand-in reading.
+def test_g4_the_micro_deck_publishes_no_stand_in_readings():
+    block = _g4_block("micro", DASHBOARD)
+    numbers = _numeric_constants(block, filename="dashboard.py micro deck")
+    assert 15.0 not in numbers, (
+        "the micro deck still falls back on the fabricated 15% Kelly reading")
+    assert "live_kelly_pct = 15.0" not in block, "the fabricated Kelly stand-in is back"
+    assert not re.search(r"\.get\([^)]*\)\s*or\s+", block), (
+        "the micro deck still invents a reading with a `.get(...) or` fallback")
+    for gone in ("mlofi_val = 0.0", "micro_p = 0.0", "micro_bps = 0.0", "vpin_val = 0.0",
+                 "hawkes_spoof_val = 0.0", "hawkes_rho_val = 0.0", "kyle_lambda_val = 0.0",
+                 "kyle_pctile_val = 0.5", "lvr_tax_bps_val = 0.0"):
+        assert gone not in block, f"the micro deck still initialises {gone}"
+    assert "NOT MEASURED" in block, (
+        "the micro deck has no badge for a reading that was never taken")
+
+
+def test_g4_the_kelly_card_publishes_the_computed_fraction_or_an_absence():
+    """The deck used to print 15.0% when RiskManager could not be built. A computed 0.0% is a
+    measurement (the engine says there is no edge); an exception is not."""
+    block = _g4_block("micro", DASHBOARD)
+    assert 'kelly_state = {"value": None, "measured": False, "reason": "no kelly fraction published"}' \
+        in block, "the Kelly card has no absence to fall back on"
+    assert "kelly_state = _published_number(rm_dash.calculate_empirical_kelly_fraction() * 100.0" \
+        in block, "the Kelly card does not publish the computed fraction"
+    assert '"no kelly fraction published"' in block, "the Kelly absence names no reason"
+
+
+# Group 8 — the radar banner and the fleet matrix publish no stand-in.
+@pytest.mark.parametrize("block_name", ["radar", "fleet"])
+def test_g4_the_symbol_panels_publish_no_stand_in(block_name):
+    block = _g4_block(block_name, DASHBOARD)
+    assert not re.search(r"\.get\([^)]*\)\s*or\s+", block), (
+        f"the {block_name} panel still invents a reading with a `.get(...) or` fallback")
+    assert "NOT MEASURED" in block, (
+        f"the {block_name} panel has no verdict for a reading that was never taken")
+    assert "microstructure telemetry published" in block, (
+        f"the {block_name} panel does not name which telemetry is missing")
+
+
+# Group 9 — a measured zero percentile survives.
+def test_g4_a_measured_zero_percentile_is_not_overwritten_by_its_own_stand_in():
+    """`float(ms_json.get("kyle_lambda_pctile", 0.5) or 0.5)` reads a measured 0.0 as falsy and
+    replaces it with 0.5 — the stand-in it was standing in for."""
+    assert _g4_helper("_published_number")(0.0, "r")["value"] == 0.0
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert 'float(ms_json.get("kyle_lambda_pctile", 0.5) or 0.5)' not in src, (
+        "the deck still overwrites a measured 0.0 percentile with 0.5")
+    assert '_published_number(ms_json.get("kyle_lambda_pctile") if ms_ok else None' in src, (
+        "the Kyle percentile is not read through the number publisher")
+
+
+# Group 10 — no retired bare reading survives.
+def test_g4_no_retired_bare_reading_survives():
+    """G-4.0: the old float names are gone because every line that did arithmetic on them now
+    reads a {"value", "measured"} dict instead. A name still bound means a line still doing
+    arithmetic on a value that can be absent — which raises TypeError and kills the panel."""
+    import ast
+
+    for path, retired in ((DASHBOARD, _G4_RETIRED_DASHBOARD),
+                          (LEGACY_DASHBOARD, _G4_RETIRED_LEGACY)):
+        bound = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+            if isinstance(node, ast.Name):
+                bound.add(node.id)
+            elif isinstance(node, ast.arg):
+                bound.add(node.arg)
+        survivors = sorted(set(retired) & bound)
+        assert not survivors, (
+            f"{path.name} still binds the retired reading(s) {survivors}; a derived line is "
+            "still treating an absent reading as a float")
+
+
+# Group 11 — every derived verdict is guarded by `measured`.
+def test_g4_every_derived_verdict_is_guarded_by_measured():
+    """The crash guard and the false-all-clear guard in one.
+
+    A verdict computed unconditionally from a reading that can be absent either raises TypeError
+    (a crashed panel publishes nothing at all) or, if the author remembered `or 0`, publishes a
+    verdict that was never measured.
+    """
+    import ast
+
+    total = 0
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        parents = _g4_parent_map(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+            else:
+                continue
+            for target in targets:
+                if not (isinstance(target, ast.Name)
+                        and target.id in _G4_DERIVED_NAMES):
+                    continue
+                total += 1
+                segment = ast.get_source_segment(source, node) or ""
+                assert "measured" in segment or _g4_enclosing_measured_guard(
+                    node, parents, source), (
+                    f"{path.name}:{node.lineno} derives {target.id} from a reading that can be "
+                    f"absent, unguarded:\n{segment}")
+    assert total >= 20, (
+        f"only {total} derived verdicts were found; the guard is scanning an empty region and "
+        "passing vacuously")
+
+
+@pytest.mark.parametrize("unguarded", ["if micro_p > 0 else", 'else "Tracking..."',
+                                       "if imb > 0.05 else", "if imb > 0.10 else"])
+def test_g4_the_unguarded_verdict_shapes_are_gone(unguarded):
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        assert unguarded not in path.read_text(encoding="utf-8"), (
+            f"{path.name} still derives a verdict from {unguarded!r}, which reads an absent "
+            "reading as a number")
+
+
+def test_g4_no_absence_is_painted_in_a_measured_colour():
+    """Neutral grey is the only colour an absence may wear. Green, amber, red, cyan and blue are
+    reserved for readings the fleet actually took.
+
+    Scoped to the panels G-4 rewrote. The capital block in the legacy app has a legitimate
+    `if not margin_measured:` / `elif …` ladder whose else-branch is the *measured* side, so a
+    file-wide walk reads it backwards; that panel is G-2's and is pinned by its own tests.
+    """
+    import ast
+
+    guards = 0
+    ternaries = 0
+    scope = [(name, DASHBOARD) for name in _G4_DASHBOARD_BLOCKS]
+    scope += [(name, LEGACY_DASHBOARD) for name in _G4_LEGACY_BLOCKS]
+    for block_name, path in scope:
+        block = _g4_block(block_name, path)
+        tree = ast.parse(block, filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If) and node.orelse and "measured" in (
+                    ast.get_source_segment(block, node.test) or ""):
+                guards += 1
+                for branch in node.orelse:
+                    for inner in ast.walk(branch):
+                        if not isinstance(inner, ast.Assign):
+                            continue
+                        for target in inner.targets:
+                            if not (isinstance(target, ast.Name)
+                                    and (target.id.endswith("_color")
+                                         or target.id.endswith("_col"))):
+                                continue
+                            segment = ast.get_source_segment(block, inner) or ""
+                            assert not any(colour in segment
+                                           for colour in _G4_MEASURED_COLOURS), (
+                                f"{path.name} {block_name} panel paints the absence "
+                                f"{target.id} in a measured colour: {segment}")
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.IfExp) \
+                    and isinstance(node.targets[0], ast.Name) \
+                    and (node.targets[0].id.endswith("_color")
+                         or node.targets[0].id.endswith("_col")):
+                test = ast.get_source_segment(block, node.value.test) or ""
+                if "measured" not in test:
+                    continue
+                ternaries += 1
+                orelse = ast.get_source_segment(block, node.value.orelse) or ""
+                assert _G4_ABSENT_COLOUR in orelse, (
+                    f"{path.name} {block_name} panel gives {node.targets[0].id} no neutral grey "
+                    f"for an absent reading: {orelse}")
+    assert guards >= 8 and ternaries >= 10, (
+        f"the colour guard inspected only {guards} measured-guards and {ternaries} verdict "
+        "ternaries; it is scanning an empty region and passing vacuously")
+
+
+# Group 12 — the OFI marker is not parked at the false centre.
+def test_g4_the_ofi_marker_is_omitted_when_the_reading_is_absent():
+    """The marker's 50% position IS the balanced assertion, drawn instead of written. Re-colouring
+    it would still assert a centre the panel never measured, so the div is omitted."""
+    import ast
+
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        block = _g4_block("ofi", path)
+        tree = ast.parse(block, filename=str(path))
+        parents = _g4_parent_map(tree)
+        found = 0
+        for node in ast.walk(tree):
+            segment = ast.get_source_segment(block, node)
+            if not isinstance(segment, str):
+                continue
+            if "left: {marker_pct}%" not in segment and \
+                    "background: #ffffff; border: 1px solid #000;" not in segment:
+                continue
+            # Only the construction that *emits* the div, not the giant f-string that contains it.
+            if not isinstance(node, (ast.JoinedStr, ast.Assign)):
+                continue
+            found += 1
+            assert _g4_enclosing_measured_guard(node, parents, block), (
+                f"{path.name}'s OFI marker div is emitted unconditionally:\n{segment[:200]}")
+        assert found, f"{path.name}'s OFI block no longer builds the marker div at all"
+        assert "{marker_html}" in block, (
+            f"{path.name}'s OFI deck does not interpolate the marker through a variable")
+        assert re.search(r'marker_html\s*=\s*""', block), (
+            f"{path.name}'s OFI deck has no empty marker for the absence case")
+
+
+# The absence convention itself, one step further than the panels can reach on a healthy box.
+def test_g4_the_absence_reasons_name_the_reading_that_is_missing():
+    """On this box every key is present, so the panels print today's digits and the reasons never
+    appear. They are still the difference between a blank and a blank that says why."""
+    block = _g4_block("micro", DASHBOARD)
+    assert "microstructure telemetry is not readable" in block
+    assert '"no mlofi in microstructure telemetry"' in block
+    assert '"no vpin in microstructure telemetry"' in block
+    assert '"no kyle_lambda_pctile in microstructure telemetry"' in block
+    ofi = _g4_block("ofi", DASHBOARD)
+    assert "no oracle microstructure row recorded" in ofi
+    assert "unknown symbol" in ofi, "the OFI deck still prints a blank symbol for a missing one"
+    note = _g4_helper("_absence_note")("no vpin in microstructure telemetry")
+    assert note.strip().startswith("<span style="), note
+    assert "#94a3b8" in note, note
+    assert "(no vpin in microstructure telemetry)</span>" in note, note

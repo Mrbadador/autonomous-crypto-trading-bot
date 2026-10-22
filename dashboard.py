@@ -1139,6 +1139,40 @@ def _gauge_display(value, formatter, classify, absent_reason) -> dict:
     return {"value": rendered, "delta": classified, "arrow": "auto", "color": "normal"}
 
 
+def _published_number(value, absent_reason: str) -> dict:
+    """Return {"value", "measured", "reason"} for a numeric reading.
+
+    A number that no source produced has nothing to publish, and None is what tells that
+    absence apart from a measured zero. `float(value or 0.0)` cannot: it invents a zero for a
+    missing key, and it overwrites a measured zero with the stand-in it was standing in for.
+    """
+    number = _optional_float(value)
+    if number is None:
+        return {"value": None, "measured": False, "reason": absent_reason}
+    return {"value": number, "measured": True, "reason": ""}
+
+
+def _published_boolean(value, absent_reason: str) -> dict:
+    """Return {"value", "measured", "reason"} for a tri-state boolean reading.
+
+    A JSON `false` is a measurement: the daemon computed the flag and the answer was no.
+    Only a missing or null key is an absence. `bool(None)` is False, so the plain
+    `bool(raw)` the code used turned "never measured" into "measured false" and published a
+    green badge for it.
+    """
+    if isinstance(value, bool):
+        return {"value": value, "measured": True, "reason": ""}
+    if isinstance(value, int) and value in (0, 1):
+        return {"value": bool(value), "measured": True, "reason": ""}
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return {"value": True, "measured": True, "reason": ""}
+        if text in ("false", "0", "no", "off"):
+            return {"value": False, "measured": True, "reason": ""}
+    return {"value": None, "measured": False, "reason": absent_reason}
+
+
 def _recorded_amount(*raw_values) -> float:
     """Return the first usable amount among `raw_values`, or None when none was recorded.
 
@@ -2802,6 +2836,10 @@ with tab_live:
         r_live_p = num(live_prices.get(radar_clean), 0.0)
 
         # 🔬 Live Microstructure & Alpha Telemetry Banner for Selected Asset
+        # A symbol entry that lacks a key used to publish 0.00 for it and a green verdict
+        # built on that zero. Each field is now measured or absent on its own; an absent one
+        # reads "not measured" in the banner's own monospace, and its label reads NOT
+        # MEASURED in neutral grey.
         try:
             if os.path.exists(MICROSTRUCTURE_STATE_FILE):
                 with open(MICROSTRUCTURE_STATE_FILE, "r", encoding="utf-8") as f_radar_ms:
@@ -2809,35 +2847,57 @@ with tab_live:
                 r_sym_code = radar_sym.replace("/", "").replace("-", "").upper()
                 r_sym_info = r_ms_data.get("symbols", {}).get(r_sym_code, {})
                 if r_sym_info:
-                    r_mlofi = float(r_sym_info.get("mlofi", 0.0) or 0.0)
-                    r_mp = float(r_sym_info.get("micro_price", 0.0) or 0.0)
-                    r_bps = float(r_sym_info.get("micro_price_bps", 0.0) or 0.0)
-                    r_vpin = float(r_sym_info.get("vpin", 0.0) or 0.0)
-                    r_h_spoof = float(r_sym_info.get("hawkes_spoof_index", 0.0) or 0.0)
-                    r_h_rho = float(r_sym_info.get("hawkes_rho", 0.0) or 0.0)
-                    r_h_veto = bool(r_sym_info.get("hawkes_veto", False))
-                    r_kyle = float(r_sym_info.get("kyle_lambda", 0.0) or 0.0)
-                    r_kyle_pct = float(r_sym_info.get("kyle_lambda_pctile", 0.5) or 0.5)
-                    r_lvr = float(r_sym_info.get("lvr_tax_bps", 0.0) or 0.0)
-                    r_tox_halt = bool(r_sym_info.get("toxicity_halt", False))
-                    
-                    r_v_col = "#00ff66" if r_vpin < 0.45 else ("#f59e0b" if r_vpin < 0.70 else "#ff003c")
-                    r_v_lbl = "Benign Flow" if r_vpin < 0.45 else ("Caution Flow" if r_vpin < 0.70 else "TOXIC CASCADE")
-                    r_m_col = "#00ff66" if r_mlofi > 0.05 else ("#ff003c" if r_mlofi < -0.05 else "#94a3b8")
-                    r_h_col = "#ff003c" if r_h_veto or r_h_spoof > 0.72 or r_h_rho >= 1.0 else ("#f59e0b" if r_h_spoof > 0.45 else "#00ff66")
-                    r_h_lbl = "VETO" if r_h_veto else ("ELEVATED" if r_h_spoof > 0.45 else "STATIONARY")
-                    r_kyle_col = "#00ff66" if r_kyle_pct < 0.60 else ("#f59e0b" if r_kyle_pct < 0.85 else "#ff003c")
-                    r_lvr_badge = "<b style='color: #ff003c;'>[TOXIC HALT]</b>" if r_tox_halt else ""
-                    
+                    r_absent = f"no {radar_sym} microstructure telemetry published"
+                    r_mlofi_st = _published_number(r_sym_info.get("mlofi"), r_absent)
+                    r_micro_price_st = _published_number(r_sym_info.get("micro_price"), r_absent)
+                    r_micro_bps_st = _published_number(r_sym_info.get("micro_price_bps"), r_absent)
+                    r_vpin_st = _published_number(r_sym_info.get("vpin"), r_absent)
+                    r_hawkes_spoof_st = _published_number(r_sym_info.get("hawkes_spoof_index"), r_absent)
+                    r_hawkes_rho_st = _published_number(r_sym_info.get("hawkes_rho"), r_absent)
+                    r_hawkes_veto_st = _published_boolean(r_sym_info.get("hawkes_veto"), r_absent)
+                    r_kyle_lambda_st = _published_number(r_sym_info.get("kyle_lambda"), r_absent)
+                    r_kyle_pctile_st = _published_number(r_sym_info.get("kyle_lambda_pctile"), r_absent)
+                    r_lvr_tax_st = _published_number(r_sym_info.get("lvr_tax_bps"), r_absent)
+                    r_tox_halt_st = _published_boolean(r_sym_info.get("toxicity_halt"), r_absent)
+
+                    r_mlofi_text = f"{r_mlofi_st['value']:+.2f}" if r_mlofi_st["measured"] else "not measured"
+                    r_m_col = ("#00ff66" if r_mlofi_st["value"] > 0.05 else ("#ff003c" if r_mlofi_st["value"] < -0.05 else "#94a3b8")) if r_mlofi_st["measured"] else "#94a3b8"
+                    r_micro_price_text = f"${r_micro_price_st['value']:,.4f}" if r_micro_price_st["measured"] else "not measured"
+                    r_micro_price_color = "#00e5ff" if r_micro_price_st["measured"] else "#94a3b8"
+                    r_micro_bps_text = f"{r_micro_bps_st['value']:+.2f} bps" if r_micro_bps_st["measured"] else "not measured"
+                    r_bps_color = ("#00ff66" if r_micro_bps_st["value"] >= 0 else "#ff003c") if r_micro_bps_st["measured"] else "#94a3b8"
+                    r_vpin_text = f"{r_vpin_st['value']:.3f}" if r_vpin_st["measured"] else "not measured"
+                    r_v_col = ("#00ff66" if r_vpin_st["value"] < 0.45 else ("#f59e0b" if r_vpin_st["value"] < 0.70 else "#ff003c")) if r_vpin_st["measured"] else "#94a3b8"
+                    r_v_lbl = ("Benign Flow" if r_vpin_st["value"] < 0.45 else ("Caution Flow" if r_vpin_st["value"] < 0.70 else "TOXIC CASCADE")) if r_vpin_st["measured"] else "NOT MEASURED"
+                    r_kyle_lambda_text = f"{r_kyle_lambda_st['value']:.4f}" if r_kyle_lambda_st["measured"] else "not measured"
+                    r_kyle_pctile_text = f"{r_kyle_pctile_st['value']*100:.0f}%" if r_kyle_pctile_st["measured"] else "not measured"
+                    r_kyle_col = ("#00ff66" if r_kyle_pctile_st["value"] < 0.60 else ("#f59e0b" if r_kyle_pctile_st["value"] < 0.85 else "#ff003c")) if r_kyle_pctile_st["measured"] else "#94a3b8"
+                    r_lvr_tax_text = f"{r_lvr_tax_st['value']:.2f} bps" if r_lvr_tax_st["measured"] else "not measured"
+                    r_lvr_color = ("#ff003c" if r_lvr_tax_st["value"] >= 10.0 else "#38bdf8") if r_lvr_tax_st["measured"] else "#94a3b8"
+                    if r_hawkes_veto_st["measured"] and r_hawkes_spoof_st["measured"] and r_hawkes_rho_st["measured"]:
+                        r_h_spoof_text = f"{r_hawkes_spoof_st['value']:.3f}"
+                        r_h_rho_text = f"{r_hawkes_rho_st['value']:.2f}"
+                        r_h_col = "#ff003c" if (r_hawkes_veto_st["value"] or r_hawkes_spoof_st["value"] > 0.72 or r_hawkes_rho_st["value"] >= 1.0) else ("#f59e0b" if r_hawkes_spoof_st["value"] > 0.45 else "#00ff66")
+                        r_h_lbl = "VETO" if r_hawkes_veto_st["value"] else ("ELEVATED" if r_hawkes_spoof_st["value"] > 0.45 else "STATIONARY")
+                    else:
+                        r_h_spoof_text = "not measured"
+                        r_h_rho_text = "not measured"
+                        r_h_col = "#94a3b8"
+                        r_h_lbl = "NOT MEASURED"
+                    if r_tox_halt_st["measured"]:
+                        r_lvr_badge = "<b style='color: #ff003c;'>[TOXIC HALT]</b>" if r_tox_halt_st["value"] else ""
+                    else:
+                        r_lvr_badge = "<b style='color: #94a3b8;'>[NOT MEASURED]</b>"
+
                     st.markdown(f"""
                     <div style="background: rgba(13, 18, 31, 0.85); border: 1px solid #1e293b; border-left: 3px solid #00e5ff; border-radius: 6px; padding: 10px 16px; margin-top: 10px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; font-size: 0.82rem; font-family: 'JetBrains Mono', monospace;">
                         <span>🔬 <b>{radar_sym} Alpha Telemetry:</b></span>
-                        <span>Micro-Price: <b style="color: #00e5ff;">${r_mp:,.4f}</b> (<b style="color: {'#00ff66' if r_bps >= 0 else '#ff003c'};">{r_bps:+.2f} bps</b>)</span>
-                        <span>MLOFI (10-Level): <b style="color: {r_m_col};">{r_mlofi:+.2f}</b></span>
-                        <span>VPIN: <b style="color: {r_v_col};">{r_vpin:.3f} [{r_v_lbl}]</b></span>
-                        <span>Hawkes Spoof: <b style="color: {r_h_col};">{r_h_spoof:.3f} (ρ={r_h_rho:.2f}) [{r_h_lbl}]</b></span>
-                        <span>Kyle's λ (Impact): <b style="color: {r_kyle_col};">{r_kyle:.4f} ({r_kyle_pct*100:.0f}%)</b></span>
-                        <span>LVR Tax (σ²/8): <b style="color: {'#ff003c' if r_lvr >= 10.0 else '#38bdf8'};">{r_lvr:.2f} bps</b> {r_lvr_badge}</span>
+                        <span>Micro-Price: <b style="color: {r_micro_price_color};">{r_micro_price_text}</b> (<b style="color: {r_bps_color};">{r_micro_bps_text}</b>)</span>
+                        <span>MLOFI (10-Level): <b style="color: {r_m_col};">{r_mlofi_text}</b></span>
+                        <span>VPIN: <b style="color: {r_v_col};">{r_vpin_text} [{r_v_lbl}]</b></span>
+                        <span>Hawkes Spoof: <b style="color: {r_h_col};">{r_h_spoof_text} (ρ={r_h_rho_text}) [{r_h_lbl}]</b></span>
+                        <span>Kyle's λ (Impact): <b style="color: {r_kyle_col};">{r_kyle_lambda_text} ({r_kyle_pctile_text})</b></span>
+                        <span>LVR Tax (σ²/8): <b style="color: {r_lvr_color};">{r_lvr_tax_text}</b> {r_lvr_badge}</span>
                         <span style="color: #94a3b8; font-size: 0.75rem;">🛡️ CRC32 Verified</span>
                     </div>
                     """, unsafe_allow_html=True)
@@ -4119,7 +4179,10 @@ with tab_risk:
     rcol1, rcol2, rcol3 = st.columns(3)
     with rcol1:
         st.markdown("#### 🔒 Margin, Leverage & Allocation")
-        st.write(f"• **Dynamic Leverage:** 3.0x CHOP / 5.0x TREND *(Auto-Adapting)*")
+        lev_state = _published_number(query_system_state("recommended_leverage", ""), "no recommended leverage published")
+        lev_text = f"{lev_state['value']:g}x" if lev_state["measured"] else "not measured"
+        lev_note = "" if lev_state["measured"] else _absence_note(lev_state["reason"])
+        st.write(f"• **Dynamic Leverage:** {lev_text}{lev_note} *(regime classifier)*", unsafe_allow_html=True)
         st.write(f"• **Core Allocation:** 2 Reserved Slots for BTC/ETH")
         st.write(f"• **Altcoin Ceiling:** 3 Coins Max Concurrent (out of {max_coin_slots})")
         st.write(f"• **Global Margin Limit:** {margin_limit_pct:.1f}% Ceiling (30% Cash Buffer)")
@@ -4128,16 +4191,45 @@ with tab_risk:
     with rcol2:
         st.markdown("#### 🌊 Macro & News Event Gating")
         df_macro = query_db(TRADING_LEDGER_DB, "SELECT * FROM macro_market_context ORDER BY id DESC LIMIT 1")
-        if not df_macro.empty:
-            spy_p = num(df_macro.iloc[0].get('spy_price'), 0.0)
-            uup_p = num(df_macro.iloc[0].get('uup_price'), 0.0)
-            dxy_p = num(df_macro.iloc[0].get('dxy_price'), 0.0)
-            st.write(f"• **S&P 500 (SPY):** ${spy_p:,.2f}")
-            st.write(f"• **USD Index (DXY):** {dxy_p:.2f}")
-            st.write(f"• **Invesco DB US Dollar (UUP):** ${uup_p:.2f}")
-            st.write(f"• **Macro Regime:** {df_macro.iloc[0].get('macro_regime', 'NEUTRAL')}")
-        st.write(f"• **News Calendar Gate:** ±30m window around FOMC/CPI/NFP")
-        st.write(f"• **Hurst Exponent Filter:** Hurst >= 0.52 for Trend Breakouts")
+        macro_row = df_macro.iloc[0] if not df_macro.empty else None
+        no_row = "no macro telemetry row recorded"
+        spy_state = _published_number(macro_row.get("spy_price") if macro_row is not None else None, no_row)
+        uup_state = _published_number(macro_row.get("uup_price") if macro_row is not None else None, no_row)
+        dxy_state = _published_number(macro_row.get("dxy_price") if macro_row is not None else None, no_row)
+        raw_regime = str(macro_row.get("macro_regime") or "").strip() if macro_row is not None else ""
+        regime_state = _published_state(raw_regime, no_row)
+
+        spy_text = f"${spy_state['value']:,.2f}" if spy_state["measured"] else "not measured"
+        spy_note = "" if spy_state["measured"] else _absence_note(spy_state["reason"])
+        dxy_text = f"{dxy_state['value']:.2f}" if dxy_state["measured"] else "not measured"
+        dxy_note = "" if dxy_state["measured"] else _absence_note(dxy_state["reason"])
+        uup_text = f"${uup_state['value']:,.2f}" if uup_state["measured"] else "not measured"
+        uup_note = "" if uup_state["measured"] else _absence_note(uup_state["reason"])
+        st.write(f"• **S&P 500 (SPY):** {spy_text}{spy_note}", unsafe_allow_html=True)
+        st.write(f"• **USD Index (DXY):** {dxy_text}{dxy_note}", unsafe_allow_html=True)
+        st.write(f"• **Invesco DB US Dollar (UUP):** {uup_text}{uup_note}", unsafe_allow_html=True)
+        # Three cases, and they must not collapse into each other: a real regime is a reading
+        # and is published as one; "UNKNOWN" is the sentinel recording that it could not
+        # resolve the regime, which is not a measured regime and not a neutral one either; a
+        # missing value is an absence that names its reason.
+        if not regime_state["measured"]:
+            st.write(f"• **Macro Regime:** <b style='color: #94a3b8;'>not measured</b>{_absence_note(regime_state['reason'])}", unsafe_allow_html=True)
+        elif regime_state["text"].upper() == "UNKNOWN":
+            st.write("• **Macro Regime:** <b style='color: #94a3b8;'>UNKNOWN (macro telemetry unresolved)</b>", unsafe_allow_html=True)
+        else:
+            st.write(f"• **Macro Regime:** {regime_state['text']}")
+
+        news_state = _published_flag(query_system_state("news_event_active", ""), "no news gate state published")
+        gate_reason = str(query_system_state("news_event_reason", "") or "").strip()
+        news_text = ("ACTIVE" if news_state["flag"] else "CLEAR") if news_state["measured"] else "not measured"
+        news_note = "" if news_state["measured"] else _absence_note(news_state["reason"])
+        gate_detail = f" — {html.escape(gate_reason)}" if (news_state["measured"] and gate_reason) else ""
+        st.write(
+            f"• **News Calendar Gate:** {news_text}{gate_detail}{news_note} "
+            f"(window −{int(config.PRE_NEWS_MINUTES)}m/+{int(config.POST_NEWS_MINUTES)}m around FOMC/CPI/NFP)",
+            unsafe_allow_html=True,
+        )
+        st.write(f"• **Hurst Exponent Filter:** Hurst >= {config.HURST_TREND_FLOOR} for Trend Breakouts")
 
     with rcol3:
         st.markdown("#### 🔬 Microstructure Veto Pulse")
@@ -4174,106 +4266,164 @@ with tab_risk:
     st.markdown("#### 🔬 Real-Time Order Flow Imbalance (OFI) & Regime Strength Deck")
 
     df_micro = query_db(TRADING_LEDGER_DB, "SELECT symbol, liquidity_imbalance, bid_wall_price, ask_wall_price, timestamp FROM oracle_microstructure ORDER BY id DESC LIMIT 1")
-    imb = 0.0
-    bid_wall = 0.0
-    ask_wall = 0.0
-    micro_sym = "BTC/USDT"
-    if not df_micro.empty:
-        imb = num(df_micro.iloc[0].get('liquidity_imbalance'), 0.0)
-        bid_wall = num(df_micro.iloc[0].get('bid_wall_price'), 0.0)
-        ask_wall = num(df_micro.iloc[0].get('ask_wall_price'), 0.0)
-        micro_sym = str(df_micro.iloc[0].get('symbol', 'BTC/USDT'))
+    micro_row = df_micro.iloc[0] if not df_micro.empty else None
+    no_ofi = "no oracle microstructure row recorded"
+    imb_state = _published_number(micro_row.get("liquidity_imbalance") if micro_row is not None else None, no_ofi)
+    bid_state = _published_number(micro_row.get("bid_wall_price") if micro_row is not None else None, no_ofi)
+    ask_state = _published_number(micro_row.get("ask_wall_price") if micro_row is not None else None, no_ofi)
+    raw_sym = str(micro_row.get("symbol") or "").strip() if micro_row is not None else ""
+    micro_sym = raw_sym if raw_sym else "unknown symbol"
+    safe_micro_sym = html.escape(micro_sym)
 
-    # Visual bipolar OFI bar calculation (-1.0 to +1.0 mapped to 0% to 100%)
-    marker_pct = max(0.0, min(100.0, ((imb + 1.0) / 2.0) * 100.0))
-    imb_color = "#00ff66" if imb > 0.05 else ("#ff003c" if imb < -0.05 else "#94a3b8")
-    bias_label = "AGGRESSIVE BUY PRESSURE" if imb > 0.10 else ("AGGRESSIVE SELL PRESSURE" if imb < -0.10 else "BALANCED LIQUIDITY")
+    # Visual bipolar OFI bar calculation (-1.0 to +1.0 mapped to 0% to 100%). The bar's 50%
+    # position IS the "balanced" assertion, so a marker parked there is the same false
+    # all-clear as the BALANCED LIQUIDITY label, drawn instead of written: when the reading
+    # is absent the marker is omitted entirely and the verdict reads NOT MEASURED.
+    if imb_state["measured"]:
+        imb_v = imb_state["value"]
+        marker_pct = max(0.0, min(100.0, ((imb_v + 1.0) / 2.0) * 100.0))
+        imb_color = "#00ff66" if imb_v > 0.05 else ("#ff003c" if imb_v < -0.05 else "#94a3b8")
+        bias_label = "AGGRESSIVE BUY PRESSURE" if imb_v > 0.10 else ("AGGRESSIVE SELL PRESSURE" if imb_v < -0.10 else "BALANCED LIQUIDITY")
+        ofi_text = f"{imb_v:+.3f}"
+        ofi_note = ""
+        marker_html = (
+            f"<div style=\"position: absolute; left: {marker_pct}%; top: -4px; width: 8px; height: 24px; "
+            f"background: #ffffff; border: 1px solid #000; border-radius: 4px; "
+            f"transform: translateX(-50%); box-shadow: 0 0 10px #ffffff;\"></div>"
+        )
+    else:
+        imb_color = "#94a3b8"
+        bias_label = "NOT MEASURED"
+        ofi_text = "not measured"
+        ofi_note = _absence_note(imb_state["reason"])
+        marker_html = ""
+
+    bid_text = f"${bid_state['value']:,.2f}" if bid_state["measured"] else "not measured"
+    bid_color = "#00ff66" if bid_state["measured"] else "#94a3b8"
+    bid_note = "" if bid_state["measured"] else _absence_note(bid_state["reason"])
+    ask_text = f"${ask_state['value']:,.2f}" if ask_state["measured"] else "not measured"
+    ask_color = "#ff003c" if ask_state["measured"] else "#94a3b8"
+    ask_note = "" if ask_state["measured"] else _absence_note(ask_state["reason"])
 
     st.markdown(f"""
     <div style="background: #0d121f; border: 1px solid #1e293b; border-radius: 8px; padding: 16px 20px; margin-bottom: 20px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;">
             <span style="color: #ff003c; font-weight: 700;">🔴 SELL PRESSURE (-1.0)</span>
             <span style="color: {imb_color}; font-weight: 800; font-size: 1.05rem;">
-                {micro_sym} OFI: {imb:+.3f} [{bias_label}]
+                {safe_micro_sym} OFI: {ofi_text} [{bias_label}]{ofi_note}
             </span>
             <span style="color: #00ff66; font-weight: 700;">🟢 BUY PRESSURE (+1.0)</span>
         </div>
         <div style="position: relative; width: 100%; height: 16px; background: linear-gradient(90deg, rgba(255,0,60,0.6) 0%, rgba(30,41,59,0.7) 50%, rgba(0,255,102,0.6) 100%); border-radius: 8px;">
-            <div style="position: absolute; left: {marker_pct}%; top: -4px; width: 8px; height: 24px; background: #ffffff; border: 1px solid #000; border-radius: 4px; transform: translateX(-50%); box-shadow: 0 0 10px #ffffff;"></div>
+            {marker_html}
         </div>
         <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #94a3b8; margin-top: 10px;">
-            <span>🟢 Major Bid Wall: <b style="color: #00ff66;">${bid_wall:,.2f}</b></span>
+            <span>🟢 Major Bid Wall: <b style="color: {bid_color};">{bid_text}</b>{bid_note}</span>
             <span>⚡ Stream: <b style="color: #00e5ff;">100ms L2 Order Book</b></span>
-            <span>🔴 Major Ask Wall: <b style="color: #ff003c;">${ask_wall:,.2f}</b></span>
+            <span>🔴 Major Ask Wall: <b style="color: {ask_color};">{ask_text}</b>{ask_note}</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
     # 🔬 Quantitative Microstructure & Sizing Telemetry (Scouted Alpha Engine)
-    mlofi_val = 0.0
-    micro_p = 0.0
-    micro_bps = 0.0
-    vpin_val = 0.0
-    hawkes_spoof_val = 0.0
-    hawkes_rho_val = 0.0
-    hawkes_veto_val = False
-    kyle_lambda_val = 0.0
-    kyle_pctile_val = 0.5
-    lvr_tax_bps_val = 0.0
-    tox_halt_val = False
+    # Every one of these eleven readings is measured or absent, per key. A missing key is an
+    # absence and never a zero: `float(x or 0.0)` invented 0.0 for a key nobody wrote, and
+    # `float(x or 0.5)` overwrote a measured 0.0 percentile with the stand-in it was standing
+    # in for. A recorded zero — including a measured -0.0 — is a fact and keeps its sign.
+    ms_json = None
     try:
         if os.path.exists(MICROSTRUCTURE_STATE_FILE):
             with open(MICROSTRUCTURE_STATE_FILE, "r", encoding="utf-8") as f_ms:
                 ms_json = json.load(f_ms)
-                mlofi_val = float(ms_json.get("mlofi", 0.0) or 0.0)
-                micro_p = float(ms_json.get("micro_price", 0.0) or 0.0)
-                micro_bps = float(ms_json.get("micro_price_bps", 0.0) or 0.0)
-                vpin_val = float(ms_json.get("vpin", 0.0) or 0.0)
-                hawkes_spoof_val = float(ms_json.get("hawkes_spoof_index", 0.0) or 0.0)
-                hawkes_rho_val = float(ms_json.get("hawkes_rho", 0.0) or 0.0)
-                hawkes_veto_val = bool(ms_json.get("hawkes_veto", False))
-                kyle_lambda_val = float(ms_json.get("kyle_lambda", 0.0) or 0.0)
-                kyle_pctile_val = float(ms_json.get("kyle_lambda_pctile", 0.5) or 0.5)
-                lvr_tax_bps_val = float(ms_json.get("lvr_tax_bps", 0.0) or 0.0)
-                tox_halt_val = bool(ms_json.get("toxicity_halt", False))
     except Exception:
-        pass
+        ms_json = None
+    ms_ok = isinstance(ms_json, dict)
+    no_ms = "microstructure telemetry is not readable"
 
-    # Kelly Sizing fraction
-    live_kelly_pct = 15.0
+    mlofi_state = _published_number(ms_json.get("mlofi") if ms_ok else None,
+                                     no_ms if not ms_ok else "no mlofi in microstructure telemetry")
+    micro_p_state = _published_number(ms_json.get("micro_price") if ms_ok else None,
+                                       no_ms if not ms_ok else "no micro_price in microstructure telemetry")
+    micro_bps_state = _published_number(ms_json.get("micro_price_bps") if ms_ok else None,
+                                         no_ms if not ms_ok else "no micro_price_bps in microstructure telemetry")
+    vpin_state = _published_number(ms_json.get("vpin") if ms_ok else None,
+                                    no_ms if not ms_ok else "no vpin in microstructure telemetry")
+    hawkes_spoof_state = _published_number(ms_json.get("hawkes_spoof_index") if ms_ok else None,
+                                            no_ms if not ms_ok else "no hawkes_spoof_index in microstructure telemetry")
+    hawkes_rho_state = _published_number(ms_json.get("hawkes_rho") if ms_ok else None,
+                                          no_ms if not ms_ok else "no hawkes_rho in microstructure telemetry")
+    hawkes_veto_state = _published_boolean(ms_json.get("hawkes_veto") if ms_ok else None,
+                                            no_ms if not ms_ok else "no hawkes_veto in microstructure telemetry")
+    kyle_pctile_state = _published_number(ms_json.get("kyle_lambda_pctile") if ms_ok else None,
+                                           no_ms if not ms_ok else "no kyle_lambda_pctile in microstructure telemetry")
+    lvr_tax_state = _published_number(ms_json.get("lvr_tax_bps") if ms_ok else None,
+                                       no_ms if not ms_ok else "no lvr_tax_bps in microstructure telemetry")
+    tox_halt_state = _published_boolean(ms_json.get("toxicity_halt") if ms_ok else None,
+                                         no_ms if not ms_ok else "no toxicity_halt in microstructure telemetry")
+
+    # Kelly Sizing fraction. A measured 0.0% is a measurement — the engine returns 0.0 when
+    # there is no edge. Only an exception or a missing import is an absence, so this deck no
+    # longer publishes a fabricated 15% when RiskManager cannot be built.
+    kelly_state = {"value": None, "measured": False, "reason": "no kelly fraction published"}
     try:
         from risk_manager import RiskManager
         rm_dash = RiskManager()
-        live_kelly_pct = rm_dash.calculate_empirical_kelly_fraction() * 100.0
+        kelly_state = _published_number(rm_dash.calculate_empirical_kelly_fraction() * 100.0, "no kelly fraction published")
     except Exception:
         pass
 
-    vpin_color = "#00ff66" if vpin_val < 0.45 else ("#f59e0b" if vpin_val < 0.70 else "#ff003c")
-    vpin_badge = "🟢 BENIGN FLOW" if vpin_val < 0.45 else ("🟡 CAUTION FLOW" if vpin_val < 0.70 else "🔴 TOXIC CASCADE")
-    mlofi_color = "#00ff66" if mlofi_val > 0.05 else ("#ff003c" if mlofi_val < -0.05 else "#94a3b8")
-    micro_color = "#00ff66" if micro_bps > 0 else ("#ff003c" if micro_bps < 0 else "#94a3b8")
-    hawkes_color = "#ff003c" if (hawkes_veto_val or hawkes_spoof_val > 0.72) else ("#f59e0b" if hawkes_spoof_val > 0.45 else "#00ff66")
-    hawkes_badge = "🔴 VETO TRIGGERED" if hawkes_veto_val else ("🟡 ELEVATED FLUX" if hawkes_spoof_val > 0.45 else "🟢 ORDER FLOW NORMAL")
-    kyle_color = "#ff003c" if (tox_halt_val or kyle_pctile_val >= 0.90) else ("#f59e0b" if kyle_pctile_val >= 0.75 else "#00ff66")
-    kyle_badge = "🔴 TOXICITY HALT" if tox_halt_val else (f"Pctile: {kyle_pctile_val*100:.0f}%")
+    # Derived verdicts read the measured value only when there is one; an absent reading
+    # gives the neutral grey and the NOT MEASURED badge, never a green all-clear.
+    mlofi_text = f"{mlofi_state['value']:+.3f}" if mlofi_state["measured"] else "not measured"
+    mlofi_color = ("#00ff66" if mlofi_state["value"] > 0.05 else ("#ff003c" if mlofi_state["value"] < -0.05 else "#94a3b8")) if mlofi_state["measured"] else "#94a3b8"
+    vpin_text = f"{vpin_state['value']:.3f}" if vpin_state["measured"] else "not measured"
+    vpin_color = ("#00ff66" if vpin_state["value"] < 0.45 else ("#f59e0b" if vpin_state["value"] < 0.70 else "#ff003c")) if vpin_state["measured"] else "#94a3b8"
+    vpin_badge = ("🟢 BENIGN FLOW" if vpin_state["value"] < 0.45 else ("🟡 CAUTION FLOW" if vpin_state["value"] < 0.70 else "🔴 TOXIC CASCADE")) if vpin_state["measured"] else "NOT MEASURED"
+    micro_color = ("#00ff66" if micro_bps_state["value"] > 0 else ("#ff003c" if micro_bps_state["value"] < 0 else "#94a3b8")) if micro_bps_state["measured"] else "#94a3b8"
+    lvr_tax_text = f"{lvr_tax_state['value']:.1f} bps" if lvr_tax_state["measured"] else "not measured"
+
+    if hawkes_veto_state["measured"] and hawkes_spoof_state["measured"]:
+        hawkes_spoof_text = f"{hawkes_spoof_state['value']:.3f}"
+        hawkes_color = "#ff003c" if (hawkes_veto_state["value"] or hawkes_spoof_state["value"] > 0.72) else ("#f59e0b" if hawkes_spoof_state["value"] > 0.45 else "#00ff66")
+        hawkes_badge = "🔴 VETO TRIGGERED" if hawkes_veto_state["value"] else ("🟡 ELEVATED FLUX" if hawkes_spoof_state["value"] > 0.45 else "🟢 ORDER FLOW NORMAL")
+    else:
+        hawkes_spoof_text = "not measured"
+        hawkes_color = "#94a3b8"
+        hawkes_badge = "NOT MEASURED"
+    hawkes_rho_text = f"{hawkes_rho_state['value']:.2f}" if hawkes_rho_state["measured"] else "not measured"
+
+    if tox_halt_state["measured"] and kyle_pctile_state["measured"]:
+        kyle_color = "#ff003c" if (tox_halt_state["value"] or kyle_pctile_state["value"] >= 0.90) else ("#f59e0b" if kyle_pctile_state["value"] >= 0.75 else "#00ff66")
+        kyle_badge = "🔴 TOXICITY HALT" if tox_halt_state["value"] else f"Pctile: {kyle_pctile_state['value']*100:.0f}%"
+    else:
+        kyle_color = "#94a3b8"
+        kyle_badge = "NOT MEASURED"
+    kelly_text = f"{kelly_state['value']:.1f}%" if kelly_state["measured"] else "not measured"
+    kelly_color = "#38bdf8" if kelly_state["measured"] else "#94a3b8"
 
     qcol1, qcol2, qcol3, qcol4, qcol5, qcol6 = st.columns(6)
     with qcol1:
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {mlofi_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">🌊 Multi-Level OFI</div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: {mlofi_color}; font-family: 'JetBrains Mono', monospace;">{mlofi_val:+.3f}</div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: {mlofi_color}; font-family: 'JetBrains Mono', monospace;">{mlofi_text}</div>
             <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">10-Level Decay (α=0.5)</div>
         </div>
         """, unsafe_allow_html=True)
 
     with qcol2:
-        micro_str = f"${micro_p:,.2f}" if micro_p > 0 else "Tracking..."
+        # The old `> 0` test on the price was wrong in both directions: an absent price
+        # rendered as a status message with no reason, and a measured 0 rendered as that same
+        # absence. The reading decides the text, and only the reading.
+        micro_str = f"${micro_p_state['value']:,.2f}" if micro_p_state["measured"] else "not measured"
+        micro_note = "" if micro_p_state["measured"] else _absence_note(micro_p_state["reason"])
+        micro_bias_text = f"{micro_bps_state['value']:+.1f} bps" if micro_bps_state["measured"] else "not measured"
+        micro_bias_note = "" if micro_bps_state["measured"] else _absence_note(micro_bps_state["reason"])
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {micro_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">⚖️ Micro-Price Fair</div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: {micro_color}; font-family: 'JetBrains Mono', monospace;">{micro_str}</div>
-            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Bias: <b style="color: {micro_color};">{micro_bps:+.1f} bps</b></div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: {micro_color}; font-family: 'JetBrains Mono', monospace;">{micro_str}{micro_note}</div>
+            <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Bias: <b style="color: {micro_color};">{micro_bias_text}</b>{micro_bias_note}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -4281,7 +4431,7 @@ with tab_risk:
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {vpin_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">☣️ VPIN Toxicity</div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: {vpin_color}; font-family: 'JetBrains Mono', monospace;">{vpin_val:.3f}</div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: {vpin_color}; font-family: 'JetBrains Mono', monospace;">{vpin_text}</div>
             <div style="color: {vpin_color}; font-size: 0.72rem; margin-top: 2px; font-weight: bold;">{vpin_badge}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -4290,8 +4440,8 @@ with tab_risk:
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {hawkes_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">🦅 Hawkes Spoof Guard</div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: {hawkes_color}; font-family: 'JetBrains Mono', monospace;">{hawkes_spoof_val:.3f}</div>
-            <div style="color: {hawkes_color}; font-size: 0.72rem; margin-top: 2px; font-weight: bold;">ρ={hawkes_rho_val:.2f} · {hawkes_badge}</div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: {hawkes_color}; font-family: 'JetBrains Mono', monospace;">{hawkes_spoof_text}</div>
+            <div style="color: {hawkes_color}; font-size: 0.72rem; margin-top: 2px; font-weight: bold;">ρ={hawkes_rho_text} · {hawkes_badge}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -4299,16 +4449,17 @@ with tab_risk:
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {kyle_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">λ Kyle / LVR Tax</div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: {kyle_color}; font-family: 'JetBrains Mono', monospace;">{lvr_tax_bps_val:.1f} bps</div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: {kyle_color}; font-family: 'JetBrains Mono', monospace;">{lvr_tax_text}</div>
             <div style="color: {kyle_color}; font-size: 0.72rem; margin-top: 2px; font-weight: bold;">{kyle_badge}</div>
         </div>
         """, unsafe_allow_html=True)
 
     with qcol6:
+        kelly_note = "" if kelly_state["measured"] else _absence_note(kelly_state["reason"])
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #38bdf8; border-radius: 6px; padding: 12px 14px;">
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {kelly_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">📐 Dynamic Kelly</div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: #38bdf8; font-family: 'JetBrains Mono', monospace;">{live_kelly_pct:.1f}%</div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: {kelly_color}; font-family: 'JetBrains Mono', monospace;">{kelly_text}{kelly_note}</div>
             <div style="color: #64748b; font-size: 0.72rem; margin-top: 2px;">Beta(13,7) Shrinkage</div>
         </div>
         """, unsafe_allow_html=True)
@@ -4590,37 +4741,61 @@ with tab_risk:
                 fleet_rows = []
                 for sym_code, sym_info in sorted(symbols_map.items()):
                     s_disp = sym_code.replace("USDT", "/USDT")
-                    s_mlofi = float(sym_info.get("mlofi", 0.0) or 0.0)
-                    s_mp = float(sym_info.get("micro_price", 0.0) or 0.0)
-                    s_bps = float(sym_info.get("micro_price_bps", 0.0) or 0.0)
-                    s_vpin = float(sym_info.get("vpin", 0.0) or 0.0)
-                    s_bbid = float(sym_info.get("best_bid", 0.0) or 0.0)
-                    s_bask = float(sym_info.get("best_ask", 0.0) or 0.0)
-                    s_h_spoof = float(sym_info.get("hawkes_spoof_index", 0.0) or 0.0)
-                    s_h_rho = float(sym_info.get("hawkes_rho", 0.0) or 0.0)
-                    s_h_veto = bool(sym_info.get("hawkes_veto", False))
-                    
-                    s_kyle_pct = float(sym_info.get("kyle_lambda_pctile", 0.5) or 0.5)
-                    s_lvr_tax = float(sym_info.get("lvr_tax_bps", 0.0) or 0.0)
-                    s_tox_halt = bool(sym_info.get("toxicity_halt", False))
-                    
-                    v_stat = "🟢 Benign (<0.45)" if s_vpin < 0.45 else ("🟡 Caution (0.45-0.70)" if s_vpin < 0.70 else "🔴 TOXIC CASCADE")
-                    flow_posture = "🟢 Buyer Depth" if s_mlofi > 5.0 else ("🔴 Seller Depth" if s_mlofi < -5.0 else "⚪ Balanced")
-                    h_stat = "🔴 VETO ACTIVE" if (s_h_veto or s_h_spoof > 0.72 or s_h_rho >= 1.0) else ("🟡 Elevated" if s_h_spoof > 0.45 else "🟢 Stationary")
-                    tox_stat = "🔴 HALT ACTIVE" if s_tox_halt else (f"🟢 Normal ({s_kyle_pct*100:.0f}%)" if s_kyle_pct < 0.80 else f"🟡 High ({s_kyle_pct*100:.0f}%)")
-                    
+                    # One row per symbol, one measurement per cell. A symbol entry that lacks a
+                    # key publishes "not measured" in that cell and NOT MEASURED for its
+                    # verdict; it does not publish 0.00 and a green label built on it.
+                    s_absent = f"no {sym_code} microstructure telemetry published"
+                    s_mlofi_st = _published_number(sym_info.get("mlofi"), s_absent)
+                    s_micro_price_st = _published_number(sym_info.get("micro_price"), s_absent)
+                    s_micro_bps_st = _published_number(sym_info.get("micro_price_bps"), s_absent)
+                    s_vpin_st = _published_number(sym_info.get("vpin"), s_absent)
+                    s_best_bid_st = _published_number(sym_info.get("best_bid"), s_absent)
+                    s_best_ask_st = _published_number(sym_info.get("best_ask"), s_absent)
+                    s_hawkes_spoof_st = _published_number(sym_info.get("hawkes_spoof_index"), s_absent)
+                    s_hawkes_rho_st = _published_number(sym_info.get("hawkes_rho"), s_absent)
+                    s_hawkes_veto_st = _published_boolean(sym_info.get("hawkes_veto"), s_absent)
+                    s_kyle_pctile_st = _published_number(sym_info.get("kyle_lambda_pctile"), s_absent)
+                    s_lvr_tax_st = _published_number(sym_info.get("lvr_tax_bps"), s_absent)
+                    s_tox_halt_st = _published_boolean(sym_info.get("toxicity_halt"), s_absent)
+
+                    if s_best_bid_st["measured"]:
+                        s_bid_price = s_best_bid_st["value"]
+                        s_bid_text = f"${s_bid_price:,.4f}" if s_bid_price < 10 else f"${s_bid_price:,.2f}"
+                    else:
+                        s_bid_text = "not measured"
+                    if s_best_ask_st["measured"]:
+                        s_ask_price = s_best_ask_st["value"]
+                        s_ask_text = f"${s_ask_price:,.4f}" if s_ask_price < 10 else f"${s_ask_price:,.2f}"
+                    else:
+                        s_ask_text = "not measured"
+                    if s_micro_price_st["measured"]:
+                        s_micro_price_text = f"${s_micro_price_st['value']:,.4f}" if s_micro_price_st["value"] < 10 else f"${s_micro_price_st['value']:,.2f}"
+                    else:
+                        s_micro_price_text = "not measured"
+
+                    flow_posture = ("🟢 Buyer Depth" if s_mlofi_st["value"] > 5.0 else ("🔴 Seller Depth" if s_mlofi_st["value"] < -5.0 else "⚪ Balanced")) if s_mlofi_st["measured"] else "NOT MEASURED"
+                    if (s_hawkes_veto_st["measured"] and s_hawkes_spoof_st["measured"]
+                            and s_hawkes_rho_st["measured"]):
+                        h_stat = "🔴 VETO ACTIVE" if (s_hawkes_veto_st["value"] or s_hawkes_spoof_st["value"] > 0.72 or s_hawkes_rho_st["value"] >= 1.0) else ("🟡 Elevated" if s_hawkes_spoof_st["value"] > 0.45 else "🟢 Stationary")
+                    else:
+                        h_stat = "NOT MEASURED"
+                    if s_tox_halt_st["measured"] and s_kyle_pctile_st["measured"]:
+                        tox_stat = "🔴 HALT ACTIVE" if s_tox_halt_st["value"] else (f"🟢 Normal ({s_kyle_pctile_st['value']*100:.0f}%)" if s_kyle_pctile_st["value"] < 0.80 else f"🟡 High ({s_kyle_pctile_st['value']*100:.0f}%)")
+                    else:
+                        tox_stat = "NOT MEASURED"
+
                     fleet_rows.append({
                         "Asset": s_disp,
-                        "Best Bid": f"${s_bbid:,.4f}" if s_bbid < 10 else f"${s_bbid:,.2f}",
-                        "Best Ask": f"${s_bask:,.4f}" if s_bask < 10 else f"${s_bask:,.2f}",
-                        "Micro-Price (Fair Value)": f"${s_mp:,.4f}" if s_mp < 10 else f"${s_mp:,.2f}",
-                        "Spread Bias": f"{s_bps:+.2f} bps",
-                        "MLOFI (10-Level)": f"{s_mlofi:+.2f}",
-                        "VPIN (Toxicity)": f"{s_vpin:.3f}",
+                        "Best Bid": s_bid_text,
+                        "Best Ask": s_ask_text,
+                        "Micro-Price (Fair Value)": s_micro_price_text,
+                        "Spread Bias": f"{s_micro_bps_st['value']:+.2f} bps" if s_micro_bps_st["measured"] else "not measured",
+                        "MLOFI (10-Level)": f"{s_mlofi_st['value']:+.2f}" if s_mlofi_st["measured"] else "not measured",
+                        "VPIN (Toxicity)": f"{s_vpin_st['value']:.3f}" if s_vpin_st["measured"] else "not measured",
                         "Kyle Flow Risk": tox_stat,
-                        "LVR Tax": f"{s_lvr_tax:.1f} bps",
-                        "Hawkes Spoof": f"{s_h_spoof:.3f}",
-                        "Spectral Radius (ρ)": f"{s_h_rho:.2f}",
+                        "LVR Tax": f"{s_lvr_tax_st['value']:.1f} bps" if s_lvr_tax_st["measured"] else "not measured",
+                        "Hawkes Spoof": f"{s_hawkes_spoof_st['value']:.3f}" if s_hawkes_spoof_st["measured"] else "not measured",
+                        "Spectral Radius (ρ)": f"{s_hawkes_rho_st['value']:.2f}" if s_hawkes_rho_st["measured"] else "not measured",
                         "LOB Anti-Spoof": h_stat,
                         "Order Flow Bias": flow_posture
                     })
