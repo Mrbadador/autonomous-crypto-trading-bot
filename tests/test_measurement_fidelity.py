@@ -198,6 +198,7 @@ def test_measured_trades_per_year_reports_no_frequency_for_an_empty_arm():
 @pytest.mark.parametrize("relpath", [
     "backtests/seven_year_backtest.py",
     "backtests/seven_year_ai_sharpened_backtest.py",
+    "scripts/compare_trigger_modes_840k.py",
 ])
 def test_runner_tests_carried_stop_before_ratcheting_it(relpath):
     """The intrabar lookahead fix is an ordering property; guard the order.
