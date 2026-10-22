@@ -3177,6 +3177,13 @@ def _section_block(path, start_pattern, end_patterns):
     src = path.read_text(encoding="utf-8")
     match = re.search(start_pattern, src, re.M)
     assert match is not None, f"{path.name} has no block starting {start_pattern!r}"
+    # M-8: `re.search` stops at the FIRST marker, so a duplicated marker string would retarget
+    # every guard that reads this panel without any of them noticing. Uniqueness is part of what
+    # an anchor means; a second occurrence is a fork to resolve, not a region to guess inside.
+    anchors = len(list(re.finditer(start_pattern, src, re.M)))
+    assert anchors == 1, (
+        f"{path.name} has {anchors} lines matching the {start_pattern!r} anchor, so this block "
+        "no longer names one panel")
     lines = src[match.start():].split("\n")
     start_indent = len(lines[0]) - len(lines[0].lstrip())
     keep = []
@@ -3258,7 +3265,10 @@ _G4_DERIVED_NAMES = frozenset({
     "marker_pct", "imb_color", "bias_label", "micro_str", "vpin_color", "vpin_badge",
     "mlofi_color", "micro_color", "hawkes_color", "hawkes_badge", "kyle_color", "kyle_badge",
     "r_v_col", "r_v_lbl", "r_m_col", "r_h_col", "r_h_lbl", "r_kyle_col", "r_lvr_badge",
-    "v_stat", "flow_posture", "h_stat", "tox_stat",
+    "flow_posture", "h_stat", "tox_stat",
+    # M-3: `v_stat` was deleted from dashboard.py as write-only dead code, so keeping it here
+    # only made the crash guard scan for an assignment that can never be found. A derived name
+    # belongs on this list while the source still derives it.
 })
 
 # The colours a *measured* reading wears. None of them may be worn by an absence.
@@ -3421,7 +3431,12 @@ def test_g4_the_macro_column_invents_no_regime_and_no_price():
             f"{path.name}'s macro column still falls back on a numeric stand-in reading")
         assert "±30m" not in src, (
             f"{path.name} still claims a ±30m news window the code does not use")
-        assert '"Hurst >= 0.52 for Trend Breakouts"' not in src, (
+        # I-1: pin the bare literal, not a quoted transcription of it. The pre-fix line was
+        # `st.write(f"• **Hurst Exponent Filter:** Hurst >= 0.52 for Trend Breakouts")`, where the
+        # character before `Hurst` is `*`, so an assertion carrying a leading `"` matched nothing in
+        # any revision and stayed green if the hardcoded floor came back beside the config read.
+        # The shipped line interpolates `{config.HURST_TREND_FLOOR}`, so it cannot contain this.
+        assert "Hurst >= 0.52" not in src, (
             f"{path.name} still hardcodes the Hurst floor instead of reading config")
         assert "config.HURST_TREND_FLOOR" in block, (
             f"{path.name} does not source the Hurst floor from the config that owns it")
@@ -3442,6 +3457,14 @@ def test_g4_the_macro_regime_has_three_states_and_never_collapses_them():
             f"{path.name} dresses an unresolved regime as a resolved one")
         assert 'regime_state = _published_state(raw_regime, no_row)' in block, (
             f"{path.name} does not read the macro regime through the publisher")
+        # M-1's pin: the measured branch is the only line in this column that sends database text
+        # to a markdown render path without unsafe_allow_html, so it has to escape first — the same
+        # way the gate reason beside it does. An unescaped `**` or `[]` in a regime value would
+        # render as formatting rather than as the reading.
+        assert "Macro Regime:** {html.escape(regime_state['text'])}" in block, (
+            f"{path.name} publishes the measured macro regime unescaped")
+        assert "Macro Regime:** {regime_state['text']}" not in block, (
+            f"{path.name} writes the raw regime text into a markdown render path")
         assert '#94a3b8' in block, f"{path.name} paints an unmeasured regime in a measured colour"
 
 
@@ -3514,6 +3537,61 @@ def test_g4_the_symbol_panels_publish_no_stand_in(block_name):
         f"the {block_name} panel has no verdict for a reading that was never taken")
     assert "microstructure telemetry published" in block, (
         f"the {block_name} panel does not name which telemetry is missing")
+
+
+# Group 8b — the radar banner publishes each Hawkes reading on its own evidence (I-2).
+@pytest.mark.parametrize("field,own_key,fmt", [
+    ("r_h_spoof_text", "r_hawkes_spoof_st", ".3f"),
+    ("r_h_rho_text", "r_hawkes_rho_st", ".2f"),
+])
+def test_g4_the_radar_banner_keys_each_hawkes_text_on_its_own_state(field, own_key, fmt):
+    """A missing `hawkes_veto` may not make the banner disown the spoof index and ρ it measured.
+
+    Both texts used to be assigned inside one trio gate on all three Hawkes keys, so with only
+    `hawkes_veto` absent the banner rendered `Hawkes Spoof: not measured (ρ=not measured)` over two
+    real readings — an absence that is a lie, the same defect class as a stand-in number pointed
+    the other way. A bundled gate is legitimate for the combined verdict (`r_h_col` / `r_h_lbl`),
+    which genuinely cannot be formed without all three keys; it is not legitimate for a field.
+
+    Two checks, because the existing `"measured" in segment` heuristic is what let this through: a
+    bundled gate also has `measured` in the segment. So the reading line must key on its OWN
+    `measured` flag, and no assignment of a published field may sit under a gate that reads
+    `hawkes_veto` at all. Both halves fail on the pre-fix block.
+    """
+    import ast
+
+    block = _g4_block("radar", DASHBOARD)
+    tree = ast.parse(block, filename="dashboard.py radar banner")
+    parents = _g4_parent_map(tree)
+    assigns = [node for node in ast.walk(tree)
+               if isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == field
+                       for target in node.targets)]
+    assert assigns, f"the radar banner no longer publishes {field} at all"
+    for node in assigns:
+        segment = ast.get_source_segment(block, node) or ""
+        assert "hawkes_veto" not in segment, (
+            f"the radar banner derives the published {field} from hawkes_veto: {segment}")
+        ancestor = parents.get(id(node))
+        while ancestor is not None:
+            if isinstance(ancestor, ast.If):
+                gate = ast.get_source_segment(block, ancestor.test) or ""
+                assert "hawkes_veto" not in gate, (
+                    f"the radar banner publishes {field} under a gate on hawkes_veto, so one "
+                    f"missing veto hides a reading that was taken: {gate}")
+            ancestor = parents.get(id(ancestor))
+    keyed = re.compile(own_key + r"\[[^\]]*measured[^\]]*\]")
+    readings = [ast.get_source_segment(block, node) or "" for node in assigns
+                if keyed.search(ast.get_source_segment(block, node) or "")]
+    assert readings, (
+        f"the radar banner never keys {field} on {own_key}'s own measured flag; the reading is "
+        "bundled with another field's state")
+    for segment in readings:
+        assert fmt in segment, (
+            f"{field} lost its {fmt} rendering — the two Hawkes fields format differently: "
+            f"{segment}")
+        assert "not measured" in segment, (
+            f"{field} has no absence for when its own state was never measured: {segment}")
 
 
 # Group 9 — a measured zero percentile survives.

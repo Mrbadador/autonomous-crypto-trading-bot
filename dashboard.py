@@ -2874,14 +2874,16 @@ with tab_live:
                     r_kyle_col = ("#00ff66" if r_kyle_pctile_st["value"] < 0.60 else ("#f59e0b" if r_kyle_pctile_st["value"] < 0.85 else "#ff003c")) if r_kyle_pctile_st["measured"] else "#94a3b8"
                     r_lvr_tax_text = f"{r_lvr_tax_st['value']:.2f} bps" if r_lvr_tax_st["measured"] else "not measured"
                     r_lvr_color = ("#ff003c" if r_lvr_tax_st["value"] >= 10.0 else "#38bdf8") if r_lvr_tax_st["measured"] else "#94a3b8"
+                    # Each Hawkes field publishes its own reading: a missing `hawkes_veto` must not
+                    # make the banner disown a spoof index or a ρ it actually measured. Only the
+                    # combined verdict below (colour + label) may be bundled, because it genuinely
+                    # needs all three keys. Note the two formats differ and are not interchangeable.
+                    r_h_spoof_text = f"{r_hawkes_spoof_st['value']:.3f}" if r_hawkes_spoof_st["measured"] else "not measured"
+                    r_h_rho_text = f"{r_hawkes_rho_st['value']:.2f}" if r_hawkes_rho_st["measured"] else "not measured"
                     if r_hawkes_veto_st["measured"] and r_hawkes_spoof_st["measured"] and r_hawkes_rho_st["measured"]:
-                        r_h_spoof_text = f"{r_hawkes_spoof_st['value']:.3f}"
-                        r_h_rho_text = f"{r_hawkes_rho_st['value']:.2f}"
                         r_h_col = "#ff003c" if (r_hawkes_veto_st["value"] or r_hawkes_spoof_st["value"] > 0.72 or r_hawkes_rho_st["value"] >= 1.0) else ("#f59e0b" if r_hawkes_spoof_st["value"] > 0.45 else "#00ff66")
                         r_h_lbl = "VETO" if r_hawkes_veto_st["value"] else ("ELEVATED" if r_hawkes_spoof_st["value"] > 0.45 else "STATIONARY")
                     else:
-                        r_h_spoof_text = "not measured"
-                        r_h_rho_text = "not measured"
                         r_h_col = "#94a3b8"
                         r_h_lbl = "NOT MEASURED"
                     if r_tox_halt_st["measured"]:
@@ -4217,7 +4219,9 @@ with tab_risk:
         elif regime_state["text"].upper() == "UNKNOWN":
             st.write("• **Macro Regime:** <b style='color: #94a3b8;'>UNKNOWN (macro telemetry unresolved)</b>", unsafe_allow_html=True)
         else:
-            st.write(f"• **Macro Regime:** {regime_state['text']}")
+            # A measured regime is a reading, and the reading is database text: escape it like the
+            # gate reason below rather than letting markdown metacharacters become formatting.
+            st.write(f"• **Macro Regime:** {html.escape(regime_state['text'])}")
 
         news_state = _published_flag(query_system_state("news_event_active", ""), "no news gate state published")
         gate_reason = str(query_system_state("news_event_reason", "") or "").strip()

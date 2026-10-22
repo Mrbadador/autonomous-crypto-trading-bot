@@ -1411,7 +1411,9 @@ with tab_risk:
         elif regime_state["text"].upper() == "UNKNOWN":
             st.write("• **Macro Regime:** <b style='color: #94a3b8;'>UNKNOWN (macro telemetry unresolved)</b>", unsafe_allow_html=True)
         else:
-            st.write(f"• **Macro Regime:** {regime_state['text']}")
+            # A measured regime is a reading, and the reading is database text: escape it like the
+            # gate reason below rather than letting markdown metacharacters become formatting.
+            st.write(f"• **Macro Regime:** {html.escape(regime_state['text'])}")
 
         news_state = _published_flag(query_system_state("news_event_active", ""), "no news gate state published")
         gate_reason = str(query_system_state("news_event_reason", "") or "").strip()
