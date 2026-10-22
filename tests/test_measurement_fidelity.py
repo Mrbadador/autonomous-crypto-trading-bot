@@ -1904,7 +1904,11 @@ def test_the_legacy_account_balance_is_not_a_demo_balance():
     src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
     assert 'query_system_state("balance", "")' in src, (
         "the balance must be read without a demo fallback")
-    assert "not measured (no account balance telemetry)" in src, (
+    # G-2 moved this absence sentence into the shared `_profit_display` helper: the legacy app
+    # now publishes "not measured (no recorded capital or no balance telemetry)" from there
+    # instead of from a literal of its own. The requirement is unchanged -- an unreadable
+    # balance is an absence, not a number.
+    assert "_profit_display(total_profit, total_roi_pct)" in src, (
         "an unreadable balance must be published as an absence")
     assert "Telemetry Offline" in src
 
@@ -2362,3 +2366,280 @@ def test_the_macro_banner_publishes_a_neutral_regime_and_an_unknown_one_apart():
             f"{path.name} has no banner for a macro regime it has no reading for")
         assert 'elif macro_trend == "NEUTRAL":' in src, (
             f"{path.name} must tell a measured NEUTRAL apart from an UNKNOWN reading")
+
+
+# ---------------------------------------------------------------------------
+# Final fix G-2 — the capital block publishes recorded capital, not a hardcoded deposit schedule
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: the three helpers under test (`_recorded_amount`,
+# `_capital_display`, `_profit_display`) are pure and module-level, so they are extracted by AST
+# and executed for real here — the shipped body, not a paraphrase of it. The `st.write(...)`,
+# `st.caption(...)`, `st.metric(...)` and `st.markdown(...)` calls they feed are NOT executed: the
+# committed suite has no Streamlit AppTest harness, and importing dashboard.py runs a 4,700-line
+# top-level script against the real DB and live price endpoints. A helper that returns a dict
+# cannot lie about what it decided; the rendering one line further out is pinned by source-text
+# checks, nothing more.
+#
+# The defect being closed: dashboard.py published a deposit schedule nobody measured — $250.00 of
+# deposited capital, a $55.00 seed, an $82.00 top-up 1 and a $113.00 top-up 2 — for any fleet that
+# had never recorded a deposit, and computed a "Real Net Profit" against that invented capital.
+# scripts/live_dashboard.py published the same kind of schedule with a DIFFERENT invented total
+# ($137.00), so the two dashboards disagreed about how much capital the fleet had. The invented
+# literal also outranked the operator's own configured INITIAL_BALANCE, because
+# `num(os.getenv("INITIAL_BALANCE"), 250.0)` returns 250.0 whenever the env var is unset.
+#
+# The convention: a figure nobody recorded is published as an absence ("not recorded" for a
+# capital figure, "not measured" for a profit), never as a number and never as a zero. A recorded
+# zero is a fact and stays a number.
+
+_CAPITAL_IDENTIFIERS = (
+    "total_deposited", "deposit_t1", "deposit_t2", "deposit_t3",
+    "total_profit", "total_roi_pct",
+)
+
+_CAPITAL_HELPERS = {}
+
+
+def _capital_helper(name, path=DASHBOARD):
+    """One of the three capital helpers, extracted once per (file, name) and cached.
+
+    The extraction is deliberately lazy: a helper that does not exist yet must fail the test
+    that asks for it, not the whole module at collection time.
+    """
+    key = (str(path), name)
+    if key not in _CAPITAL_HELPERS:
+        _CAPITAL_HELPERS[key] = _dashboard_helper(name, path)
+    return _CAPITAL_HELPERS[key]
+
+
+def _numeric_literal_sites(path):
+    """Every numeric constant that sits inside a module-level function, with that function's name.
+
+    The whole-module `_numeric_literals` helper cannot tell the integer 250 (a token estimate)
+    from the float 250.0 (an invented capital figure), because 250 == 250.0 in Python. This one
+    keeps the function each constant sits in, so the survivor can be pinned to its one
+    legitimate home.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    sites = []
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                    and not isinstance(node.value, bool):
+                sites.append((fn.name, node.value))
+    return sites
+
+
+@pytest.mark.parametrize("raw_values, expected", [
+    (("55.00",), 55.0),
+    (("55.00", "82.00"), 55.0),
+    (("", "82.00"), 82.0),
+    (("", None, "junk"), None),
+    ((), None),
+    (("not recorded",), None),
+    (("$1,000.00",), 1000.0),
+    (("0",), 0.0),
+])
+def test_recorded_amount_returns_the_first_usable_amount(raw_values, expected):
+    """A deposit tranche is an operator figure: recorded in system_state, or configured in the
+    environment. The first usable one wins, and nothing usable means the figure was never
+    recorded.
+
+    A recorded zero is a fact, not an absence: it must not collapse into None the way an empty
+    string or a junk value does.
+    """
+    assert _capital_helper("_recorded_amount")(*raw_values) == expected
+
+
+def test_capital_display_publishes_a_recorded_deposit_schedule():
+    """The schedule a reader sees when every figure was recorded."""
+    out = _capital_helper("_capital_display")(250.0, 55.0, 82.0, 113.0)
+    assert out["deposited"] == "$250.00", out
+    assert out["deposited_usdt"] == "$250.00 USDT", out
+    assert out["seed"] == "$55", out
+    assert out["topup1"] == "$82", out
+    assert out["topup2"] == "$113", out
+    assert out["topup2_shown"] is True, out
+    assert out["tranches"] == "$55 seed + $82 top-up 1 + $113 top-up 2", out
+    assert out["tranches_plain"] == "$55 + $82 + $113", out
+
+
+def test_capital_display_publishes_an_absence_for_an_unrecorded_deposit_schedule():
+    """A fleet with no recorded deposit has no deposit schedule. It must not render one."""
+    out = _capital_helper("_capital_display")(None, None, None, None)
+    assert out["deposited"] == "not recorded", out
+    assert out["deposited_usdt"] == "not recorded", out
+    assert out["seed"] == "not recorded", out
+    assert out["topup1"] == "not recorded", out
+    assert out["topup2"] == "not recorded", out
+    assert out["topup2_shown"] is None, out
+    assert "not recorded" in out["tranches"], out
+    assert "not recorded" in out["tranches_plain"], out
+    assert "$" not in out["tranches"], (
+        f"an unrecorded schedule must publish no money at all: {out['tranches']}")
+
+
+def test_capital_display_publishes_no_third_tranche_for_a_recorded_zero():
+    """A third tranche of zero is a recorded fact, but there is no top-up 2 to show."""
+    out = _capital_helper("_capital_display")(250.0, 55.0, 82.0, 0.0)
+    assert out["topup2_shown"] is False, out
+    assert "top-up 2" not in out["tranches"], out
+
+
+def test_capital_display_keeps_a_recorded_tranche_when_the_total_is_unrecorded():
+    """The tranches were recorded even though the total was not: each figure stands on its own."""
+    out = _capital_helper("_capital_display")(None, 55.0, 82.0, None)
+    assert out["deposited_usdt"] == "not recorded", out
+    assert out["seed"] == "$55", out
+    assert out["topup1"] == "$82", out
+
+
+@pytest.mark.parametrize("total_profit, total_roi_pct, expected", [
+    (12.5, 5.0, "+$12.50 USDT (+5.00%)"),
+    (-3.25, -1.5, "-$3.25 USDT (-1.50%)"),
+    (0.0, 0.0, "+$0.00 USDT (+0.00%)"),
+])
+def test_profit_display_publishes_a_measured_profit(total_profit, total_roi_pct, expected):
+    """A measured break-even is a fact, not an absence: it publishes as a number."""
+    assert _capital_helper("_profit_display")(total_profit, total_roi_pct) == expected
+
+
+@pytest.mark.parametrize("total_profit, total_roi_pct", [
+    (None, None),
+    (None, 5.0),
+    (12.5, None),
+])
+def test_profit_display_says_it_was_not_measured(total_profit, total_roi_pct):
+    """A profit needs both a live balance and a recorded capital.
+
+    With either missing there is no profit to publish, and publishing $0.00 would say the fleet
+    broke even — a measured statement about a fleet that was never measured.
+    """
+    out = _capital_helper("_profit_display")(total_profit, total_roi_pct)
+    assert "not measured" in out, out
+
+
+def test_the_two_dashboards_publish_the_same_capital_figures():
+    """scripts/live_dashboard.py is a standalone Streamlit script and cannot import dashboard.py,
+    so it carries its own copies of the three helpers. The copies have to agree, or the same fleet
+    would be shown two different capital schedules."""
+    cases = [
+        ("_recorded_amount", (("55.00", "82.00"),)),
+        ("_recorded_amount", (("", None, "junk"),)),
+        ("_recorded_amount", (("0",),)),
+        ("_capital_display", (250.0, 55.0, 82.0, 113.0)),
+        ("_capital_display", (None, None, None, None)),
+        ("_capital_display", (None, 55.0, 82.0, 0.0)),
+        ("_profit_display", (12.5, 5.0)),
+        ("_profit_display", (None, None)),
+    ]
+    for name, args in cases:
+        main = _capital_helper(name, DASHBOARD)
+        legacy = _capital_helper(name, LEGACY_DASHBOARD)
+        assert main(*args) == legacy(*args), (
+            f"the two dashboards disagree about {name}{args}: {main(*args)} != {legacy(*args)}")
+
+
+def test_the_two_dashboards_carry_byte_identical_copies_of_the_capital_helpers():
+    """The copies are duplicated on purpose (the legacy script cannot import dashboard.py), so
+    they are pinned to be the same source, not merely to behave the same today."""
+    import ast
+
+    for name in ("_recorded_amount", "_capital_display", "_profit_display"):
+        sources = []
+        for path in (DASHBOARD, LEGACY_DASHBOARD):
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=str(path))
+            node = next(n for n in tree.body
+                        if isinstance(n, ast.FunctionDef) and n.name == name)
+            sources.append(ast.get_source_segment(text, node))
+        assert sources[0] == sources[1], (
+            f"{name} differs between the two dashboards, so the same fleet would be shown two "
+            f"different capital schedules")
+
+
+def test_the_invented_capital_figures_are_gone_from_both_dashboards():
+    """The HUD used to publish a deposit schedule nobody measured.
+
+    dashboard.py carried $250.00 / $55.00 / $82.00 / $113.00 and scripts/live_dashboard.py carried
+    $137.00 / $55.00 / $82.00, so the two dashboards disagreed about how much capital the fleet
+    had — and neither figure was ever measured.
+    """
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        published = _published_strings(path)
+        for gone in ("55.00", "82.00", "113.00", "137.00"):
+            hits = [s for s in published if gone in s]
+            assert not hits, f"{path.name} still publishes {gone!r}: {hits[:3]}"
+        # The invented total was the FLOAT constant 250.0. dashboard.py legitimately carries the
+        # INTEGER 250 elsewhere (the AI telemetry token estimate), and 250 == 250.0 in Python, so
+        # the whole-module membership test cannot be used on that file: the float-typed check
+        # below is what pins the defect, and the integer is pinned to its one legitimate home by
+        # the next test.
+        floats = [v for v in _numeric_literals(path) if isinstance(v, float)]
+        assert 250.0 not in floats, (
+            f"{path.name} still carries the invented 250.0 capital figure as a float constant")
+    assert 250.0 not in _numeric_literals(LEGACY_DASHBOARD), (
+        "the legacy dashboard still carries the invented 250.0 capital figure")
+
+
+def test_the_one_remaining_250_in_dashboard_is_not_a_capital_figure():
+    """dashboard.py carries the integer literal 250 in the AI usage estimate (the tape
+    whisperer's per-call token cost). It is not a capital figure, and it is the only 250 left."""
+    leftovers = [fn for fn, value in _numeric_literal_sites(DASHBOARD) if value == 250]
+    assert leftovers == ["fetch_ai_usage_stats"], (
+        f"dashboard.py carries a 250 outside the AI token estimate: {leftovers}")
+
+
+def test_the_invented_deposit_schedule_is_gone_from_the_source():
+    """Neither file may read a tranche through the old `state_num(key, invented_literal)` shape,
+    and both must read the tranches through `_recorded_amount`."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert 'state_num("initial_deposit_tranche_1"' not in src, (
+            f"{path.name} still reads the seed tranche with an invented fallback")
+        assert 'state_num("topup_deposit_tranche_2"' not in src, (
+            f"{path.name} still reads the top-up tranche with an invented fallback")
+        assert "_recorded_amount(" in src, (
+            f"{path.name} does not read its capital figures through the helper")
+        assert 'os.getenv("INITIAL_DEPOSIT_TRANCHE_1", "")' in src, (
+            f"{path.name} does not read the operator's configured seed tranche")
+        # Scoped form of the whole-module 250 check: no invented 250 may sit on a capital line.
+        capital_lines = {i for i, line in enumerate(src.splitlines(), start=1)
+                         if any(name in line for name in _CAPITAL_IDENTIFIERS)}
+        import ast
+
+        tree = ast.parse(src, filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                    and not isinstance(node.value, bool) and node.value == 250:
+                assert node.lineno not in capital_lines, (
+                    f"{path.name}:{node.lineno} still carries an invented 250 on a capital line")
+
+
+def test_the_capital_block_is_wired_to_the_helpers():
+    """Source-text check of the wiring the helper tests cannot reach — see the section note.
+
+    It proves each dashboard reads its capital figures through the helpers and renders them
+    through `_capital_display` / `_profit_display`. It does not prove Streamlit renders them.
+    """
+    main = DASHBOARD.read_text(encoding="utf-8")
+    legacy = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "capital = _capital_display(total_deposited, deposit_t1, deposit_t2, deposit_t3)" in main, (
+        "dashboard.py does not build its capital figures through the helper")
+    assert "capital = _capital_display(total_deposited, deposit_t1, deposit_t2, None)" in legacy, (
+        "scripts/live_dashboard.py does not build its capital figures through the helper")
+    for src, name in ((main, "dashboard.py"), (legacy, "scripts/live_dashboard.py")):
+        assert 'os.getenv("INITIAL_BALANCE", "")' in src, (
+            f"{name} does not read the operator's configured capital")
+        assert 'os.getenv("TOPUP_DEPOSIT_TRANCHE_2", "")' in src, (
+            f"{name} does not read the operator's configured top-up tranche")
+        assert "_profit_display(total_profit, total_roi_pct)" in src, (
+            f"{name} does not render its profit through the helper")
+        assert 'num(os.getenv("INITIAL_BALANCE"), 250.0)' not in src, (
+            f"{name} still lets an invented literal outrank the operator's configured capital")
+    assert 'os.getenv("TOPUP_DEPOSIT_TRANCHE_3", "")' in main, (
+        "dashboard.py does not read the operator's configured third tranche")

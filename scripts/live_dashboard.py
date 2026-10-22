@@ -325,6 +325,85 @@ def _gauge_display(value, formatter, classify, absent_reason) -> dict:
     return {"value": rendered, "delta": classified, "arrow": "auto", "color": "normal"}
 
 
+def _recorded_amount(*raw_values) -> float:
+    """Return the first usable amount among `raw_values`, or None when none was recorded.
+
+    A deposit tranche is an operator figure: it lives in system_state once the operator
+    has recorded it, and in the environment when it was only configured. The HUD used to
+    fall back on hardcoded amounts that happened to match one operator's history, so a
+    fleet with no recorded deposit still rendered a deposit schedule. None means: not
+    recorded.
+    """
+    for raw in raw_values:
+        number = _optional_float(raw)
+        if number is not None:
+            return number
+    return None
+
+
+def _capital_display(total_deposited, deposit_t1, deposit_t2, deposit_t3) -> dict:
+    """Render the HUD's capital figures as the strings a reader sees.
+
+    Each argument is a float when the figure was recorded and None when it was not.
+    A figure nobody recorded reads "not recorded" -- never a number borrowed from a
+    hardcoded deposit schedule, and never a zero. A recorded zero is a fact and stays a
+    number.
+
+    Keys:
+      deposited      -- "$250.00", or "not recorded"
+      deposited_usdt -- "$250.00 USDT", or "not recorded"
+      seed           -- "$55", or "not recorded"
+      topup1         -- "$82", or "not recorded"
+      topup2         -- "$113", or "not recorded"
+      topup2_shown   -- True when the third tranche is a recorded non-zero amount, False
+                        when it is a recorded zero, and None when it was never recorded
+      tranches       -- "$55 seed + $82 top-up 1 + $113 top-up 2", with "not recorded"
+                        standing in for any figure that was never recorded
+      tranches_plain -- the same three figures without their labels
+    """
+    def _amount(value, decimals=2):
+        return f"${value:,.{decimals}f}" if value is not None else "not recorded"
+
+    seed = _amount(deposit_t1, 0)
+    topup1 = _amount(deposit_t2, 0)
+    topup2 = _amount(deposit_t3, 0)
+    deposited = _amount(total_deposited)
+
+    labelled = f"{seed} seed + {topup1} top-up 1"
+    plain = f"{seed} + {topup1}"
+    if deposit_t3 is None:
+        labelled += " + not recorded top-up 2"
+        plain += " + not recorded"
+    elif deposit_t3 > 0:
+        labelled += f" + {topup2} top-up 2"
+        plain += f" + {topup2}"
+
+    return {
+        "deposited": deposited,
+        "deposited_usdt": f"{deposited} USDT" if total_deposited is not None else "not recorded",
+        "seed": seed,
+        "topup1": topup1,
+        "topup2": topup2,
+        "topup2_shown": None if deposit_t3 is None else (deposit_t3 > 0),
+        "tranches": labelled,
+        "tranches_plain": plain,
+    }
+
+
+def _profit_display(total_profit, total_roi_pct) -> str:
+    """Render the net profit, or say why there is none.
+
+    `total_profit` is the measured profit in USDT and `total_roi_pct` the measured return
+    on the recorded capital; both are None when the profit could not be measured. A
+    profit needs both a live balance and a recorded capital. With either missing there
+    is no profit to publish, and publishing $0.00 would say the fleet broke even.
+    """
+    if total_profit is None or total_roi_pct is None:
+        return "not measured (no recorded capital or no balance telemetry)"
+    sign = "+" if total_profit >= 0 else "-"
+    return f"{sign}${abs(total_profit):,.2f} USDT ({total_roi_pct:+.2f}%)"
+
+
 def calculate_estimated_liquidation(entry_p: float, lev: float, side: str, mmr: float = 0.005) -> float:
     """Calculates estimated isolated liquidation price given leverage and MMR buffer."""
     if entry_p <= 0 or lev <= 0:
@@ -511,29 +590,40 @@ with st.sidebar:
         live_bal_val = float(_balance_raw) if _balance_raw else None
     except (TypeError, ValueError):
         live_bal_val = None
-    total_deposited = float(query_system_state("user_total_deposit", os.getenv("INITIAL_BALANCE", "137.00")))
-    deposit_t1 = float(query_system_state("initial_deposit_tranche_1", "55.00"))
-    deposit_t2 = float(query_system_state("topup_deposit_tranche_2", "82.00"))
-    if live_bal_val is not None:
+    total_deposited = _recorded_amount(
+        query_system_state("user_total_deposit", ""),
+        os.getenv("INITIAL_BALANCE", ""),
+    )
+    deposit_t1 = _recorded_amount(
+        query_system_state("initial_deposit_tranche_1", ""),
+        os.getenv("INITIAL_DEPOSIT_TRANCHE_1", ""),
+    )
+    deposit_t2 = _recorded_amount(
+        query_system_state("topup_deposit_tranche_2", ""),
+        os.getenv("TOPUP_DEPOSIT_TRANCHE_2", ""),
+    )
+    # This app never had a third tranche, so there is none to record.
+    capital = _capital_display(total_deposited, deposit_t1, deposit_t2, None)
+    if live_bal_val is not None and total_deposited is not None:
         total_profit = live_bal_val - total_deposited
         total_roi_pct = (total_profit / total_deposited) * 100.0 if total_deposited > 0 else 0.0
     else:
-        total_profit = 0.0
-        total_roi_pct = 0.0
+        total_profit = None
+        total_roi_pct = None
 
     st.write(f"**Connected Exchange:** Bitget UTA (Live)")
     if live_bal_val is not None:
         st.write(f"**Current Equity:** `${live_bal_val:.2f} USDT`")
     else:
         st.write("**Current Equity:** `⚠️ Telemetry Offline (Syncing...)`")
-    st.write(f"**Deposited Capital:** `${total_deposited:.2f} USDT`")
-    st.caption(f"↳ Seed: `${deposit_t1:.2f}` | Top-up: `${deposit_t2:.2f}`")
-    if live_bal_val is not None:
+    st.write(f"**Deposited Capital:** `{capital['deposited_usdt']}`")
+    st.caption(f"↳ Seed: `{capital['seed']}` | Top-up: `{capital['topup1']}`")
+    if total_profit is None:
+        st.markdown(f"**Real Net Profit:** <span style='font-weight:700;'>{_profit_display(total_profit, total_roi_pct)}</span>", unsafe_allow_html=True)
+    else:
         profit_sign = "+$" if total_profit >= 0 else "-$"
         profit_color = "#00ff66" if total_profit >= 0 else "#ff003c"
         st.markdown(f"**Real Net Profit:** <span style='color:{profit_color}; font-weight:700;'>{profit_sign}{abs(total_profit):.2f} USDT ({total_roi_pct:+.2f}%)</span>", unsafe_allow_html=True)
-    else:
-        st.markdown("**Real Net Profit:** <span style='font-weight:700;'>not measured (no account balance telemetry)</span>", unsafe_allow_html=True)
     local_ip = get_local_ip()
     st.write(f"**Local Mobile URL:** `http://{local_ip}:8501`")
     st.markdown("---")
@@ -697,7 +787,7 @@ with kpi1:
         label="💰 Live Account Equity",
         value=f"${live_bal_val:.2f} USDT" if live_bal_val is not None else "Syncing...",
         delta=(f"{'+$' if total_profit>=0 else '-$'}{abs(total_profit):.2f} ({total_roi_pct:+.2f}% ROI)"
-               if live_bal_val is not None else None),
+               if total_profit is not None else None),
     )
 
 with kpi2:
