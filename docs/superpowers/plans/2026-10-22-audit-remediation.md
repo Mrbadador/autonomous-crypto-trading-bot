@@ -37,6 +37,30 @@ Tasks are sequenced so that code which *changes measurements* lands before prose
 
 ---
 
+## Status (controller, 2026-10-23)
+
+**All six tasks landed on this branch. Do not re-dispatch them.** The `- [ ]` step boxes below were
+never individually ticked during execution — that bookkeeping was not kept, so the unchecked boxes are
+not open work. The per-task record, including review verdicts and fix rounds, is the SDD ledger at
+`.superpowers/sdd/2026-10-22-audit-remediation/progress.md` (it names the commits and the rulings; if
+the two disagree, the ledger and `git log` are authoritative and this plan is a snapshot).
+
+| Plan task | Principal commits (not exhaustive — `git log` is) |
+|---|---|
+| 1 — Monte Carlo honesty | `fc326ed`, `87583e9`, `d0eefdd`, `8739af8`, `054d65d` |
+| 2 — cooldown keyed on realised PnL | `828d744`, `f6f7947` |
+| 3 — invented training data / bounds / determinism | `b6740f8`, `ea5506f` |
+| 4 — ablation verdicts from delta-EV CIs | `4877b85`, `39ed676` |
+| 5 — Sharpe annualization + lookahead | `0f762f7`, `a245a20`, `f7265cb`, `46ce3f4`, `818817f` |
+| 6 — README metrics and claims | `d3bdf37`, `bf05784`, `7a14a7a`, `7fd1e18`, `567e129` |
+
+**The G-series (G-1 … G-5) is a follow-on round of the same defect class, found after this plan was
+written, and is not in this plan's task numbering.** It repairs the same "label claims more than the
+measurement supports" pattern in the dashboard and the remaining analytics surfaces. Read the ledger for
+it; nothing in this plan describes it.
+
+---
+
 ## Task 1: Make the Monte Carlo validator report only what it actually measured
 
 **Files:**
