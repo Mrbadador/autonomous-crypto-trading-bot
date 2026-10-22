@@ -8,6 +8,7 @@ not find being reported as missing instead of silently skipped.
 """
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -3158,6 +3159,11 @@ _G4_BLOCKS = {
               (r"\n[ \t]*fig_radar = build_position_candlestick_chart",)),
     "fleet": (r"^.*Fleet Multi-Level Microstructure & Toxicity Matrix",
               (r"\n[ \t]*# .*AI Order Flow Tape Whisperer",)),
+    # G-5a: the cash-and-carry panel. `^.*BTC Cash-and-Carry Basis Oracle` matches TWO lines (the
+    # section comment and the subheader), so `_section_block`'s exactly-once anchor assertion would
+    # reject it; the subheader prefix makes it name one panel.
+    "basis": (r'^[ \t]*st\.subheader\(".*BTC Cash-and-Carry Basis Oracle',
+              (r'\n[ \t]*st\.markdown\("---"\)',)),
 }
 
 _G4_DASHBOARD_BLOCKS = ("macro", "ofi", "micro", "radar", "fleet")
@@ -3283,6 +3289,10 @@ _G4_RETIRED_DASHBOARD = (
     "r_kyle_pct", "r_lvr", "r_tox_halt",
     "s_mlofi", "s_mp", "s_bps", "s_vpin", "s_bbid", "s_bask", "s_h_spoof", "s_h_rho",
     "s_h_veto", "s_kyle_pct", "s_lvr_tax", "s_tox_halt",
+    # G-5a: five stand-in readings the carry panel assigned and then never used. A stand-in that
+    # feeds nothing is still a stand-in the next reader will trust, so they are deleted outright and
+    # listed here so no line can quietly re-bind one.
+    "b_spot", "b_perp", "b_upnl", "b_has_pos", "b_roundtrip_fee",
 )
 _G4_RETIRED_LEGACY = ("imb", "bid_wall", "ask_wall")
 
@@ -3772,3 +3782,613 @@ def test_g4_the_absence_reasons_name_the_reading_that_is_missing():
     assert note.strip().startswith("<span style="), note
     assert "#94a3b8" in note, note
     assert "(no vpin in microstructure telemetry)</span>" in note, note
+
+
+# ---------------------------------------------------------------------------
+# G-5a — the cash-and-carry basis panel: a parked engine's economics as readings
+# ---------------------------------------------------------------------------
+# Measured at BASE against `file:trading_data.db?mode=ro`, `system_state`, key
+# `basis_trader_telemetry`: the payload carries FIVE keys for an engine that is DISABLED, while the
+# panel read twenty-three. Every field the payload does not carry came from a hardcoded stand-in, so
+# the HUD published a $1,000 allocation, an 8 % hurdle, a 100 % liquidation buffer, a CROSSED margin
+# mode and an "Active" margin guard for a book that does not exist.
+#
+# What is proven below: `_basis_readings` and the panel's own f-string are executed for real. The
+# panel block is compiled out of dashboard.py and run against the live payload in a namespace built
+# from dashboard.py's own top-level helpers, so a `{x['value']}` that formats None raises here rather
+# than on the fleet — that is the crash-hazard claim, and it is a real one. `query_system_state` is
+# `@st.cache_data`-wrapped and cannot be extracted, so the DB read itself is stubbed at its return
+# value; the row is still seeded in a real `system_state` table and read back through sqlite, so the
+# JSON the panel parses is the JSON a publisher would send. The clock is injected, so the age line
+# is deterministic.
+
+_G5_LIVE_PAYLOAD = {
+    "status": "DISABLED",
+    "state": "DISABLED",
+    "reason": "Temporarily parked for account segregation",
+    "net_delta": 0.0,
+    "timestamp": "2026-09-17T22:45:48.677606+00:00",
+}
+
+# 2026-09-17T22:45:48Z published, this instant reading: 35 days.
+_G5_FIX_NOW = datetime(2026, 10, 22, 20, 0, tzinfo=timezone.utc)
+
+# The fields the panel used to invent and that the live five-key payload does not carry.
+_G5_ABSENT_IN_LIVE = ("capital_allocated_usd", "hurdle_rate_pct", "distance_to_liq_pct",
+                      "margin_mode", "annualized_yield_pct", "unwind_hurdle_pct",
+                      "funding_rate_8h", "cumulative_funding_harvested", "liquidation_price",
+                      "fee_amortized_pct", "fee_hurdle_target_usd", "holding_days",
+                      "min_holding_days", "basis_spread_usd", "basis_dislocation_pct")
+
+# The fields published through `_published_state`, which carry {"text"} instead of {"value"}.
+_G5_TEXT_FIELDS = ("state", "reason", "margin_mode", "timestamp")
+
+# Every payload field the panel publishes, so an "all fields measured" fixture can be built without
+# transcribing the panel by hand.
+_G5_ALL_FIELDS = _G5_ABSENT_IN_LIVE + ("state", "reason", "net_delta", "timestamp")
+
+# (rendered text variable, the one state variable it may read). A field's own text must key on its
+# own flag — G-4's radar banner is the precedent, and the one-line summary of its weakness is that a
+# ternary naming a sibling's flag slips through, so this table is checked against a set.
+_G5_FIELD_OWNERS = {
+    "b_alloc_text": "b_alloc_st", "b_alloc_note": "b_alloc_st",
+    "b_funding_text": "b_funding_st", "b_funding_note": "b_funding_st",
+    "b_yield_text": "b_yield_st", "b_yield_note": "b_yield_st",
+    "b_hurdle_text": "b_hurdle_st", "b_hurdle_note": "b_hurdle_st",
+    "b_spread_text": "b_spread_st", "b_spread_note": "b_spread_st",
+    "b_disloc_text": "b_disloc_st", "b_disloc_note": "b_disloc_st",
+    "b_harvest_text": "b_harvest_st", "b_harvest_note": "b_harvest_st",
+    "b_net_delta_text": "b_net_delta_st", "b_net_delta_note": "b_net_delta_st",
+    "b_fee_amort_text": "b_fee_amort_st", "b_fee_amort_note": "b_fee_amort_st",
+    "b_fee_target_text": "b_fee_target_st",
+    "b_liq_price_text": "b_liq_price_st", "b_liq_price_note": "b_liq_price_st",
+    "b_dist_liq_text": "b_dist_liq_st", "b_dist_liq_note": "b_dist_liq_st",
+    "b_margin_mode_text": "b_margin_mode_st", "b_margin_mode_note": "b_margin_mode_st",
+    "b_holding_text": "b_holding_st", "b_min_holding_text": "b_min_holding_st",
+}
+
+# Every verdict/colour the block derives, and so every one that must be guarded.
+_G5_DERIVED_NAMES = frozenset({
+    "status_color", "status_badge", "yield_color", "funding_color", "liq_color", "fee_color",
+    "fee_bar_width", "margin_guard_color", "disloc_color", "harvest_color", "delta_color",
+    "b_delta_posture", "b_time_text", "b_time_color", "b_reason_line", "b_coverage_line",
+    "b_unmeasured_count", "b_is_stale", "b_age_days",
+})
+
+
+class _G5RecordingStreamlit:
+    """Captures what the panel emits, so its f-string can be rendered without an app."""
+
+    def __init__(self):
+        self.markdown_calls = []
+        self.infos = []
+
+    def markdown(self, body, **kwargs):
+        self.markdown_calls.append(str(body))
+
+    def info(self, body, **kwargs):
+        self.infos.append(str(body))
+
+    def __getattr__(self, name):
+        def _record(*args, **kwargs):
+            return None
+        return _record
+
+
+def _g5_system_state_row(tmp_path, payload=_G5_LIVE_PAYLOAD):
+    """Seed one real `system_state` row and hand back the JSON text sqlite stores for it.
+
+    Written to a database in `tmp_path` — never to `trading_data.db`, which every test here opens
+    read-only or not at all.
+    """
+    import json as _json
+    import sqlite3
+
+    db = tmp_path / "telemetry_fixture.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT, "
+                     "updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        raw = _json.dumps(payload)
+        conn.execute("INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+                     ("basis_trader_telemetry", raw, "2026-09-17T22:45:48.677606+00:00"))
+        conn.commit()
+        stored = conn.execute("SELECT value FROM system_state WHERE key = ?",
+                              ("basis_trader_telemetry",)).fetchone()[0]
+    finally:
+        conn.close()
+    return str(stored)
+
+
+def _g5_panel_namespace(path, raw_value, now=None):
+    """A namespace holding dashboard.py's own shipped helpers, without booting dashboard.py.
+
+    Only stdlib imports, the `_BASIS_*` module constants and the pure renderers the block calls are
+    compiled out of the file, in source order. `streamlit` is replaced by a recorder and
+    `query_system_state` by the seeded payload text.
+    """
+    import ast
+
+    wanted_funcs = {"_optional_float", "_published_number", "_published_boolean",
+                    "_published_state", "_absence_note", "utc_to_sast", "_basis_readings"}
+    safe_imports = {"json", "html", "pytz", "datetime", "typing", "time"}
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    ns = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            roots = [alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            roots = [(node.module or "").split(".")[0]]
+        else:
+            continue
+        if roots and all(root in safe_imports for root in roots):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+    for node in tree.body:
+        targets = ([node.target] if isinstance(node, ast.AnnAssign)
+                   else (node.targets if isinstance(node, ast.Assign) else []))
+        if any(isinstance(t, ast.Name) and t.id.startswith("_BASIS_") for t in targets):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+
+    fake = _G5RecordingStreamlit()
+    ns["st"] = fake
+    ns["query_system_state"] = lambda key, default="": (
+        raw_value if key == "basis_trader_telemetry" else default)
+    if now is not None and callable(ns.get("_basis_readings")):
+        shipped = ns["_basis_readings"]
+        ns["_basis_readings"] = lambda data, _s=shipped, _n=now: _s(data, now=_n)
+    return ns, fake
+
+
+def _g5_render_carry_panel(tmp_path, payload=None, path=None, raw=None):
+    """Run the shipped carry-panel block for one payload and return the HTML it published.
+
+    With a `tmp_path` the payload is seeded as a real `system_state` row and read back out of
+    sqlite first, so the JSON the panel parses went through a storage round-trip; without one it is
+    dumped straight. Either way the block itself is dashboard.py's own source.
+    """
+    import json as _json
+
+    path = DASHBOARD if path is None else path
+    if raw is None:
+        body = _G5_LIVE_PAYLOAD if payload is None else payload
+        raw = (_g5_system_state_row(tmp_path, body) if tmp_path is not None
+               else _json.dumps(body))
+    ns, fake = _g5_panel_namespace(path, raw, now=_G5_FIX_NOW)
+    block = _g4_block("basis", path)
+    exec(compile(block, f"{path.name} carry panel", "exec"), ns)
+    return "\n".join(fake.markdown_calls), fake
+
+
+def _g5_readings(payload, path=None):
+    """`_basis_readings`, compiled out of the shipped file, called on one payload."""
+    return _g4_helper("_basis_readings", path)(payload, now=_G5_FIX_NOW)
+
+
+# Group 1 — the live payload, run through the shipped read path.
+@pytest.mark.parametrize("field", _G5_ABSENT_IN_LIVE)
+def test_g5a_the_live_payload_leaves_the_carry_economics_unmeasured(field):
+    """A parked engine published no book, so the panel may publish none either.
+
+    The five-key DISABLED payload is read exactly as the shipped helper reads it. `net_delta = 0.0`
+    IS carried and must come back measured; everything with a stand-in default today must come back
+    absent with a reason naming the field.
+    """
+    state = _g5_readings(dict(_G5_LIVE_PAYLOAD))[field]
+    assert state["measured"] is False, (_G5_LIVE_PAYLOAD, field, state)
+    if field in _G5_TEXT_FIELDS:
+        assert "value" not in state, f"{field} is published as text but carries a value: {state}"
+        assert state["text"] == "not measured", (field, state)
+    else:
+        assert state["value"] is None, f"{field} was absent but still carries a value: {state}"
+    assert field in state["reason"], f"the absence for {field} does not name itself: {state}"
+
+
+def test_g5a_the_live_payload_keeps_net_delta_a_measured_zero():
+    """`net_delta = 0.0` is the one number in the live payload. It must stay a reading.
+
+    This is the regression the round is judged on: an absence is not a zero and a zero is not an
+    absence. The panel also used to read a USD-suffixed key the payload has never carried, so the
+    reading it printed came from a default rather than from the engine.
+    """
+    readings = _g5_readings(dict(_G5_LIVE_PAYLOAD))
+    assert readings["net_delta"] == {"value": 0.0, "measured": True, "reason": ""}, readings["net_delta"]
+    src = _function_source(DASHBOARD, "_basis_readings")
+    assert '"net_delta": _number("net_delta")' in src, (
+        "the carry readings do not read the key the engine publishes")
+    assert "net_delta_usd" not in DASHBOARD.read_text(encoding="utf-8"), (
+        "the panel still reads the USD-suffixed delta key the payload never carried")
+
+
+@pytest.mark.parametrize("field,expected", [("state", "DISABLED"),
+                                            ("reason", "Temporarily parked for account segregation")])
+def test_g5a_the_live_payload_publishes_the_state_and_the_engines_own_reason(field, expected):
+    state = _g5_readings(dict(_G5_LIVE_PAYLOAD))[field]
+    assert state["measured"] is True, (field, state)
+    assert state["text"] == expected, (field, state)
+
+
+def test_g5a_the_age_of_the_live_telemetry_is_measured_from_its_own_timestamp():
+    """35 days old is a fact about the payload, computed from the payload's timestamp."""
+    readings = _g5_readings(dict(_G5_LIVE_PAYLOAD))
+    assert readings["timestamp"]["measured"] is True, readings["timestamp"]
+    assert readings["age_days"] is not None and 34.0 <= readings["age_days"] <= 36.0, \
+        readings["age_days"]
+    assert readings["stale"] is True, readings["age_days"]
+    fresh = _g5_readings({**_G5_LIVE_PAYLOAD,
+                          "timestamp": _G5_FIX_NOW.isoformat()})
+    assert fresh["age_days"] <= 0.01 and fresh["stale"] is False, fresh["age_days"]
+    broken = _g5_readings({**_G5_LIVE_PAYLOAD, "timestamp": "not a date"})
+    assert broken["age_days"] is None and broken["stale"] is False, broken
+
+
+def test_g5a_basis_readings_survives_a_payload_that_is_not_a_dict():
+    """`json.loads` can hand back a list or a string; a panel that raises publishes nothing."""
+    for junk in (None, [], "DISABLED", 7, True, {}):
+        readings = _g5_readings(junk)
+        assert readings["net_delta"]["measured"] is False, (junk, readings["net_delta"])
+        assert readings["age_days"] is None and readings["stale"] is False, junk
+
+
+# Group 2 — a measured zero is never an absence, for every field converted.
+@pytest.mark.parametrize("field", sorted(_G5_ALL_FIELDS))
+def test_g5a_a_measured_zero_stays_a_reading_in_the_carry_panel(field):
+    """Every stand-in here was `... or 0.0` or `... or <default>`, which cannot tell a recorded
+    zero from no record. Feed a real 0.0 to each field and it must come back as a reading."""
+    state = _g5_readings({field: 0.0})[field]
+    assert state["measured"] is True, (field, state)
+    if field in _G5_TEXT_FIELDS:
+        assert state["text"] == "0.0", (field, state)
+    else:
+        assert state["value"] == 0.0, (field, state)
+
+
+def test_g5a_a_floor_of_measured_zeros_renders_no_absences_at_all(tmp_path):
+    """With every field measured at zero, the panel must print zeros, not `not measured`."""
+    payload = {field: 0.0 for field in _G5_ALL_FIELDS}
+    payload["state"] = "ACTIVE_DELTA_NEUTRAL"
+    payload["timestamp"] = _G5_FIX_NOW.isoformat()
+    html, _fake = _g5_render_carry_panel(tmp_path, payload=payload)
+    assert "not measured" not in html, html[:2500]
+    assert "$0 USDT" in html, html
+    assert "$+0.00" in html, html
+    assert "+0.0000%" in html, html
+    assert "$+0.0000 USD" in html, html
+    assert "+0.0% Buffer" in html, html
+    assert "panel scale: 125%" in html, html
+
+
+# Group 3 — no numeric stand-in survives in this block.
+@pytest.mark.parametrize("stand_in", ["or 8.0", "or 1.5", "or 1000.0", "or 7", "or 2.40",
+                                      "or 3.00", "or 100.0", '"margin_mode", "crossed"'])
+def test_g5a_no_numeric_stand_in_survives_in_the_carry_panel(stand_in):
+    block = _g4_block("basis", DASHBOARD)
+    assert stand_in not in block, f"the carry panel still invents a reading with {stand_in!r}"
+
+
+def test_g5a_the_carry_panel_reads_through_the_publishers_and_the_scan_is_not_vacuous():
+    """Positive side of the stand-in scan, plus the floor that makes the negative side mean
+    something: a block that extracted the wrong region would be short and key-free.
+
+    The payload keys are allowed to appear in exactly two places — the panel block and the pure
+    `_basis_readings` helper it now calls. Anywhere else is a second reader of the same telemetry
+    that this test is not looking at.
+    """
+    block = _g4_block("basis", DASHBOARD)
+    assert "_basis_readings(basis_data)" in block, (
+        "the carry panel does not read its payload through the published-reading helper")
+    assert block.count("_absence_note(") >= 12, (
+        f"the carry panel explains only {block.count('_absence_note(')} absences")
+    assert len(block.splitlines()) >= 150, (
+        f"the extracted carry panel is {len(block.splitlines())} lines, so this is not the panel")
+    helper = _function_source(DASHBOARD, "_basis_readings")
+    assert helper, "dashboard.py has no _basis_readings to route the panel through"
+    src = DASHBOARD.read_text(encoding="utf-8")
+    for key in ("capital_allocated_usd", "hurdle_rate_pct", "unwind_hurdle_pct",
+                "distance_to_liq_pct", "fee_hurdle_target_usd", "basis_dislocation_pct",
+                "fee_amortized_pct", "liquidation_price"):
+        outside = src.count(f'"{key}"') - block.count(f'"{key}"') - helper.count(f'"{key}"')
+        assert outside == 0, (
+            f"{key} is read {outside} time(s) outside the carry panel and its reader helper, so "
+            "the block this test scanned is not the only place the figure is invented")
+
+
+def test_g5a_the_dead_stand_in_reads_are_gone():
+    """Five fields were assigned and never used. A stand-in feeding nothing is still a stand-in."""
+    src = DASHBOARD.read_text(encoding="utf-8")
+    for key in ("unrealized_pnl_usd", "has_active_position", "spot_price", "perp_price",
+                "roundtrip_fee_usd"):
+        assert f'"{key}"' not in src, f"the carry panel still reads {key}, which renders nowhere"
+
+
+# Group 4 — an absence never wears a measured colour.
+@pytest.mark.parametrize("signal_colour", ["#00ff66", "#ff9900", "#ff003c"])
+def test_g5a_the_live_payload_prints_no_signal_colour_for_a_field_it_never_measured(signal_colour):
+    """Against today's payload the only readings are state, reason and net delta, so the green
+    all-clear, the amber warning and the red alarm all belong to numbers that do not exist. The
+    Funding Harvested card used to be fixed `#00ff66` and the liquidation guard used to be bought
+    green by a stand-in 100.0."""
+    html, _fake = _g5_render_carry_panel(None)
+    assert signal_colour not in html, (signal_colour, html[:2500])
+    assert "#94a3b8" in html, html[:2500]
+
+
+def test_g5a_the_funding_harvested_card_no_longer_hardcodes_the_all_clear():
+    block = _g4_block("basis", DASHBOARD)
+    assert "color: #00ff66; font-size: 0.95rem" not in block, (
+        "a card still wears a hardcoded green instead of a measured colour")
+    assert "harvest_color" in block, "the Funding Harvested card has no state-driven colour"
+    assert 'if b_harvest_st["measured"] else "#94a3b8"' in block, (
+        "the Funding Harvested colour does not fall back to absence grey")
+
+
+def test_g5a_the_thresholds_are_named_as_thresholds():
+    """125% and 20% are the panel's own scale, not measurements — and they may not sit beside a
+    stand-in reading so closely that they read as part of it."""
+    block = _g4_block("basis", DASHBOARD)
+    assert "panel scale: {_BASIS_FEE_SCALE_PCT:.0f}%" in block, (
+        "the 125% fee scale is not labelled as the panel's own threshold")
+    assert "panel min-buffer threshold: {_BASIS_MIN_BUFFER_PCT:.0f}%" in block, (
+        "the 20% min buffer is not labelled as the panel's own threshold")
+    assert re.search(r"fee_bar_width\s*=\s*min\([^)]*b_fee_amort_st\[[^\]]*value[^\]]*\]",
+                     block, re.S), (
+        "the fee bar is not computed from the measured amortisation")
+    html, _fake = _g5_render_carry_panel(None)
+    assert "0.0% / 125%" not in html, html
+
+
+# Group 5 — the three fabricated prose claims.
+@pytest.mark.parametrize("claim", ["(Neutral)", "Margin Mode Active",
+                                   "IDLE (SCANNING YIELD & SPREAD)"])
+def test_g5a_the_fabricated_prose_claims_are_gone(claim):
+    block = _g4_block("basis", DASHBOARD)
+    assert claim not in block, f"the carry panel still asserts {claim!r} regardless of the payload"
+
+
+def test_g5a_the_replacements_are_present_and_reachable():
+    """Absence checks pass on a panel that deleted the card entirely, so the new wording is pinned
+    in the block AND in the HTML the live payload actually renders."""
+    block = _g4_block("basis", DASHBOARD)
+    for reachable in ("STATE NOT MEASURED", "b_delta_posture", "Engine-reported reason",
+                      "Margin mode:", "STALE TELEMETRY"):
+        assert reachable in block, f"the carry panel has no {reachable!r} to fall back on"
+    html, _fake = _g5_render_carry_panel(None)
+    assert "STATE PUBLISHED" not in html and "⏸️ PARKED / DISABLED" in html, html[:2000]
+    assert "posture not measured" not in html, "the published delta lost its posture"
+    assert "Engine-reported reason: <b style='color: #e2e8f0;'>" \
+           "Temporarily parked for account segregation</b>" in html, html
+    assert "35d old · ⚠️ STALE TELEMETRY" in html, html
+    assert "15 of 18 economics fields" in html, html
+    # And the state that was never published really does reach the absence badge.
+    no_state = dict(_G5_LIVE_PAYLOAD)
+    no_state.pop("state")
+    html2, _fake2 = _g5_render_carry_panel(None, payload=no_state)
+    assert "STATE NOT MEASURED" in html2, html2[:2000]
+    assert "#94a3b8" in html2, html2[:2000]
+
+
+def test_g5a_an_unrecognised_published_state_is_not_renamed():
+    """A state the panel does not know was still measured, so it is shown as published — never
+    quietly rewritten as IDLE, and never dressed in the cyan the stand-in used."""
+    html, _fake = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "state": "REBALANCING_HALTED"})
+    assert "STATE PUBLISHED, UNRECOGNISED: REBALANCING_HALTED" in html, html[:2000]
+
+
+def test_g5a_the_disabled_engine_keeps_its_dimmed_colour_and_is_not_promoted():
+    """`#64748b` is the parked colour; a stale row must not be painted the live cyan."""
+    html, _fake = _g5_render_carry_panel(None)
+    assert "border-left: 3px solid #64748b" in html, html[:2000]
+    assert "IDLE" not in html, html[:2000]
+
+
+# Group 6 — the AST guards: derived verdicts guarded, field values keyed on their own state.
+def _function_source(path, name):
+    """The source of one module-level function, read out of the file's own syntax tree."""
+    import ast
+
+    src = path.read_text(encoding="utf-8")
+    for node in ast.parse(src, filename=str(path)).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(src, node) or ""
+    raise AssertionError(f"{path.name} has no module-level function named {name}")
+
+
+def test_g5a_every_derived_verdict_in_the_carry_panel_guards_on_measured():
+    """A verdict computed from a reading that can be absent either raises TypeError (the panel then
+    publishes NOTHING, which is worse than any stand-in) or publishes an all-clear nobody measured.
+
+    Ancestor-walk over the enclosing `If` gates, the approach `test_g4_the_radar_banner_...` uses;
+    its known limitation — a bundled gate also has `measured` in its test — is why the field values
+    are checked separately and more strictly by `test_g5a_the_carry_panel_keys_each_field_on_its_own_state`.
+    """
+    import ast
+
+    block = _g4_block("basis", DASHBOARD)
+    tree = ast.parse(block, filename="dashboard.py carry panel")
+    parents = _g4_parent_map(tree)
+    seen = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if not (isinstance(target, ast.Name) and target.id in _G5_DERIVED_NAMES):
+                continue
+            seen.add(target.id)
+            segment = ast.get_source_segment(block, node) or ""
+            assert "measured" in segment or _g4_enclosing_measured_guard(node, parents, block), (
+                f"the carry panel derives {target.id} from a reading that can be absent: "
+                f"{segment[:160]}")
+    missing = sorted(_G5_DERIVED_NAMES - seen)
+    assert not missing, (
+        f"the carry panel no longer derives {missing}, so this guard has nothing to check")
+
+
+@pytest.mark.parametrize("field,own_key", sorted(_G5_FIELD_OWNERS.items()))
+def test_g5a_the_carry_panel_keys_each_field_on_its_own_state(field, own_key):
+    """A missing hurdle may not make the panel disown the yield it measured, and a measured yield
+    may not be published under the hurdle's flag.
+
+    Stronger than the G-4 radar guard it is copied from: there, a ternary keyed on its own flag plus
+    a sibling's still passed. Here the set of state variables a field's own line may name must be
+    exactly one — its own.
+    """
+    import ast
+
+    block = _g4_block("basis", DASHBOARD)
+    tree = ast.parse(block, filename="dashboard.py carry panel")
+    parents = _g4_parent_map(tree)
+    assigns = [node for node in ast.walk(tree)
+               if isinstance(node, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == field for t in node.targets)]
+    assert assigns, f"the carry panel no longer publishes {field} at all"
+    keyed = re.compile(own_key + r"\[[^\]]*measured[^\]]*\]")
+    for node in assigns:
+        segment = ast.get_source_segment(block, node) or ""
+        named = set(re.findall(r"\bb_[a-z_]*_st\b", segment))
+        assert named == {own_key}, (
+            f"{field} is keyed on {sorted(named)}; a published field value may read only its own "
+            f"state ({own_key}): {segment[:200]}")
+        assert keyed.search(segment), (
+            f"the carry panel never keys {field} on {own_key}'s own measured flag: {segment[:200]}")
+        if field.endswith("_note"):
+            # The parenthetical line: its whole job is the absence, so it must render the reason.
+            assert "_absence_note(" in segment and "reason" in segment, (
+                f"{field} publishes no reason for its own absence: {segment[:200]}")
+        else:
+            assert "not measured" in segment, (
+                f"{field} has no absence for when its own state was never measured: "
+                f"{segment[:200]}")
+        assert not _g5_enclosing_gate_is_bundled(node, parents, block, own_key), (
+            f"{field} is published under a gate on another field's state")
+
+
+def _g5_enclosing_gate_is_bundled(node, parents, block, own_key):
+    """True when an enclosing `If` gate reads a state variable other than `own_key`.
+
+    The G-4 radar guard (`test_g4_the_radar_banner_keys_each_hawkes_text_on_its_own_state`) only
+    excluded one named sibling, so a ternary keyed on its own flag *plus* a sibling's still passed.
+    This one asks whether any other field's state is in scope at all.
+    """
+    import ast
+
+    ancestor = parents.get(id(node))
+    while ancestor is not None:
+        if isinstance(ancestor, ast.If):
+            gate = ast.get_source_segment(block, ancestor.test) or ""
+            named = set(re.findall(r"\bb_[a-z_]*_st\b", gate))
+            if named and named != {own_key}:
+                return True
+        ancestor = parents.get(id(ancestor))
+    return False
+
+
+def test_g5a_the_combined_yield_verdict_is_legitimately_bundled():
+    """`yield_color` compares the yield against two thresholds, so it genuinely needs all three
+    states — the one place in the panel where a bundled gate is the right answer, pinned so a later
+    reader does not un-bundle it into `b_yield_st` alone and compare against a None hurdle."""
+    import ast
+
+    block = _g4_block("basis", DASHBOARD)
+    tree = ast.parse(block, filename="dashboard.py carry panel")
+    parents = _g4_parent_map(tree)
+    gates = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id == "yield_color":
+            ancestor = parents.get(id(node))
+            while ancestor is not None:
+                if isinstance(ancestor, ast.If):
+                    gates.append(ast.get_source_segment(block, ancestor.test) or "")
+                ancestor = parents.get(id(ancestor))
+    assert any({"b_yield_st", "b_hurdle_st", "b_unwind_st"}
+               <= set(re.findall(r"\bb_[a-z_]*_st\b", gate)) for gate in gates), (
+        "the yield verdict is no longer gated on every threshold it compares against: "
+        f"{gates}")
+    assert re.search(r'yield_color\s*=\s*"#94a3b8"', block), (
+        "the bundled yield verdict has no absence colour for when it cannot be formed")
+
+
+# Group 7 — the panel renders. This is the claim the whole rewrite is checked against.
+def test_g5a_the_live_payload_renders_parked_economics_instead_of_a_carry_book(tmp_path):
+    """Nothing here re-asserts a string the panel happens to contain: the shipped f-string is
+    executed against the live payload, so a `{x['value']}` formatting a None would raise here.
+
+    The payload reaches the panel the way the fleet sends it: written into a `system_state` row in a
+    fixture database and read back out of sqlite.
+    """
+    raw = _g5_system_state_row(tmp_path)
+    import json as _json
+    assert _json.loads(raw) == _G5_LIVE_PAYLOAD, raw
+    html, fake = _g5_render_carry_panel(tmp_path, raw=raw)
+    assert len(fake.markdown_calls) == 1, "the panel published an unexpected number of blocks"
+    assert "None" not in html, html[:2500]
+    assert "$1,000" not in html and "1,000.00" not in html, "an invented allocation is published"
+    assert "(Hurdle: 8.0%)" not in html, "the invented 8% hurdle is published"
+    assert "+100.0% Buffer" not in html, "the invented 100% liquidation buffer is published"
+    assert "CROSSED" not in html, "an invented margin mode is published"
+    assert "🛡️" not in html, "a guard the engine never armed is still claimed"
+    assert "0.0% / 125%" not in html, "the fee line still reads as a measurement"
+    assert "$+0.00" in html, "the one measured reading lost its digits"
+    assert "not measured" in html and "(no capital_allocated_usd in basis trader telemetry)" in html
+    assert "2026-09-18 00:45:48" in html, "the payload's own timestamp is not rendered"
+
+
+def test_g5a_an_empty_payload_still_publishes_the_standing_by_message(tmp_path):
+    """`if basis_data:` is truthy for a five-key dict, which is what let the stand-ins through. The
+    genuinely-empty case must keep its own branch rather than rendering the deck."""
+    _html, fake = _g5_render_carry_panel(tmp_path, payload={})
+    assert _html == "", _html
+    assert len(fake.infos) == 1 and "Cash-and-Carry Basis Trader standing by" in fake.infos[0], \
+        fake.infos
+
+
+def test_g5a_an_active_engine_still_publishes_its_real_book():
+    """The other half of the crash hazard: with every field present, the panel must show the
+    readings and stop claiming absences — and a full book must still format."""
+    payload = {
+        "state": "ACTIVE_DELTA_NEUTRAL", "reason": "carry captured", "margin_mode": "isolated",
+        "capital_allocated_usd": 2500.0, "hurdle_rate_pct": 8.0, "unwind_hurdle_pct": 1.5,
+        "annualized_yield_pct": 11.25, "funding_rate_8h": 0.00012, "basis_spread_usd": -350.25,
+        "basis_dislocation_pct": 0.42, "cumulative_funding_harvested": 1.8675, "net_delta": -0.75,
+        "holding_days": 3.5, "min_holding_days": 7.0, "fee_hurdle_target_usd": 3.0,
+        "fee_amortized_pct": 118.4, "liquidation_price": 91000.0, "distance_to_liq_pct": 24.5,
+        "timestamp": _G5_FIX_NOW.isoformat(),
+    }
+    html, _fake = _g5_render_carry_panel(None, payload=payload)
+    assert "not measured" not in html, html[:2500]
+    assert "$2,500 USDT" in html, html
+    assert "+11.25%" in html and "(Hurdle: 8.0%)" in html, html
+    assert "+0.0120%" in html, html
+    assert "$+1.8675 USD" in html, html
+    assert "$-0.75" in html, "the published net delta is not printed"
+    assert "+24.5% Buffer" in html and "(Liq: $91,000.00)" in html, html
+    assert "ISOLATED" in html, html
+    assert "🟢 ACTIVE 1:1 DELTA-NEUTRAL TWIN" in html, html
+    assert "3.5d / 7d" in html, html
+
+
+def test_g5a_a_negative_harvest_is_not_printed_as_a_gain():
+    """The old line hardcoded a `+` before the dollar figure, so a $-4.50 harvest read as a gain."""
+    html, _fake = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "cumulative_funding_harvested": -4.5})
+    assert "$-4.5000 USD" in html, html
+    assert "+$-4.5000" not in html, html
+    assert "#ff003c" in html, "a negative harvest still wears the all-clear green"
+
+
+def test_g5a_the_legacy_dashboard_has_no_carry_panel_to_convert():
+    """The scope claim in the brief, checked rather than assumed: `scripts/live_dashboard.py` never
+    read this telemetry, so there is one file to fix and one block to guard."""
+    legacy_src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "basis_trader_telemetry" not in legacy_src
+    assert "CASH-AND-CARRY" not in legacy_src
+    with pytest.raises(Exception):
+        _g4_block("basis", LEGACY_DASHBOARD)
+

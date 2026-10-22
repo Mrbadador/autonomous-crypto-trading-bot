@@ -1316,6 +1316,99 @@ def _absence_note(reason: str) -> str:
     return f" <span style='color: #94a3b8; font-size: 0.8rem;'>({html.escape(str(reason))})</span>"
 
 
+# ── BTC cash-and-carry basis engine: published readings only, never a stand-in book ──────
+# The panel used to default every economics field to a plausible figure — a 1000-dollar
+# allocation, an 8 percent hurdle, a 100 percent liquidation buffer, a "crossed" margin mode — and
+# to a status the engine never claimed. The live telemetry carries five keys for a DISABLED engine,
+# so the HUD was publishing a delta-neutral carry book with a 100% liquidation buffer for a
+# position that does not exist. Each field is now read on its own, and an absent field says so.
+# These three are the panel's OWN thresholds — they are not measurements and are labelled where
+# they are shown.
+_BASIS_FEE_SCALE_PCT = 125.0
+_BASIS_MIN_BUFFER_PCT = 20.0
+_BASIS_NEUTRAL_TOL_USD = 1.0
+# Telemetry older than this is reported as stale rather than being allowed to look current.
+_BASIS_STALE_DAYS = 1.0
+
+# The states the basis engine publishes, with the badge each one earns. A state that is not in
+# here was measured but is not a state this panel understands, so it is shown as published rather
+# than quietly renamed into a status the engine never claimed.
+_BASIS_STATE_BADGES = {
+    "ACTIVE_DELTA_NEUTRAL": ("#00ff66", "🟢 ACTIVE 1:1 DELTA-NEUTRAL TWIN"),
+    "PENDING_PERP_FILL": ("#ffcc00", "⏳ PENDING PERP MAKER FILL (15s GATE)"),
+    "UNWINDING": ("#ff003c", "⚠️ UNWINDING TWIN POSITION"),
+    "DISABLED": ("#64748b", "⏸️ PARKED / DISABLED"),
+}
+
+
+def _basis_readings(basis_data, now=None) -> dict:
+    """Return the cash-and-carry panel's figures, each one a measurement or an absence.
+
+    `basis_data` is the parsed `basis_trader_telemetry` JSON, and may be any subset of the keys —
+    today's live payload carries five (`status`, `state`, `reason`, `net_delta`, `timestamp`) for
+    an engine that is parked. Every economics field the panel shows is published through
+    `_published_number` / `_published_state` on its own, so absence is per field: a missing key
+    yields {"value": None, "measured": False, "reason": ...} and never the stand-in the panel used
+    to substitute. A recorded zero is a fact and stays a reading, which matters because
+    `net_delta = 0.0` IS published today and must keep rendering as a measured `+0.00`.
+
+    `age_days` is derived from the payload's own `timestamp` — a measurement — and is None when no
+    usable timestamp was published. `now` is injectable so the age is testable without a clock.
+
+    Pure and module-level: it boots no Streamlit and touches no database, so it can be compiled out
+    of the source and called with the live payload shape.
+    """
+    data = basis_data if isinstance(basis_data, dict) else {}
+
+    def _number(key):
+        return _published_number(data.get(key), f"no {key} in basis trader telemetry")
+
+    readings = {
+        "state": _published_state(data.get("state"), "no state in basis trader telemetry"),
+        "reason": _published_state(data.get("reason"), "no reason in basis trader telemetry"),
+        "margin_mode": _published_state(data.get("margin_mode"),
+                                        "no margin_mode in basis trader telemetry"),
+        "timestamp": _published_state(data.get("timestamp"),
+                                      "no timestamp in basis trader telemetry"),
+        "funding_rate_8h": _number("funding_rate_8h"),
+        "annualized_yield_pct": _number("annualized_yield_pct"),
+        "hurdle_rate_pct": _number("hurdle_rate_pct"),
+        "unwind_hurdle_pct": _number("unwind_hurdle_pct"),
+        "capital_allocated_usd": _number("capital_allocated_usd"),
+        "cumulative_funding_harvested": _number("cumulative_funding_harvested"),
+        # The engine publishes `net_delta`. The panel used to read a USD-suffixed variant of that
+        # key, which the payload has never carried, so a measured zero was being rendered off a
+        # stand-in default and the real reading was never looked at.
+        "net_delta": _number("net_delta"),
+        "holding_days": _number("holding_days"),
+        "min_holding_days": _number("min_holding_days"),
+        "fee_hurdle_target_usd": _number("fee_hurdle_target_usd"),
+        "fee_amortized_pct": _number("fee_amortized_pct"),
+        "liquidation_price": _number("liquidation_price"),
+        "distance_to_liq_pct": _number("distance_to_liq_pct"),
+        "basis_spread_usd": _number("basis_spread_usd"),
+        "basis_dislocation_pct": _number("basis_dislocation_pct"),
+    }
+
+    age_days = None
+    if readings["timestamp"]["measured"]:
+        raw_ts = str(readings["timestamp"]["text"]).strip().replace("Z", "+00:00")
+        try:
+            published_at = datetime.fromisoformat(raw_ts)
+        except (TypeError, ValueError):
+            published_at = None
+        if published_at is not None:
+            if published_at.tzinfo is None:
+                published_at = pytz.utc.localize(published_at)
+            reference = now if isinstance(now, datetime) else datetime.now(pytz.utc)
+            if reference.tzinfo is None:
+                reference = pytz.utc.localize(reference)
+            age_days = (reference - published_at).total_seconds() / 86400.0
+    readings["age_days"] = age_days
+    readings["stale"] = bool(age_days is not None and age_days >= _BASIS_STALE_DAYS)
+    return readings
+
+
 # ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
@@ -3971,51 +4064,162 @@ with tab_ai:
         pass
 
     if basis_data:
-        b_state = basis_data.get("state", "IDLE")
-        b_spot = float(basis_data.get("spot_price", 0.0) or 0.0)
-        b_perp = float(basis_data.get("perp_price", 0.0) or 0.0)
-        b_spread = float(basis_data.get("basis_spread_usd", 0.0) or 0.0)
-        b_disloc = float(basis_data.get("basis_dislocation_pct", 0.0) or 0.0)
-        b_funding = float(basis_data.get("funding_rate_8h", 0.0) or 0.0)
-        b_yield = float(basis_data.get("annualized_yield_pct", 0.0) or 0.0)
-        b_hurdle = float(basis_data.get("hurdle_rate_pct", 8.0) or 8.0)
-        b_unwind = float(basis_data.get("unwind_hurdle_pct", 1.5) or 1.5)
-        b_alloc = float(basis_data.get("capital_allocated_usd", 1000.0) or 1000.0)
-        b_funding_coll = float(basis_data.get("cumulative_funding_harvested", 0.0) or 0.0)
-        b_upnl = float(basis_data.get("unrealized_pnl_usd", 0.0) or 0.0)
-        b_has_pos = basis_data.get("has_active_position", False)
-        b_net_delta = float(basis_data.get("net_delta_usd", 0.0) or 0.0)
-        b_holding_days = float(basis_data.get("holding_days", 0.0) or 0.0)
-        b_min_holding_days = int(basis_data.get("min_holding_days", 7) or 7)
-        b_roundtrip_fee = float(basis_data.get("roundtrip_fee_usd", 2.40) or 2.40)
-        b_fee_target = float(basis_data.get("fee_hurdle_target_usd", 3.00) or 3.00)
-        b_fee_amortized = float(basis_data.get("fee_amortized_pct", 0.0) or 0.0)
-        b_margin_mode = str(basis_data.get("margin_mode", "crossed")).upper()
-        b_liq_price = float(basis_data.get("liquidation_price", 0.0) or 0.0)
-        b_dist_liq = float(basis_data.get("distance_to_liq_pct", 100.0) or 100.0)
-        b_time = utc_to_sast(basis_data.get("timestamp"))
+        # Every figure below is published per field: a measured reading is shown as a reading and
+        # a key the engine never sent is shown as an absence. The live telemetry carries 5 keys for
+        # a DISABLED engine, so most of these are absences — and `net_delta = 0.0` is a measured
+        # zero that stays a reading.
+        b_r = _basis_readings(basis_data)
+        b_state_st = b_r["state"]
+        b_reason_st = b_r["reason"]
+        b_margin_mode_st = b_r["margin_mode"]
+        b_timestamp_st = b_r["timestamp"]
+        b_funding_st = b_r["funding_rate_8h"]
+        b_yield_st = b_r["annualized_yield_pct"]
+        b_hurdle_st = b_r["hurdle_rate_pct"]
+        b_unwind_st = b_r["unwind_hurdle_pct"]
+        b_alloc_st = b_r["capital_allocated_usd"]
+        b_harvest_st = b_r["cumulative_funding_harvested"]
+        b_net_delta_st = b_r["net_delta"]
+        b_holding_st = b_r["holding_days"]
+        b_min_holding_st = b_r["min_holding_days"]
+        b_fee_target_st = b_r["fee_hurdle_target_usd"]
+        b_fee_amort_st = b_r["fee_amortized_pct"]
+        b_liq_price_st = b_r["liquidation_price"]
+        b_dist_liq_st = b_r["distance_to_liq_pct"]
+        b_spread_st = b_r["basis_spread_usd"]
+        b_disloc_st = b_r["basis_dislocation_pct"]
 
-        # Dynamic state styling
-        if b_state == "ACTIVE_DELTA_NEUTRAL":
-            status_color = "#00ff66"
-            status_badge = "🟢 ACTIVE 1:1 DELTA-NEUTRAL TWIN"
-        elif b_state == "PENDING_PERP_FILL":
-            status_color = "#ffcc00"
-            status_badge = "⏳ PENDING PERP MAKER FILL (15s GATE)"
-        elif b_state == "UNWINDING":
-            status_color = "#ff003c"
-            status_badge = "⚠️ UNWINDING TWIN POSITION"
-        elif b_state == "DISABLED":
-            status_color = "#64748b"
-            status_badge = "⏸️ PARKED / DISABLED"
+        # ── Published figures, one text variable per card, so no `{x['value']}` can format None.
+        b_alloc_text = f"${b_alloc_st['value']:,.0f} USDT" if b_alloc_st["measured"] else "not measured"
+        b_alloc_note = "" if b_alloc_st["measured"] else _absence_note(b_alloc_st["reason"])
+        b_funding_text = f"{b_funding_st['value'] * 100:+.4f}%" if b_funding_st["measured"] else "not measured"
+        b_funding_note = "" if b_funding_st["measured"] else _absence_note(b_funding_st["reason"])
+        b_yield_text = f"{b_yield_st['value']:+.2f}%" if b_yield_st["measured"] else "not measured"
+        b_yield_note = "" if b_yield_st["measured"] else _absence_note(b_yield_st["reason"])
+        b_hurdle_text = f"{b_hurdle_st['value']:.1f}%" if b_hurdle_st["measured"] else "not measured"
+        b_hurdle_note = "" if b_hurdle_st["measured"] else _absence_note(b_hurdle_st["reason"])
+        b_spread_text = f"${b_spread_st['value']:+.2f}" if b_spread_st["measured"] else "not measured"
+        b_spread_note = "" if b_spread_st["measured"] else _absence_note(b_spread_st["reason"])
+        b_disloc_text = f"({b_disloc_st['value']:+.2f}%)" if b_disloc_st["measured"] else "not measured"
+        b_disloc_note = "" if b_disloc_st["measured"] else _absence_note(b_disloc_st["reason"])
+        b_harvest_text = f"${b_harvest_st['value']:+.4f} USD" if b_harvest_st["measured"] else "not measured"
+        b_harvest_note = "" if b_harvest_st["measured"] else _absence_note(b_harvest_st["reason"])
+        b_net_delta_text = f"${b_net_delta_st['value']:+.2f}" if b_net_delta_st["measured"] else "not measured"
+        b_net_delta_note = "" if b_net_delta_st["measured"] else _absence_note(b_net_delta_st["reason"])
+        b_fee_amort_text = f"{b_fee_amort_st['value']:.1f}%" if b_fee_amort_st["measured"] else "not measured"
+        b_fee_amort_note = "" if b_fee_amort_st["measured"] else _absence_note(b_fee_amort_st["reason"])
+        b_fee_target_text = f"${b_fee_target_st['value']:.2f}" if b_fee_target_st["measured"] else "not measured"
+        b_liq_price_text = f"${b_liq_price_st['value']:,.2f}" if b_liq_price_st["measured"] else "not measured"
+        b_liq_price_note = "" if b_liq_price_st["measured"] else _absence_note(b_liq_price_st["reason"])
+        b_dist_liq_text = f"+{b_dist_liq_st['value']:.1f}% Buffer" if b_dist_liq_st["measured"] else "not measured"
+        b_dist_liq_note = "" if b_dist_liq_st["measured"] else _absence_note(b_dist_liq_st["reason"])
+        b_margin_mode_text = b_margin_mode_st["text"].upper() if b_margin_mode_st["measured"] else "not measured"
+        b_margin_mode_note = "" if b_margin_mode_st["measured"] else _absence_note(b_margin_mode_st["reason"])
+        b_holding_text = f"{b_holding_st['value']:.1f}d" if b_holding_st["measured"] else "not measured"
+        b_min_holding_text = f"{b_min_holding_st['value']:.0f}d" if b_min_holding_st["measured"] else "not measured"
+
+        # Net-delta posture: the word "Neutral" used to be hardcoded beside the figure, so the
+        # panel asserted a hedged book even when no delta was published. It is now derived from the
+        # published delta only, and says nothing when there is none.
+        if b_net_delta_st["measured"]:
+            b_delta_posture = ("Neutral" if abs(b_net_delta_st["value"]) <= _BASIS_NEUTRAL_TOL_USD
+                               else "Not neutral")
+            delta_color = "#00e5ff"
         else:
-            status_color = "#00e5ff"
-            status_badge = "📡 IDLE (SCANNING YIELD & SPREAD)"
+            b_delta_posture = "posture not measured"
+            delta_color = "#94a3b8"
 
-        yield_color = "#00ff66" if b_yield >= b_hurdle else ("#ff9900" if b_yield > b_unwind else "#ff003c")
-        liq_color = "#00ff66" if b_dist_liq >= 30.0 else ("#ff9900" if b_dist_liq >= 20.0 else "#ff003c")
-        fee_color = "#00ff66" if b_fee_amortized >= 100.0 else ("#00e5ff" if b_fee_amortized >= 50.0 else "#94a3b8")
-        fee_bar_width = min(100.0, max(0.0, (b_fee_amortized / 125.0) * 100.0))
+        # ── State badge. The old else-branch claimed the engine was idle and scanning for yield and
+        # spread for EVERY state, including a payload that published none, so a silent engine was
+        # described as hunting a trade. An unpublished state is now published as an absence.
+        if b_state_st["measured"]:
+            b_state_key = b_state_st["text"].strip().upper()
+            if b_state_key in _BASIS_STATE_BADGES:
+                status_color = _BASIS_STATE_BADGES[b_state_key][0]
+                status_badge = _BASIS_STATE_BADGES[b_state_key][1]
+            else:
+                status_color = "#94a3b8"
+                status_badge = f"STATE PUBLISHED, UNRECOGNISED: {html.escape(b_state_st['text'])}"
+        else:
+            status_color = "#94a3b8"
+            status_badge = "STATE NOT MEASURED"
+
+        # The reason is the engine's own claim, so it is published when present and missed when not.
+        if b_reason_st["measured"]:
+            b_reason_line = (f"Engine-reported reason: "
+                             f"<b style='color: #e2e8f0;'>{html.escape(b_reason_st['text'])}</b>")
+        else:
+            b_reason_line = ("Engine-reported reason: <b style='color: #94a3b8;'>not measured</b>"
+                             + _absence_note(b_reason_st["reason"]))
+
+        # ── Telemetry age: the payload's own timestamp is a measurement, so a 35-day-old row is
+        # labelled stale instead of being allowed to look current.
+        if b_timestamp_st["measured"]:
+            b_age_days = b_r["age_days"]
+            b_is_stale = bool(b_r["stale"])
+            b_time_color = "#ffcc00" if b_is_stale else "#64748b"
+            b_rendered_ts = utc_to_sast(b_timestamp_st["text"])
+            if b_age_days is None:
+                b_time_text = f"{b_rendered_ts} · age unknown"
+            elif b_is_stale:
+                b_time_text = f"{b_rendered_ts} · {b_age_days:.0f}d old · ⚠️ STALE TELEMETRY"
+            else:
+                b_time_text = f"{b_rendered_ts} · {b_age_days:.0f}d old"
+        else:
+            b_age_days = None
+            b_is_stale = False
+            b_time_color = "#94a3b8"
+            b_time_text = "timestamp not measured"
+
+        # ── Derived verdicts. Each one guards on the measured state of every reading it uses.
+        # `yield_color` is a combined verdict — it compares the yield against two thresholds — so
+        # it is legitimately bundled on all three states; a field's own text never is.
+        if b_yield_st["measured"] and b_hurdle_st["measured"] and b_unwind_st["measured"]:
+            yield_color = "#00ff66" if b_yield_st["value"] >= b_hurdle_st["value"] else (
+                "#ff9900" if b_yield_st["value"] > b_unwind_st["value"] else "#ff003c")
+        else:
+            yield_color = "#94a3b8"
+        if b_funding_st["measured"]:
+            funding_color = "#00ff66" if b_funding_st["value"] >= 0.0 else "#ff003c"
+        else:
+            funding_color = "#94a3b8"
+        if b_dist_liq_st["measured"]:
+            liq_color = "#00ff66" if b_dist_liq_st["value"] >= 30.0 else (
+                "#ff9900" if b_dist_liq_st["value"] >= 20.0 else "#ff003c")
+            margin_guard_color = "#00ff66" if b_dist_liq_st["value"] >= 30.0 else "#ff9900"
+        else:
+            liq_color = "#94a3b8"
+            margin_guard_color = "#94a3b8"
+        if b_disloc_st["measured"]:
+            disloc_color = "#00ff66" if abs(b_disloc_st["value"]) < 1.0 else "#ff9900"
+        else:
+            disloc_color = "#94a3b8"
+        if b_fee_amort_st["measured"]:
+            fee_color = "#00ff66" if b_fee_amort_st["value"] >= 100.0 else (
+                "#00e5ff" if b_fee_amort_st["value"] >= 50.0 else "#94a3b8")
+            fee_bar_width = min(100.0, max(
+                0.0, (b_fee_amort_st["value"] / _BASIS_FEE_SCALE_PCT) * 100.0))
+        else:
+            fee_color = "#94a3b8"
+            fee_bar_width = 0.0
+        harvest_color = ("#00ff66" if b_harvest_st["value"] >= 0.0 else "#ff003c") \
+            if b_harvest_st["measured"] else "#94a3b8"
+
+        # One honest headline for a panel whose engine is parked: say how much of it was never
+        # measured, instead of letting each blank look like a zero.
+        b_economics_states = (b_state_st, b_reason_st, b_margin_mode_st, b_funding_st, b_yield_st,
+                              b_hurdle_st, b_unwind_st, b_alloc_st, b_harvest_st, b_net_delta_st,
+                              b_holding_st, b_min_holding_st, b_fee_target_st, b_fee_amort_st,
+                              b_liq_price_st, b_dist_liq_st, b_spread_st, b_disloc_st)
+        b_unmeasured_count = sum(1 for one_st in b_economics_states if not one_st["measured"])
+        b_field_count = len(b_economics_states)
+        if b_unmeasured_count:
+            b_coverage_line = (f"<span style='color: #94a3b8; font-size: 0.72rem;'>⚠️ "
+                               f"{b_unmeasured_count} of {b_field_count} economics fields in this "
+                               f"panel were never published by the basis engine — they are shown "
+                               f"as not measured, not as readings.</span>")
+        else:
+            b_coverage_line = ""
 
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {status_color}; border-radius: 8px; padding: 14px 18px; margin-bottom: 16px;">
@@ -4026,49 +4230,50 @@ with tab_ai:
                         {status_badge}
                     </span>
                     <span style="background: rgba(148,163,184,0.12); color: #94a3b8; border: 1px solid #334155; padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; margin-left: 6px;">
-                        Alloc: ${b_alloc:,.0f} USDT (50% Spot / 50% Perp Short · {b_margin_mode})
+                        Allocated: {b_alloc_text}{b_alloc_note}
                     </span>
                 </div>
-                <span style="color: #64748b; font-size: 0.75rem;">{b_time}</span>
+                <span style="color: {b_time_color}; font-size: 0.75rem;">{b_time_text}</span>
             </div>
+            <div style="margin-bottom: 8px;">{b_reason_line}<br>{b_coverage_line}</div>
             <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 8px;">
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">8H FUNDING RATE</span><br>
-                    <b style="color: {yield_color}; font-size: 0.95rem;">{b_funding*100:+.4f}%</b>
+                    <b style="color: {funding_color}; font-size: 0.95rem;">{b_funding_text}</b>{b_funding_note}
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">ANNUALIZED YIELD</span><br>
-                    <b style="color: {yield_color}; font-size: 0.95rem;">{b_yield:+.2f}%</b> <span style="font-size:0.72rem; color:#64748b;">(Hurdle: {b_hurdle}%)</span>
+                    <b style="color: {yield_color}; font-size: 0.95rem;">{b_yield_text}</b>{b_yield_note} <span style="font-size:0.72rem; color:#64748b;">(Hurdle: {b_hurdle_text}{b_hurdle_note})</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">SPOT VS PERP SPREAD</span><br>
-                    <b style="color: #ffffff; font-size: 0.95rem;">${b_spread:+.2f}</b> <span style="font-size:0.72rem; color:{'#00ff66' if abs(b_disloc)<1.0 else '#ff9900'};">({b_disloc:+.2f}%)</span>
+                    <b style="color: #ffffff; font-size: 0.95rem;">{b_spread_text}</b>{b_spread_note} <span style="font-size:0.72rem; color:{disloc_color};">{b_disloc_text}{b_disloc_note}</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">FUNDING HARVESTED</span><br>
-                    <b style="color: #00ff66; font-size: 0.95rem;">+${b_funding_coll:.4f} USD</b>
+                    <b style="color: {harvest_color}; font-size: 0.95rem;">{b_harvest_text}</b>{b_harvest_note}
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">NET MARKET DELTA</span><br>
-                    <b style="color: #00e5ff; font-size: 0.95rem;">${b_net_delta:+.2f} (Neutral)</b>
+                    <b style="color: {delta_color}; font-size: 0.95rem;">{b_net_delta_text}</b> · {b_delta_posture}{b_net_delta_note}
                 </div>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06);">
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <span style="color: #94a3b8; font-size: 0.72rem;">FEE HURDLE AMORTIZATION</span>
-                        <span style="color: {fee_color}; font-size: 0.75rem; font-weight: bold;">{b_fee_amortized:.1f}% / 125%</span>
+                        <span style="color: {fee_color}; font-size: 0.75rem; font-weight: bold;">{b_fee_amort_text}{b_fee_amort_note} · panel scale: {_BASIS_FEE_SCALE_PCT:.0f}%</span>
                     </div>
                     <div style="width: 100%; background: #1e293b; height: 6px; border-radius: 3px; margin: 5px 0; overflow: hidden;">
                         <div style="width: {fee_bar_width:.1f}%; background: {fee_color}; height: 100%; border-radius: 3px;"></div>
                     </div>
-                    <span style="color: #cbd5e1; font-size: 0.72rem;">Harvested: ${b_funding_coll:.2f} · Target: ${b_fee_target:.2f} · Hold: {b_holding_days:.1f}d / {b_min_holding_days}d</span>
+                    <span style="color: #cbd5e1; font-size: 0.72rem;">Harvested: {b_harvest_text} · Target: {b_fee_target_text} · Hold: {b_holding_text} / {b_min_holding_text}</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">PERP SHORT LIQUIDATION GUARD</span><br>
-                    <b style="color: {liq_color}; font-size: 0.95rem;">+{b_dist_liq:.1f}% Buffer</b>
-                    <span style="color: #94a3b8; font-size: 0.72rem; margin-left: 6px;">(Liq: ${b_liq_price:,.2f})</span><br>
-                    <span style="color: {'#00ff66' if b_dist_liq>=30.0 else '#ff9900'}; font-size: 0.72rem;">🛡️ {b_margin_mode} Margin Mode Active (Min Buffer: 20%)</span>
+                    <b style="color: {liq_color}; font-size: 0.95rem;">{b_dist_liq_text}</b>{b_dist_liq_note}
+                    <span style="color: #94a3b8; font-size: 0.72rem; margin-left: 6px;">(Liq: {b_liq_price_text}{b_liq_price_note})</span><br>
+                    <span style="color: {margin_guard_color}; font-size: 0.72rem;">Margin mode: {b_margin_mode_text}{b_margin_mode_note} · panel min-buffer threshold: {_BASIS_MIN_BUFFER_PCT:.0f}%</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">EXECUTION STATE MACHINE</span><br>
