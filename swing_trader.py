@@ -634,12 +634,13 @@ class SwingArchitectTrader:
         # Senkou Span A & B: Classic 26-period forward shift (cloud at current bar was projected 26 bars ago)
         span_a_raw = (tenkan + kijun) / 2.0
         span_b_raw = (high.rolling(window=52).max() + low.rolling(window=52).min()) / 2.0
-        if len(df) >= 78:
-            span_a = span_a_raw.shift(26)
-            span_b = span_b_raw.shift(26)
-        else:
-            span_a = span_a_raw
-            span_b = span_b_raw
+        # Always projected 26 bars, at every frame length, exactly as quant_validation.py now does.
+        # The deleted `if len(df) >= 78 / else` guard published the *raw* span for short frames, so
+        # every frame under 78 bars had the same-bar lookahead the shift exists to remove handed
+        # back to it. A frame too short to have measured the projection now says so (below)
+        # instead of guessing a cloud off its own bar.
+        span_a = span_a_raw.shift(26)
+        span_b = span_b_raw.shift(26)
 
         # ATR(14)
         prev_close = close.shift(1)
@@ -677,10 +678,20 @@ class SwingArchitectTrader:
         prev_c = float(close.iloc[-2]) if len(close) >= 2 else o
         t = float(tenkan.iloc[-1])
         k = float(kijun.iloc[-1])
-        sa_val = span_a.iloc[-1] if not pd.isna(span_a.iloc[-1]) else span_a_raw.iloc[-1]
-        sb_val = span_b.iloc[-1] if not pd.isna(span_b.iloc[-1]) else span_b_raw.iloc[-1]
-        sa = float(sa_val)
-        sb = float(sb_val)
+        # The cloud at this bar was projected 26 bars ago. A frame too short to have measured that
+        # projection (52 bars to build span_b, plus the 26-bar shift) has NO cloud — and the old
+        # code substituted the *unshifted, same-bar* span here, relocating the very lookahead the
+        # shift removes. Refuse rather than guess: {} is the "no 4H indicators" sentinel the
+        # checklist and the entry path already read as "no entry", and the log line says why.
+        if pd.isna(span_a.iloc[-1]) or pd.isna(span_b.iloc[-1]):
+            log.warning(
+                f"[4H-CLOUD-UNAVAILABLE] 4H history of {len(df)} bars is too short to project the "
+                f"Ichimoku cloud 26 bars ahead (78 bars needed). Refusing 4H entries on this "
+                f"frame rather than reading a same-bar cloud."
+            )
+            return {}
+        sa = float(span_a.iloc[-1])
+        sb = float(span_b.iloc[-1])
         atr = float(atr_14.iloc[-1])
         adx = float(adx_14.iloc[-1]) if not pd.isna(adx_14.iloc[-1]) else 0.0
 
@@ -780,6 +791,12 @@ class SwingArchitectTrader:
         """Same AND-ed checklist as scan_fleet, but reports which conditions failed.
         A 'near miss' = pattern side present but secondary gates failed; used to
         measure the checklist without changing which trades get taken."""
+        if not ind_4h:
+            # _compute_4h_indicators returns {} when the 4H frame is too short to project the
+            # Ichimoku cloud 26 bars ahead. There is no kumo to read in either direction, so
+            # there is no candidate: refuse the entry rather than guess a cloud off the bar.
+            return {"direction": None, "long_failed": ["no_4h_indicators"],
+                    "short_failed": ["no_4h_indicators"], "near_miss": False}
         close_4h = float(ind_4h["close"])
         long_checks = [
             ("no_bullish_kumo", not bool(ind_4h.get("bullish_kumo", False))),

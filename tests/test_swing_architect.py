@@ -132,6 +132,51 @@ class TestSwingArchitectAndMutex(unittest.TestCase):
         self.assertGreater(ind["atr"], 0.0)
         self.assertGreaterEqual(ind["adx"], 0.0)
 
+        # The cloud published at the last bar is the one projected 26 bars earlier, never the
+        # one built from this bar's own high/low. The engine used to shift the spans only when
+        # the frame had >= 78 bars and published the raw, same-bar span otherwise.
+        tenkan = (df["high"].rolling(9).max() + df["low"].rolling(9).min()) / 2.0
+        kijun = (df["high"].rolling(26).max() + df["low"].rolling(26).min()) / 2.0
+        span_a_raw = (tenkan + kijun) / 2.0
+        span_b_raw = (df["high"].rolling(52).max() + df["low"].rolling(52).min()) / 2.0
+        projected_top = float(np.maximum(span_a_raw.iloc[-27], span_b_raw.iloc[-27]))
+        same_bar_top = float(np.maximum(span_a_raw.iloc[-1], span_b_raw.iloc[-1]))
+        self.assertAlmostEqual(ind["cloud_top"], projected_top, places=6)
+        self.assertFalse(np.isclose(ind["cloud_top"], same_bar_top),
+                         "the published cloud must be the 26-bar-projected cloud, not the same-bar cloud")
+
+    def test_03b_short_4h_frame_refuses_to_publish_an_unprojectable_cloud(self):
+        """A 4H frame too short to project the cloud 26 bars ahead must refuse, not guess.
+
+        The engine shifted the spans only when the frame had >= 78 bars and published the raw,
+        same-bar span otherwise; a NaN shifted span was also replaced by that raw span at the
+        cloud read, so deleting the guard alone changed nothing observable. A frame that cannot
+        know the cloud must produce no indicators at all — the empty dict the entry path reads
+        as "no entry" — rather than a same-bar cloud the checklist would read as a breakout.
+        """
+        trader = self.trader_cls()
+
+        np.random.seed(42)
+        base_price = 100.0 + np.cumsum(np.random.normal(0.5, 1.0, 100))
+        df = pd.DataFrame({
+            "timestamp": pd.date_range(end=datetime.now(UTC), periods=100, freq='4h'),
+            "open": base_price,
+            "high": base_price + np.random.uniform(0.5, 2.0, 100),
+            "low": base_price - np.random.uniform(0.5, 2.0, 100),
+            "close": base_price + np.random.uniform(-0.5, 0.5, 100),
+            "volume": np.random.uniform(1000, 5000, 100),
+        })
+
+        for n in (55, 60, 77):
+            short = df.iloc[:n].reset_index(drop=True)
+            ind = trader._compute_4h_indicators(short)
+            self.assertEqual(ind, {},
+                             f"a {n}-bar 4H frame cannot know a cloud projected 26 bars ahead "
+                             f"and must refuse; it published {ind}")
+
+        # 78 bars is the first frame that can measure the projection, and it publishes one.
+        self.assertTrue(trader._compute_4h_indicators(df.iloc[:78].reset_index(drop=True)))
+
     def test_04_live_position_preservation(self):
         """Verify that live positions in swing_open_positions remain active and uncorrupted."""
         with sqlite3.connect(self.db_path) as conn:

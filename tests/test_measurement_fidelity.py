@@ -370,6 +370,60 @@ def test_the_cloud_is_projected_26_bars_at_every_frame_length(n, expected_valid_
             assert df[col].isna().all(), f"{col}: a {n}-bar frame must carry no cloud value at all"
 
 
+# The live engine carried the same conditional projection `quant_validation.py` just lost, plus a
+# second fallback at the cloud read: the spans were shifted only when the frame had >= 78 bars,
+# every shorter frame published the *raw* span, and a NaN shifted span was replaced by that same
+# raw span again. Both routes handed a short frame a cloud built from its own bar. A frame too
+# short to project the cloud 26 bars ahead must now REFUSE — no indicators at all — rather than
+# publish a same-bar cloud the entry checklist would read as a breakout.
+@pytest.mark.parametrize("n", [55, 60, 77])
+def test_the_live_engine_refuses_a_4h_frame_too_short_to_project_the_cloud(n):
+    from swing_trader import SwingArchitectTrader
+
+    trader = SwingArchitectTrader.__new__(SwingArchitectTrader)
+    ind = trader._compute_4h_indicators(_frame(_fixture_closes(n)))
+    assert ind == {}, (
+        f"a {n}-bar 4H frame published {ind!r}; it cannot know a cloud projected 26 bars ahead, "
+        "so it must refuse (the empty indicator dict) instead of publishing a same-bar cloud"
+    )
+
+
+def test_the_live_engine_publishes_the_projected_cloud_not_the_same_bar_cloud():
+    from swing_trader import SwingArchitectTrader
+
+    trader = SwingArchitectTrader.__new__(SwingArchitectTrader)
+    df = _frame(_fixture_closes(120))
+    ind = trader._compute_4h_indicators(df)
+    assert ind, "a 120-bar 4H frame can project the cloud 26 bars ahead and must publish it"
+
+    high, low = df["high"], df["low"]
+    tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2.0
+    kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2.0
+    span_a_raw = (tenkan + kijun) / 2.0
+    span_b_raw = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
+    # The cloud published at the last bar is the one projected 26 bars earlier.
+    projected_top = float(np.maximum(span_a_raw.iloc[-27], span_b_raw.iloc[-27]))
+    projected_bottom = float(np.minimum(span_a_raw.iloc[-27], span_b_raw.iloc[-27]))
+    same_bar_top = float(np.maximum(span_a_raw.iloc[-1], span_b_raw.iloc[-1]))
+    assert ind["cloud_top"] == pytest.approx(projected_top)
+    assert ind["cloud_bottom"] == pytest.approx(projected_bottom)
+    assert not np.isclose(ind["cloud_top"], same_bar_top), (
+        "the published cloud is the same-bar cloud — the 26-bar projection did not happen"
+    )
+
+
+def test_a_refused_4h_frame_yields_no_candidate_in_either_direction():
+    """The empty indicator dict is the "no entry" sentinel, not a missing-key crash."""
+    from swing_trader import SwingArchitectTrader
+
+    cand = SwingArchitectTrader._evaluate_swing_candidate(
+        {}, {"bullish_alignment": True, "bearish_alignment": True},
+        100.0, 100.0, 30.0, 50.0, 22.0,
+    )
+    assert cand["direction"] is None, "a frame with no known cloud must not produce a candidate"
+    assert cand["near_miss"] is False
+
+
 @pytest.mark.parametrize("field", ["atr", "cloud_top", "cloud_bottom"])
 def test_swing_entry_gate_treats_a_missing_indicator_as_no_entry(field):
     from dataclasses import replace
