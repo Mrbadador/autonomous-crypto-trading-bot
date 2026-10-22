@@ -3856,6 +3856,77 @@ _G5_DERIVED_NAMES = frozenset({
 })
 
 
+# ── M-5: a negative scan means CODE, not prose ──────────────────────────────────────────
+# `_section_block` hands back the block verbatim, comments included, so a guard that greps it can
+# be tripped by a one-line note quoting the stand-in it removed — the accident the G-5a implementer
+# hit and documented — and can never be argued with. Both halves are pinned below: prose does not
+# fail the guard, and the same text really in the code still does. Every G-5a block/helper scan
+# reads `_g5_block_code()` or `_g5_code_only(...)` so this is structural, not discipline.
+#
+# Each case is paired with one line of code that genuinely contains the banned text, which is what
+# makes the second half of the immunity test more than a restatement of the first.
+_G5_STAND_IN_CASES = (
+    ("or 8.0", "b_hurdle_text = raw or 8.0"),
+    ("or 1.5", "b_unwind_text = raw or 1.5"),
+    ("or 1000.0", "b_alloc_text = raw or 1000.0"),
+    ("or 7", "b_min_holding_text = raw or 7"),
+    ("or 2.40", "b_fee_text = raw or 2.40"),
+    ("or 3.00", "b_target_text = raw or 3.00"),
+    ("or 100.0", "b_liq_text = raw or 100.0"),
+    ('"margin_mode", "crossed"', 'b_margin_mode_text = basis_data.get("margin_mode", "crossed")'),
+)
+_G5_PROSE_CLAIMS = (
+    ("(Neutral)", 'b_delta_posture = "(Neutral)"'),
+    ("Margin Mode Active", 'status_badge = "Margin Mode Active"'),
+    ("IDLE (SCANNING YIELD & SPREAD)", 'status_badge = "IDLE (SCANNING YIELD & SPREAD)"'),
+)
+
+
+def _g5_code_only(src):
+    """`src` with every `tokenize.COMMENT` blanked out.
+
+    Line count and the columns before each comment are preserved, so the result still parses at the
+    same positions and `ast.get_source_segment` stays meaningful on it. A comment is prose: it
+    cannot put a reading into the panel and it cannot take one out.
+    """
+    import io
+    import tokenize
+
+    text = src if src.endswith("\n") else src + "\n"
+    lines = text.splitlines(True)
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (SyntaxError, IndentationError, tokenize.TokenError) as exc:
+        raise AssertionError(
+            f"the scanned fragment is not valid Python ({exc}), so a comment-stripped scan of it "
+            "would prove nothing about the shipped panel")
+    for token in tokens:
+        if token.type == tokenize.COMMENT:
+            row, col = token.start[0], token.start[1]
+            line = lines[row - 1]
+            lines[row - 1] = line[:col] + ("\n" if line.endswith("\n") else "")
+    stripped = "".join(lines)
+    assert len(stripped.splitlines()) == len(text.splitlines()), (
+        "comment stripping changed the line count, so scanned positions no longer match the block")
+    return stripped
+
+
+def _g5_banned_hits(src, banned):
+    """The entries of `banned` that survive in `src` once its comments are stripped."""
+    code = _g5_code_only(src)
+    return [token for token in banned if token in code]
+
+
+def _g5_block_code(path=None):
+    """The carry panel's own source, comments removed: what every scan below actually reads."""
+    return _g5_code_only(_g4_block("basis", DASHBOARD if path is None else path))
+
+
+def _g5_helper_code(name="_basis_readings"):
+    """One module-level helper's source, comments removed."""
+    return _g5_code_only(_function_source(DASHBOARD, name))
+
+
 class _G5RecordingStreamlit:
     """Captures what the panel emits, so its f-string can be rendered without an app."""
 
@@ -4061,11 +4132,31 @@ def test_g5a_a_floor_of_measured_zeros_renders_no_absences_at_all(tmp_path):
 
 
 # Group 3 — no numeric stand-in survives in this block.
-@pytest.mark.parametrize("stand_in", ["or 8.0", "or 1.5", "or 1000.0", "or 7", "or 2.40",
-                                      "or 3.00", "or 100.0", '"margin_mode", "crossed"'])
+@pytest.mark.parametrize("stand_in", [case[0] for case in _G5_STAND_IN_CASES])
 def test_g5a_no_numeric_stand_in_survives_in_the_carry_panel(stand_in):
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     assert stand_in not in block, f"the carry panel still invents a reading with {stand_in!r}"
+
+
+@pytest.mark.parametrize("stand_in,code_line", _G5_STAND_IN_CASES + _G5_PROSE_CLAIMS)
+def test_g5a_a_comment_neither_trips_nor_hides_a_negative_scan(stand_in, code_line):
+    """M-5, both halves, or the guard is just weaker than it was.
+
+    Prose about a stand-in is not a stand-in: a note that quotes `or 8.0` while explaining why it
+    went must not fail a guard over correct code. And the same text really in the code must still
+    fail it, even with a comment beside it — immunity to prose is not a licence to hide one.
+    """
+    prose = (f"def f():\n    # the panel used to publish {stand_in} here, and {stand_in} is "
+             f"still what the note says\n    return 1\n")
+    assert _g5_banned_hits(prose, [stand_in]) == [], (
+        f"a comment quoting {stand_in!r} failed a negative scan against code that does not "
+        "contain it")
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [stand_in]) == [stand_in], (
+        f"{stand_in!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {stand_in}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [stand_in]) == [stand_in], (
+        f"a comment beside {stand_in!r} in the code hid the stand-in from the scan")
 
 
 def test_g5a_the_carry_panel_reads_through_the_publishers_and_the_scan_is_not_vacuous():
@@ -4076,16 +4167,18 @@ def test_g5a_the_carry_panel_reads_through_the_publishers_and_the_scan_is_not_va
     `_basis_readings` helper it now calls. Anywhere else is a second reader of the same telemetry
     that this test is not looking at.
     """
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     assert "_basis_readings(basis_data)" in block, (
         "the carry panel does not read its payload through the published-reading helper")
     assert block.count("_absence_note(") >= 12, (
         f"the carry panel explains only {block.count('_absence_note(')} absences")
     assert len(block.splitlines()) >= 150, (
         f"the extracted carry panel is {len(block.splitlines())} lines, so this is not the panel")
-    helper = _function_source(DASHBOARD, "_basis_readings")
+    helper = _g5_helper_code()
     assert helper, "dashboard.py has no _basis_readings to route the panel through"
-    src = DASHBOARD.read_text(encoding="utf-8")
+    # M-5: every side of this subtraction is code-only, so a note that mentions a key cannot be
+    # counted as a second reader of it — and a second reader cannot mention it in prose instead.
+    src = _g5_code_only(DASHBOARD.read_text(encoding="utf-8"))
     for key in ("capital_allocated_usd", "hurdle_rate_pct", "unwind_hurdle_pct",
                 "distance_to_liq_pct", "fee_hurdle_target_usd", "basis_dislocation_pct",
                 "fee_amortized_pct", "liquidation_price"):
@@ -4116,7 +4209,7 @@ def test_g5a_the_live_payload_prints_no_signal_colour_for_a_field_it_never_measu
 
 
 def test_g5a_the_funding_harvested_card_no_longer_hardcodes_the_all_clear():
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     assert "color: #00ff66; font-size: 0.95rem" not in block, (
         "a card still wears a hardcoded green instead of a measured colour")
     assert "harvest_color" in block, "the Funding Harvested card has no state-driven colour"
@@ -4127,7 +4220,7 @@ def test_g5a_the_funding_harvested_card_no_longer_hardcodes_the_all_clear():
 def test_g5a_the_thresholds_are_named_as_thresholds():
     """125% and 20% are the panel's own scale, not measurements — and they may not sit beside a
     stand-in reading so closely that they read as part of it."""
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     assert "panel scale: {_BASIS_FEE_SCALE_PCT:.0f}%" in block, (
         "the 125% fee scale is not labelled as the panel's own threshold")
     assert "panel min-buffer threshold: {_BASIS_MIN_BUFFER_PCT:.0f}%" in block, (
@@ -4140,17 +4233,16 @@ def test_g5a_the_thresholds_are_named_as_thresholds():
 
 
 # Group 5 — the three fabricated prose claims.
-@pytest.mark.parametrize("claim", ["(Neutral)", "Margin Mode Active",
-                                   "IDLE (SCANNING YIELD & SPREAD)"])
+@pytest.mark.parametrize("claim", [case[0] for case in _G5_PROSE_CLAIMS])
 def test_g5a_the_fabricated_prose_claims_are_gone(claim):
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     assert claim not in block, f"the carry panel still asserts {claim!r} regardless of the payload"
 
 
 def test_g5a_the_replacements_are_present_and_reachable():
     """Absence checks pass on a panel that deleted the card entirely, so the new wording is pinned
     in the block AND in the HTML the live payload actually renders."""
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     for reachable in ("STATE NOT MEASURED", "b_delta_posture", "Engine-reported reason",
                       "Margin mode:", "STALE TELEMETRY"):
         assert reachable in block, f"the carry panel has no {reachable!r} to fall back on"
@@ -4206,7 +4298,9 @@ def test_g5a_every_derived_verdict_in_the_carry_panel_guards_on_measured():
     """
     import ast
 
-    block = _g4_block("basis", DASHBOARD)
+    # M-5/M-6: the segments this guard reads are comment-stripped source, so the word "measured"
+    # has to come from the panel's code — a note beside an unguarded verdict no longer satisfies it.
+    block = _g5_block_code()
     tree = ast.parse(block, filename="dashboard.py carry panel")
     parents = _g4_parent_map(tree)
     seen = set()
@@ -4241,7 +4335,7 @@ def test_g5a_the_carry_panel_keys_each_field_on_its_own_state(field, own_key):
     """
     import ast
 
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     tree = ast.parse(block, filename="dashboard.py carry panel")
     parents = _g4_parent_map(tree)
     assigns = [node for node in ast.walk(tree)
@@ -4295,7 +4389,7 @@ def test_g5a_the_combined_yield_verdict_is_legitimately_bundled():
     reader does not un-bundle it into `b_yield_st` alone and compare against a None hurdle."""
     import ast
 
-    block = _g4_block("basis", DASHBOARD)
+    block = _g5_block_code()
     tree = ast.parse(block, filename="dashboard.py carry panel")
     parents = _g4_parent_map(tree)
     gates = []
