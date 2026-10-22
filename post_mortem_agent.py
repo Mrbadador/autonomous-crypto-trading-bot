@@ -22,6 +22,23 @@ def _handle_shutdown(signum, frame):
     _stop_event.set()
 
 
+def _write_ledger_rule(conn, category, rule_text, confidence, source):
+    """Write one learned rule through the fleet's single shared writer.
+
+    The import is function-local on purpose: `backtests/batch_backtest_learner.py` imports this
+    module at module scope (`:25`), so a module-level import in the other direction is a cycle
+    that breaks whichever module Python imports first.
+
+    `source` is mandatory here rather than defaulted: an untagged row in `learned_rules` is
+    indistinguishable from a hand-typed exemplar, and that is exactly the laundering the column
+    exists to stop. The three producers below are all LLM readings of real closed ledger trades,
+    which makes them lessons, not measurements — the text is model-authored.
+    """
+    from backtests.batch_backtest_learner import write_learned_rule
+
+    write_learned_rule(conn, category, rule_text, confidence, source=source)
+
+
 def init_db():
     conn = sqlite3.connect("trading_ledger.db")
     with conn:
@@ -217,9 +234,9 @@ Output exactly ONE JSON object (no markdown, no extra text) with this schema:
                                 (r_cat, r_txt)
                             ).fetchone()
                             if not exists:
-                                conn_ledger.execute(
-                                    "INSERT INTO learned_rules (category, rule_text, confidence, created_at) VALUES (?, ?, ?, datetime('now'))",
-                                    (r_cat, r_txt, r_conf)
+                                _write_ledger_rule(
+                                    conn_ledger, r_cat, r_txt, r_conf,
+                                    source="post_mortem_llm_lesson",
                                 )
                                 conn_ledger.commit()
                                 log.info(f"[POST-MORTEM-RULE] 🧠 Added Dynamic Learned Rule: [{r_cat}] {r_txt} (Conf: {r_conf:.0%})")
@@ -455,9 +472,9 @@ Output exactly ONE JSON object (no markdown, no extra text) with this schema:
 
                                     existing = conn_ledger.execute("SELECT 1 FROM learned_rules WHERE lower(rule_text) = lower(?)", (r_txt,)).fetchone()
                                     if not existing:
-                                        conn_ledger.execute(
-                                            "INSERT INTO learned_rules (category, rule_text, confidence, created_at) VALUES (?, ?, ?, datetime('now'))",
-                                            (r_cat, r_txt, r_conf)
+                                        _write_ledger_rule(
+                                            conn_ledger, r_cat, r_txt, r_conf,
+                                            source="post_mortem_llm_lesson",
                                         )
                                         conn_ledger.commit()
                                         log.info(f"[POST-MORTEM-RULE] 🧠 Added Dynamic Learned Rule: [{r_cat}] {r_txt} (Conf: {r_conf:.0%})")
@@ -585,9 +602,9 @@ Output exactly ONE JSON object (no markdown, no extra text) with this schema:
                     try:
                         existing = conn_ledger.execute("SELECT 1 FROM learned_rules WHERE lower(rule_text) = lower(?)", (r_clean,)).fetchone()
                         if not existing:
-                            conn_ledger.execute(
-                                "INSERT INTO learned_rules (category, rule_text, confidence, created_at) VALUES (?, ?, ?, datetime('now'))",
-                                (cat, r_clean, conf_val)
+                            _write_ledger_rule(
+                                conn_ledger, cat, r_clean, conf_val,
+                                source="three_agent_autopsy_lesson",
                             )
                             conn_ledger.commit()
                             log.info(f"[3-AGENT-AUTOPSY] 🧠 Added Dynamic Rule [{cat}]: {r_clean} (Conf: {conf_val:.0%})")

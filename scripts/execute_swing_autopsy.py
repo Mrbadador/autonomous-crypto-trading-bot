@@ -128,12 +128,14 @@ Output JSON:
 }}"""
 
         autopsy = None
+        autopsy_producer = None
         # Attempt LLM query
         try:
             raw_resp = await query_cloud_llm(user_prompt, system_prompt)
             parsed = robust_json_decode(raw_resp)
             if parsed and isinstance(parsed, dict) and "lesson" in parsed:
                 autopsy = parsed
+                autopsy_producer = "swing_autopsy_llm_lesson"
                 log.info(f"   [LLM AUTOPSY] {autopsy['lesson']}")
         except Exception as e:
             log.warning(f"   [LLM BYPASS] Using quantitative autopsy engine: {e}")
@@ -141,6 +143,9 @@ Output JSON:
         # Fallback to deterministic institutional quant engine if LLM throttled
         if not autopsy:
             autopsy = institutional_quant_autopsy(trade_data)
+            # The fallback's rule texts and confidence numbers are hand-written in this file, so a
+            # row it produces must not be labelled as anything a model or a measurement authored.
+            autopsy_producer = "swing_autopsy_handwritten_template"
             log.info(f"   [QUANT AUTOPSY] {autopsy['lesson']}")
 
         lesson_text = autopsy["lesson"]
@@ -160,16 +165,27 @@ Output JSON:
 
         # Store Rule if high confidence and not duplicated
         if rule_txt:
+            # Deferred: `backtests/batch_backtest_learner.py` imports `post_mortem_agent`, and this
+            # script's producers sit behind that module, so the shared writer is reached inside the
+            # loop rather than at module scope.
+            from backtests.batch_backtest_learner import write_learned_rule
+
             existing = conn_ledger.execute(
                 "SELECT 1 FROM learned_rules WHERE lower(rule_text) = lower(?)", (rule_txt.strip(),)
             ).fetchone()
             if not existing:
-                conn_ledger.execute(
-                    "INSERT INTO learned_rules (category, rule_text, confidence, created_at) VALUES (?, ?, ?, datetime('now'))",
-                    (rule_cat.upper(), rule_txt.strip(), rule_conf)
+                write_learned_rule(
+                    conn_ledger,
+                    rule_cat.upper(),
+                    rule_txt.strip(),
+                    rule_conf,
+                    source=autopsy_producer,
                 )
                 rules_added += 1
-                log.info(f"   ⭐ [NEW LEARNED RULE] [{rule_cat.upper()}] {rule_txt} (Conf: {rule_conf:.0%})")
+                log.info(
+                    f"   ⭐ [NEW LEARNED RULE] [{rule_cat.upper()}] {rule_txt} "
+                    f"(Conf: {rule_conf:.0%}, source: {autopsy_producer})"
+                )
             else:
                 log.info(f"   [RULE PREVIOUSLY LEARNED]")
 

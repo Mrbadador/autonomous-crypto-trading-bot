@@ -91,9 +91,14 @@ Output JSON only:
 
                         existing = conn_ledger.execute("SELECT 1 FROM learned_rules WHERE lower(rule_text) = lower(?)", (r_txt,)).fetchone()
                         if not existing:
-                            conn_ledger.execute(
-                                "INSERT INTO learned_rules (category, rule_text, confidence, created_at) VALUES (?, ?, ?, datetime('now'))",
-                                (r_cat, r_txt, r_conf)
+                            # Deferred import: the learner module imports post_mortem_agent, so the
+                            # shared writer is reached here rather than at module scope. This rule is
+                            # an LLM's reading of one closed trade, so it is a lesson, not a measurement.
+                            from backtests.batch_backtest_learner import write_learned_rule
+
+                            write_learned_rule(
+                                conn_ledger, r_cat, r_txt, r_conf,
+                                source="swing_autopsy_llm_lesson",
                             )
                             conn_ledger.commit()
                             log.info(f"   [LEARNED RULE] [{r_cat}] {r_txt} (Conf: {r_conf:.0%})")

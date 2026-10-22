@@ -103,14 +103,32 @@ def normalise_bot_name(bot_name):
 
 
 def ensure_learned_rules_source_column(conn):
-    """Add the provenance column if this database predates it. Never destructive."""
+    """Add the provenance column if this database predates it. Never destructive.
+
+    The default is `unlabelled`, and it has to be. `ALTER TABLE ... ADD COLUMN ... DEFAULT x` stamps
+    EVERY row already in the table with x, so a `measured` default would relabel the ledger's
+    pre-migration history the first time this writer ran against it — including the hand-typed
+    2026-08-15 exemplars under rule_id 1-16 whose writers Task 3 quarantined. `measured` is a claim
+    about where a row came from, so it can only be granted by a writer that names it, never by a
+    column default or by an omitted argument.
+
+    `created_at` is not a discriminator: every row in the live table is stamped at write time, so a
+    pre-migration row and a row written today are indistinguishable once the default is applied.
+    That is why this is one-shot and why the backfill below exists — it also covers a table whose
+    column was added by an earlier NULL-defaulted migration.
+    """
     cols = {r[1] for r in conn.execute("PRAGMA table_info(learned_rules)")}
     if "source" not in cols:
-        conn.execute("ALTER TABLE learned_rules ADD COLUMN source TEXT DEFAULT 'measured'")
+        conn.execute("ALTER TABLE learned_rules ADD COLUMN source TEXT DEFAULT 'unlabelled'")
+        conn.execute("UPDATE learned_rules SET source = 'unlabelled' WHERE source IS NULL")
 
 
-def write_learned_rule(conn, category, rule_text, confidence, source="synthetic_exemplar"):
+def write_learned_rule(conn, category, rule_text, confidence, source="unlabelled"):
     """Insert one distilled rule, self-labelled with where it came from.
+
+    `source` names the population the rule came from (`synthetic_exemplar`, `post_mortem_lesson`,
+    `distilled_pipeline`, ...). Callers that cannot say where a rule came from get `unlabelled`,
+    which is what an omitted source actually means; nothing defaults to a claim of measurement.
 
     `ai_engine._get_top_rules_sync` deliberately never selects or filters on `source`, so
     this is provenance for whoever audits the table later, not a prompt filter.
@@ -267,12 +285,15 @@ Output strictly valid JSON with this exact schema:
                 f"[{cluster_key}] {data.get('master_lesson', 'Lesson learned.')}"
             ))
             
-            # Store Defense Rule into learned_rules, self-labelled as exemplar-derived.
+            # Store Defense Rule into learned_rules. The source is named HERE, not inherited from
+            # the writer's default: these clusters are built from this file's hand-written
+            # exemplar scenarios, so `synthetic_exemplar` is a claim this caller can make.
             write_learned_rule(
                 conn,
                 cluster_key,
                 data.get("defense_rule", "Strict risk management enforced."),
                 float(data.get("confidence_score", 0.90)),
+                source="synthetic_exemplar",
             )
             
         # 2. Apply Parameter Adjustments

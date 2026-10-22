@@ -1,7 +1,16 @@
 """
 lesson_distillation_pipeline.py — Autonomous Trade Lesson Distillation & Rule Synthesizer
-Mines the 220+ post-mortem lessons from trading_ledger.db, extracts recurring failure
-patterns, and synthesizes high-confidence actionable trading rules into learned_rules.
+
+Reads the post-mortem lessons out of trading_ledger.db, counts how many fall into each failure
+theme, and writes six rule templates into learned_rules. Read that last part precisely: the six
+rule TEXTS are fixed strings in this file, so what this script synthesizes is a *confidence
+number*, not a rule. Rule 101's confidence is the measured loss-share of the REGIME_CHOP bucket
+plus a 0.15 nudge, floored at 0.65 and capped at 0.95, and it degrades to a flat 0.85 when that
+bucket is empty. Rules 102-106 carry hand-typed confidences (0.92, 0.89, 0.84, 0.88, 0.90) that no
+lesson influences at all. Their rows therefore say source='handwritten_template_confidence_miner'.
+
+Nothing in the repo imports or schedules this script; it is run by hand (`python
+scripts/lesson_distillation_pipeline.py`) against whatever ledger is in the working directory.
 """
 
 import os
@@ -23,9 +32,12 @@ class LessonDistillationPipeline:
 
     def _init_tables(self):
         with sqlite3.connect(self.db_ledger, timeout=10.0) as conn:
+            # Same shape as backtests/batch_backtest_learner.init_tables and the live ledger. A
+            # TEXT primary key here would give every shared-writer row a NULL rule_id, because the
+            # writer inserts (category, rule_text, confidence, created_at, source) and nothing else.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS learned_rules (
-                    rule_id TEXT PRIMARY KEY,
+                    rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     category TEXT,
                     rule_text TEXT,
                     confidence REAL,
@@ -133,17 +145,40 @@ class LessonDistillationPipeline:
             "confidence": 0.90
         })
 
-        # Upsert rules into learned_rules table
-        ts = datetime.now(timezone.utc).isoformat()
+        # Commit the templates through the shared writer. It used to be
+        # `INSERT OR REPLACE INTO learned_rules (rule_id, ...)` with rule_id hand-typed 101-106:
+        # a primary-key replace, so any real lesson already sitting on one of those ids was
+        # destroyed on the first run of this script, and a re-run overwrote the whole set instead
+        # of leaving it alone. Now a duplicate `rule_text` is skipped the same way the post-mortem
+        # writers skip theirs, and every row carries the source that says what it is: a
+        # hand-written template, only whose *confidence* is (partly) mined from the lessons.
+        from backtests.batch_backtest_learner import write_learned_rule
+
+        added = 0
         with sqlite3.connect(self.db_ledger, timeout=10.0) as conn:
             for r in rules_to_upsert:
-                conn.execute("""
-                    INSERT OR REPLACE INTO learned_rules (rule_id, category, rule_text, confidence, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (r["rule_id"], r["category"], r["rule_text"], r["confidence"], ts))
+                existing = conn.execute(
+                    "SELECT 1 FROM learned_rules WHERE lower(rule_text) = lower(?)",
+                    (str(r["rule_text"]).strip(),),
+                ).fetchone()
+                if existing:
+                    log.info(f"[RULE ALREADY LEARNED] Skipping template: {r['rule_text'][:60]}...")
+                    continue
+                write_learned_rule(
+                    conn,
+                    r["category"],
+                    r["rule_text"],
+                    float(r["confidence"]),
+                    source="handwritten_template_confidence_miner",
+                )
+                added += 1
             conn.commit()
 
-        log.info(f"[DISTILLATION COMPLETE] Successfully synthesized and committed {len(rules_to_upsert)} rules from {len(lessons)} trade lessons.")
+        log.info(
+            f"[DISTILLATION COMPLETE] Committed {added} of {len(rules_to_upsert)} rule templates "
+            f"after reading {len(lessons)} trade lessons. The template texts are fixed in this "
+            "file; only rule 101's confidence is mined from the lessons."
+        )
         return rules_to_upsert
 
 if __name__ == "__main__":

@@ -250,13 +250,16 @@ Provide a rigorous institutional analysis in strictly valid JSON:
                 f"[{item['category']}] {data.get('master_lesson', 'Lesson learned.')}"
             ))
             
-            # Save rule to learned_rules, self-labelled as exemplar-derived. The shared writer
-            # adds the provenance column itself, so this must not pre-empt it.
+            # Save rule to learned_rules. The source is named HERE, not inherited from the shared
+            # writer's default: these scenarios are this trainer's own exemplar prompts, so
+            # `synthetic_exemplar` is a claim this caller can make. The shared writer still adds
+            # the provenance column itself, so this must not pre-empt it.
             write_learned_rule(
                 conn,
                 item["category"],
                 data.get("defense_rule", "Risk rule enforced."),
                 float(data.get("confidence_score", 0.90)),
+                source="synthetic_exemplar",
             )
             
         # 2. Update parameter. The learner's writer owns bot-name normalisation, the band clamp,

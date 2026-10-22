@@ -36,6 +36,7 @@ import importlib
 import json
 import logging
 import pathlib
+import re
 import signal
 import sqlite3
 import sys
@@ -47,6 +48,13 @@ LEARNER_SRC = REPO_ROOT / "backtests" / "batch_backtest_learner.py"
 TRAINER_SRC = REPO_ROOT / "scripts" / "deep_brain_trainer.py"
 AI_ENGINE_SRC = REPO_ROOT / "ai_engine.py"
 POST_MORTEM_SRC = REPO_ROOT / "post_mortem_agent.py"
+PIPELINE_SRC = REPO_ROOT / "scripts" / "lesson_distillation_pipeline.py"
+SWING_AUTOPSY_SRC = REPO_ROOT / "scripts" / "execute_swing_autopsy.py"
+RUN_AUTOPSY_SRC = REPO_ROOT / "scripts" / "run_swing_autopsy.py"
+
+# Every file that writes learned_rules rows, plus the shared writer itself (whose own INSERT
+# is the one legal raw write).
+RULE_WRITERS = (POST_MORTEM_SRC, PIPELINE_SRC, SWING_AUTOPSY_SRC, RUN_AUTOPSY_SRC)
 
 # The seven measured safe ranges, spelled out independently of PARAM_BOUNDS so that editing
 # the table in the source cannot quietly move the target this test checks.
@@ -354,7 +362,64 @@ def test_source_column_helper_adds_the_column_when_missing(tmp_path, monkeypatch
     conn.commit()
     conn.close()
     assert "source" in cols
-    assert src == [("measured",)]
+    # A row written by a writer that names no source is NOT labelled measured: the label has to be
+    # earned by the writer that passes it, or the column launders un-attributed data.
+    assert src == [("unlabelled",)], src
+
+
+def test_migration_stamps_pre_existing_rows_unlabelled_not_measured(tmp_path, monkeypatch):
+    """The one-shot half of this migration: ALTER TABLE DEFAULT stamps EVERY row already in the table.
+
+    The live `trading_ledger.db` has no `source` column and 579 rows, including the hand-typed
+    2026-08-15 exemplars (rule_id 1-16, confidence 0.92) whose *writers* Task 3 quarantined. A
+    `measured` default would rewrite that history the first time the shared writer touched the file,
+    and the distinction would be unrecoverable afterwards.
+    """
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "trading_ledger.db"
+    make_learned_rules(db, with_source=False)
+    conn = sqlite3.connect(db)
+    conn.executemany(
+        "INSERT INTO learned_rules (category, rule_text, confidence, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        [("CHOP_FAILURES", "ETH Price > $1,885", 0.92, "2026-08-15 21:56:14"),
+         ("RISK", "written before the column existed", 0.75, "2026-08-15 21:56:15")],
+    )
+    conn.commit()
+    conn.close()
+
+    from backtests.batch_backtest_learner import ensure_learned_rules_source_column
+
+    conn = sqlite3.connect(db)
+    ensure_learned_rules_source_column(conn)
+    rows = conn.execute("SELECT rule_id, source FROM learned_rules ORDER BY rule_id").fetchall()
+    conn.commit()
+    conn.close()
+    assert [r[0] for r in rows] == [1, 2], rows
+    assert [r[1] for r in rows] == ["unlabelled", "unlabelled"], rows
+    assert all(r[1] != "measured" for r in rows), rows
+
+
+def test_no_writer_defaults_the_provenance_label_to_measured():
+    """`measured` is a claim about a row's origin, so nothing may grant it by omission."""
+    learner_src = LEARNER_SRC.read_text(encoding="utf-8")
+    assert "DEFAULT 'measured'" not in learner_src, (
+        "the migration still stamps every pre-existing row as measured")
+    assert "source=\"measured\"" not in learner_src
+    assert "source TEXT DEFAULT 'unlabelled'" in learner_src
+
+
+def test_prompt_readers_do_not_select_the_source_column():
+    """The two boardroom readers filter on confidence only, so the label is audit provenance.
+
+    Pinned because the readers decide whether an unlabelled row can still reach a live prompt: it can
+    (the label is not a gate), and that is the documented behaviour, not an accident.
+    """
+    ai_src = AI_ENGINE_SRC.read_text(encoding="utf-8")
+    for selector in ("_load_learned_rules_from_db", "_get_top_rules_sync"):
+        body = ai_src.split(f"def {selector}(")[-1].split("\n        return rules")[0]
+        assert "source" not in body, f"{selector} reads the provenance column; the label is a gate"
+        assert "confidence >= 0.70" in body
 
 
 def test_source_column_helper_is_a_noop_when_the_column_exists(tmp_path, monkeypatch):
@@ -380,6 +445,8 @@ def test_source_column_helper_is_a_noop_when_the_column_exists(tmp_path, monkeyp
 
 
 def test_exemplar_rule_writer_tags_its_output(tmp_path, monkeypatch):
+    """The label must come from the caller. An omitted `source` means nobody knows where the row
+    came from, so it is written as `unlabelled`, never as a claim about exemplars or measurement."""
     monkeypatch.chdir(tmp_path)
     db = tmp_path / "trading_ledger.db"
     make_learned_rules(db, with_source=False)
@@ -393,7 +460,28 @@ def test_exemplar_rule_writer_tags_its_output(tmp_path, monkeypatch):
     ).fetchone()
     conn.commit()
     conn.close()
-    assert row == ("VOLATILITY_SPIKES", "ATR > 2.5x and DXY move > 0.4%", 0.94, "synthetic_exemplar")
+    assert row == ("VOLATILITY_SPIKES", "ATR > 2.5x and DXY move > 0.4%", 0.94, "unlabelled")
+
+
+def test_both_exemplar_learners_name_their_source_at_the_call_site():
+    """`synthetic_exemplar` is a claim the two learner scripts can actually make — so they must make
+    it explicitly rather than inherit it from a default that also serves real ledger writers."""
+    for path in (LEARNER_SRC, TRAINER_SRC):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "write_learned_rule")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "write_learned_rule")
+            )
+        ]
+        assert calls, f"{path.name} no longer writes learned rules"
+        for node in calls:
+            named = {kw.arg for kw in node.keywords}
+            assert "source" in named, (
+                f"{path.name}:{node.lineno} calls write_learned_rule without naming a source, "
+                "so its rows land in the ledger as unlabelled")
 
 
 def test_rule_writer_can_label_a_measured_lesson(tmp_path, monkeypatch):
@@ -409,7 +497,7 @@ def test_rule_writer_can_label_a_measured_lesson(tmp_path, monkeypatch):
     rows = conn.execute("SELECT rule_text, source FROM learned_rules ORDER BY rule_id").fetchall()
     conn.commit()
     conn.close()
-    assert rows == [("measured lesson", "measured"), ("exemplar lesson", "synthetic_exemplar")]
+    assert rows == [("measured lesson", "measured"), ("exemplar lesson", "unlabelled")]
 
 
 # ---------------------------------------------------------------------------
@@ -679,18 +767,159 @@ def test_deep_brain_trainer_no_longer_writes_raw_bot_names():
     assert 'adj.get("bot_name"' not in body
 
 
-def test_live_fleet_rule_writers_are_not_relabelled():
-    """Only the two learner writers get the exemplar tag. The fleet's own post-mortem writers
-    keep their untagged INSERT — relabelling the live lesson producers is a different decision
-    than the one this task authorises."""
-    tree = ast.parse(POST_MORTEM_SRC.read_text(encoding="utf-8"))
-    inserts = [
-        node.value for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "INSERT INTO learned_rules" in node.value
+def test_every_rule_writer_routes_through_the_shared_writer():
+    """Final dispatch item 4: no `learned_rules` writer may keep an untagged INSERT.
+
+    The previous version of this test *blessed* the untagged INSERT on the theory that relabelling
+    the fleet's own producers was out of scope for Task 3. It is in scope here: an untagged row is
+    indistinguishable from a hand-typed exemplar in the same table, which is the laundering the
+    provenance column exists to prevent. Every writer now names its source, and `write_learned_rule`
+    owns the column add, so the five producers cannot drift apart.
+    """
+    for path in RULE_WRITERS:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        # Constants only: the fix comments are allowed to NAME the SQL they removed, a comment is
+        # not a write path.
+        sql = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        for text in sql:
+            assert "INSERT INTO learned_rules" not in text, (
+                f"{path.name} still writes learned_rules with a raw INSERT; the row carries no source")
+            assert "INSERT OR REPLACE INTO learned_rules" not in text, (
+                f"{path.name} still upserts learned_rules by primary key")
+
+    for path in RULE_WRITERS:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name)
+                 and node.func.id in ("write_learned_rule", "_write_ledger_rule"))
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "write_learned_rule")
+            )
+        ]
+        assert calls, f"{path.name} no longer writes learned rules at all"
+        for node in calls:
+            source_kw = next((kw for kw in node.keywords if kw.arg == "source"), None)
+            assert source_kw is not None, (
+                f"{path.name}:{node.lineno} writes a rule without naming its source")
+            if isinstance(node.func, ast.Name) and node.func.id == "_write_ledger_rule":
+                # The bridge forwards `source=source`; a producer site must spell its own label out.
+                assert not isinstance(source_kw.value, ast.Name), (
+                    f"{path.name}:{node.lineno} passes a forwarded source instead of its own label")
+
+    # Three producers live in post_mortem_agent (per-trade tweak, per-trade forensic path, and the
+    # 3-agent autopsy); a fourth writer appearing there must be counted, not silently merged.
+    pm_tree = ast.parse(POST_MORTEM_SRC.read_text(encoding="utf-8"))
+    bridge_sites = [
+        node for node in ast.walk(pm_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "_write_ledger_rule"
     ]
-    assert inserts, "post_mortem_agent should still write learned rules"
-    for sql in inserts:
-        assert "source" not in sql
+    assert len(bridge_sites) == 3, len(bridge_sites)
+
+
+def test_post_mortem_writer_helper_reaches_the_shared_writer(tmp_path, monkeypatch):
+    """Behaviour, not shape: the deferred import inside `_write_ledger_rule` resolves, adds the
+    provenance column to a pre-migration table, and tags the row with the caller's label."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "trading_ledger.db"
+    make_learned_rules(db, with_source=False)
+
+    import post_mortem_agent as pma
+
+    conn = sqlite3.connect(db)
+    pma._write_ledger_rule(
+        conn, "RISK", "a lesson from a real closed trade", 0.81,
+        source="post_mortem_llm_lesson",
+    )
+    row = conn.execute(
+        "SELECT category, rule_text, confidence, source FROM learned_rules").fetchone()
+    conn.commit()
+    conn.close()
+    assert row == ("RISK", "a lesson from a real closed trade", 0.81, "post_mortem_llm_lesson"), row
+
+
+def test_the_shared_writer_is_imported_deferred_in_post_mortem_agent():
+    """`batch_backtest_learner` imports `post_mortem_agent` at module scope (`:25`), so the reverse
+    import must be function-local or the two modules dead-lock on the first import."""
+    tree = ast.parse(POST_MORTEM_SRC.read_text(encoding="utf-8"))
+    module_level = [
+        node for node in tree.body if isinstance(node, ast.ImportFrom)
+    ]
+    for node in module_level:
+        assert "batch_backtest_learner" not in (node.module or ""), (
+            f"post_mortem_agent:{node.lineno} imports the learner at module scope: circular import")
+    deferred = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and "batch_backtest_learner" in (node.module or "")
+    ]
+    assert deferred, "post_mortem_agent must reach write_learned_rule through a deferred import"
+
+
+def test_pipeline_rule_rows_survive_a_second_run(tmp_path, monkeypatch):
+    """`INSERT OR REPLACE ... (rule_id, ...)` with hand-typed ids 101-106 destroyed any row already
+    sitting on that primary key, and a re-run silently overwrote the whole template set. Both
+    behaviours are gone: a colliding row survives, and a re-run neither duplicates nor destroys."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "trading_ledger.db"
+    make_learned_rules(db, with_source=False)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE trade_lessons (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER,"
+        " bot_type TEXT, symbol TEXT, pnl REAL, original_rationale TEXT, lesson TEXT, timestamp TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO learned_rules (rule_id, category, rule_text, confidence, created_at)"
+        " VALUES (101, 'RISK', 'a real measured lesson', 0.91, '2026-08-15 21:56:14')"
+    )
+    conn.execute(
+        "INSERT INTO trade_lessons (trade_id, bot_type, symbol, pnl, original_rationale, lesson,"
+        " timestamp) VALUES (1, 'sniper', 'BTC', -5.0, 'ADX 12 chop', 'got chopped in a sideways"
+        " regime, adx was low', '2026-10-01 00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    from scripts.lesson_distillation_pipeline import LessonDistillationPipeline
+
+    def run():
+        LessonDistillationPipeline(
+            db_ledger=str(db), db_data=str(tmp_path / "trading_data.db")).distill_lessons()
+
+    run()
+    conn = sqlite3.connect(db)
+    survivor = conn.execute(
+        "SELECT rule_text FROM learned_rules WHERE rule_id = 101").fetchone()
+    assert survivor == ("a real measured lesson",), (
+        f"the pipeline overwrote the row sitting on rule_id 101 with {survivor!r}")
+    first = conn.execute("SELECT COUNT(*) FROM learned_rules").fetchone()[0]
+    tagged = conn.execute(
+        "SELECT DISTINCT source FROM learned_rules WHERE rule_id <> 101").fetchall()
+    conn.close()
+    assert first == 7, first
+    assert tagged and all(r[0] not in (None, "measured") for r in tagged), tagged
+
+    run()
+    conn = sqlite3.connect(db)
+    second = conn.execute("SELECT COUNT(*) FROM learned_rules").fetchone()[0]
+    survivor_again = conn.execute(
+        "SELECT rule_text FROM learned_rules WHERE rule_id = 101").fetchone()
+    conn.close()
+    assert survivor_again == ("a real measured lesson",), survivor_again
+    assert second == first, (second, first)
+
+
+def test_writer_sources_are_not_a_measurement_claim():
+    """No writer may hand out the `measured` label, and each label must say what its producer is."""
+    for path in RULE_WRITERS + (LEARNER_SRC, TRAINER_SRC):
+        src = path.read_text(encoding="utf-8")
+        assert 'source="measured"' not in src, f"{path.name} grants the measured label by writing"
+        for call in re.findall(r'source=(["\'])([^"\']+)\1', src):
+            assert call[1] != "measured", f"{path.name} labels a row measured"
 
 
 def test_enforce_parameter_bounds_callers_were_not_rewired():
