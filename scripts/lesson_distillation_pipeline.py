@@ -11,6 +11,8 @@ lesson influences at all. Their rows therefore say source='handwritten_template_
 
 Nothing in the repo imports or schedules this script; it is run by hand (`python
 scripts/lesson_distillation_pipeline.py`) against whatever ledger is in the working directory.
+That invocation puts <repo>/scripts on sys.path, not the repo root, so this module puts the repo
+root there itself before it reaches the shared writer in backtests/.
 """
 
 import os
@@ -20,6 +22,13 @@ import sqlite3
 import logging
 from datetime import datetime, timezone
 from collections import defaultdict, Counter
+
+# The shared writer lives in backtests/ (a namespace package: it has no __init__.py) and itself
+# imports config/ai_engine/post_mortem_agent from the repo root, so neither `backtests` nor those
+# modules resolve under the documented hand-run invocation until the repo root is on sys.path.
+# Same spelling the repo's other hand-run scripts use (scripts/quant_validation.py,
+# scripts/run_grid_ablation.py, scripts/reconcile_d4_corrupt_exits.py).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] DISTILLER: %(message)s")
 log = logging.getLogger("distiller")
