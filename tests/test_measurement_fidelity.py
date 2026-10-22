@@ -1199,3 +1199,121 @@ def test_the_bootstrap_arm_publishes_a_real_ratio_once_a_signal_loses(tmp_path, 
         f"no wins against a loss is a real zero ratio, and it is measured: {arm}")
 
 
+# ---------------------------------------------------------------------------
+# Final fix E-1 — the swing backtester's two ratios are measurements or absences
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: `measure_trade_ratios` IS the producer's arithmetic (the
+# backtester calls it), and `format_profit_factor` / `format_win_loss_ratio` are the renderers the
+# audit matrix prints, so these tests call the shipped code and check every decision.
+# `SwingArchitectBacktester.run()` itself is NOT executed -- it replays years of local history per
+# scenario -- so the wiring between the producer and the two printers is pinned by source-text
+# checks, and the matrix row itself is exercised by the E-2 tests below, once the script is
+# importable at all.
+#
+# The defect being closed: the backtester published a hardcoded 99.0 as its profit factor whenever
+# the run had no losing trade to divide by, and a 0.0 as its win/loss ratio. The comparative audit
+# matrix printed them as measured numbers (99.00, 0.00x) in the same table as rows that had been
+# measured.
+
+SWING_BACKTESTER = REPO_ROOT / "backtests" / "backtest_swing_architect.py"
+SWING_AUDIT_SCRIPT = REPO_ROOT / "scripts" / "run_swing_comparative_audit.py"
+
+from backtests.backtest_swing_architect import (  # noqa: E402
+    format_profit_factor as swing_format_profit_factor,
+    format_win_loss_ratio as swing_format_win_loss_ratio,
+    measure_trade_ratios,
+)
+
+
+def _closed_trades(rows):
+    """A closed-trade frame carrying the columns the producer reads: net_pnl and gross_pnl."""
+    return pd.DataFrame(list(rows), columns=["net_pnl", "gross_pnl"])
+
+
+def test_a_lossless_swing_run_publishes_no_profit_factor():
+    """A run whose trades never lost has no denominator: 99.0 was a constant dressed as a ratio."""
+    trades = _closed_trades([(5.0, 5.0), (3.0, 3.0)])
+    profit_factor, win_loss_ratio = measure_trade_ratios(trades)
+    assert profit_factor is None, (
+        f"a lossless run has no denominator, so there is no ratio to publish: {profit_factor}")
+    assert profit_factor != 99.0
+    assert win_loss_ratio is None, (
+        f"a lossless run has no losing trade to average: {win_loss_ratio}")
+    assert win_loss_ratio != 0.0
+
+
+def test_a_swing_run_with_a_losing_trade_measures_its_ratios():
+    """The control: with a denominator the ratios are measurements, not absences."""
+    trades = _closed_trades([(5.0, 5.0), (-2.0, -2.0)])
+    profit_factor, win_loss_ratio = measure_trade_ratios(trades)
+    assert profit_factor == pytest.approx(2.5)
+    assert win_loss_ratio == pytest.approx(2.5)
+
+
+def test_a_swing_run_that_never_won_still_measures_a_zero_ratio():
+    """A measured zero is a real number: the denominator was there and there was no profit in it."""
+    trades = _closed_trades([(-2.0, -2.0), (-1.0, -1.0)])
+    profit_factor, win_loss_ratio = measure_trade_ratios(trades)
+    assert profit_factor == 0.0
+    assert win_loss_ratio == 0.0
+
+
+def test_an_empty_swing_run_publishes_no_ratio_at_all():
+    profit_factor, win_loss_ratio = measure_trade_ratios(
+        pd.DataFrame(columns=["net_pnl", "gross_pnl"]))
+    assert profit_factor is None
+    assert win_loss_ratio is None
+
+
+def test_the_swing_renderers_name_the_absence_and_its_cause():
+    """The absence has to say WHICH absence: no denominator, or nothing measured at all."""
+    assert swing_format_profit_factor(1.23, 80, 20) == "1.23"
+    assert swing_format_profit_factor(None, 0, 0).startswith("n/a")
+    assert "no closed trades" in swing_format_profit_factor(None, 0, 0)
+    assert "no losing" in swing_format_profit_factor(None, 8, 0)
+    assert "denominator" in swing_format_profit_factor(None, 8, 0)
+    assert "99" not in swing_format_profit_factor(None, 8, 0)
+    assert "no closed trades" in swing_format_profit_factor(None, 0, 0)
+
+    assert swing_format_win_loss_ratio(1.5, 80, 20) == "1.50x"
+    assert swing_format_win_loss_ratio(None, 0, 0).startswith("n/a")
+    assert "no closed trades" in swing_format_win_loss_ratio(None, 0, 0)
+    assert "no losing" in swing_format_win_loss_ratio(None, 8, 0)
+    assert "0.00x" not in swing_format_win_loss_ratio(None, 8, 0)
+
+
+def test_the_swing_renderers_never_stand_in_for_a_missing_measurement():
+    """No absence may carry a number that could be read as a measurement."""
+    for n_trades, loss_count in [(0, 0), (8, 0), (8, 3)]:
+        for out in (swing_format_profit_factor(None, n_trades, loss_count),
+                    swing_format_win_loss_ratio(None, n_trades, loss_count)):
+            assert "99" not in out, out
+            assert "0.00" not in out, out
+            assert out.startswith("n/a"), out
+
+
+def test_the_swing_backtester_no_longer_publishes_a_constant_ratio():
+    """Source-text check of the producer's own arithmetic and of the two printers that consume it."""
+    src = SWING_BACKTESTER.read_text(encoding="utf-8")
+    assert "gross_loss > 0 else 99.0" not in src, (
+        "the profit factor must be the absence of a ratio, not a hardcoded constant")
+    assert "avg_loss > 0 else 0.0" not in src, (
+        "the win/loss ratio must be the absence of a ratio, not a measured zero")
+    assert '"profit_factor": None if profit_factor is None else round(profit_factor, 2)' in src
+    assert '"win_loss_ratio": None if win_loss_ratio is None else round(win_loss_ratio, 2)' in src
+    # The backtester's own printer is a consumer too, and it must render the absence.
+    assert "format_profit_factor(res.get('profit_factor'), n_trades, loss_count)" in src
+    assert "format_win_loss_ratio(res.get('win_loss_ratio'), n_trades, loss_count)" in src
+    assert "{res['profit_factor']:.2f}" not in src
+    assert "{res['win_loss_ratio']:.2f}x" not in src
+
+
+def test_the_audit_matrix_routes_through_the_swing_renderers():
+    """Source-text check of the matrix printer — see the section note above."""
+    src = SWING_AUDIT_SCRIPT.read_text(encoding="utf-8")
+    assert 'format_profit_factor(res.get("profit_factor"), n_trades, loss_count)' in src
+    assert 'format_win_loss_ratio(res.get("win_loss_ratio"), n_trades, loss_count)' in src
+    assert '{res[\'profit_factor\']:.2f}' not in src
+    assert '{res[\'win_loss_ratio\']:.2f}x' not in src
+
+

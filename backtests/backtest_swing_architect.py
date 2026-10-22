@@ -20,6 +20,73 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
+def measure_trade_ratios(df_trades):
+    """Measure a run's profit factor and average win/loss ratio, or None where there is no denominator.
+
+    Both ratios divide by something the run may not have produced: a losing trade. A run whose
+    trades never lost has no denominator, so the ratio is None -- the absence of a measurement --
+    and not a hardcoded constant dressed as one. The old code published 99.0 for the profit factor
+    and 0.0 for the win/loss ratio, and the comparative audit matrix printed them as measured
+    numbers (99.00, 0.00x) next to rows that had actually been measured.
+
+    `df_trades` is the closed-trade frame and must carry `net_pnl` and `gross_pnl`. A ratio that
+    was measured is returned as a number, including a measured 0.0 (a run that never won has a
+    denominator and no profit in it); only the missing denominator is None.
+    """
+    if df_trades is None or len(df_trades) == 0:
+        return None, None
+
+    wins = df_trades[df_trades["net_pnl"] > 0]
+    losses = df_trades[df_trades["net_pnl"] <= 0]
+
+    gross_profit = wins["gross_pnl"].sum() if not wins.empty else 0.0
+    gross_loss = abs(losses["gross_pnl"].sum()) if not losses.empty else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+
+    avg_win = wins["net_pnl"].mean() if not wins.empty else 0.0
+    avg_loss = abs(losses["net_pnl"].mean()) if not losses.empty else 0.0
+    win_loss_ratio = (avg_win / avg_loss) if avg_loss > 0 else None
+
+    return profit_factor, win_loss_ratio
+
+
+def format_profit_factor(profit_factor, n_trades, loss_count=0):
+    """Render a run's profit factor, printing absence where the ratio has no denominator.
+
+    The cause is derived from the run's own counts, so the sentence a reader gets is the one that
+    actually applied:
+      - no closed trades at all -> nothing was measured;
+      - closed trades and not one of them a loser -> the ratio has no denominator;
+      - closed trades whose non-winners carry no gross loss -> the ratio has no denominator.
+
+    Same shape as the ablation harness's renderer (`format_profit_factor` in
+    backtests/backtest_ablation_harness.py), which this repo's reports already follow.
+    """
+    if profit_factor is not None:
+        return f"{profit_factor:.2f}"
+    if not n_trades:
+        return "n/a (no closed trades, profit factor not measured)"
+    if not loss_count:
+        return "n/a (no losing trade, profit factor has no denominator)"
+    return "n/a (no gross loss to divide by, profit factor has no denominator)"
+
+
+def format_win_loss_ratio(win_loss_ratio, n_trades, loss_count=0):
+    """Render a run's average win/loss ratio, printing absence where it has no denominator.
+
+    A ratio of the average win to the average loss needs a losing trade to average: a run that
+    never lost has none, and a run whose non-wins were all exactly breakeven has an average loss
+    of zero. Both are absences, not measured zeros.
+    """
+    if win_loss_ratio is not None:
+        return f"{win_loss_ratio:.2f}x"
+    if not n_trades:
+        return "n/a (no closed trades, win/loss ratio not measured)"
+    if not loss_count:
+        return "n/a (no losing trade, win/loss ratio has no denominator)"
+    return "n/a (every non-win was a breakeven, win/loss ratio has no denominator)"
+
+
 def compute_4h_indicators(df: pd.DataFrame, shifted_cloud: bool = False) -> pd.DataFrame:
     """Computes Tenkan, Kijun, Senkou Span A/B, ATR(14), ADX(14), and RSI(14)."""
     df = df.copy().sort_values("timestamp").reset_index(drop=True)
@@ -449,25 +516,43 @@ class SwingArchitectBacktester:
         df_trades = pd.DataFrame(closed_trades)
         total_trades = len(df_trades)
         if total_trades == 0:
-            return {"trades": 0, "net_pnl": 0.0, "win_rate": 0.0}
+            # Nothing was traded, so nothing was measured: the rate and the two ratios have no
+            # population and no denominator. They are published as None so every reader renders
+            # the absence and names its cause, instead of a number that was never measured.
+            return {
+                "trades": 0,
+                "net_pnl": 0.0,
+                "initial_balance": self.initial_balance,
+                "final_balance": round(balance, 2),
+                "net_profit": 0.0,
+                "total_return_pct": 0.0,
+                "total_trades": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "win_rate": None,
+                "profit_factor": None,
+                "win_loss_ratio": None,
+                "max_drawdown_pct": round(max_drawdown, 2),
+                "total_fees_paid": 0.0,
+                "sharpe_ratio": None,
+                "sortino_ratio": None,
+                "avg_holding_hours": None,
+                "df_trades": df_trades,
+            }
 
         wins = df_trades[df_trades["net_pnl"] > 0]
         losses = df_trades[df_trades["net_pnl"] <= 0]
         win_count = len(wins)
         loss_count = len(losses)
         win_rate = (win_count / total_trades) * 100.0
-        
-        gross_profit = wins["gross_pnl"].sum() if not wins.empty else 0.0
-        gross_loss = abs(losses["gross_pnl"].sum()) if not losses.empty else 0.0
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 99.0
-        
+
+        # A run with no losing trade has no denominator for either ratio, so both are published as
+        # None (the absence of a measurement) instead of the constants this axis used to wear.
+        profit_factor, win_loss_ratio = measure_trade_ratios(df_trades)
+
         total_fees = df_trades["total_fees"].sum()
         net_profit = df_trades["net_pnl"].sum()
         total_return_pct = ((balance - self.initial_balance) / self.initial_balance) * 100.0
-
-        avg_win = wins["net_pnl"].mean() if not wins.empty else 0.0
-        avg_loss = abs(losses["net_pnl"].mean()) if not losses.empty else 0.0
-        win_loss_ratio = (avg_win / avg_loss) if avg_loss > 0 else 0.0
 
         # Sharpe & Sortino calculation
         df_eq = pd.DataFrame(equity_curve, columns=["dt", "balance"])
@@ -485,8 +570,8 @@ class SwingArchitectBacktester:
             "win_count": win_count,
             "loss_count": loss_count,
             "win_rate": round(win_rate, 2),
-            "profit_factor": round(profit_factor, 2),
-            "win_loss_ratio": round(win_loss_ratio, 2),
+            "profit_factor": None if profit_factor is None else round(profit_factor, 2),
+            "win_loss_ratio": None if win_loss_ratio is None else round(win_loss_ratio, 2),
             "max_drawdown_pct": round(max_drawdown, 2),
             "total_fees_paid": round(total_fees, 2),
             "sharpe_ratio": round(sharpe, 2),
@@ -514,6 +599,20 @@ if __name__ == "__main__":
         t2_roe=t2_r
     )
     res = tester.run()
+    if res.get("error"):
+        # No history was loaded, so nothing was measured on any axis. Say so instead of reading
+        # keys the run never produced.
+        print(f"[ERROR] Swing Architect backtest produced no result: {res['error']}")
+        raise SystemExit(1)
+
+    n_trades = res.get("total_trades", 0)
+    loss_count = res.get("loss_count", 0)
+    # A value that was not measured is rendered as its absence, never as a stand-in number.
+    win_rate_str = f"{res['win_rate']:.1f}%" if res.get("win_rate") is not None else "n/a (no closed trades)"
+    sharpe_str = res["sharpe_ratio"] if res.get("sharpe_ratio") is not None else "n/a"
+    sortino_str = res["sortino_ratio"] if res.get("sortino_ratio") is not None else "n/a"
+    holding_str = (f"{res['avg_holding_hours']:.1f} hours"
+                   if res.get("avg_holding_hours") is not None else "n/a (no closed trades)")
 
     print("=" * 65)
     print("      THE SWING ARCHITECT (4H) — HISTORICAL BACKTEST RESULTS      ")
@@ -522,13 +621,13 @@ if __name__ == "__main__":
     print(f" Final Balance:         ${res['final_balance']:,.2f}")
     print(f" Net Profit:            ${res['net_profit']:+,.2f} ({res['total_return_pct']:+.2f}%)")
     print(f" Total Closed Trades:   {res['total_trades']} ({res['win_count']} Wins / {res['loss_count']} Losses)")
-    print(f" Win Rate:              {res['win_rate']:.1f}%")
-    print(f" Profit Factor:         {res['profit_factor']:.2f}")
-    print(f" Win/Loss PnL Ratio:    {res['win_loss_ratio']:.2f}x")
+    print(f" Win Rate:              {win_rate_str}")
+    print(f" Profit Factor:         {format_profit_factor(res.get('profit_factor'), n_trades, loss_count)}")
+    print(f" Win/Loss PnL Ratio:    {format_win_loss_ratio(res.get('win_loss_ratio'), n_trades, loss_count)}")
     print(f" Max Drawdown:          {res['max_drawdown_pct']:.2f}%")
     print(f" Total Taker/Funding:   ${res['total_fees_paid']:,.2f}")
-    print(f" Sharpe / Sortino:      {res['sharpe_ratio']} / {res['sortino_ratio']}")
-    print(f" Avg Holding Time:      {res['avg_holding_hours']:.1f} hours")
+    print(f" Sharpe / Sortino:      {sharpe_str} / {sortino_str}")
+    print(f" Avg Holding Time:      {holding_str}")
     print("=" * 65)
 
     if "df_trades" in res and not res["df_trades"].empty:

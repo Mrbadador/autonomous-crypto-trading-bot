@@ -3,10 +3,20 @@ run_swing_comparative_audit.py — Runs parametric backtests to identify what ne
 """
 import sys
 import pandas as pd
-from backtest_swing_architect import SwingArchitectBacktester
+from backtest_swing_architect import (
+    SwingArchitectBacktester,
+    format_profit_factor,
+    format_win_loss_ratio,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+
+# Every cell of the matrix is a measurement or an explicit absence. A run that closed no trade has
+# no rate, no ratio and no denominator to divide by, and the row says so instead of printing a
+# number that was never measured (the profit-factor cell used to print a hardcoded 99.00).
+NO_DATA = "n/a (no historical data)"
+NO_CLOSED_TRADES = "n/a (no closed trades, nothing was measured)"
 
 scenarios = [
     {
@@ -47,28 +57,69 @@ scenarios = [
     }
 ]
 
-results = []
-for sc in scenarios:
-    print(f"Running: {sc['name']}...")
-    tester = SwingArchitectBacktester(**sc["params"])
-    res = tester.run()
-    results.append({
-        "Configuration": sc["name"],
-        "Return %": f"{res['total_return_pct']:+.1f}%",
-        "Net Profit": f"${res['net_profit']:+.2f}",
-        "Trades": res["total_trades"],
-        "Win Rate": f"{res['win_rate']:.1f}%",
-        "Profit Factor": f"{res['profit_factor']:.2f}",
-        "Win/Loss": f"{res['win_loss_ratio']:.2f}x",
-        "Max DD": f"{res['max_drawdown_pct']:.1f}%",
-        "Sharpe": f"{res['sharpe_ratio']:.2f}",
-        "Sortino": f"{res['sortino_ratio']:.2f}",
-        "Fees Paid": f"${res['total_fees_paid']:.2f}"
-    })
 
-df_res = pd.DataFrame(results)
-print("\n" + "=" * 90)
-print("             THE SWING ARCHITECT — PARAMETRIC COMPARATIVE AUDIT MATRIX")
-print("=" * 90)
-print(df_res.to_string(index=False))
-print("=" * 90)
+def _cell(value, spec, absence):
+    """Render a measured value in `spec`, or the absence that says why there is none."""
+    return absence if value is None else spec.format(value)
+
+
+def arm_row(name, res):
+    """Build one row of the comparative audit matrix from a backtest result.
+
+    `res` is the dictionary `SwingArchitectBacktester.run()` returns. Every cell is either a
+    measurement or an explicit absence naming its cause: a run that produced no history, and a run
+    that closed no trade, are told apart from a run that measured a value.
+    """
+    if res.get("error"):
+        # The run produced no data at all, so nothing was measured on any axis.
+        return {
+            "Configuration": name,
+            "Return %": NO_DATA,
+            "Net Profit": NO_DATA,
+            "Trades": 0,
+            "Win Rate": NO_DATA,
+            "Profit Factor": NO_DATA,
+            "Win/Loss": NO_DATA,
+            "Max DD": NO_DATA,
+            "Sharpe": NO_DATA,
+            "Sortino": NO_DATA,
+            "Fees Paid": NO_DATA,
+        }
+
+    n_trades = res.get("total_trades", 0)
+    loss_count = res.get("loss_count", 0)
+    return {
+        "Configuration": name,
+        "Return %": _cell(res.get("total_return_pct"), "{:+.1f}%", NO_CLOSED_TRADES),
+        "Net Profit": _cell(res.get("net_profit"), "${:+.2f}", NO_CLOSED_TRADES),
+        "Trades": n_trades,
+        "Win Rate": _cell(res.get("win_rate"), "{:.1f}%", NO_CLOSED_TRADES),
+        # The two ratios have no denominator when the run had no losing trade: the backtester
+        # publishes None there and the renderers say which absence it is.
+        "Profit Factor": format_profit_factor(res.get("profit_factor"), n_trades, loss_count),
+        "Win/Loss": format_win_loss_ratio(res.get("win_loss_ratio"), n_trades, loss_count),
+        "Max DD": _cell(res.get("max_drawdown_pct"), "{:.1f}%", NO_CLOSED_TRADES),
+        "Sharpe": _cell(res.get("sharpe_ratio"), "{:.2f}", NO_CLOSED_TRADES),
+        "Sortino": _cell(res.get("sortino_ratio"), "{:.2f}", NO_CLOSED_TRADES),
+        "Fees Paid": _cell(res.get("total_fees_paid"), "${:.2f}", NO_CLOSED_TRADES),
+    }
+
+
+def main():
+    results = []
+    for sc in scenarios:
+        print(f"Running: {sc['name']}...")
+        tester = SwingArchitectBacktester(**sc["params"])
+        res = tester.run()
+        results.append(arm_row(sc["name"], res))
+
+    df_res = pd.DataFrame(results)
+    print("\n" + "=" * 90)
+    print("             THE SWING ARCHITECT — PARAMETRIC COMPARATIVE AUDIT MATRIX")
+    print("=" * 90)
+    print(df_res.to_string(index=False))
+    print("=" * 90)
+
+
+if __name__ == "__main__":
+    main()
