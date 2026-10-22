@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 import config
 from ai_engine import query_cloud_llm
-from post_mortem_agent import clamp_parameter_value
+from post_mortem_agent import PARAM_BOUNDS, clamp_parameter_value
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AI_LEARNER] %(message)s")
 log = logging.getLogger("batch_learner")
@@ -127,9 +127,9 @@ def write_parameter_adjustments(db_path, adjustments):
 
     `suggested_value` is an ABSOLUTE target value, not a delta, so it goes through
     `clamp_parameter_value` and never through `enforce_parameter_bounds` (which would add
-    it to the current value). A knob with no measured band is dropped and logged instead of
-    written, and bot names are normalised so `SNIPER` updates `sniper` rather than creating
-    a shadow row beside it.
+    it to the current value). Anything that cannot be written is logged and dropped, never
+    skipped in silence, and bot names are normalised so `SNIPER` updates `sniper` rather
+    than creating a shadow row beside it.
     """
     with sqlite3.connect(db_path) as conn:
         for adj in adjustments:
@@ -137,12 +137,25 @@ def write_parameter_adjustments(db_path, adjustments):
             param = adj.get("param_name")
             raw_val = adj.get("suggested_value")
             if not param or raw_val is None:
+                # Never a silent skip: name the part of the suggestion that is missing.
+                missing = "param_name" if not param else "suggested_value"
+                log.info(
+                    f"  [PARAM REFUSED] {bot} -> {param}: the suggestion carries no {missing}, "
+                    f"nothing written ({adj.get('rationale', '')})"
+                )
                 continue
             val = clamp_parameter_value(param, raw_val)
             if val is None:
+                # The clamp answers `None` for two different failures; name the one that actually
+                # happened. A knob that DOES have a band can only have failed on the value.
+                reason = (
+                    "suggested_value is not a number"
+                    if param in PARAM_BOUNDS
+                    else "no measured safe range for that knob"
+                )
                 log.info(
-                    f"  [PARAM REFUSED] {bot} -> {param}: no measured safe range for that "
-                    f"knob, value {raw_val} not written ({adj.get('rationale', '')})"
+                    f"  [PARAM REFUSED] {bot} -> {param}: {reason}, value {raw_val} not written"
+                    f" ({adj.get('rationale', '')})"
                 )
                 continue
             conn.execute("""

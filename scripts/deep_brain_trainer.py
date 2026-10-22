@@ -21,11 +21,9 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 import config
 from ai_engine import query_cloud_llm
 from backtests.batch_backtest_learner import (
-    ensure_learned_rules_source_column,
-    normalise_bot_name,
     write_learned_rule,
+    write_parameter_adjustments,
 )
-from post_mortem_agent import clamp_parameter_value
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [DEEP_BRAIN] %(message)s")
 log = logging.getLogger("deep_brain")
@@ -252,8 +250,8 @@ Provide a rigorous institutional analysis in strictly valid JSON:
                 f"[{item['category']}] {data.get('master_lesson', 'Lesson learned.')}"
             ))
             
-            # Save rule to learned_rules, self-labelled as exemplar-derived.
-            ensure_learned_rules_source_column(conn)
+            # Save rule to learned_rules, self-labelled as exemplar-derived. The shared writer
+            # adds the provenance column itself, so this must not pre-empt it.
             write_learned_rule(
                 conn,
                 item["category"],
@@ -261,23 +259,15 @@ Provide a rigorous institutional analysis in strictly valid JSON:
                 float(data.get("confidence_score", 0.90)),
             )
             
-        # 2. Update parameter
-        adj = data.get("parameter_adjustment", {})
-        bot = normalise_bot_name(adj.get("bot_name", item["target_bot"]))
-        param = adj.get("param_name")
-        raw_val = adj.get("suggested_value")
-        if param and raw_val is not None:
-            # suggested_value is ABSOLUTE, so clamp it; a knob with no measured band is refused.
-            val = clamp_parameter_value(param, raw_val)
-            if val is None:
-                log.info(f"  [PARAM REFUSED] {bot} -> {param}: no measured safe range for that knob, value {raw_val} not written")
-            else:
-                with sqlite3.connect(DATA_DB) as conn:
-                    conn.execute("""
-                        INSERT INTO bot_parameters (bot_name, param_name, param_value, last_updated)
-                        VALUES (?, ?, ?, datetime('now'))
-                        ON CONFLICT(bot_name, param_name) DO UPDATE SET param_value=excluded.param_value, last_updated=excluded.last_updated
-                    """, (bot, param, float(val)))
+        # 2. Update parameter. The learner's writer owns bot-name normalisation, the band clamp,
+        # the upsert and the refusal logging, so both learners share one behaviour instead of
+        # keeping two copies that drift apart.
+        adj = data.get("parameter_adjustment") or {}
+        if adj:
+            # suggested_value is an ABSOLUTE target value, and the scenario's own target bot is
+            # the fallback name when the model leaves bot_name out.
+            adj.setdefault("bot_name", item["target_bot"])
+            write_parameter_adjustments(DATA_DB, [adj])
                 
         log.info(f"  ✅ Learned: {data.get('defense_rule', '')[:80]}...")
         return data

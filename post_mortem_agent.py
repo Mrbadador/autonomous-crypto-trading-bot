@@ -21,8 +21,6 @@ def _handle_shutdown(signum, frame):
     log.info(f"[SHUTDOWN] Signal {signum} received. Post-Mortem Agent will exit after current sweep.")
     _stop_event.set()
 
-signal.signal(signal.SIGTERM, _handle_shutdown)
-signal.signal(signal.SIGINT, _handle_shutdown)
 
 def init_db():
     conn = sqlite3.connect("trading_ledger.db")
@@ -685,6 +683,14 @@ async def trigger_instant_loss_autopsy(symbol: str, pnl: float, exit_reason: str
 
 def run_agent():
     init_db()
+    # Registered here, never at import time: backtests/batch_backtest_learner.py and
+    # scripts/deep_brain_trainer.py import this module at module scope and swing_trader.py
+    # imports it lazily inside its position-close path, so an import-time registration used to
+    # overwrite the importer's own SIGINT/SIGTERM handler and disarm graceful shutdown.
+    # run_agent() only ever runs on the main thread (this module's __main__, and the
+    # `python post_mortem_agent.py` subprocesses spawned by main.py and start_system.py).
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
     # P3-PATCH: Persistent event loop — avoids creating/destroying a loop every hour.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

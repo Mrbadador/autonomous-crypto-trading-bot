@@ -16,15 +16,29 @@ Covers four hygiene defects in the AI self-optimisation loop:
      boardroom prompt were an arbitrary tie subset and a 2025 exemplar could starve a lesson
      written today.
 
+Fix round 1 of the review adds the signal-purity test (importing `post_mortem_agent` must not
+take over the process signal table), the delegation tests (the trainer calls the learner's
+parameter writer instead of re-implementing the upsert), and the refusal-reason tests (every
+dropped adjustment is logged with the reason that actually applies).
+
 Every database here is a fixture built under ``tmp_path`` with the working directory moved
 there. The production ``trading_data.db``, ``trading_ledger.db`` and ``live_paper_trades.db``
-are never opened, written, or read. ``scripts/deep_brain_trainer.py`` is a script whose import
-runs ``load_dotenv``, so it is asserted structurally through ``ast`` rather than imported.
+are never opened, written, or read. ``scripts/deep_brain_trainer.py`` is imported for the
+behavioural write-path tests with its ``DATA_DB``/``LEDGER_DB`` module constants repointed at
+the fixture (its defaults name ``scripts/trading_data.db``), and asserted structurally with
+``ast`` wherever the point is which helper the script calls rather than what a row ends up
+containing.
 """
 
 import ast
+import asyncio
+import importlib
+import json
+import logging
 import pathlib
+import signal
 import sqlite3
+import sys
 
 import pytest
 
@@ -74,6 +88,21 @@ def make_learned_rules(db_path, with_source=False):
     conn.execute(f"CREATE TABLE learned_rules ({cols})")
     conn.commit()
     conn.close()
+
+
+def make_trade_lessons(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE trade_lessons (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER,"
+        " bot_type TEXT, symbol TEXT, pnl REAL, original_rationale TEXT, lesson TEXT, timestamp TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def refusal_lines(caplog_text):
+    """Every `[PARAM REFUSED]` line the writers logged, so a test can pin the *reason* text."""
+    return [line for line in caplog_text.splitlines() if "[PARAM REFUSED]" in line]
 
 
 def live_top_rules_sql():
@@ -481,8 +510,8 @@ def test_exemplar_clusters_are_renamed_but_still_seeded():
     assert "Simulates multi-asset historical trade executions" not in LEARNER_SRC.read_text(encoding="utf-8")
 
 
-def test_deep_brain_trainer_uses_the_shared_hygiene_helpers():
-    """deep_brain_trainer runs load_dotenv at import, so assert it structurally."""
+def test_deep_brain_trainer_delegates_the_parameter_upsert_to_the_learner():
+    """Finding 2/4: one writer owns the upsert, so the two learners cannot drift again."""
     tree = ast.parse(TRAINER_SRC.read_text(encoding="utf-8"))
     calls = set()
     for node in ast.walk(tree):
@@ -498,12 +527,141 @@ def test_deep_brain_trainer_uses_the_shared_hygiene_helpers():
             imported.append((node.module, {alias.name for alias in node.names}))
 
     assert ("backtests.batch_backtest_learner",
-            {"ensure_learned_rules_source_column", "normalise_bot_name", "write_learned_rule"}) in imported
-    assert ("post_mortem_agent", {"clamp_parameter_value"}) in imported
+            {"write_learned_rule", "write_parameter_adjustments"}) in imported
 
-    # Both hygiene helpers are actually invoked, not merely imported.
-    for helper in ("normalise_bot_name", "clamp_parameter_value", "ensure_learned_rules_source_column", "write_learned_rule"):
+    # Both shared writers are actually invoked, not merely imported.
+    for helper in ("write_learned_rule", "write_parameter_adjustments"):
         assert helper in calls, f"{helper} is imported but never called"
+    # Finding 4: `write_learned_rule` calls the source-column helper itself, so a second
+    # call in front of it is dead code.
+    assert "ensure_learned_rules_source_column" not in calls
+    # Finding 2: normalising and clamping belong to the shared writer, not to this script.
+    assert "normalise_bot_name" not in calls
+    assert "clamp_parameter_value" not in calls
+
+    # The trainer must not keep its own copy of the upsert or its own copy of the refusal text.
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "process_training_scenario"
+    )
+    body = ast.unparse(fn)
+    assert "INSERT INTO bot_parameters" not in body
+    assert "ON CONFLICT" not in body
+    assert "[PARAM REFUSED]" not in TRAINER_SRC.read_text(encoding="utf-8")
+
+
+def run_trainer_scenario(tmp_path, monkeypatch, caplog, adjustment, seed=(), target_bot="sniper"):
+    """Drive deep_brain_trainer's real per-scenario write path with a canned LLM reply.
+
+    Returns (bot_parameters rows, captured log text). Both DB paths are repointed at
+    ``tmp_path`` fixtures because the script's own module constants name
+    ``scripts/trading_data.db`` / ``scripts/trading_ledger.db``, and the script's ``DATA_DB``
+    is handed straight to the writer.
+    """
+    trainer = importlib.import_module("scripts.deep_brain_trainer")
+    monkeypatch.chdir(tmp_path)
+    data_db = tmp_path / "trading_data.db"
+    ledger_db = tmp_path / "trading_ledger.db"
+    make_bot_parameters(data_db, seed)
+    make_learned_rules(ledger_db, with_source=False)
+    make_trade_lessons(ledger_db)
+
+    # Guard the real script-local databases rather than trusting the monkeypatch alone.
+    real_dbs = [
+        path for path in (
+            REPO_ROOT / "scripts" / "trading_data.db",
+            REPO_ROOT / "scripts" / "trading_ledger.db",
+        ) if path.exists()
+    ]
+    before = {path: (path.stat().st_mtime_ns, path.stat().st_size) for path in real_dbs}
+
+    monkeypatch.setattr(trainer, "DATA_DB", str(data_db))
+    monkeypatch.setattr(trainer, "LEDGER_DB", str(ledger_db))
+
+    reply = {
+        "master_lesson": "Veto breakout entries while ADX is under 20.",
+        "defense_rule": "ADX < 20 -> veto",
+        "confidence_score": 0.90,
+        "parameter_adjustment": adjustment,
+    }
+
+    async def fake_query_cloud_llm(*args, **kwargs):
+        return json.dumps(reply)
+
+    monkeypatch.setattr(trainer, "query_cloud_llm", fake_query_cloud_llm)
+    item = {
+        "category": "CHOP_DEFENSE",
+        "asset": "BTC/USDT",
+        "title": "Low-Momentum Asian Session Range Compression",
+        "scenario": "ADX=11.5, Hurst=0.34.",
+        "failure_mode": "4 false breakout trades.",
+        "target_bot": target_bot,
+    }
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(trainer.process_training_scenario(1, item))
+    # process_training_scenario swallows exceptions into a None return, so a fixture mistake
+    # must not read as "nothing was refused".
+    assert result is not None, f"scenario errored out; log was:\n{caplog.text}"
+
+    for path, signature in before.items():
+        current = (path.stat().st_mtime_ns, path.stat().st_size)
+        assert current == signature, f"{path} was written by the trainer test"
+
+    conn = sqlite3.connect(data_db)
+    try:
+        rows = conn.execute(
+            "SELECT bot_name, param_name, param_value FROM bot_parameters ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return rows, caplog.text
+
+
+def test_trainer_writer_updates_the_canonical_row_instead_of_shadowing(tmp_path, monkeypatch, caplog):
+    """Finding 2: the trainer's own write path, exercised for real, not ast-walked."""
+    rows, _ = run_trainer_scenario(
+        tmp_path, monkeypatch, caplog,
+        {"bot_name": "SNIPER", "param_name": "veto_threshold", "suggested_value": 90.0,
+         "rationale": "veto earlier"},
+        seed=[("sniper", "veto_threshold", 75.0)],
+    )
+    assert rows == [("sniper", "veto_threshold", 90.0)]
+
+
+def test_trainer_writer_clamps_an_out_of_band_absolute_suggestion(tmp_path, monkeypatch, caplog):
+    rows, text = run_trainer_scenario(
+        tmp_path, monkeypatch, caplog,
+        {"bot_name": "BERSERKER", "param_name": "veto_threshold", "suggested_value": 5000.0,
+         "rationale": "raise the gate"},
+        seed=[("berserker", "veto_threshold", 75.0)],
+        target_bot="berserker",
+    )
+    assert rows == [("berserker", "veto_threshold", 95.0)]
+    assert "[PARAM OPTIMIZED]" in text
+
+
+def test_trainer_writer_refuses_a_knob_with_no_measured_band(tmp_path, monkeypatch, caplog):
+    rows, text = run_trainer_scenario(
+        tmp_path, monkeypatch, caplog,
+        {"bot_name": "sniper", "param_name": "trail_dist", "suggested_value": 99.0,
+         "rationale": "tighten the trail"},
+        seed=[("sniper", "trail_dist", 2.0)],
+    )
+    assert rows == [("sniper", "trail_dist", 2.0)]
+    refusals = refusal_lines(text)
+    assert len(refusals) == 1
+    assert "no measured safe range" in refusals[0]
+
+
+def test_trainer_writer_defaults_the_bot_to_the_scenario_target(tmp_path, monkeypatch, caplog):
+    """A suggestion with no bot_name must not silently retarget `sniper`."""
+    rows, _ = run_trainer_scenario(
+        tmp_path, monkeypatch, caplog,
+        {"param_name": "min_nn_confidence", "suggested_value": 0.80, "rationale": "sharpen entry"},
+        seed=[("berserker", "min_nn_confidence", 0.65)],
+        target_bot="berserker",
+    )
+    assert rows == [("berserker", "min_nn_confidence", 0.80)]
 
 
 def test_deep_brain_trainer_no_longer_writes_raw_bot_names():
@@ -513,9 +671,10 @@ def test_deep_brain_trainer_no_longer_writes_raw_bot_names():
         if isinstance(n, ast.AsyncFunctionDef) and n.name == "process_training_scenario"
     )
     body = ast.unparse(fn)
-    assert "normalise_bot_name" in body
-    assert "clamp_parameter_value" in body
-    assert "ensure_learned_rules_source_column" in body
+    # Canonicalising and clamping now live in the shared writer; the script hands over the
+    # suggestion plus the scenario's target bot as the fallback name, and nothing else.
+    assert "write_parameter_adjustments" in body
+    assert "bot_parameters" not in body
     # The raw accessor form that created the shadow rows must be gone.
     assert 'adj.get("bot_name"' not in body
 
@@ -540,3 +699,153 @@ def test_enforce_parameter_bounds_callers_were_not_rewired():
     src = POST_MORTEM_SRC.read_text(encoding="utf-8")
     assert src.count("new_val = enforce_parameter_bounds(p_name, cur_val, p_adj)") == 2
     assert src.count("if new_val != cur_val:") == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, Finding 1 — importing post_mortem_agent must not take over the
+# process signal table.
+# ---------------------------------------------------------------------------
+
+def _signal_registrations(node):
+    """The signal names registered by `signal.signal(signal.SIGX, ...)` under an AST node."""
+    found = []
+    for call in ast.walk(node):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "signal"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "signal"
+            and call.args
+            and isinstance(call.args[0], ast.Attribute)
+        ):
+            found.append(call.args[0].attr)
+    return found
+
+
+def _module_scope_signal_registrations(tree):
+    found = []
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        found += _signal_registrations(stmt)
+    return found
+
+
+def test_importing_post_mortem_agent_leaves_the_process_signal_table_alone():
+    """`import post_mortem_agent` must not replace the importer's SIGINT/SIGTERM handlers.
+
+    `swing_trader.py` registers graceful-shutdown handlers (`:3471-3472`) and then lazily
+    imports post_mortem_agent from the position-close path (`:3082`), so an import-time
+    registration silently disarms Ctrl-C on the live trader after the first losing swing exit.
+    `backtests/batch_backtest_learner.py` and `scripts/deep_brain_trainer.py` import it at
+    module scope, which made both multi-minute human-run LLM loops uninterruptible.
+    """
+    def sentinel(signum, frame):
+        return None
+
+    watched = (signal.SIGINT, signal.SIGTERM)
+    original = {sig: signal.getsignal(sig) for sig in watched}
+    saved_module = sys.modules.pop("post_mortem_agent", None)
+    try:
+        # Install a distinctive handler FIRST. Without this the test is order-dependent: if an
+        # earlier test already imported a handler-hijacking module, the recorded baseline would
+        # BE that hijacked handler and the assertion would pass by accident.
+        for sig in watched:
+            signal.signal(sig, sentinel)
+        importlib.import_module("post_mortem_agent")
+        for sig in watched:
+            assert signal.getsignal(sig) is sentinel, (
+                f"importing post_mortem_agent overwrote the process {sig.name} handler"
+            )
+    finally:
+        for sig, handler in original.items():
+            signal.signal(sig, handler)
+        if saved_module is not None:
+            sys.modules["post_mortem_agent"] = saved_module
+
+
+def test_post_mortem_agent_installs_its_shutdown_handlers_in_run_agent():
+    """The registrations must MOVE into run_agent(), not be deleted along with the module scope."""
+    tree = ast.parse(POST_MORTEM_SRC.read_text(encoding="utf-8"))
+    assert _module_scope_signal_registrations(tree) == []
+    run_agent = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "run_agent"
+    )
+    assert sorted(_signal_registrations(run_agent)) == ["SIGINT", "SIGTERM"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, Findings 3 and 5 — every refusal says why, and nothing is skipped
+# in silence.
+# ---------------------------------------------------------------------------
+
+def test_refusal_log_names_the_real_cause(tmp_path, monkeypatch, caplog):
+    """A bounded knob fed an unparsable value must not be reported as a knob with no band."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "trading_data.db"
+    make_bot_parameters(db, [("sniper", "trail_dist", 2.0)])
+
+    from backtests.batch_backtest_learner import write_parameter_adjustments
+
+    with caplog.at_level(logging.INFO):
+        write_parameter_adjustments(str(db), [
+            {"bot_name": "sniper", "param_name": "vol_gate_mult", "suggested_value": "banana"},
+            {"bot_name": "sniper", "param_name": "trail_dist", "suggested_value": 9.0},
+        ])
+
+    refusals = refusal_lines(caplog.text)
+    assert len(refusals) == 2
+    unparsable = next(line for line in refusals if "vol_gate_mult" in line)
+    unbounded = next(line for line in refusals if "trail_dist" in line)
+    assert "not a number" in unparsable
+    assert "no measured safe range" not in unparsable
+    assert "no measured safe range" in unbounded
+    assert "not a number" not in unbounded
+
+    # Fail-closed behaviour is untouched by the wording change.
+    conn = sqlite3.connect(db)
+    rows = conn.execute("SELECT bot_name, param_name, param_value FROM bot_parameters").fetchall()
+    conn.close()
+    assert rows == [("sniper", "trail_dist", 2.0)]
+
+
+def test_malformed_adjustment_is_logged_not_silently_dropped(tmp_path, monkeypatch, caplog):
+    """Finding 5: a skipped adjustment has to be visible; a silent skip is the defect class."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "trading_data.db"
+    make_bot_parameters(db, [("sniper", "vol_gate_mult", 1.2)])
+
+    from backtests.batch_backtest_learner import write_parameter_adjustments
+
+    with caplog.at_level(logging.INFO):
+        write_parameter_adjustments(str(db), [
+            {"bot_name": "sniper", "suggested_value": 2.0},
+            {"bot_name": "sniper", "param_name": "vol_gate_mult"},
+        ])
+
+    refusals = refusal_lines(caplog.text)
+    assert len(refusals) == 2
+    assert any("carries no param_name" in line for line in refusals)
+    assert any("carries no suggested_value" in line for line in refusals)
+
+    conn = sqlite3.connect(db)
+    rows = conn.execute("SELECT bot_name, param_name, param_value FROM bot_parameters").fetchall()
+    conn.close()
+    assert rows == [("sniper", "vol_gate_mult", 1.2)]
+
+
+def test_trainer_writer_refuses_an_unparsable_suggestion_and_says_why(tmp_path, monkeypatch, caplog):
+    """The same two distinguishable reasons through the trainer's own write path."""
+    rows, text = run_trainer_scenario(
+        tmp_path, monkeypatch, caplog,
+        {"bot_name": "sniper", "param_name": "vol_gate_mult", "suggested_value": "high",
+         "rationale": "loosen the vol gate"},
+        seed=[("sniper", "vol_gate_mult", 1.2)],
+    )
+    assert rows == [("sniper", "vol_gate_mult", 1.2)]
+    refusals = refusal_lines(text)
+    assert len(refusals) == 1
+    assert "not a number" in refusals[0]
+    assert "no measured safe range" not in refusals[0]
