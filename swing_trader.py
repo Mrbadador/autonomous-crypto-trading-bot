@@ -56,6 +56,11 @@ if not log.handlers:
         pass
 
 
+def _cooldown_should_trigger(exit_reason: str, pnl: float) -> bool:
+    """Anti-whipsaw cooldown applies to realised losses only, never to a label."""
+    return pnl < 0
+
+
 class SwingArchitectTrader:
     def __init__(self):
         self.symbols = getattr(config, "SYMBOLS", ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
@@ -243,7 +248,7 @@ class SwingArchitectTrader:
                     if target_dir and last_side and last_side != target_dir:
                         return None
                     last_ts_str, exit_reason, last_pnl = str(trade_row[0]), str(trade_row[1] or ""), float(trade_row[2] or 0.0)
-                    is_stop_or_loss = ("stop" in exit_reason.lower() or "sl" in exit_reason.lower() or last_pnl < 0)
+                    is_stop_or_loss = _cooldown_should_trigger(exit_reason, last_pnl)
                     if is_stop_or_loss:
                         try:
                             # Normalize SQLite timestamp format
@@ -3065,8 +3070,8 @@ class SwingArchitectTrader:
         deleted_locks = await asyncio.to_thread(self._release_lock_sync, symbol, owner)
         log.info(f"[POSITION-CLOSED] {symbol} trade finalized. Mutex lock released (owner={owner}, rows={deleted_locks}).")
 
-        # Enforce Anti-Whipsaw Cooldown (Rule #166) if closed by stop-loss or loss
-        if "stop" in reason.lower() or "sl" in reason.lower() or pnl < 0:
+        # Enforce Anti-Whipsaw Cooldown (Rule #166) only on a realised loss, never on the exit label
+        if _cooldown_should_trigger(reason, pnl):
             cooldown_h = getattr(config, "SWING_COOLDOWN_HOURS", 12.0)
             await asyncio.to_thread(self._set_cooldown_sync, symbol, cooldown_h, f"{pos_side.upper()}_{reason}")
 
