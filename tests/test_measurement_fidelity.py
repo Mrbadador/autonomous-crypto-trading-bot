@@ -2643,3 +2643,382 @@ def test_the_capital_block_is_wired_to_the_helpers():
             f"{name} still lets an invented literal outrank the operator's configured capital")
     assert 'os.getenv("TOPUP_DEPOSIT_TRANCHE_3", "")' in main, (
         "dashboard.py does not read the operator's configured third tranche")
+
+
+# ---------------------------------------------------------------------------
+# Final fix G-3 — the state-backed labels publish readings or absences, never stand-ins
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: the four helpers under test (`_published_state`,
+# `_published_flag`, `_stance_color`, `_absence_note`) are pure and module-level, so they are
+# extracted by AST and executed for real here — the shipped body, not a paraphrase of it. The
+# `st.metric(...)`, `st.markdown(...)` and `st.write(...)` calls they feed are NOT executed: the
+# committed suite has no Streamlit AppTest harness, and importing dashboard.py runs a 5,000-line
+# top-level script against the real DB and live price endpoints. A helper that returns a dict
+# cannot lie about what it decided; the rendering one line further out is pinned by source-text
+# checks, nothing more.
+#
+# The defect being closed: the top banner published a leverage cap, a Fear & Greed, a news gate
+# and a halt state that no measurement produced — `RISK_HALT` defaulted to "0", so a fleet whose
+# risk engine had published nothing wore a green "SYSTEM ACTIVE" badge next to the controls that
+# halt trading. The Microstructure Veto Pulse published a regime, a warden bias and a DI spread it
+# had not measured, painted the warden row green whatever the warden said, and published a
+# hardcoded green "CLEAR (Normal Flow)" for a volatility cascade that no component measures at
+# all. The AI Cognitive Regime Arbiter published a bias, a trap risk, a thesis and a leverage cap
+# out of hardcoded defaults — a trap risk nobody measured rendered as "40%" with a green "Safe
+# Expansion" delta. And two of those panels interpolated DB- or LLM-derived text into
+# `unsafe_allow_html=True` with no escaping at all.
+#
+# The convention: a figure that was never recorded is published as an absence, never as a number
+# and never as a zero. A recorded zero is a fact and stays a reading.
+
+_G3_STATE_HELPERS = {}
+
+
+def _g3_helper(name, path=DASHBOARD):
+    """One of the four state-label helpers, extracted once per (file, name) and cached.
+
+    The extraction is deliberately lazy: a helper that does not exist yet must fail the test
+    that asks for it, not the whole module at collection time.
+    """
+    key = (str(path), name)
+    if key not in _G3_STATE_HELPERS:
+        _G3_STATE_HELPERS[key] = _dashboard_helper(name, path)
+    return _G3_STATE_HELPERS[key]
+
+
+# Group 1 — `_published_state`: a reading that was taken, or an absence that names itself.
+@pytest.mark.parametrize("value", ["", None, "None", "null", "nan", "N/A", "na", "--", "   "])
+def test_g3_published_state_reports_an_absence_for_an_unpublished_key(value):
+    """A key nobody published is an absence, and the HUD says why it is absent."""
+    out = _g3_helper("_published_state")(value, "no regime bias published")
+    assert out == {"text": "not measured", "measured": False,
+                   "reason": "no regime bias published"}, out
+
+
+@pytest.mark.parametrize("value", ["0", "BULL_TREND", "63.0", "LONG_ONLY", "ACTIVE"])
+def test_g3_published_state_reports_a_published_value_as_a_measurement(value):
+    """A value that IS present is published exactly as the fleet wrote it."""
+    out = _g3_helper("_published_state")(value, "no regime bias published")
+    assert out == {"text": value, "measured": True, "reason": ""}, out
+
+
+def test_g3_published_state_keeps_a_published_zero_as_a_reading():
+    """A published "0" is a fact. It must not collapse into the absence."""
+    out = _g3_helper("_published_state")("0", "no recommended leverage published")
+    assert out["measured"] is True, out
+    assert out["text"] == "0", out
+    assert out["reason"] == "", out
+
+
+# Group 2 — `_published_flag`: a control flag that was never published is NOT "not halted".
+@pytest.mark.parametrize("value", ["", None])
+def test_g3_published_flag_reports_an_absence_for_an_unpublished_key(value):
+    """A halt flag that was never published must not read as "not halted"."""
+    out = _g3_helper("_published_flag")(value, "no halt state published")
+    assert out == {"flag": False, "measured": False, "reason": "no halt state published"}, out
+
+
+def test_g3_published_flag_reads_a_published_zero_as_a_measured_off():
+    """A published "0" is a measured off — the state was published, and it was published off."""
+    out = _g3_helper("_published_flag")("0", "no halt state published")
+    assert out == {"flag": False, "measured": True, "reason": ""}, out
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "YES", "on", "On"])
+def test_g3_published_flag_reads_a_published_on_in_every_spelling(value):
+    """The fleet's own spelling of a set flag must be read as set."""
+    out = _g3_helper("_published_flag")(value, "no halt state published")
+    assert out == {"flag": True, "measured": True, "reason": ""}, out
+
+
+# Group 3 — `_stance_color`: an absent stance is neutral grey, never the colour of a measured one.
+@pytest.mark.parametrize("label", ["TRENDING", "LONG_ONLY", "BULL_TREND", "BEAR_TREND",
+                                   "SHORT_ONLY", "CHOP_GRID_ACTIVE", ""])
+def test_g3_stance_color_paints_an_unmeasured_stance_neutral_grey(label):
+    """The defect: the veto pulse defaulted the regime to "TRENDING" and painted the panel green
+    off a reading nobody took. An absent stance must never wear a measured stance's colour."""
+    out = _g3_helper("_stance_color")(label, False, ("BULL_TREND", "BULLISH", "TRENDING"),
+                                      ("BEAR_TREND", "BEARISH"))
+    assert out == "#94a3b8", out
+
+
+@pytest.mark.parametrize("label, expected", [
+    ("BULL_TREND", "#00ff66"),
+    ("BULLISH", "#00ff66"),
+    ("TRENDING", "#00ff66"),
+    ("BEAR_TREND", "#ff003c"),
+    ("BEARISH", "#ff003c"),
+    ("CHOP_GRID_ACTIVE", "#f59e0b"),
+    ("LONG_ONLY", "#f59e0b"),
+])
+def test_g3_stance_color_paints_a_measured_stance_by_what_it_says(label, expected):
+    """A measured stance is coloured by its own words. The warden bias is no longer hardcoded
+    green, so a published SHORT_ONLY is painted red."""
+    out = _g3_helper("_stance_color")(label, True, ("BULL_TREND", "BULLISH", "TRENDING"),
+                                      ("BEAR_TREND", "BEARISH"))
+    assert out == expected, out
+
+
+def test_g3_stance_color_normalises_the_case_of_a_stance():
+    """The fleet's vocabulary is upper case, but the comparison must not depend on it."""
+    helper = _g3_helper("_stance_color")
+    bullish = ("BULL_TREND", "BULLISH", "TRENDING")
+    bearish = ("BEAR_TREND", "BEARISH")
+    assert helper("bull_trend", True, bullish, bearish) == helper("BULL_TREND", True, bullish, bearish)
+    assert helper("bear_trend", True, bullish, bearish) == helper("BEAR_TREND", True, bullish, bearish)
+
+
+def test_g3_stance_color_paints_a_short_only_warden_red():
+    """The warden row used to be hardcoded green whatever the warden said."""
+    out = _g3_helper("_stance_color")("SHORT_ONLY", True, ("LONG_ONLY",), ("SHORT_ONLY",))
+    assert out == "#ff003c", out
+
+
+# Group 4 — `_absence_note`: the dimmed parenthetical that says why a reading is missing.
+def test_g3_absence_note_names_the_reason_it_is_missing():
+    out = _g3_helper("_absence_note")("no 60m warden regime published")
+    assert "no 60m warden regime published" in out, out
+    assert "<span" in out and "</span>" in out, out
+
+
+def test_g3_absence_note_escapes_the_reason_it_is_missing():
+    """The reason reaches a reader through an HTML block, so it may not carry markup."""
+    out = _g3_helper("_absence_note")("<b>x</b>")
+    assert "<b>" not in out, out
+    assert "&lt;b&gt;" in out, out
+
+
+# Group 5 — the two apps carry byte-identical copies of the four helpers.
+def test_g3_the_two_dashboards_carry_byte_identical_copies_of_the_state_helpers():
+    """The copies are duplicated on purpose (the legacy script cannot import dashboard.py), so
+    they are pinned to be the same source, not merely to behave the same today."""
+    import ast
+
+    for name in ("_published_state", "_published_flag", "_stance_color", "_absence_note"):
+        sources = []
+        for path in (DASHBOARD, LEGACY_DASHBOARD):
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=str(path))
+            node = next(n for n in tree.body
+                        if isinstance(n, ast.FunctionDef) and n.name == name)
+            sources.append(ast.get_source_segment(text, node))
+        assert sources[0] == sources[1], (
+            f"{name} differs between the two dashboards, so the same fleet would be shown two "
+            f"different readings")
+
+
+# Group 6 — the same behaviour across the two apps.
+def test_g3_the_two_dashboards_publish_the_same_state_readings():
+    """scripts/live_dashboard.py is a standalone Streamlit script and cannot import dashboard.py,
+    so it carries its own copies of the four helpers. The copies have to agree, or the same fleet
+    would be shown two different stances.
+
+    None of the four takes a callable argument, so nothing here can slip through an `except`
+    branch and make the comparison vacuous; the arguments are compared exactly as they are.
+    """
+    bullish = ("BULL_TREND", "BULLISH", "TRENDING")
+    bearish = ("BEAR_TREND", "BEARISH")
+    cases = [
+        ("_published_state", ("", "no regime bias published"), {}),
+        ("_published_state", (None, "no regime bias published"), {}),
+        ("_published_state", ("BULL_TREND", "no regime bias published"), {}),
+        ("_published_state", ("0", "no regime bias published"), {}),
+        ("_published_flag", ("", "no halt state published"), {}),
+        ("_published_flag", (None, "no halt state published"), {}),
+        ("_published_flag", ("0", "no halt state published"), {}),
+        ("_published_flag", ("1", "no halt state published"), {}),
+        ("_stance_color", ("TRENDING", False), {"bullish": bullish, "bearish": bearish}),
+        ("_stance_color", ("BULL_TREND", True), {"bullish": bullish, "bearish": bearish}),
+        ("_stance_color", ("BEAR_TREND", True), {"bullish": bullish, "bearish": bearish}),
+        ("_stance_color", ("LONG_ONLY", True), {"bullish": ("LONG_ONLY",),
+                                                "bearish": ("SHORT_ONLY",)}),
+        ("_absence_note", ("no 60m warden regime published",), {}),
+    ]
+    for name, args, kwargs in cases:
+        main = _g3_helper(name, DASHBOARD)
+        legacy = _g3_helper(name, LEGACY_DASHBOARD)
+        assert main(*args, **kwargs) == legacy(*args, **kwargs), (
+            f"the two dashboards disagree about {name}{args}: "
+            f"{main(*args, **kwargs)} != {legacy(*args, **kwargs)}")
+
+
+# Group 7 — no stand-in default survives in the panels that were rewritten.
+_G3_OLD_DEFAULTS = {
+    "RISK_HALT": "0",
+    "recommended_leverage": "3",
+    "fear_greed_index": "50.0",
+    "news_event_active": "0",
+    "market_regime_label": "TRENDING",
+    "warden_60m_regime": "LONG_ONLY",
+    "market_regime_di_spread": "0.0",
+    "macro_trend_4h": "NEUTRAL",
+    "ai_regime_bias": "DEFENSIVE_CHOP",
+    "ai_regime_trap_risk": "0.40",
+    "ai_regime_thesis": "Consolidation within range; capital shield priority.",
+}
+
+# The keys both dashboards read: the banner's four and the veto pulse's two.
+_G3_SHARED_KEYS = (
+    "RISK_HALT", "recommended_leverage", "fear_greed_index", "news_event_active",
+    "market_regime_label", "warden_60m_regime",
+)
+
+# The keys only dashboard.py reads: the legacy panel has no DI row, no 4H macro row and no
+# arbiter panel at all — they are a different panel, not a stale copy.
+_G3_MAIN_ONLY_KEYS = (
+    "market_regime_di_spread", "macro_trend_4h",
+    "ai_regime_bias", "ai_regime_trap_risk", "ai_regime_thesis",
+)
+
+
+@pytest.mark.parametrize("key", sorted(_G3_OLD_DEFAULTS))
+def test_g3_no_stand_in_default_survives_in_the_state_backed_reads(key):
+    """Every one of these keys used to be read with an invented default, and the HUD published
+    that default as if a measurement had produced it.
+
+    The guard is on the DEFAULT and not on the word: "LONG_ONLY", "TRENDING" and
+    "DEFENSIVE_CHOP" survive as the vocabulary the fleet itself publishes (the warden's stance,
+    the regime label, a bias), so they may not be banned outright.
+    """
+    old = _G3_OLD_DEFAULTS[key]
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert f'query_system_state("{key}", "{old}")' not in src, (
+            f"{path.name} still reads {key} with the invented default {old!r}")
+        defaults = re.findall(
+            r'query_system_state\(\s*"%s"\s*,\s*"([^"]*)"\s*\)' % re.escape(key), src)
+        assert all(default == "" for default in defaults), (
+            f"{path.name} reads {key} with the default(s) {defaults}; only an empty default may "
+            f"reach the publisher")
+
+
+@pytest.mark.parametrize("key", _G3_SHARED_KEYS)
+def test_g3_both_dashboards_read_the_shared_keys_with_an_empty_default(key):
+    """The banner's keys and the veto pulse's keys are read by both apps, and both read them
+    with an empty default so the publisher can tell "never published" from "published as 0"."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert f'query_system_state("{key}", "")' in src, (
+            f"{path.name} does not read {key} with an empty default")
+
+
+@pytest.mark.parametrize("key", _G3_MAIN_ONLY_KEYS)
+def test_g3_dashboard_reads_the_panel_only_keys_with_an_empty_default(key):
+    """The DI spread, the 4H macro trend and the three arbiter keys live only in dashboard.py."""
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert f'query_system_state("{key}", "")' in src, (
+        f"dashboard.py does not read {key} with an empty default")
+
+
+def test_g3_the_unused_state_reads_are_gone():
+    """`news_event_reason` and `ai_regime_updated_at` were read and read nowhere. Their defaults
+    ("No active events") were stand-ins in their own right."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert "news_reason" not in src, (
+            f"{path.name} still reads the unused news_event_reason")
+        assert "news_event_reason" not in src, (
+            f"{path.name} still reads the unused news_event_reason")
+    assert "arb_upd" not in DASHBOARD.read_text(encoding="utf-8"), (
+        "dashboard.py still reads the unused ai_regime_updated_at")
+
+
+def test_g3_the_cascade_row_publishes_no_all_clear():
+    """No component in this repository publishes a volatility-cascade state key, so the row has
+    nothing to read: it states the absence and why. It is not wired to funding_crash_risk or
+    btc_contagion_risk_score, which are different measurements."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert "CLEAR (Normal Flow)" not in src, (
+            f"{path.name} still publishes a hardcoded all-clear for a measurement nobody took")
+        assert "no cascade telemetry is published" in src, (
+            f"{path.name} does not say why the cascade row is empty")
+
+
+# Group 8 — the two HTML injection holes are closed.
+def test_g3_the_arbiter_thesis_interpolation_is_escaped():
+    """The thesis is model-generated prose interpolated into an unsafe_allow_html=True block."""
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert 'html.escape(arb_thesis_state["text"])' in src, (
+        "the arbiter thesis is not escaped before it reaches the HTML block")
+    assert "{arb_thesis}" not in src, (
+        "the arbiter thesis is still interpolated raw into an unsafe_allow_html=True block")
+    assert "Arbiter Structural Thesis" in src, (
+        "the arbiter thesis card must survive the fix")
+
+
+def test_g3_the_legacy_veto_pulse_escapes_every_interpolated_value():
+    """The legacy app never received the L-1 escaping fix and did not even import html."""
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "import html" in src, (
+        "scripts/live_dashboard.py does not import html, so it cannot escape anything")
+    assert "safe_market_label = html.escape(" in src, (
+        "the legacy veto pulse does not escape the market regime label")
+    assert "safe_warden_regime = html.escape(" in src, (
+        "the legacy veto pulse does not escape the warden bias")
+    assert "safe_last_veto = html.escape(str(last_sniper_veto))" in src, (
+        "the legacy veto pulse does not escape the last filter gate")
+    assert "{safe_market_label}" in src, (
+        "the legacy veto pulse does not interpolate the escaped market regime label")
+    assert "{safe_warden_regime}" in src, (
+        "the legacy veto pulse does not interpolate the escaped warden bias")
+    assert "{veto_preview}" in src, (
+        "the legacy veto pulse does not interpolate the escaped last filter gate")
+    for raw in ("{market_label}", "{warden_regime}", "{last_sniper_veto}"):
+        assert raw not in src, (
+            f"the legacy veto pulse still interpolates {raw} raw into an unsafe_allow_html=True "
+            "block")
+    assert "{last_sniper_veto[:40]}..." not in src, (
+        "the legacy veto pulse still prints an ellipsis on every value, even a three-character one")
+
+
+# Group 9 — the banner cannot claim an all-clear it did not measure.
+def test_g3_the_banner_publishes_an_unpublished_halt_state_in_neutral_grey():
+    """A halt flag nobody published is not "SYSTEM ACTIVE": it is a grey badge that says the
+    halt state was never published."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert '"HALT STATE NOT PUBLISHED"' in src, (
+            f"{path.name} does not publish an unpublished halt state")
+        assert "badge-neutral" in src, (
+            f"{path.name} does not use the neutral badge for an unpublished halt state")
+        assert ".badge-neutral {" in src, (
+            f"{path.name} has no .badge-neutral CSS rule")
+        assert 'risk_halt_state = _published_flag(query_system_state("RISK_HALT", "")' in src, (
+            f"{path.name} does not read the halt flag through the publisher")
+        assert '"SYSTEM ACTIVE"' in src, (
+            f"{path.name} no longer publishes the measured-off halt text")
+        assert '"ENTRIES PAUSED (CLOSE ONLY)"' in src, (
+            f"{path.name} no longer publishes the measured-on halt text")
+
+
+def test_g3_the_banner_no_longer_claims_an_all_clear_it_did_not_measure():
+    """The news gate and the halt badge used to read CLEAR and SYSTEM ACTIVE for a fleet that
+    had published neither."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert "NOT PUBLISHED" in src, (
+            f"{path.name} does not publish an unpublished news gate")
+        assert ('news_state = _published_flag(query_system_state("news_event_active", "")'
+                in src), (
+            f"{path.name} does not read the news gate through the publisher")
+        assert "{'SYSTEM ACTIVE' if risk_halt == '0' else 'ENTRIES PAUSED (CLOSE ONLY)'}" not in src, (
+            f"{path.name} still claims a halt state it may not have published")
+        assert "{'EVENT VETO' if news_active=='1' else 'CLEAR'}" not in src, (
+            f"{path.name} still claims a news gate it may not have published")
+
+
+def test_g3_the_banner_publishes_an_unmeasured_leverage_cap_and_fear_greed_as_absences():
+    """The banner used to publish "3x Dynamic" and "50/100" for a fleet that had published
+    neither."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert 'rec_lev_state = _published_state(query_system_state("recommended_leverage", "")' \
+            in src, (
+            f"{path.name} does not read the leverage cap through the publisher")
+        assert 'fg_num = _optional_float(query_system_state("fear_greed_index", ""))' in src, (
+            f"{path.name} does not read the Fear & Greed through the number parser")
+        assert 'lev_text = f"{html.escape(rec_lev_state[\'text\'])}x Dynamic"' in src, (
+            f"{path.name} does not publish the leverage cap through the publisher")
+        assert 'fg_text = f"{fg_num:.0f}/100" if fg_num is not None else "not measured"' in src, (
+            f"{path.name} does not publish the Fear & Greed as an absence when it is missing")

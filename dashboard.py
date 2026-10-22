@@ -1218,6 +1218,68 @@ def _profit_display(total_profit, total_roi_pct) -> str:
     return f"{sign}${abs(total_profit):,.2f} USDT ({total_roi_pct:+.2f}%)"
 
 
+def _published_state(value, absent_reason: str) -> dict:
+    """Return what the HUD should publish for one state-backed reading.
+
+    `value` is the raw value the fleet published for a `system_state` key, or the empty
+    string when the key was never published. An empty value, a NULL or placeholder text
+    means the reading was never taken, so the HUD says so and names the reason instead of
+    publishing a stand-in. A value that IS present is returned exactly as the publisher
+    wrote it — a recorded zero is a fact and stays a reading.
+
+    Returns {"text": str, "measured": bool, "reason": str}.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text or text.lower() in ("none", "null", "nan", "n/a", "na", "--"):
+        return {"text": "not measured", "measured": False, "reason": absent_reason}
+    return {"text": text, "measured": True, "reason": ""}
+
+
+def _published_flag(value, absent_reason: str) -> dict:
+    """Return the published flag state, or an absence when the key was never published.
+
+    A control flag and a reading are read the same way but mean different things when they
+    are absent: a halt flag that was never published is NOT "not halted". The HUD used to
+    default `RISK_HALT` to "0", so a fleet whose risk engine had published nothing showed a
+    green "SYSTEM ACTIVE" badge beside the trading controls.
+
+    Returns {"flag": bool, "measured": bool, "reason": str}.
+    """
+    state = _published_state(value, absent_reason)
+    if not state["measured"]:
+        return {"flag": False, "measured": False, "reason": state["reason"]}
+    return {
+        "flag": state["text"].strip().lower() in ("1", "true", "yes", "on"),
+        "measured": True,
+        "reason": "",
+    }
+
+
+def _stance_color(label: str, measured: bool, bullish: tuple, bearish: tuple) -> str:
+    """Colour a published stance by what it says; an absent stance is neutral grey.
+
+    A stance the HUD could not measure must never wear the colour of a measured one: the
+    veto pulse defaulted the market regime to "TRENDING" and painted the whole panel green
+    off a reading nobody took, and the warden bias was hardcoded green whatever the warden
+    said.
+
+    Returns a CSS colour string.
+    """
+    if not measured:
+        return "#94a3b8"
+    text = str(label or "").strip().upper()
+    if text in bullish:
+        return "#00ff66"
+    if text in bearish:
+        return "#ff003c"
+    return "#f59e0b"
+
+
+def _absence_note(reason: str) -> str:
+    """The dimmed parenthetical that says why a reading is missing."""
+    return f" <span style='color: #94a3b8; font-size: 0.8rem;'>({html.escape(str(reason))})</span>"
+
+
 # ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
@@ -1389,6 +1451,18 @@ tbody tr:hover {
     background: rgba(233, 30, 99, 0.12) !important;
     color: var(--accent-rose) !important;
     border: 1px solid var(--accent-rose) !important;
+    padding: 3px 10px !important;
+    border-radius: 2px !important;
+    font-weight: 600 !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.05em !important;
+}
+
+.badge-neutral {
+    background: rgba(148, 163, 184, 0.12) !important;
+    color: #94a3b8 !important;
+    border: 1px solid #94a3b8 !important;
     padding: 3px 10px !important;
     border-radius: 2px !important;
     font-weight: 600 !important;
@@ -1756,11 +1830,10 @@ if not top_integ_report["is_ok"]:
 
 # ── Top Macro & Intelligence Banner ─────────────────────────────────────────
 macro_trend = _macro_regime(query_system_state("btc_macro_trend", ""))
-risk_halt = query_system_state("RISK_HALT", "0")
-rec_lev = query_system_state("recommended_leverage", "3")
-fg_val = query_system_state("fear_greed_index", "50.0")
-news_active = "1" if state_flag("news_event_active") else "0"
-news_reason = query_system_state("news_event_reason", "No active events")
+risk_halt_state = _published_flag(query_system_state("RISK_HALT", ""), "no halt state published")
+rec_lev_state = _published_state(query_system_state("recommended_leverage", ""), "no recommended leverage published")
+fg_num = _optional_float(query_system_state("fear_greed_index", ""))
+news_state = _published_flag(query_system_state("news_event_active", ""), "no news gate state published")
 
 if macro_trend == "BULLISH":
     banner_color = "#00ff66"
@@ -1783,6 +1856,22 @@ else:
     banner_icon = "⚪"
     regime_text = "REGIME: MACRO UNKNOWN (NO STANCE)"
 
+lev_text = f"{html.escape(rec_lev_state['text'])}x Dynamic" if rec_lev_state["measured"] else "not measured"
+fg_text = f"{fg_num:.0f}/100" if fg_num is not None else "not measured"
+if news_state["measured"]:
+    news_text = "EVENT VETO" if news_state["flag"] else "CLEAR"
+    news_color = "#ff003c" if news_state["flag"] else "#00ff66"
+else:
+    news_text = "NOT PUBLISHED"
+    news_color = "#94a3b8"
+if risk_halt_state["measured"]:
+    halted = risk_halt_state["flag"]
+    halt_badge = "badge-red" if halted else "badge-green"
+    halt_text = "ENTRIES PAUSED (CLOSE ONLY)" if halted else "SYSTEM ACTIVE"
+else:
+    halt_badge = "badge-neutral"
+    halt_text = "HALT STATE NOT PUBLISHED"
+
 st.markdown(f"""
 <div style="
     background: {banner_bg};
@@ -1801,12 +1890,12 @@ st.markdown(f"""
             {banner_icon} {regime_text}
         </span>
         <span style="color: #94a3b8; font-size: 0.8rem; margin-left: 15px;">
-            ⚡ Lev: <b style="color: #00e5ff;">{rec_lev}x Dynamic</b> | 🧠 F&G: <b style="color: #e2e8f0;">{num(fg_val, 50.0):.0f}/100</b> | 📰 Event Gate: <b style="color: {'#ff003c' if news_active=='1' else '#00ff66'};">{'EVENT VETO' if news_active=='1' else 'CLEAR'}</b>
+            ⚡ Lev: <b style="color: #00e5ff;">{lev_text}</b> | 🧠 F&G: <b style="color: #e2e8f0;">{fg_text}</b> | 📰 Event Gate: <b style="color: {news_color};">{news_text}</b>
         </span>
     </div>
     <div>
-        <span class="{'badge-green' if risk_halt == '0' else 'badge-red'}">
-            {'SYSTEM ACTIVE' if risk_halt == '0' else 'ENTRIES PAUSED (CLOSE ONLY)'}
+        <span class="{halt_badge}">
+            {halt_text}
         </span>
     </div>
 </div>
@@ -3316,26 +3405,37 @@ with tab_ai:
     st.markdown("---")
     st.subheader("⚖️ AI Cognitive Regime Arbiter & Breakout Trap Gate Shield")
 
-    arb_bias = query_system_state("ai_regime_bias", "DEFENSIVE_CHOP")
-    arb_risk = query_system_state("ai_regime_trap_risk", "0.40")
-    arb_thesis = query_system_state("ai_regime_thesis", "Consolidation within range; capital shield priority.")
-    arb_lev = query_system_state("recommended_leverage", "3")
-    arb_upd = query_system_state("ai_regime_updated_at", "")
+    arb_bias_state = _published_state(query_system_state("ai_regime_bias", ""), "arbiter published no regime bias")
+    arb_risk_num = _optional_float(query_system_state("ai_regime_trap_risk", ""))
+    arb_thesis_state = _published_state(query_system_state("ai_regime_thesis", ""), "arbiter published no thesis")
+    arb_lev_state = _published_state(query_system_state("recommended_leverage", ""), "no recommended leverage published")
 
     col_arb1, col_arb2, col_arb3 = st.columns([1.2, 1, 2.0])
     with col_arb1:
-        st.metric("Cognitive Regime Bias", arb_bias, delta=f"Dynamic Cap: {arb_lev}x")
+        if arb_bias_state["measured"]:
+            arb_lev_delta = (f"Dynamic Cap: {html.escape(arb_lev_state['text'])}x"
+                             if arb_lev_state["measured"] else "Dynamic Cap: not measured")
+            st.metric("Cognitive Regime Bias", html.escape(arb_bias_state["text"]),
+                      delta=arb_lev_delta, delta_color="normal")
+        else:
+            st.metric("Cognitive Regime Bias", "not measured",
+                      delta=arb_bias_state["reason"], delta_color="off")
     with col_arb2:
-        try:
-            risk_val = float(arb_risk or 0.40)
-        except Exception:
-            risk_val = 0.40
-        st.metric("Institutional Trap Risk", f"{risk_val*100:.0f}%", delta="Safe Expansion" if risk_val < 0.5 else "High Trap Risk", delta_color="normal" if risk_val < 0.5 else "inverse")
+        if arb_risk_num is None:
+            st.metric("Institutional Trap Risk", "not measured",
+                      delta="trap risk was not published", delta_color="off")
+        else:
+            st.metric("Institutional Trap Risk", f"{arb_risk_num * 100:.0f}%",
+                      delta="Safe Expansion" if arb_risk_num < 0.5 else "High Trap Risk",
+                      delta_color="normal" if arb_risk_num < 0.5 else "inverse")
     with col_arb3:
+        thesis_text = (html.escape(arb_thesis_state["text"]) if arb_thesis_state["measured"]
+                       else "not measured")
+        thesis_note = "" if arb_thesis_state["measured"] else _absence_note(arb_thesis_state["reason"])
         st.markdown(f"""
         <div style="background: #0d121f; border: 1px solid #1e293b; border-radius: 6px; padding: 10px 14px; font-size: 0.82rem; color: #cbd5e1;">
             <b style="color: #00e5ff;">🧠 Arbiter Structural Thesis:</b><br/>
-            {arb_thesis}
+            {thesis_text}{thesis_note}
         </div>
         """, unsafe_allow_html=True)
 
@@ -4040,19 +4140,29 @@ with tab_risk:
     with rcol3:
         st.markdown("#### 🔬 Microstructure Veto Pulse")
         last_sniper_veto = query_system_state("last_veto_sniper", "None")
-        market_label = query_system_state("market_regime_label", "TRENDING")
-        warden_regime = query_system_state("warden_60m_regime", "LONG_ONLY")
-        di_spread = query_system_state("market_regime_di_spread", "0.0")
-        macro_4h = query_system_state("macro_trend_4h", "NEUTRAL")
-        
-        reg_color = "#00ff66" if market_label in ("BULL_TREND", "BULLISH", "TRENDING") else ("#ef4444" if market_label in ("BEAR_TREND", "BEARISH") else "#f59e0b")
+        market_state = _published_state(query_system_state("market_regime_label", ""), "no market regime label published")
+        warden_state = _published_state(query_system_state("warden_60m_regime", ""), "no 60m warden regime published")
+        di_state = _optional_float(query_system_state("market_regime_di_spread", ""))
+        macro4h_state = _published_state(query_system_state("macro_trend_4h", ""), "no 4h macro trend published")
+
+        reg_color = _stance_color(market_state["text"], market_state["measured"],
+                                  ("BULL_TREND", "BULLISH", "TRENDING"), ("BEAR_TREND", "BEARISH"))
+        warden_color = _stance_color(warden_state["text"], warden_state["measured"],
+                                     ("LONG_ONLY",), ("SHORT_ONLY",))
         # L-1 FIX: Escape all DB/LLM-derived text before interpolation into unsafe_allow_html=True
-        safe_market_label = html.escape(str(market_label))
+        safe_market_label = html.escape(market_state["text"])
+        safe_warden_regime = html.escape(warden_state["text"])
+        safe_macro_4h = html.escape(macro4h_state["text"])
         safe_last_veto = html.escape(str(last_sniper_veto))
-        st.write(f"• **Market Regime Label:** <b style='color: {reg_color};'>{safe_market_label}</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(4H: {html.escape(str(macro_4h))})</span>", unsafe_allow_html=True)
-        st.write(f"• **DI Polarity Spread:** <b style='color: {reg_color};'>{html.escape(str(di_spread))}</b>", unsafe_allow_html=True)
-        st.write(f"• **60m Warden Bias:** <b style='color: #00ff66;'>{html.escape(str(warden_regime))}</b>", unsafe_allow_html=True)
-        st.write(f"• **Volatility Cascade Risk:** <b style='color: #00ff66;'>CLEAR (Normal Flow)</b>", unsafe_allow_html=True)
+        di_text = f"{di_state:+.2f}" if di_state is not None else "not measured"
+        market_note = "" if market_state["measured"] else _absence_note(market_state["reason"])
+        warden_note = "" if warden_state["measured"] else _absence_note(warden_state["reason"])
+        di_note = "" if di_state is not None else _absence_note("no DI spread published")
+        macro_note = "" if macro4h_state["measured"] else _absence_note(macro4h_state["reason"])
+        st.write(f"• **Market Regime Label:** <b style='color: {reg_color};'>{safe_market_label}</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(4H: {safe_macro_4h})</span>{macro_note}", unsafe_allow_html=True)
+        st.write(f"• **DI Polarity Spread:** <b style='color: {reg_color};'>{html.escape(di_text)}</b>{di_note}", unsafe_allow_html=True)
+        st.write(f"• **60m Warden Bias:** <b style='color: {warden_color};'>{safe_warden_regime}</b>{warden_note}", unsafe_allow_html=True)
+        st.write(f"• **Volatility Cascade Risk:** <b style='color: #94a3b8;'>not measured</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(no cascade telemetry is published)</span>", unsafe_allow_html=True)
         veto_preview = safe_last_veto[:40] + ("..." if len(safe_last_veto) > 40 else "")
         st.write(f"• **Last Filter Gate:** <span style='color: #94a3b8; font-size: 0.8rem;'>{veto_preview}</span>", unsafe_allow_html=True)
 

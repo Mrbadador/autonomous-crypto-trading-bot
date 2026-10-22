@@ -7,6 +7,7 @@ Includes Auto-Refresh, Dual-Layer Stop Loss, Liquidation Distance, Margin Gauge,
 import os
 import sys
 import json
+import html  # L-1 FIX: HTML escaping for unsafe_allow_html=True blocks
 import sqlite3
 import pytz
 import requests
@@ -404,6 +405,68 @@ def _profit_display(total_profit, total_roi_pct) -> str:
     return f"{sign}${abs(total_profit):,.2f} USDT ({total_roi_pct:+.2f}%)"
 
 
+def _published_state(value, absent_reason: str) -> dict:
+    """Return what the HUD should publish for one state-backed reading.
+
+    `value` is the raw value the fleet published for a `system_state` key, or the empty
+    string when the key was never published. An empty value, a NULL or placeholder text
+    means the reading was never taken, so the HUD says so and names the reason instead of
+    publishing a stand-in. A value that IS present is returned exactly as the publisher
+    wrote it — a recorded zero is a fact and stays a reading.
+
+    Returns {"text": str, "measured": bool, "reason": str}.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text or text.lower() in ("none", "null", "nan", "n/a", "na", "--"):
+        return {"text": "not measured", "measured": False, "reason": absent_reason}
+    return {"text": text, "measured": True, "reason": ""}
+
+
+def _published_flag(value, absent_reason: str) -> dict:
+    """Return the published flag state, or an absence when the key was never published.
+
+    A control flag and a reading are read the same way but mean different things when they
+    are absent: a halt flag that was never published is NOT "not halted". The HUD used to
+    default `RISK_HALT` to "0", so a fleet whose risk engine had published nothing showed a
+    green "SYSTEM ACTIVE" badge beside the trading controls.
+
+    Returns {"flag": bool, "measured": bool, "reason": str}.
+    """
+    state = _published_state(value, absent_reason)
+    if not state["measured"]:
+        return {"flag": False, "measured": False, "reason": state["reason"]}
+    return {
+        "flag": state["text"].strip().lower() in ("1", "true", "yes", "on"),
+        "measured": True,
+        "reason": "",
+    }
+
+
+def _stance_color(label: str, measured: bool, bullish: tuple, bearish: tuple) -> str:
+    """Colour a published stance by what it says; an absent stance is neutral grey.
+
+    A stance the HUD could not measure must never wear the colour of a measured one: the
+    veto pulse defaulted the market regime to "TRENDING" and painted the whole panel green
+    off a reading nobody took, and the warden bias was hardcoded green whatever the warden
+    said.
+
+    Returns a CSS colour string.
+    """
+    if not measured:
+        return "#94a3b8"
+    text = str(label or "").strip().upper()
+    if text in bullish:
+        return "#00ff66"
+    if text in bearish:
+        return "#ff003c"
+    return "#f59e0b"
+
+
+def _absence_note(reason: str) -> str:
+    """The dimmed parenthetical that says why a reading is missing."""
+    return f" <span style='color: #94a3b8; font-size: 0.8rem;'>({html.escape(str(reason))})</span>"
+
+
 def calculate_estimated_liquidation(entry_p: float, lev: float, side: str, mmr: float = 0.005) -> float:
     """Calculates estimated isolated liquidation price given leverage and MMR buffer."""
     if entry_p <= 0 or lev <= 0:
@@ -531,6 +594,7 @@ button[data-baseweb="tab"][aria-selected="true"] {
 /* Badges & Tables */
 .badge-green { background: rgba(0,255,102,0.15); color: #00ff66; border: 1px solid #00ff66; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
 .badge-red { background: rgba(255,0,60,0.15); color: #ff003c; border: 1px solid #ff003c; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
+.badge-neutral { background: rgba(148,163,184,0.15); color: #94a3b8; border: 1px solid #94a3b8; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
 .badge-cyan { background: rgba(0,229,255,0.15); color: #00e5ff; border: 1px solid #00e5ff; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
 .badge-orange { background: rgba(255,153,0,0.15); color: #ff9900; border: 1px solid #ff9900; padding: 2px 8px; border-radius: 4px; font-weight: 700; font-family: monospace; }
 
@@ -631,11 +695,10 @@ with st.sidebar:
 
 # ── Top Macro & Intelligence Banner ─────────────────────────────────────────
 macro_trend = _macro_regime(query_system_state("btc_macro_trend", ""))
-risk_halt = query_system_state("RISK_HALT", "0")
-rec_lev = query_system_state("recommended_leverage", "3")
-fg_val = query_system_state("fear_greed_index", "50.0")
-news_active = query_system_state("news_event_active", "0")
-news_reason = query_system_state("news_event_reason", "No active events")
+risk_halt_state = _published_flag(query_system_state("RISK_HALT", ""), "no halt state published")
+rec_lev_state = _published_state(query_system_state("recommended_leverage", ""), "no recommended leverage published")
+fg_num = _optional_float(query_system_state("fear_greed_index", ""))
+news_state = _published_flag(query_system_state("news_event_active", ""), "no news gate state published")
 
 if macro_trend == "BULLISH":
     banner_color = "#00ff66"
@@ -658,6 +721,22 @@ else:
     banner_icon = "⚪"
     regime_text = "REGIME: MACRO UNKNOWN (NO STANCE)"
 
+lev_text = f"{html.escape(rec_lev_state['text'])}x Dynamic" if rec_lev_state["measured"] else "not measured"
+fg_text = f"{fg_num:.0f}/100" if fg_num is not None else "not measured"
+if news_state["measured"]:
+    news_text = "EVENT VETO" if news_state["flag"] else "CLEAR"
+    news_color = "#ff003c" if news_state["flag"] else "#00ff66"
+else:
+    news_text = "NOT PUBLISHED"
+    news_color = "#94a3b8"
+if risk_halt_state["measured"]:
+    halted = risk_halt_state["flag"]
+    halt_badge = "badge-red" if halted else "badge-green"
+    halt_text = "ENTRIES PAUSED (CLOSE ONLY)" if halted else "SYSTEM ACTIVE"
+else:
+    halt_badge = "badge-neutral"
+    halt_text = "HALT STATE NOT PUBLISHED"
+
 st.markdown(f"""
 <div style="
     background: {banner_bg};
@@ -676,12 +755,12 @@ st.markdown(f"""
             {banner_icon} {regime_text}
         </span>
         <span style="color: #94a3b8; font-size: 0.8rem; margin-left: 15px;">
-            ⚡ Lev: <b style="color: #00e5ff;">{rec_lev}x Dynamic</b> | 🧠 F&G: <b style="color: #e2e8f0;">{float(fg_val):.0f}/100</b> | 📰 Event Gate: <b style="color: {'#ff003c' if news_active=='1' else '#00ff66'};">{'EVENT VETO' if news_active=='1' else 'CLEAR'}</b>
+            ⚡ Lev: <b style="color: #00e5ff;">{lev_text}</b> | 🧠 F&G: <b style="color: #e2e8f0;">{fg_text}</b> | 📰 Event Gate: <b style="color: {news_color};">{news_text}</b>
         </span>
     </div>
     <div>
-        <span class="{'badge-green' if risk_halt == '0' else 'badge-red'}">
-            {'SYSTEM ACTIVE' if risk_halt == '0' else 'ENTRIES PAUSED (CLOSE ONLY)'}
+        <span class="{halt_badge}">
+            {halt_text}
         </span>
     </div>
 </div>
@@ -1302,13 +1381,24 @@ with tab_risk:
     with rcol3:
         st.markdown("#### 🔬 Microstructure Veto Pulse")
         last_sniper_veto = query_system_state("last_veto_sniper", "None")
-        market_label = query_system_state("market_regime_label", "TRENDING")
-        warden_regime = query_system_state("warden_60m_regime", "LONG_ONLY")
-        
-        st.write(f"• **Market Regime Label:** <b style='color: #00e5ff;'>{market_label}</b>", unsafe_allow_html=True)
-        st.write(f"• **60m Warden Bias:** <b style='color: #00ff66;'>{warden_regime}</b>", unsafe_allow_html=True)
-        st.write(f"• **Volatility Cascade Risk:** <b style='color: #00ff66;'>CLEAR (Normal Flow)</b>", unsafe_allow_html=True)
-        st.write(f"• **Last Filter Gate:** <span style='color: #94a3b8; font-size: 0.8rem;'>{last_sniper_veto[:40]}...</span>", unsafe_allow_html=True)
+        market_state = _published_state(query_system_state("market_regime_label", ""), "no market regime label published")
+        warden_state = _published_state(query_system_state("warden_60m_regime", ""), "no 60m warden regime published")
+
+        reg_color = _stance_color(market_state["text"], market_state["measured"],
+                                  ("BULL_TREND", "BULLISH", "TRENDING"), ("BEAR_TREND", "BEARISH"))
+        warden_color = _stance_color(warden_state["text"], warden_state["measured"],
+                                     ("LONG_ONLY",), ("SHORT_ONLY",))
+        # L-1 FIX: Escape all DB/LLM-derived text before interpolation into unsafe_allow_html=True
+        safe_market_label = html.escape(market_state["text"])
+        safe_warden_regime = html.escape(warden_state["text"])
+        safe_last_veto = html.escape(str(last_sniper_veto))
+        market_note = "" if market_state["measured"] else _absence_note(market_state["reason"])
+        warden_note = "" if warden_state["measured"] else _absence_note(warden_state["reason"])
+        st.write(f"• **Market Regime Label:** <b style='color: {reg_color};'>{safe_market_label}</b>{market_note}", unsafe_allow_html=True)
+        st.write(f"• **60m Warden Bias:** <b style='color: {warden_color};'>{safe_warden_regime}</b>{warden_note}", unsafe_allow_html=True)
+        st.write(f"• **Volatility Cascade Risk:** <b style='color: #94a3b8;'>not measured</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(no cascade telemetry is published)</span>", unsafe_allow_html=True)
+        veto_preview = safe_last_veto[:40] + ("..." if len(safe_last_veto) > 40 else "")
+        st.write(f"• **Last Filter Gate:** <span style='color: #94a3b8; font-size: 0.8rem;'>{veto_preview}</span>", unsafe_allow_html=True)
 
     # P1: Visual OFI Depth Imbalance Meter & Regime Strength Deck
     st.markdown("---")
