@@ -56,9 +56,9 @@ if not log.handlers:
         pass
 
 
-def _cooldown_should_trigger(exit_reason: str, pnl: float) -> bool:
-    """Anti-whipsaw cooldown applies to realised losses only, never to a label."""
-    return pnl < 0
+def _cooldown_should_trigger(exit_reason: str, pnl: float | None) -> bool:
+    """Anti-whipsaw cooldown applies to realised losses and to unknown PnL, never to a label."""
+    return pnl is None or pnl < 0
 
 
 class SwingArchitectTrader:
@@ -247,7 +247,9 @@ class SwingArchitectTrader:
                 if trade_row and trade_row[0]:
                     if target_dir and last_side and last_side != target_dir:
                         return None
-                    last_ts_str, exit_reason, last_pnl = str(trade_row[0]), str(trade_row[1] or ""), float(trade_row[2] or 0.0)
+                    last_pnl_raw = trade_row[2]
+                    last_ts_str, exit_reason = str(trade_row[0]), str(trade_row[1] or "")
+                    last_pnl = float(last_pnl_raw) if last_pnl_raw is not None else None
                     is_stop_or_loss = _cooldown_should_trigger(exit_reason, last_pnl)
                     if is_stop_or_loss:
                         try:
