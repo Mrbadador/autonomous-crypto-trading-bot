@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 
 from backtests.backtest_ablation_harness import (
+    format_ev_ci,
     precompute_4h_indicators_vectorized,
     precompute_1d_trend_vectorized,
     run_ablation_simulation,
@@ -210,7 +211,7 @@ def write_report(all_results, report_path=None):
             f.write("| Gate Configuration | Trades (N) | Win Rate (%) | Cumulative Return (%) | Profit Factor | Sharpe | EV / Trade (90% CI) |\n")
             f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n")
             for r in rows:
-                ci = f"{r['ev_mean']:+.2f}% [{r['ev_ci_90'][0]:+.2f}%, {r['ev_ci_90'][1]:+.2f}%]"
+                ci = format_ev_ci(r["ev_mean"], r["ev_ci_90"])
                 f.write(f"| {r['name']} | {r['n_trades']} | {r['win_rate']:.1f}% | {r['total_return']:+.2f}% | {r['profit_factor']:.2f} | {r['sharpe']:.2f} | {ci} |\n")
             f.write("\n")
             

@@ -116,8 +116,8 @@ def build_signals(ind_1h, ind_15m, ind_5m, mode="precision"):
         if bear: return -1
         return 0
 
-    bias_1h  = ind_1h.apply(htf_bias, axis=1).resample("5min").last().reindex(ind_5m.index, method="ffill").fillna(0)
-    conf_15m = ind_15m.apply(mtf_confirm, axis=1).resample("5min").last().reindex(ind_5m.index, method="ffill").fillna(0)
+    bias_1h  = ind_1h.apply(htf_bias, axis=1).shift(1).reindex(ind_5m.index, method="ffill").fillna(0)
+    conf_15m = ind_15m.apply(mtf_confirm, axis=1).shift(1).reindex(ind_5m.index, method="ffill").fillna(0)
     trigger  = ind_5m.apply(trig_5m, axis=1).fillna(0)
 
     signal = pd.Series(0, index=ind_5m.index)
@@ -130,7 +130,7 @@ def build_signals(ind_1h, ind_15m, ind_5m, mode="precision"):
         signal[(bias_1h == 1)  & ((conf_15m == 1)  | (trigger == 1))]  =  1
         signal[(bias_1h == -1) & ((conf_15m == -1) | (trigger == -1))] = -1
 
-    return signal.shift(1).fillna(0), ind_15m["ema_20"].resample("5min").last().reindex(ind_5m.index, method="ffill")
+    return signal.shift(1).fillna(0), ind_15m["ema_20"].shift(1).reindex(ind_5m.index, method="ffill")
 
 
 def simulate_production_execution(df_5m, signals, ema20_15m, symbol):

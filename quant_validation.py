@@ -81,15 +81,21 @@ def _prepare_indicator_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     # Ichimoku
     df["tenkan"] = (high.rolling(9).max() + low.rolling(9).min()) / 2.0
     df["kijun"] = (high.rolling(26).max() + low.rolling(26).min()) / 2.0
-    span_a = (df["tenkan"] + df["kijun"]) / 2.0
-    span_b = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
+    span_a_raw = (df["tenkan"] + df["kijun"]) / 2.0
+    span_b_raw = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
+    if len(df) >= 78:
+        span_a = span_a_raw.shift(26)
+        span_b = span_b_raw.shift(26)
+    else:
+        span_a = span_a_raw
+        span_b = span_b_raw
     df["cloud_top"] = np.maximum(span_a, span_b)
     df["cloud_bottom"] = np.minimum(span_a, span_b)
 
     # ATR(14)
     prev_c = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_c).abs(), (low - prev_c).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(14).mean().bfill()
+    df["atr"] = tr.rolling(14).mean()
 
     # ADX(14) & DI spread
     up_move = high - high.shift(1)
@@ -370,6 +376,7 @@ def run_bootstrap_entry_significance(
     b_iterations: int = 2000,
     noise_sigma: float = 0.15,
     seed: int = 42,
+    missing_datasets: Dict[str, List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Runs B = 2,000 Bootstrap Resampling iterations for each of the 3 declarative strategies:
@@ -377,6 +384,8 @@ def run_bootstrap_entry_significance(
       2. 5m Chop Grid Dip-Buy (ChopGridMakerStrategy)
       3. 5m Quick Scalp Short (BearScalpShortStrategy)
     Also performs Gaussian ATR Candle-Path Perturbation (±0.15 * ATR) to measure ratchet survival.
+    `missing_datasets`, when a dict is passed in, is filled with the dataset file names each arm
+    asked for and did not find, including for arms that therefore produced no result at all.
     """
     rng = np.random.default_rng(seed)
     files_5m = _ensure_5m_validation_datasets()
@@ -409,10 +418,12 @@ def run_bootstrap_entry_significance(
         ratchet_premature_stops = 0
         ratchet_clean_survivors = 0
         random_pool_rets: List[float] = []
+        arm_missing_datasets: List[str] = []
 
         for fname in file_list:
             fpath = os.path.join("data", "historical", fname)
             if not os.path.exists(fpath):
+                arm_missing_datasets.append(fname)
                 continue
             try:
                 if fname.endswith(".parquet"):
@@ -467,6 +478,9 @@ def run_bootstrap_entry_significance(
             except Exception:
                 continue
 
+        if missing_datasets is not None and arm_missing_datasets:
+            missing_datasets[strat.name] = list(arm_missing_datasets)
+
         if not all_signal_rets or not random_pool_rets:
             continue
 
@@ -520,6 +534,7 @@ def run_bootstrap_entry_significance(
             "rolling_recent_roe_pct": round(rec_mean, 3),
             "rolling_sharpe": rolling_sharpe,
             "rolling_sortino": rolling_sortino,
+            "missing_datasets": list(arm_missing_datasets),
         }
 
     return results
@@ -717,7 +732,10 @@ def generate_full_validation_report(force_refresh: bool = False) -> Dict[str, An
             pass
 
     t0 = time.time()
-    bootstrap_res = run_bootstrap_entry_significance(b_iterations=2000, noise_sigma=0.15)
+    missing_datasets: Dict[str, List[str]] = {}
+    bootstrap_res = run_bootstrap_entry_significance(
+        b_iterations=2000, noise_sigma=0.15, missing_datasets=missing_datasets
+    )
     ensemble_res = compute_finrl_rolling_sharpe_selector(bootstrap_res)
     try:
         mc_res = run_trade_sequence_monte_carlo(n_simulations=5000, horizon_trades=60)
@@ -731,6 +749,7 @@ def generate_full_validation_report(force_refresh: bool = False) -> Dict[str, An
         "bootstrap_significance": bootstrap_res,
         "finrl_ensemble_selector": ensemble_res,
         "monte_carlo": mc_res,
+        "missing_datasets": missing_datasets,
     }
 
     try:
@@ -753,6 +772,9 @@ def main() -> None:
             f"| Pass={v['significant_edge']} | Rolling Sharpe={v.get('rolling_sharpe', 0.0):+.2f} "
             f"| Ratchet Survival={v['ratchet_survival_rate_pct']:.1f}%"
         )
+    for k, v in rep.get("missing_datasets", {}).items():
+        if v:
+            print(f"   [DATA GAP] {k}: no dataset found for {v}")
     ens = rep.get("finrl_ensemble_selector", {})
     print(f"[FINRL ENSEMBLE WINNER] {ens.get('ensemble_winner')} (Sharpe={ens.get('winner_sharpe', 0.0):+.2f}) | Weights: {ens.get('strategy_weights')}")
     mc = rep["monte_carlo"]

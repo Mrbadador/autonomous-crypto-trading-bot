@@ -173,17 +173,18 @@ def run_full_history_simulation(df, symbol):
                         qty = qty_half
                         sl_px = entry_px * 1.0005
                 else:
-                    sl_px = max(sl_px, price - trail_distance)
                     if low <= sl_px:
                         pnl_run = qty * (sl_px - entry_px) - (qty * sl_px * FEE_TAKER)
                         balance += pnl_run
                         trades.append({"symbol": symbol, "side": "long", "pnl": pnl_run, "exit": "runner"})
                         in_pos = False
-                    elif high >= tp_px:
-                        pnl_tp = qty * (tp_px - entry_px) - (qty * tp_px * FEE_MAKER)
-                        balance += pnl_tp
-                        trades.append({"symbol": symbol, "side": "long", "pnl": pnl_tp, "exit": "runner_tp"})
-                        in_pos = False
+                    else:
+                        sl_px = max(sl_px, price - trail_distance)
+                        if high >= tp_px:
+                            pnl_tp = qty * (tp_px - entry_px) - (qty * tp_px * FEE_MAKER)
+                            balance += pnl_tp
+                            trades.append({"symbol": symbol, "side": "long", "pnl": pnl_tp, "exit": "runner_tp"})
+                            in_pos = False
 
             else:  # SHORT
                 cur_mfe = (entry_px - low) / entry_px
@@ -213,17 +214,18 @@ def run_full_history_simulation(df, symbol):
                         qty = qty_half
                         sl_px = entry_px * 0.9995
                 else:
-                    sl_px = min(sl_px, price + trail_distance)
                     if high >= sl_px:
                         pnl_run = qty * (entry_px - sl_px) - (qty * sl_px * FEE_TAKER)
                         balance += pnl_run
                         trades.append({"symbol": symbol, "side": "short", "pnl": pnl_run, "exit": "runner"})
                         in_pos = False
-                    elif low <= tp_px:
-                        pnl_tp = qty * (entry_px - tp_px) - (qty * tp_px * FEE_MAKER)
-                        balance += pnl_tp
-                        trades.append({"symbol": symbol, "side": "short", "pnl": pnl_tp, "exit": "runner_tp"})
-                        in_pos = False
+                    else:
+                        sl_px = min(sl_px, price + trail_distance)
+                        if low <= tp_px:
+                            pnl_tp = qty * (entry_px - tp_px) - (qty * tp_px * FEE_MAKER)
+                            balance += pnl_tp
+                            trades.append({"symbol": symbol, "side": "short", "pnl": pnl_tp, "exit": "runner_tp"})
+                            in_pos = False
 
         # Entry
         if not in_pos and sig != 0:

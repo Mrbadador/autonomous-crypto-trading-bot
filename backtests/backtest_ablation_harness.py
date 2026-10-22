@@ -23,6 +23,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from indicators import compute_indicators, compute_td_sequential, compute_volume_profile, detect_momentum_divergence
 
+MIN_BOOTSTRAP_TRADES = 5
+
+
+def annualized_sharpe(pnls, bars, hours_per_bar):
+    """Annualize a per-trade Sharpe by the trade frequency the run actually produced."""
+    if len(pnls) < 2 or bars <= 0:
+        return 0.0
+    years = (bars * hours_per_bar) / (365.0 * 24.0)
+    if years <= 0:
+        return 0.0
+    trades_per_year = len(pnls) / years
+    return float(np.mean(pnls) / (np.std(pnls) + 1e-9) * np.sqrt(trades_per_year))
+
+
+def format_ev_ci(ev_mean, ev_ci_90):
+    """Render an arm's EV and its bootstrap interval, printing absence where nothing was measured."""
+    if ev_mean is None:
+        return "n/a (no closed trades, EV not measured)"
+    if ev_ci_90 is None:
+        return f"{ev_mean:+.2f}% (CI n/a: fewer than {MIN_BOOTSTRAP_TRADES} trades to bootstrap)"
+    lo, hi = ev_ci_90
+    if lo == hi:
+        return f"{ev_mean:+.2f}% (CI n/a: variance-free sample, interval has no width)"
+    return f"{ev_mean:+.2f}% [{lo:+.2f}%, {hi:+.2f}%]"
+
 
 def precompute_4h_indicators_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -298,7 +323,18 @@ def run_ablation_simulation(
         cooldown_until = idx + max(1, trade_res["bars_held"])
 
     if not trades:
-        return {"n_trades": 0, "win_rate": 0.0, "total_return": 0.0, "profit_factor": 0.0, "sharpe": 0.0, "gate_fires": gate_fires, "trades": []}
+        return {
+            "n_trades": 0,
+            "win_rate": 0.0,
+            "total_return": 0.0,
+            "profit_factor": 0.0,
+            "sharpe": 0.0,
+            "sharpe_trades_per_year": 0.0,
+            "ev_mean": None,
+            "ev_ci_90": None,
+            "gate_fires": gate_fires,
+            "trades": []
+        }
 
     pnls = [t["net_pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
@@ -308,12 +344,12 @@ def run_ablation_simulation(
     gross_win = sum(wins)
     gross_loss = abs(sum(losses)) if losses else 1e-6
     pf = gross_win / gross_loss if gross_loss > 0 else 999.0
-    sharpe = (np.mean(pnls) / (np.std(pnls) + 1e-9)) * np.sqrt(365 * 6) if len(pnls) > 1 else 0.0
+    sharpe = annualized_sharpe(pnls, bars=total_bars, hours_per_bar=4.0)
 
     # Bootstrap 90% Confidence Interval for Expected Value (EV) per trade
     ev_mean = float(np.mean(pnls))
-    ev_ci_lo, ev_ci_hi = ev_mean, ev_mean
-    if len(pnls) >= 5:
+    ev_ci_lo, ev_ci_hi = None, None
+    if len(pnls) >= MIN_BOOTSTRAP_TRADES:
         rng = np.random.default_rng(42)
         n_boot = 1500
         boot_means = [float(np.mean(rng.choice(pnls, size=len(pnls), replace=True))) for _ in range(n_boot)]
@@ -326,8 +362,9 @@ def run_ablation_simulation(
         "total_return": round(tot_ret, 2),
         "profit_factor": round(pf, 2),
         "sharpe": round(sharpe, 2),
+        "sharpe_trades_per_year": round(len(pnls) / max((total_bars * 4.0) / 8760.0, 1e-9), 2),
         "ev_mean": round(ev_mean * 100.0, 3),
-        "ev_ci_90": (round(ev_ci_lo * 100.0, 3), round(ev_ci_hi * 100.0, 3)),
+        "ev_ci_90": None if ev_ci_lo is None else (round(ev_ci_lo * 100.0, 3), round(ev_ci_hi * 100.0, 3)),
         "gate_fires": gate_fires,
         "trades": trades
     }
@@ -408,7 +445,7 @@ def main():
             df_4h_vec=df_4h_vec,
             df_1d_vec=df_1d_vec
         )
-        ci_str = f"{res['ev_mean']:+.2f}% [{res['ev_ci_90'][0]:+.2f}%, {res['ev_ci_90'][1]:+.2f}%]"
+        ci_str = format_ev_ci(res["ev_mean"], res["ev_ci_90"])
         gf = res.get("gate_fires", {})
         gf_str = ", ".join(f"{k.replace('gate_', '')}:{v}" for k, v in gf.items() if v > 0) or "none"
         print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>6.2f} | {res['sharpe']:>6.2f} | {ci_str:<22} | {gf_str}")

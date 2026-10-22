@@ -141,67 +141,71 @@ def run_ai_sharpened_simulation(df, symbol):
 
             if side == 1:  # LONG
                 if not tp1_hit:
-                    # AI Rule #4: Early Profit Protection (move SL to -0.5R once +0.8R is reached)
-                    if high >= entry_px + (stop_dist * 0.8):
-                        sl_px = max(sl_px, entry_px - (stop_dist * 0.5))
-
                     if low <= sl_px:
                         pnl = qty * (sl_px - entry_px) - (qty * sl_px * FEE_TAKER)
                         balance += pnl
                         trades.append({"symbol": symbol, "side": "long", "pnl": pnl, "exit": "sl"})
                         in_pos = False
-                    elif high >= tp1_px:
-                        tp1_hit = True
-                        qty_half = qty * 0.5
-                        pnl_tp1 = qty_half * (tp1_px - entry_px) - (qty_half * tp1_px * FEE_MAKER)
-                        balance += pnl_tp1
-                        trades.append({"symbol": symbol, "side": "long", "pnl": pnl_tp1, "exit": "tp1"})
-                        qty = qty_half
-                        sl_px = entry_px * 1.0005  # Breakeven
+                    else:
+                        # AI Rule #4: Early Profit Protection (move SL to -0.5R once +0.8R is reached)
+                        if high >= entry_px + (stop_dist * 0.8):
+                            sl_px = max(sl_px, entry_px - (stop_dist * 0.5))
+
+                        if high >= tp1_px:
+                            tp1_hit = True
+                            qty_half = qty * 0.5
+                            pnl_tp1 = qty_half * (tp1_px - entry_px) - (qty_half * tp1_px * FEE_MAKER)
+                            balance += pnl_tp1
+                            trades.append({"symbol": symbol, "side": "long", "pnl": pnl_tp1, "exit": "tp1"})
+                            qty = qty_half
+                            sl_px = entry_px * 1.0005  # Breakeven
                 else:
-                    sl_px = max(sl_px, price - trail_distance)
                     if low <= sl_px:
                         pnl_run = qty * (sl_px - entry_px) - (qty * sl_px * FEE_TAKER)
                         balance += pnl_run
                         trades.append({"symbol": symbol, "side": "long", "pnl": pnl_run, "exit": "runner"})
                         in_pos = False
-                    elif high >= tp_px:
-                        pnl_tp = qty * (tp_px - entry_px) - (qty * tp_px * FEE_MAKER)
-                        balance += pnl_tp
-                        trades.append({"symbol": symbol, "side": "long", "pnl": pnl_tp, "exit": "runner_tp"})
-                        in_pos = False
+                    else:
+                        sl_px = max(sl_px, price - trail_distance)
+                        if high >= tp_px:
+                            pnl_tp = qty * (tp_px - entry_px) - (qty * tp_px * FEE_MAKER)
+                            balance += pnl_tp
+                            trades.append({"symbol": symbol, "side": "long", "pnl": pnl_tp, "exit": "runner_tp"})
+                            in_pos = False
 
             else:  # SHORT
                 if not tp1_hit:
-                    # AI Rule #4: Early Profit Protection for Short
-                    if low <= entry_px - (stop_dist * 0.8):
-                        sl_px = min(sl_px, entry_px + (stop_dist * 0.5))
-
                     if high >= sl_px:
                         pnl = qty * (entry_px - sl_px) - (qty * sl_px * FEE_TAKER)
                         balance += pnl
                         trades.append({"symbol": symbol, "side": "short", "pnl": pnl, "exit": "sl"})
                         in_pos = False
-                    elif low <= tp1_px:
-                        tp1_hit = True
-                        qty_half = qty * 0.5
-                        pnl_tp1 = qty_half * (entry_px - tp1_px) - (qty_half * tp1_px * FEE_MAKER)
-                        balance += pnl_tp1
-                        trades.append({"symbol": symbol, "side": "short", "pnl": pnl_tp1, "exit": "tp1"})
-                        qty = qty_half
-                        sl_px = entry_px * 0.9995
+                    else:
+                        # AI Rule #4: Early Profit Protection for Short
+                        if low <= entry_px - (stop_dist * 0.8):
+                            sl_px = min(sl_px, entry_px + (stop_dist * 0.5))
+
+                        if low <= tp1_px:
+                            tp1_hit = True
+                            qty_half = qty * 0.5
+                            pnl_tp1 = qty_half * (entry_px - tp1_px) - (qty_half * tp1_px * FEE_MAKER)
+                            balance += pnl_tp1
+                            trades.append({"symbol": symbol, "side": "short", "pnl": pnl_tp1, "exit": "tp1"})
+                            qty = qty_half
+                            sl_px = entry_px * 0.9995
                 else:
-                    sl_px = min(sl_px, price + trail_distance)
                     if high >= sl_px:
                         pnl_run = qty * (entry_px - sl_px) - (qty * sl_px * FEE_TAKER)
                         balance += pnl_run
                         trades.append({"symbol": symbol, "side": "short", "pnl": pnl_run, "exit": "runner"})
                         in_pos = False
-                    elif low <= tp_px:
-                        pnl_tp = qty * (entry_px - tp_px) - (qty * tp_px * FEE_MAKER)
-                        balance += pnl_tp
-                        trades.append({"symbol": symbol, "side": "short", "pnl": pnl_tp, "exit": "runner_tp"})
-                        in_pos = False
+                    else:
+                        sl_px = min(sl_px, price + trail_distance)
+                        if low <= tp_px:
+                            pnl_tp = qty * (entry_px - tp_px) - (qty * tp_px * FEE_MAKER)
+                            balance += pnl_tp
+                            trades.append({"symbol": symbol, "side": "short", "pnl": pnl_tp, "exit": "runner_tp"})
+                            in_pos = False
 
         # Entry
         if not in_pos and sig != 0:
