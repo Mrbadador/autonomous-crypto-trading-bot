@@ -664,7 +664,7 @@ git commit -m "fix(audit): derive gate-ablation verdicts from bootstrap delta-EV
 ## Task 5: Fix the Sharpe annualization and the three lookahead bugs
 
 **Files:**
-- Modify: `backtests/backtest_ablation_harness.py:181, 311, 323-333`
+- Modify: `backtests/backtest_ablation_harness.py:181, 311, 323-333` (as landed: the constants and the two Sharpe functions at `:26-77`, the call site at `:455-456`, the published axes at `:467-468`)
 - Modify: `backtests/seven_year_backtest.py:176-181, 216-221`
 - Modify: `backtests/seven_year_ai_sharpened_backtest.py:162-167, 194-199`
 - Modify: `scripts/compare_trigger_modes_840k.py:119-120, 133`
@@ -672,7 +672,7 @@ git commit -m "fix(audit): derive gate-ablation verdicts from bootstrap delta-EV
 - Test: `tests/test_measurement_fidelity.py` (create)
 
 **Interfaces:**
-- Produces: `annualized_sharpe(pnls, bars, hours_per_bar)` in `backtests/backtest_ablation_harness.py` — a pure function so the arithmetic is testable without the 2-year CSV corpus.
+- Produces: `annualized_sharpe(pnls, bars, hours_per_bar)` in `backtests/backtest_ablation_harness.py` — a pure function so the arithmetic is testable without the 2-year CSV corpus. **As shipped it returns `None`, not `0.0`, whenever no Sharpe is measurable** — fewer than `MIN_BOOTSTRAP_TRADES = 5` closed trades, a variance-free per-trade series, or no elapsed window to annualize over — because `0.0` for an unmeasured statistic is the defect this plan exists to remove: a reader cannot tell a measured zero from an absent measurement. **The absence convention is deliberate; do not "helpfully" restore the `0.0` returns.** A renderer that needs a string uses the harness's own `format_sharpe` (`:80-95`), which prints the reason the axis refused.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -707,10 +707,12 @@ def test_sharpe_of_dense_and_sparse_trade_series_differ():
     assert dense > sparse
 
 
-def test_degenerate_inputs_annualize_to_zero():
-    assert annualized_sharpe([], bars=2190, hours_per_bar=4.0) == 0.0
-    assert annualized_sharpe([0.01], bars=2190, hours_per_bar=4.0) == 0.0
-    assert annualized_sharpe([0.01, -0.01], bars=0, hours_per_bar=4.0) == 0.0
+def test_degenerate_inputs_refuse_to_measure():
+    # Absence, not a measured zero: the shipped function returns None for a sample it cannot
+    # measure (below MIN_BOOTSTRAP_TRADES, variance-free, or with no elapsed window).
+    assert annualized_sharpe([], bars=2190, hours_per_bar=4.0) is None
+    assert annualized_sharpe([0.01], bars=2190, hours_per_bar=4.0) is None
+    assert annualized_sharpe([0.01, -0.01], bars=0, hours_per_bar=4.0) is None
 
 
 @pytest.mark.parametrize("relpath", [
@@ -738,30 +740,79 @@ Expected: FAIL — `annualized_sharpe` does not exist; the Sharpe factor is a co
 
 - [ ] **Step 3: Annualize by measured frequency**
 
-Add to `backtests/backtest_ablation_harness.py`:
+Add to `backtests/backtest_ablation_harness.py`. The block below is **transcribed from the landed code** (`backtests/backtest_ablation_harness.py:26-77`), not from the intent this step originally recorded — the change has already shipped, so the plan documents it as it is:
 
 ```python
-def annualized_sharpe(pnls, bars, hours_per_bar):
-    """Annualize a per-trade Sharpe by the trade frequency the run actually produced."""
-    if len(pnls) < 2 or bars <= 0:
-        return 0.0
-    years = (bars * hours_per_bar) / (365.0 * 24.0)
+MIN_BOOTSTRAP_TRADES = 5
+
+# The smallest per-trade dispersion annualized_sharpe will divide by. It is BOTH the refusal floor
+# and (through the max() inside that function) the divisor's guard, so there is no band of std values
+# that clears the guard and then gets scaled by an epsilon.
+SHARPE_MIN_DISPERSION = 1e-9
+
+# One copy of the annual-hours window: annualized_sharpe and the published basis both read it from
+# measured_trades_per_year, so the figure a reader sees can never drift from the factor applied.
+HOURS_PER_YEAR = 365.0 * 24.0
+
+
+def measured_trades_per_year(n_trades, bars, hours_per_bar):
+    """The trade frequency a run actually produced, or None when the elapsed window measures none.
+
+    Single source of truth for the annualization basis: the sqrt factor inside annualized_sharpe and
+    the ``sharpe_trades_per_year`` value the arm publishes are both computed here.
+    """
+    if n_trades <= 0 or bars <= 0:
+        return None
+    years = (bars * hours_per_bar) / HOURS_PER_YEAR
     if years <= 0:
-        return 0.0
-    trades_per_year = len(pnls) / years
-    return float(np.mean(pnls) / (np.std(pnls) + 1e-9) * np.sqrt(trades_per_year))
+        return None
+    return n_trades / years
+
+
+def annualized_sharpe(pnls, bars, hours_per_bar):
+    """Annualize a per-trade Sharpe by the trade frequency the run actually produced.
+
+    Returns None when no Sharpe is measurable for the sample: fewer closed trades than
+    ``MIN_BOOTSTRAP_TRADES`` (the same minimum the EV axis refuses below), a variance-free trade
+    series (every per-trade PnL identical, so there is no dispersion to divide by), or no elapsed
+    window to annualize over. Publishing a number for any of those would let a reader take an
+    unmeasured ratio for a measurement — including the ~1e6 magnitudes a near-zero denominator
+    produces.
+    """
+    if len(pnls) < MIN_BOOTSTRAP_TRADES or bars <= 0:
+        return None
+    mean = float(np.mean(pnls))
+    std = float(np.std(pnls))
+    # ONE threshold serves as both the refusal floor and the divisor's guard, so no band of
+    # dispersion can pass the guard and then be divided by an epsilon. np.std leaves
+    # floating-point noise (~1e-18) on a variance-free series rather than an exact 0.0, so the floor
+    # is scaled to the sample; the absolute part of it closes the 2.2e-16 < std <= 1e-9 band the old
+    # `std + 1e-9` denominator left open.
+    floor = max(SHARPE_MIN_DISPERSION, np.finfo(float).eps * max(abs(mean), 1.0))
+    if std <= floor:
+        return None
+    trades_per_year = measured_trades_per_year(len(pnls), bars, hours_per_bar)
+    if trades_per_year is None:
+        return None
+    return float(mean / std * np.sqrt(trades_per_year))
 ```
 
-Replace `:311` with a call that uses the bar count already in scope (`total_bars`, `:181`) and the 4H timeframe the harness replays:
+Where the thresholds live, so a future executor edits them in one place: `MIN_BOOTSTRAP_TRADES = 5` at `:26` (the same minimum the EV axis refuses below), `SHARPE_MIN_DISPERSION = 1e-9` at `:31` (both the refusal floor and the divisor's guard, so no band of dispersion can pass the guard and then be divided by an epsilon), and `HOURS_PER_YEAR = 365.0 * 24.0` at `:35` (the single annual-hours divisor, read by `measured_trades_per_year`).
+
+**The absence convention is deliberate: `annualized_sharpe` returns `None` for a statistic it cannot measure, never `0.0`.** `0.0` for an unmeasured statistic is exactly the defect this plan exists to remove — a reader cannot tell a measured zero from an absent measurement — so do not "helpfully" restore the `0.0` returns this step originally prescribed. The old `std + 1e-9` denominator is gone with them: it divided a near-zero dispersion by an epsilon and published the ~1e6 magnitudes that made an unmeasured ratio look like a measurement. A caller that needs a string uses the harness's own `format_sharpe` (`:80-95`), which prints the reason the axis refused.
+
+Replace `:311` with a call that uses the bar count already in scope (`total_bars` — `len(df_4h)`, `:307` as shipped) and the 4H timeframe the harness replays — the call site is at `:455-456` as shipped and is unchanged:
 
 ```python
     sharpe = annualized_sharpe(pnls, bars=total_bars, hours_per_bar=4.0)
+    trades_per_year = measured_trades_per_year(len(pnls), total_bars, 4.0)
 ```
 
-Add to the returned dict (`:323-333`) so a reader can see the basis rather than infer it:
+Add to the returned dict (`:462-473` as shipped; `:323-333` when this task was written) so a reader can see the basis rather than infer it — as shipped, the basis comes from the same function that scales the Sharpe, so the published frequency and the applied factor cannot drift apart, and either may be absent while the other is a number:
 
 ```python
-        "sharpe_trades_per_year": round(len(pnls) / max((total_bars * 4.0) / 8760.0, 1e-9), 2),
+        "sharpe": None if sharpe is None else round(sharpe, 2),
+        "sharpe_trades_per_year": None if trades_per_year is None else round(trades_per_year, 2),
 ```
 
 - [ ] **Step 4: Fix the intrabar trailing-stop lookahead (four sites)**
