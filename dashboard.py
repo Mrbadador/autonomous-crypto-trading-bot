@@ -1243,16 +1243,18 @@ def _published_flag(value, absent_reason: str) -> dict:
     default `RISK_HALT` to "0", so a fleet whose risk engine had published nothing showed a
     green "SYSTEM ACTIVE" badge beside the trading controls.
 
+    A published value the HUD does not recognise is not evidence of "off" either. The pre-fix
+    code read the halt flag as `!= "0"`, so any spelling other than "0" paused entries; reading
+    an unknown spelling as "off" would move that control from fail-safe to fail-open. Only an
+    explicit off is read as off, and anything else is read as the control being engaged.
+
     Returns {"flag": bool, "measured": bool, "reason": str}.
     """
     state = _published_state(value, absent_reason)
     if not state["measured"]:
         return {"flag": False, "measured": False, "reason": state["reason"]}
-    return {
-        "flag": state["text"].strip().lower() in ("1", "true", "yes", "on"),
-        "measured": True,
-        "reason": "",
-    }
+    text = state["text"].strip().lower()
+    return {"flag": text not in ("0", "false", "no", "off"), "measured": True, "reason": ""}
 
 
 def _stance_color(label: str, measured: bool, bullish: tuple, bearish: tuple) -> str:
@@ -4155,12 +4157,13 @@ with tab_risk:
         safe_macro_4h = html.escape(macro4h_state["text"])
         safe_last_veto = html.escape(str(last_sniper_veto))
         di_text = f"{di_state:+.2f}" if di_state is not None else "not measured"
+        di_color = reg_color if di_state is not None else "#94a3b8"
         market_note = "" if market_state["measured"] else _absence_note(market_state["reason"])
         warden_note = "" if warden_state["measured"] else _absence_note(warden_state["reason"])
         di_note = "" if di_state is not None else _absence_note("no DI spread published")
         macro_note = "" if macro4h_state["measured"] else _absence_note(macro4h_state["reason"])
         st.write(f"• **Market Regime Label:** <b style='color: {reg_color};'>{safe_market_label}</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(4H: {safe_macro_4h})</span>{macro_note}", unsafe_allow_html=True)
-        st.write(f"• **DI Polarity Spread:** <b style='color: {reg_color};'>{html.escape(di_text)}</b>{di_note}", unsafe_allow_html=True)
+        st.write(f"• **DI Polarity Spread:** <b style='color: {di_color};'>{html.escape(di_text)}</b>{di_note}", unsafe_allow_html=True)
         st.write(f"• **60m Warden Bias:** <b style='color: {warden_color};'>{safe_warden_regime}</b>{warden_note}", unsafe_allow_html=True)
         st.write(f"• **Volatility Cascade Risk:** <b style='color: #94a3b8;'>not measured</b> <span style='color: #94a3b8; font-size: 0.8rem;'>(no cascade telemetry is published)</span>", unsafe_allow_html=True)
         veto_preview = safe_last_veto[:40] + ("..." if len(safe_last_veto) > 40 else "")

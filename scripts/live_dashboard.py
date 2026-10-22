@@ -430,16 +430,18 @@ def _published_flag(value, absent_reason: str) -> dict:
     default `RISK_HALT` to "0", so a fleet whose risk engine had published nothing showed a
     green "SYSTEM ACTIVE" badge beside the trading controls.
 
+    A published value the HUD does not recognise is not evidence of "off" either. The pre-fix
+    code read the halt flag as `!= "0"`, so any spelling other than "0" paused entries; reading
+    an unknown spelling as "off" would move that control from fail-safe to fail-open. Only an
+    explicit off is read as off, and anything else is read as the control being engaged.
+
     Returns {"flag": bool, "measured": bool, "reason": str}.
     """
     state = _published_state(value, absent_reason)
     if not state["measured"]:
         return {"flag": False, "measured": False, "reason": state["reason"]}
-    return {
-        "flag": state["text"].strip().lower() in ("1", "true", "yes", "on"),
-        "measured": True,
-        "reason": "",
-    }
+    text = state["text"].strip().lower()
+    return {"flag": text not in ("0", "false", "no", "off"), "measured": True, "reason": ""}
 
 
 def _stance_color(label: str, measured: bool, bullish: tuple, bearish: tuple) -> str:

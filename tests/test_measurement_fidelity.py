@@ -2731,6 +2731,26 @@ def test_g3_published_flag_reads_a_published_on_in_every_spelling(value):
     assert out == {"flag": True, "measured": True, "reason": ""}, out
 
 
+@pytest.mark.parametrize("value", ["HALTED", "2", "enabled", "1.0", "paused"])
+def test_g3_published_flag_reads_an_unrecognised_published_value_as_engaged(value):
+    """A published value the HUD does not recognise is not evidence of "off".
+
+    The pre-fix code read the halt flag as `!= "0"`, so any spelling other than "0" paused
+    entries. Reading an unknown spelling as "off" would move that control from fail-safe to
+    fail-open and publish a green "SYSTEM ACTIVE" badge nobody measured.
+    """
+    out = _g3_helper("_published_flag")(value, "no halt state published")
+    assert out == {"flag": True, "measured": True, "reason": ""}, out
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "NO", "off", "OFF"])
+def test_g3_published_flag_reads_every_explicit_off_spelling_as_off(value):
+    """Only an explicit off is off. A published "0" is a measured off, and the other spellings
+    mean the same thing."""
+    out = _g3_helper("_published_flag")(value, "no halt state published")
+    assert out == {"flag": False, "measured": True, "reason": ""}, out
+
+
 # Group 3 — `_stance_color`: an absent stance is neutral grey, never the colour of a measured one.
 @pytest.mark.parametrize("label", ["TRENDING", "LONG_ONLY", "BULL_TREND", "BEAR_TREND",
                                    "SHORT_ONLY", "CHOP_GRID_ACTIVE", ""])
@@ -2827,6 +2847,9 @@ def test_g3_the_two_dashboards_publish_the_same_state_readings():
         ("_published_flag", (None, "no halt state published"), {}),
         ("_published_flag", ("0", "no halt state published"), {}),
         ("_published_flag", ("1", "no halt state published"), {}),
+        ("_published_flag", ("HALTED", "no halt state published"), {}),
+        ("_published_flag", ("off", "no halt state published"), {}),
+        ("_published_flag", ("false", "no halt state published"), {}),
         ("_stance_color", ("TRENDING", False), {"bullish": bullish, "bearish": bearish}),
         ("_stance_color", ("BULL_TREND", True), {"bullish": bullish, "bearish": bearish}),
         ("_stance_color", ("BEAR_TREND", True), {"bullish": bullish, "bearish": bearish}),
@@ -2843,6 +2866,17 @@ def test_g3_the_two_dashboards_publish_the_same_state_readings():
 
 
 # Group 7 — no stand-in default survives in the panels that were rewritten.
+def _g3_state_reads(src: str, key: str):
+    """Every `query_system_state("<key>", <default>)` call in `src`, with its default.
+
+    The key may be quoted with either quote style and the default is captured verbatim, so a
+    non-literal default (a name, a constant) is visible to the caller instead of silently
+    escaping a literal-only match.
+    """
+    pattern = r"query_system_state\(\s*(['\"])%s\1\s*,\s*([^)]*)\)" % re.escape(key)
+    return re.findall(pattern, src)
+
+
 _G3_OLD_DEFAULTS = {
     "RISK_HALT": "0",
     "recommended_leverage": "3",
@@ -2881,15 +2915,15 @@ def test_g3_no_stand_in_default_survives_in_the_state_backed_reads(key):
     the regime label, a bias), so they may not be banned outright.
     """
     old = _G3_OLD_DEFAULTS[key]
-    for path in (DASHBOARD, LEGACY_DASHBOARD):
+    paths = (DASHBOARD, LEGACY_DASHBOARD) if key in _G3_SHARED_KEYS else (DASHBOARD,)
+    for path in paths:
         src = path.read_text(encoding="utf-8")
         assert f'query_system_state("{key}", "{old}")' not in src, (
             f"{path.name} still reads {key} with the invented default {old!r}")
-        defaults = re.findall(
-            r'query_system_state\(\s*"%s"\s*,\s*"([^"]*)"\s*\)' % re.escape(key), src)
-        assert all(default == "" for default in defaults), (
-            f"{path.name} reads {key} with the default(s) {defaults}; only an empty default may "
-            f"reach the publisher")
+        for _quote, default in _g3_state_reads(src, key):
+            assert default.strip() == '""', (
+                f"{path.name} reads {key} with the default {default!r}; only an empty literal "
+                f"default may reach the publisher")
 
 
 @pytest.mark.parametrize("key", _G3_SHARED_KEYS)
@@ -2898,16 +2932,44 @@ def test_g3_both_dashboards_read_the_shared_keys_with_an_empty_default(key):
     with an empty default so the publisher can tell "never published" from "published as 0"."""
     for path in (DASHBOARD, LEGACY_DASHBOARD):
         src = path.read_text(encoding="utf-8")
-        assert f'query_system_state("{key}", "")' in src, (
-            f"{path.name} does not read {key} with an empty default")
+        reads = _g3_state_reads(src, key)
+        assert reads, f"{path.name} does not read {key} at all"
+        for _quote, default in reads:
+            assert default.strip() == '""', (
+                f"{path.name} reads {key} with the default {default!r}; only an empty literal "
+                f"default may reach the publisher")
 
 
 @pytest.mark.parametrize("key", _G3_MAIN_ONLY_KEYS)
 def test_g3_dashboard_reads_the_panel_only_keys_with_an_empty_default(key):
     """The DI spread, the 4H macro trend and the three arbiter keys live only in dashboard.py."""
     src = DASHBOARD.read_text(encoding="utf-8")
-    assert f'query_system_state("{key}", "")' in src, (
-        f"dashboard.py does not read {key} with an empty default")
+    reads = _g3_state_reads(src, key)
+    assert reads, f"dashboard.py does not read {key} at all"
+    for _quote, default in reads:
+        assert default.strip() == '""', (
+            f"dashboard.py reads {key} with the default {default!r}; only an empty literal "
+            f"default may reach the publisher")
+
+
+def test_g3_the_default_guard_cannot_pass_vacuously():
+    """The Group 7 guard must fail on a read whose default is not an empty literal.
+
+    Before this round the guard matched only a literal double-quoted default, so a read like
+    `query_system_state("RISK_HALT", HALT_DEFAULT)` matched nothing and `all(...)` over an
+    empty list passed.
+
+    The guard's own assertion is the thing under test here, so it is expected to raise on the
+    non-literal default: the hole this pins is the guard passing vacuously, not the guard
+    rejecting a default it can see.
+    """
+    src = 'x = query_system_state("RISK_HALT", HALT_DEFAULT)\n'
+    reads = _g3_state_reads(src, "RISK_HALT")
+    assert reads, "a non-literal default must still be visible to the guard"
+    with pytest.raises(AssertionError):
+        for _quote, default in reads:
+            assert default.strip() == '""', (
+                f"the guard accepted the non-literal default {default!r}")
 
 
 def test_g3_the_unused_state_reads_are_gone():
@@ -2933,6 +2995,22 @@ def test_g3_the_cascade_row_publishes_no_all_clear():
             f"{path.name} still publishes a hardcoded all-clear for a measurement nobody took")
         assert "no cascade telemetry is published" in src, (
             f"{path.name} does not say why the cascade row is empty")
+
+
+def test_g3_the_di_row_publishes_no_green_absence():
+    """The DI spread borrows the regime's colour, but an unmeasured spread must not wear the
+    regime's green: a green "not measured" is an all-clear the HUD did not measure."""
+    src = DASHBOARD.read_text(encoding="utf-8")
+    # The veto pulse's bullet row only. The G-1 gauge deck also carries a
+    # `st.metric(label="DI Polarity Spread")`, which is a different panel and a different
+    # measurement, so the row filter is narrowed to the labelled bullet.
+    di_rows = [line for line in src.split("\n") if "**DI Polarity Spread:**" in line]
+    assert len(di_rows) == 1, di_rows
+    row = di_rows[0]
+    assert "{di_color}" in row, row
+    assert "{reg_color}" not in row, row
+    assert 'di_color = reg_color if di_state is not None else "#94a3b8"' in src, (
+        "the DI colour must fall back to neutral grey when the spread was not measured")
 
 
 # Group 8 — the two HTML injection holes are closed.
