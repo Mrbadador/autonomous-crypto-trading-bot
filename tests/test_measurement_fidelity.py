@@ -1108,3 +1108,94 @@ def test_the_kpi_card_routes_through_the_helper():
         "an absent ratio must not wear the green up-arrow st.metric gives a non-negative delta "
         "(streamlit/elements/metric.py::_is_negative_delta only looks for a leading '-')")
 
+
+# ---------------------------------------------------------------------------
+# Final fix D-5 — the bootstrap arm's own profit factor, driven for real
+# ---------------------------------------------------------------------------
+# The grep in test_no_padded_profit_factor_denominator_survives_anywhere pins the SOURCE of
+# quant_validation's absence; it never drives the producer that publishes it. The producer is
+# driven here instead: `run_bootstrap_entry_significance` runs over a corpus it can actually read
+# (a temp data/historical tree, a patched dataset list, a patched signal extractor) exactly as the
+# dataset-gap tests above already do. It needs no real corpus, no file list and no large bootstrap
+# budget -- 50 iterations over a 300-bar frame is enough -- and the producer's behaviour is not
+# changed to make the test pass.
+
+def _bootstrap_arm_over_a_rising_frame(tmp_path, monkeypatch):
+    """Runs the real bootstrap loop over a frame that rises 0.4% a bar, and returns (results, gaps).
+
+    A GRID_MAKER long on that frame reaches its +1.35% target (or its ratcheted stop above the
+    entry) on the third bar after entry, so every signal the arm produces is a win: the arm has
+    no losing trade and therefore no denominator.
+    """
+    import quant_validation
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data" / "historical").mkdir(parents=True)
+    closes = [100.0 * (1.004 ** i) for i in range(300)]
+    _frame(closes).to_csv(tmp_path / "data" / "historical" / "BTCUSDT_1h_full.csv", index=False)
+    monkeypatch.setattr(
+        quant_validation, "_ensure_5m_validation_datasets", lambda *a, **k: ["BTCUSDT_1h_full.csv"])
+    monkeypatch.setattr(
+        quant_validation, "_extract_strategy_signals",
+        lambda df, strategy, symbol: (
+            [(70, "long"), (90, "long"), (110, "long")] if strategy.name == "GRID_MAKER" else []),
+    )
+    gaps = {}
+    res = quant_validation.run_bootstrap_entry_significance(
+        b_iterations=50, noise_sigma=0.0, missing_datasets=gaps
+    )
+    return res, gaps
+
+
+def _bootstrap_arm_over_a_falling_frame(tmp_path, monkeypatch):
+    """The same run over a frame that falls 0.4% a bar: the arm's longs hit their stop."""
+    import quant_validation
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data" / "historical").mkdir(parents=True)
+    closes = [100.0 * (0.996 ** i) for i in range(300)]
+    _frame(closes).to_csv(tmp_path / "data" / "historical" / "BTCUSDT_1h_full.csv", index=False)
+    monkeypatch.setattr(
+        quant_validation, "_ensure_5m_validation_datasets", lambda *a, **k: ["BTCUSDT_1h_full.csv"])
+    monkeypatch.setattr(
+        quant_validation, "_extract_strategy_signals",
+        lambda df, strategy, symbol: (
+            [(70, "long"), (90, "long"), (110, "long")] if strategy.name == "GRID_MAKER" else []),
+    )
+    gaps = {}
+    res = quant_validation.run_bootstrap_entry_significance(
+        b_iterations=50, noise_sigma=0.0, missing_datasets=gaps
+    )
+    return res, gaps
+
+
+def test_the_bootstrap_arm_publishes_no_profit_factor_when_no_signal_ever_loses(tmp_path, monkeypatch):
+    """The producer's behaviour, not its source text: a lossless arm has no denominator."""
+    res, gaps = _bootstrap_arm_over_a_rising_frame(tmp_path, monkeypatch)
+    assert "GRID_MAKER" in res, f"the lossless arm published no result at all: {res}"
+    arm = res["GRID_MAKER"]
+    assert arm["Sampled Signals (K)"] == 3, arm
+    assert arm["observed_win_rate_pct"] == 100.0, (
+        f"the fixture is no longer lossless, so the absence below would be vacuous: {arm}")
+    assert arm["observed_expectancy_roe_pct"] > 0, arm
+    assert arm["observed_profit_factor"] is None, (
+        f"a lossless arm has no denominator, so there is no ratio to publish: {arm}")
+    assert arm["observed_profit_factor"] != 0.0, (
+        "a measured zero is a number nobody measured: this arm never lost a trade")
+    assert arm["observed_profit_factor"] != 2.5
+
+
+def test_the_bootstrap_arm_publishes_a_real_ratio_once_a_signal_loses(tmp_path, monkeypatch):
+    """The control: the None above is the absence of a measurement, not a constant the producer
+    always publishes. With a losing signal there is a denominator, and the ratio is published."""
+    res, gaps = _bootstrap_arm_over_a_falling_frame(tmp_path, monkeypatch)
+    assert "GRID_MAKER" in res, f"the losing arm published no result at all: {res}"
+    arm = res["GRID_MAKER"]
+    assert arm["observed_win_rate_pct"] == 0.0, (
+        f"the fixture is no longer loss-making, so the control below would be vacuous: {arm}")
+    assert arm["observed_profit_factor"] is not None, (
+        "an arm that lost a trade has a denominator and must publish its ratio")
+    assert arm["observed_profit_factor"] == 0.0, (
+        f"no wins against a loss is a real zero ratio, and it is measured: {arm}")
+
+
