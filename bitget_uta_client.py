@@ -536,7 +536,9 @@ class BitgetUTAClient:
     ) -> dict:
         """
         Places a Maker Post-Only Limit Order on Bitget Unified Account.
-        Guarantees maker rebate capture and eliminates taker fee drag (0.02% maker vs 0.04% taker).
+        Post-only means the order cannot cross as a taker: it rests on the book or the exchange cancels it.
+        This method books no fee of its own — the calling engine does, at the maker rate (0.02%, against the
+        0.06% taker rate it books on a market close; `swing_trader.py:2073`, `:2877-2878`).
         If the order would execute immediately as a taker, the exchange cancels it automatically.
         """
         await self.ensure_time_sync()

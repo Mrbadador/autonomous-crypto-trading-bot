@@ -1744,13 +1744,13 @@ class SwingArchitectTrader:
                     if discount_diff <= 0.015:
                         actual_entry_price = rec_entry
                         execution_order_type = "POST_ONLY_LIMIT"
-                        log.info(f"[ENTRY-SNIPER] Attempting Maker Post-Only Retest Snipe on {symbol} (LONG) at ${actual_entry_price:,.4f} (-{discount_diff*100:.2f}% rebate discount)...")
+                        log.info(f"[ENTRY-SNIPER] Attempting Maker Post-Only Retest Snipe on {symbol} (LONG) at ${actual_entry_price:,.4f} ({discount_diff*100:.2f}% better price from the maker fill)...")
                 elif (not is_long) and rec_entry > entry_price:
                     discount_diff = (rec_entry - entry_price) / entry_price
                     if discount_diff <= 0.015:
                         actual_entry_price = rec_entry
                         execution_order_type = "POST_ONLY_LIMIT"
-                        log.info(f"[ENTRY-SNIPER] Attempting Maker Post-Only Retest Snipe on {symbol} (SHORT) at ${actual_entry_price:,.4f} (+{discount_diff*100:.2f}% rebate discount)...")
+                        log.info(f"[ENTRY-SNIPER] Attempting Maker Post-Only Retest Snipe on {symbol} (SHORT) at ${actual_entry_price:,.4f} ({discount_diff*100:.2f}% better price from the maker fill)...")
         except Exception as sniper_err:
             log.warning(f"[ENTRY-SNIPER-NOTE] Sniper optimization fallback to market: {sniper_err}")
 
@@ -1805,7 +1805,7 @@ class SwingArchitectTrader:
                                     deal_p = float(o_info.get("deal_avg_price") or o_info.get("avgPrice") or 0.0)
                                     if deal_p > 0:
                                         actual_entry_price = deal_p
-                                    log.info(f"[ENTRY-SNIPER-FILLED] Maker limit order {po_order_id} FILLED on {symbol}! Qty: {filled_amount} @ ${actual_entry_price:,.4f}. Maker fee rebate captured!")
+                                    log.info(f"[ENTRY-SNIPER-FILLED] Maker limit order {po_order_id} FILLED on {symbol}! Qty: {filled_amount} @ ${actual_entry_price:,.4f}. Booked at the maker rate (0.02%) — no taker fee.")
                                     break
                                 elif o_status in ("canceled", "cancelled"):
                                     log.warning(f"[ENTRY-SNIPER-CANCELED] Limit order {po_order_id} was cancelled by exchange.")

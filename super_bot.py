@@ -1036,7 +1036,7 @@ class SuperBotTrader:
             
             log.info(f"[{engine_tag}] [POST-ONLY-{order_verb.upper()}] Placing True Post-Only Maker Limit {order_verb} for {symbol}: {qty:.4f} units @ ${current_price:,.4f}")
             
-            # Place TRUE Maker Post-Only order via UTA client (guarantees maker rebate and zero taker fee crossing)
+            # Place TRUE Maker Post-Only order via UTA client (cannot cross as a taker; booked at the 0.02% maker rate)
             order = await self.uta_client.create_post_only_order(
                 symbol=symbol,
                 side=pos_side,
