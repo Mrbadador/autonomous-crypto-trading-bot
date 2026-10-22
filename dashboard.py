@@ -879,6 +879,51 @@ def _missing_dataset_warnings(missing_datasets) -> list[str]:
     return msgs
 
 
+def _profit_factor_delta(profit_factor, win_count, loss_count) -> str:
+    """Render the fleet's profit factor, or say why there is not one. Absence-tolerant by design.
+
+    The KPI card used to publish `2.62` -- a hardcoded constant -- whenever the closed trades had
+    no losing trade to divide by, `1.0` when there were none at all, and `0.0` for the empty
+    ledger: a fabricated ratio dressed as a measurement, and a measured zero for a measurement
+    that was never taken. The harness axis was fixed the same way (`format_profit_factor` in
+    `backtests/backtest_ablation_harness.py`): the ratio is None when it has no denominator, and
+    the renderer prints the absence and names its cause.
+
+    `profit_factor` is that ratio, or None when there is no denominator to divide by. The win and
+    loss counts are the population it would have been measured over, and they tell the causes
+    apart:
+      - no closed trades at all -> nothing was measured;
+      - closed trades and not one of them a loser -> the ratio has no denominator;
+      - closed trades whose every non-win was a breakeven -> same, and the counts say so.
+
+    The decision lives here, pure and module-level, so it can be tested without booting this
+    4,500-line script; the panel's ``st.metric`` call is then the one line this helper cannot
+    prove, and nothing else. Never raises: an unreadable trade population must not take down the
+    card around it.
+    """
+    try:
+        win_count = int(win_count)
+        loss_count = int(loss_count)
+    except (TypeError, ValueError):
+        win_count = loss_count = 0
+
+    ratio = None
+    if profit_factor is not None:
+        try:
+            ratio = float(profit_factor)
+        except (TypeError, ValueError):
+            ratio = None
+
+    if ratio is not None:
+        return f"{ratio:.2f}x Profit Factor ({win_count}W / {loss_count}L)"
+    if win_count == 0 and loss_count == 0:
+        return "Profit Factor not measured (no closed trades)"
+    if loss_count == 0:
+        return "Profit Factor not measured (no losing trade, so the ratio has no denominator)"
+    return ("Profit Factor not measured (every losing trade was breakeven, so the ratio has no "
+            "denominator)")
+
+
 # ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
@@ -1530,10 +1575,13 @@ if not df_all_trades.empty:
     win_rate_pct = (win_count / total_closed_count) * 100.0 if total_closed_count > 0 else 0.0
     gross_profit = wins_df['pnl'].astype(float).sum()
     gross_loss = abs(losses_df['pnl'].astype(float).sum())
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (2.62 if win_count > 0 else 1.0)
+    # No losing trade means no denominator, so there is no ratio to publish: the card prints the
+    # absence and its cause (see _profit_factor_delta) instead of a constant that was never
+    # measured. An empty ledger has nothing to measure either.
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
     net_realized_pnl = gross_profit - gross_loss
 else:
-    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 0, 0, 0.0, 0.0, 0.0
+    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 0, 0, 0.0, None, 0.0
 
 # Active Positions Query across all 5 fleet sub-engines
 df_open_1 = query_db(TRADING_DATA_DB, "SELECT * FROM open_positions")
@@ -1612,7 +1660,13 @@ with kpi2:
     st.metric(
         label="🏆 Fleet Win Rate & PF",
         value=f"{win_rate_pct:.1f}% Win Rate",
-        delta=f"{profit_factor:.2f}x Profit Factor ({win_count}W / {loss_count}L)"
+        delta=_profit_factor_delta(profit_factor, win_count, loss_count),
+        # An absent ratio is not a fall from the last reading, so it must not wear the green
+        # up-arrow st.metric gives every delta that does not start with "-" (streamlit's
+        # elements/metric.py::_is_negative_delta). Gray, no arrow: the card says what it could
+        # not measure, and nothing more.
+        delta_color="off" if profit_factor is None else "normal",
+        delta_arrow="off" if profit_factor is None else "auto",
     )
 
 with kpi3:

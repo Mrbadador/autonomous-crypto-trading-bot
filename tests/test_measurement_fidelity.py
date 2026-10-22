@@ -1030,3 +1030,81 @@ def test_quant_validation_publishes_no_profit_factor_for_an_arm_without_losses()
     from backtests.backtest_ablation_harness import format_profit_factor
 
     assert format_profit_factor(None, 3).startswith("n/a")
+
+
+# ---------------------------------------------------------------------------
+# Final fix D-2 — the dashboard's profit factor is a measurement or an absence, never a constant
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: `_profit_factor_delta` is a pure function that turns the
+# KPI card's profit factor (a ratio, or None when there is no denominator) into the text the card
+# shows, so these tests can call the shipped code and check every decision. The `st.metric(...)`
+# call in dashboard.py's KPI row is NOT executed by any of them — the committed suite has no
+# Streamlit AppTest harness, and importing dashboard.py runs a 4,500-line top-level script against
+# the real DB and live price endpoints. A helper that returns a string cannot lie about what it
+# decided; only the rendering one line further out is unverified, and
+# test_the_kpi_card_routes_through_the_helper below is a source-text check of that line, nothing
+# more.
+
+_profit_factor_delta = _dashboard_helper("_profit_factor_delta")
+
+
+def test_the_profit_factor_card_publishes_no_fabricated_ratio():
+    """The card used to publish 2.62 for a fleet with no losing trade, 1.0 for an empty ledger and
+    0.0 for the no-data case: three numbers that were never measured."""
+    for win_count, loss_count in [(0, 0), (7, 0), (0, 3), (7, 3)]:
+        out = _profit_factor_delta(None, win_count, loss_count)
+        assert "2.62" not in out, out
+        assert "1.00" not in out, out
+        assert not any(ch.isdigit() for ch in out), (
+            f"an unmeasured profit factor must print no number at all, not a stand-in: {out}")
+
+
+def test_no_closed_trades_says_so_instead_of_measuring_zero():
+    out = _profit_factor_delta(None, 0, 0)
+    assert "not measured" in out.lower(), out
+    assert "no closed trades" in out, out
+    assert "0.00" not in out and "0.0x" not in out, out
+
+
+def test_closed_trades_with_no_loser_name_the_missing_denominator():
+    out = _profit_factor_delta(None, 7, 0)
+    assert "not measured" in out.lower(), out
+    assert "no losing" in out, out
+    assert "denominator" in out, out
+    assert "2.62" not in out and "0.00" not in out, out
+
+
+def test_a_measured_profit_factor_is_published_as_a_number():
+    assert _profit_factor_delta(2.35, 3, 1) == "2.35x Profit Factor (3W / 1L)"
+    # A ratio with a real denominator is a measurement even when it is zero: no wins at all.
+    assert _profit_factor_delta(0.0, 0, 4) == "0.00x Profit Factor (0W / 4L)"
+
+
+def test_the_card_does_not_call_a_breakeven_population_lossless():
+    out = _profit_factor_delta(None, 4, 2)
+    assert "not measured" in out.lower(), out
+    assert "no losing" not in out, (
+        "there were losing trades (breakevens): calling that 'no losing trade' states the "
+        f"opposite of what was measured: {out}")
+
+
+def test_the_kpi_card_routes_through_the_helper():
+    """Source-text check of the one line the helper tests cannot reach — see the section note above.
+
+    It proves the panel publishes the ratio as None when there is no denominator and hands the
+    card's delta to the helper. It does not prove Streamlit renders it.
+    """
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert re.search(
+        r"profit_factor\s*=\s*\(gross_profit\s*/\s*gross_loss\)\s*if\s+gross_loss\s*>\s*0\s*"
+        r"else\s*None", src), (
+        "the panel must publish the ratio as None when there is no denominator, not a constant")
+    wired = [ln for ln in src.splitlines() if "delta=_profit_factor_delta(profit_factor" in ln]
+    assert len(wired) == 1, wired
+    assert wired[0].strip().startswith("delta="), (
+        f"the helper's text must be the metric's delta argument: {wired[0]!r}")
+    call = src[src.rindex("st.metric(", 0, src.index(wired[0])):]
+    assert "delta_color=" in call and "delta_arrow=" in call, (
+        "an absent ratio must not wear the green up-arrow st.metric gives a non-negative delta "
+        "(streamlit/elements/metric.py::_is_negative_delta only looks for a leading '-')")
+
