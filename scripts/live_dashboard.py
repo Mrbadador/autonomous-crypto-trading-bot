@@ -223,6 +223,108 @@ def _calibration_panel_values(c_metrics) -> dict:
     }
 
 
+def _optional_float(value):
+    """Return the reading as a float, or None when the source carried none.
+
+    A gauge that was never measured has no number to publish, and None is what tells that
+    absence apart from a measured zero. Placeholder text ("--", "syncing..."), NULL, NaN
+    and unparseable strings are the absence, not a value.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip().replace(",", "").replace("$", "")
+        if not text or text.lower() in ("none", "null", "nan", "n/a", "na", "--", "syncing..."):
+            return None
+        value = text
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
+def _regime_readings(regime_row, oracle_row) -> dict:
+    """Return the regime/oracle gauge readings, or None for each one never measured.
+
+    Every value is a float when the source carried a usable reading and None when it did
+    not: no row at all, a missing column, a NULL, a NaN, or unparseable junk. The gauges
+    used to fall back on stand-in numbers (ADX 28.5, Hurst 0.62, volatility 0.55, trend
+    strength 0.40), so a fleet whose regime daemon had published nothing yet rendered a
+    confident-looking regime deck. A gauge with no reading must say the reading was never
+    taken.
+
+    `regime_row` is the latest `market_regime` row and `oracle_row` the latest
+    `oracle_state` row, or None when the table was empty. Both may be a pandas Series or
+    a dict. Pure and module-level, so it can be tested without booting either app, and it
+    never raises.
+    """
+    def _pick(row, key):
+        if row is None:
+            return None
+        try:
+            if key not in row:
+                return None
+        except TypeError:
+            return None
+        try:
+            return _optional_float(row.get(key))
+        except AttributeError:
+            return None
+
+    return {
+        "adx": _pick(regime_row, "adx"),
+        "hurst": _pick(regime_row, "hurst"),
+        "plus_di": _pick(regime_row, "plus_di"),
+        "minus_di": _pick(regime_row, "minus_di"),
+        "volatility": _pick(oracle_row, "volatility"),
+        "trend_strength": _pick(oracle_row, "trend_strength"),
+    }
+
+
+def _macro_regime(raw) -> str:
+    """Normalise the macro regime into a stance the HUD is allowed to show.
+
+    The fleet publishes BULLISH, BEARISH, NEUTRAL and UNKNOWN for `btc_macro_trend`
+    (live_oracle.py:404-440), so UNKNOWN is a real published state, not only an absence.
+    The HUD used to default the key to "BULLISH", which invented a direction out of a
+    reading that had never been taken and announced "MACRO BULLISH (LONG ONLY)". Absent,
+    UNKNOWN and junk all mean the same thing here: no stance.
+
+    Returns "BULLISH", "BEARISH", "NEUTRAL" or "UNKNOWN".
+    """
+    text = str(raw or "").strip().upper()
+    if text in ("BULLISH", "BEARISH", "NEUTRAL"):
+        return text
+    return "UNKNOWN"
+
+
+def _gauge_display(value, formatter, classify, absent_reason) -> dict:
+    """Return what one gauge should show: its value, its delta, and how to dress it.
+
+    `value` is the measured reading or None. When it is None the gauge says the reading
+    was never taken, and its delta carries the reason with no arrow and no colour, so an
+    absence can never be mistaken for a reading that moved. When the reading exists,
+    `formatter` renders it and `classify` turns it into the delta text the panel shows.
+
+    Pure and module-level, so it can be tested without booting either app, and it never
+    raises.
+    """
+    if value is None:
+        return {"value": "not measured", "delta": absent_reason, "arrow": "off", "color": "off"}
+    try:
+        rendered = formatter(value)
+    except Exception:
+        rendered = "not measured"
+    try:
+        classified = classify(value)
+    except Exception:
+        classified = "measured"
+    return {"value": rendered, "delta": classified, "arrow": "auto", "color": "normal"}
+
+
 def calculate_estimated_liquidation(entry_p: float, lev: float, side: str, mmr: float = 0.005) -> float:
     """Calculates estimated isolated liquidation price given leverage and MMR buffer."""
     if entry_p <= 0 or lev <= 0:
@@ -438,7 +540,7 @@ with st.sidebar:
     st.caption(f"Last HUD Refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
 # ── Top Macro & Intelligence Banner ─────────────────────────────────────────
-macro_trend = query_system_state("btc_macro_trend", "BULLISH").upper()
+macro_trend = _macro_regime(query_system_state("btc_macro_trend", ""))
 risk_halt = query_system_state("RISK_HALT", "0")
 rec_lev = query_system_state("recommended_leverage", "3")
 fg_val = query_system_state("fear_greed_index", "50.0")
@@ -455,11 +557,16 @@ elif macro_trend == "BEARISH":
     banner_bg = "rgba(255, 0, 60, 0.08)"
     banner_icon = "🔴"
     regime_text = "REGIME: MACRO BEARISH (SHORT ONLY)"
-else:
+elif macro_trend == "NEUTRAL":
     banner_color = "#ff9900"
     banner_bg = "rgba(255, 153, 0, 0.08)"
     banner_icon = "🟠"
     regime_text = "REGIME: RANGE-BOUND CHOP"
+else:
+    banner_color = "#94a3b8"
+    banner_bg = "rgba(148, 163, 184, 0.08)"
+    banner_icon = "⚪"
+    regime_text = "REGIME: MACRO UNKNOWN (NO STANCE)"
 
 st.markdown(f"""
 <div style="
@@ -775,7 +882,7 @@ with tab_live:
             "Role": "⭐ Core (Reserved Slot)" if is_core else "Altcoin (Dynamic Slot)",
             "Dynamic Lev": f"{coin_lev}x Isolated",
             "Fleet Status": "🟢 ACTIVE POSITION" if is_active else "⏳ SCANNING (RADAR)",
-            "Macro Direction": "LONG ONLY" if macro_trend == "BULLISH" else "SHORT ONLY"
+            "Macro Direction": {"BULLISH": "LONG ONLY", "BEARISH": "SHORT ONLY"}.get(macro_trend, "NO STANCE")
         })
     st.dataframe(pd.DataFrame(radar_data), width="stretch", hide_index=True)
 
@@ -1157,35 +1264,75 @@ with tab_risk:
     df_regime = query_db(TRADING_DATA_DB, "SELECT * FROM market_regime ORDER BY id DESC LIMIT 1")
     df_oracle = query_db(TRADING_LEDGER_DB, "SELECT * FROM oracle_state ORDER BY id DESC LIMIT 1")
 
-    adx_val = float(df_regime.iloc[0].get('adx', 28.5) if not df_regime.empty else 28.5)
-    hurst_val = float(df_regime.iloc[0].get('hurst', 0.62) if not df_regime.empty else 0.62)
-    vol_state = float(df_oracle.iloc[0].get('volatility', 0.55) if not df_oracle.empty else 0.55)
-    trend_pwr = float(df_oracle.iloc[0].get('trend_strength', 0.40) if not df_oracle.empty else 0.40)
+    readings = _regime_readings(
+        df_regime.iloc[0] if not df_regime.empty else None,
+        df_oracle.iloc[0] if not df_oracle.empty else None,
+    )
+    adx_val = readings["adx"]
+    hurst_val = readings["hurst"]
+    vol_state = readings["volatility"]
+    trend_pwr = readings["trend_strength"]
+
+    regime_absent = "no market_regime row"
+    oracle_absent = "no oracle_state row"
+
+    adx_gauge = _gauge_display(
+        adx_val,
+        lambda v: f"{v:.1f}",
+        lambda v: "Strong Trend (>25)" if v >= 25 else "Low Momentum Chop (<20)",
+        regime_absent,
+    )
+    hurst_gauge = _gauge_display(
+        hurst_val,
+        lambda v: f"{v:.3f}",
+        lambda v: "Persistent Trending (>0.52)" if v >= 0.52 else "Mean-Reverting (<0.48)",
+        regime_absent,
+    )
+    vol_gauge = _gauge_display(
+        vol_state,
+        lambda v: f"{v:.2f}",
+        lambda v: "Calibrated ATR Regime",
+        oracle_absent,
+    )
+    trend_gauge = _gauge_display(
+        trend_pwr,
+        lambda v: f"{v * 100:.1f}%",
+        lambda v: "High Boardroom Conviction" if v > 0.35 else "Selective Filtering",
+        oracle_absent,
+    )
 
     gcol1, gcol2, gcol3, gcol4 = st.columns(4)
     with gcol1:
         st.metric(
             label="Trend Strength (ADX)",
-            value=f"{adx_val:.1f}",
-            delta="Strong Trend (>25)" if adx_val >= 25 else "Low Momentum Chop (<20)"
+            value=adx_gauge["value"],
+            delta=adx_gauge["delta"],
+            delta_arrow=adx_gauge["arrow"],
+            delta_color=adx_gauge["color"]
         )
     with gcol2:
         st.metric(
             label="Persistence (Hurst)",
-            value=f"{hurst_val:.3f}",
-            delta="Persistent Trending (>0.52)" if hurst_val >= 0.52 else "Mean-Reverting (<0.48)"
+            value=hurst_gauge["value"],
+            delta=hurst_gauge["delta"],
+            delta_arrow=hurst_gauge["arrow"],
+            delta_color=hurst_gauge["color"]
         )
     with gcol3:
         st.metric(
             label="Volatility State (\u03c3)",
-            value=f"{vol_state:.2f}",
-            delta="Calibrated ATR Regime"
+            value=vol_gauge["value"],
+            delta=vol_gauge["delta"],
+            delta_arrow=vol_gauge["arrow"],
+            delta_color=vol_gauge["color"]
         )
     with gcol4:
         st.metric(
             label="Signal Readiness",
-            value=f"{trend_pwr*100:.1f}%",
-            delta="High Boardroom Conviction" if trend_pwr > 0.35 else "Selective Filtering"
+            value=trend_gauge["value"],
+            delta=trend_gauge["delta"],
+            delta_arrow=trend_gauge["arrow"],
+            delta_color=trend_gauge["color"]
         )
 
 # ═════════════════════════════════════════════════════════════════════════════

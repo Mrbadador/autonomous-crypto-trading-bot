@@ -688,6 +688,10 @@ def _dashboard_helper(name, path=DASHBOARD):
     module-level assignment they load by name — is compiled in an empty namespace and called for real.
     That executes the shipped body, which is a stronger claim than matching its source text.
 
+    The compiled set is closed over the helper's own dependencies: a module-level function it calls is
+    compiled alongside it, and so is a module-level constant that function calls. Without that, a helper
+    that calls another helper raises NameError when the test calls it.
+
     `path` defaults to dashboard.py; the legacy scripts/live_dashboard.py carries its own copies of
     the same pure renderers (it is a standalone Streamlit script and cannot import dashboard.py),
     and they are extracted the same way.
@@ -698,14 +702,38 @@ def _dashboard_helper(name, path=DASHBOARD):
     target = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name), None)
     assert target is not None, f"{path.name} has no module-level function named {name}"
 
-    loaded = {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    def _loads(node):
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+    needed = set()
+    pending = [target]
+    while pending:
+        node = pending.pop()
+        fresh = _loads(node) - needed
+        if not fresh:
+            continue
+        needed |= fresh
+        for other in tree.body:
+            if isinstance(other, ast.FunctionDef) and other.name in fresh:
+                pending.append(other)
+
     ns = {}
-    for node in [target] + [
-        n for n in tree.body
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id in loaded for t in n.targets)
-    ]:
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            try:
+                exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+            except Exception:
+                pass
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in needed for t in node.targets):
+            try:
+                exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+            except Exception:
+                pass
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in needed and node is not target:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+    exec(compile(ast.Module(body=[target], type_ignores=[]), str(path), "exec"), ns)
     fn = ns[name]
     assert callable(fn), f"{name} is not callable after extraction"
     return fn
@@ -1917,5 +1945,377 @@ def test_the_legacy_daemon_count_is_not_a_fabricated_number():
     src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
     assert "18 Background Processes" not in src
     assert "Autonomous Daemon Subsystems (Unified Super Bot Architecture)" in src
+
+
+# ---------------------------------------------------------------------------
+# Final fix G-1 — the regime gauges and the macro regime publish absences, not stand-in readings
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: the four helpers under test (`_optional_float`,
+# `_regime_readings`, `_macro_regime`, `_gauge_display`) are pure and module-level, so they are
+# extracted by AST and executed for real here — the shipped body, not a paraphrase of it. The
+# `st.metric(...)` calls they feed are NOT executed: the committed suite has no Streamlit AppTest
+# harness, and importing dashboard.py runs a 4,700-line top-level script against the real DB and
+# live price endpoints. A helper that returns a dict cannot lie about what it decided; the
+# rendering one line further out is pinned by source-text checks, nothing more.
+#
+# The defect being closed: the regime deck fell back on 28.5 (ADX), 0.62 (Hurst), 0.55
+# (volatility) and 0.40 (trend strength) whenever the regime daemon had published nothing, so a
+# fleet with no regime row rendered a confident "Trend Strength (ADX) 28.5 / Strong Trend (>25)"
+# deck. The DI pair fell back on 0.0 and was then classified as "Balanced" — a measured statement
+# about two numbers nobody measured. And the macro banner defaulted `btc_macro_trend` to
+# "BULLISH", so a fleet whose macro key had never been written announced "REGIME: MACRO BULLISH
+# (LONG ONLY)" and published "Macro Direction: SHORT ONLY" for the very same absence.
+
+_GAUGE_HELPERS = {}
+
+
+def _gauge_helper(name, path=DASHBOARD):
+    """One of the four regime/macro helpers, extracted once per (file, name) and cached.
+
+    The extraction is deliberately lazy: a helper that does not exist yet must fail the test
+    that asks for it, not the whole module at collection time.
+    """
+    key = (str(path), name)
+    if key not in _GAUGE_HELPERS:
+        _GAUGE_HELPERS[key] = _dashboard_helper(name, path)
+    return _GAUGE_HELPERS[key]
+
+
+def _gauge_block(path):
+    """The source of the regime gauge block, so the stand-in readings can be looked for in it.
+
+    The block runs from the "Quantitative Regime Deck Gauges" marker to the next section break,
+    so a stand-in reading anywhere inside it is a stand-in reading the deck publishes.
+    """
+    import re
+    import textwrap
+
+    src = path.read_text(encoding="utf-8")
+    match = re.search(r"^[ \t]*# Quantitative Regime Deck Gauges", src, re.M)
+    assert match is not None, f"{path.name} has no regime gauge block"
+    tail = src[match.start():]
+    stop = len(tail)
+    for marker in ('st.markdown("---")', "\n# ═"):
+        idx = tail.find(marker)
+        if idx != -1:
+            stop = min(stop, idx)
+    return textwrap.dedent(tail[:stop])
+
+
+def _numeric_constants(text, filename="<gauge block>"):
+    """Every numeric constant in a source fragment."""
+    import ast
+
+    tree = ast.parse(text, filename=filename)
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float))
+            and not isinstance(n.value, bool)]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("55.00", 55.0),
+    (55, 55.0),
+    (55.5, 55.5),
+    ("$1,000.00", 1000.0),
+    ("  42  ", 42.0),
+    (None, None),
+    ("", None),
+    ("   ", None),
+    ("--", None),
+    ("syncing...", None),
+    ("none", None),
+    ("null", None),
+    ("nan", None),
+    ("abc", None),
+    (float("nan"), None),
+    (True, None),
+])
+def test_optional_float_reads_a_number_and_names_every_absence(raw, expected):
+    """A reading that was taken is a number; a reading that was not taken is None.
+
+    None is what tells an absence apart from a measured zero, so it is the only value the
+    gauge layer is allowed to see for "nothing was published here".
+    """
+    assert _gauge_helper("_optional_float")(raw) == expected
+
+
+def test_regime_readings_are_all_absences_when_no_row_was_published():
+    """The fleet whose regime daemon has published nothing has no gauge readings at all."""
+    readings = _gauge_helper("_regime_readings")(None, None)
+    assert set(readings) == {"adx", "hurst", "plus_di", "minus_di",
+                              "volatility", "trend_strength"}, readings
+    assert all(value is None for value in readings.values()), readings
+
+
+def test_regime_readings_read_every_column_of_a_published_row():
+    readings = _gauge_helper("_regime_readings")(
+        {"adx": 37.5, "hurst": 0.61, "plus_di": 22.0, "minus_di": 14.0},
+        {"volatility": 0.44, "trend_strength": 0.52},
+    )
+    assert readings == {
+        "adx": 37.5, "hurst": 0.61, "plus_di": 22.0, "minus_di": 14.0,
+        "volatility": 0.44, "trend_strength": 0.52,
+    }, readings
+
+
+def test_regime_readings_leave_a_missing_column_absent_and_read_the_rest():
+    """A row that predates a column is not a row with a zero in it."""
+    readings = _gauge_helper("_regime_readings")({"hurst": 0.61}, {"volatility": 0.44})
+    assert readings["adx"] is None, readings
+    assert readings["hurst"] == 0.61, readings
+    assert readings["volatility"] == 0.44, readings
+    assert readings["plus_di"] is None, readings
+
+
+def test_regime_readings_treat_null_and_junk_as_absences():
+    readings = _gauge_helper("_regime_readings")(
+        {"adx": None, "hurst": "nan", "plus_di": ""}, {"volatility": "n/a"})
+    assert readings["adx"] is None, readings
+    assert readings["hurst"] is None, readings
+    assert readings["plus_di"] is None, readings
+    assert readings["volatility"] is None, readings
+
+
+def test_regime_readings_accept_a_numeric_string_as_a_reading():
+    """The daemon writes text into SQLite, so "37.5" is a reading and not an absence."""
+    readings = _gauge_helper("_regime_readings")({"adx": "37.5"}, None)
+    assert readings["adx"] == 37.5, readings
+
+
+def test_a_measured_zero_di_is_a_reading_not_an_absence():
+    """A measured zero is a fact. It must not collapse into "nothing was measured"."""
+    readings = _gauge_helper("_regime_readings")({"plus_di": 0.0, "minus_di": 0.0}, None)
+    assert readings["plus_di"] == 0.0, readings
+    assert readings["minus_di"] == 0.0, readings
+    assert readings["plus_di"] is not None, readings
+
+
+def test_regime_readings_read_a_pandas_series_row():
+    """The deck reads a DataFrame row, so a Series must read exactly like the equivalent dict."""
+    readings = _gauge_helper("_regime_readings")(
+        pd.Series({"adx": 37.5, "hurst": 0.61, "plus_di": 22.0, "minus_di": 14.0}),
+        pd.Series({"volatility": 0.44, "trend_strength": 0.52}),
+    )
+    assert readings == {
+        "adx": 37.5, "hurst": 0.61, "plus_di": 22.0, "minus_di": 14.0,
+        "volatility": 0.44, "trend_strength": 0.52,
+    }, readings
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("bullish", "BULLISH"),
+    (" BEARISH ", "BEARISH"),
+    ("NEUTRAL", "NEUTRAL"),
+    ("UNKNOWN", "UNKNOWN"),
+    ("", "UNKNOWN"),
+    (None, "UNKNOWN"),
+    ("chop", "UNKNOWN"),
+    ("0", "UNKNOWN"),
+])
+def test_macro_regime_publishes_only_the_stances_the_fleet_publishes(raw, expected):
+    """BULLISH / BEARISH / NEUTRAL are the fleet's own states; UNKNOWN is one of them too.
+
+    Anything else — an absent key, an empty string, junk — means the same thing here: no
+    stance. The banner must never announce a direction it did not measure.
+    """
+    assert _gauge_helper("_macro_regime")(raw) == expected
+
+
+def test_an_absent_gauge_says_the_reading_was_never_taken():
+    """The absence carries the reason, with no arrow and no colour.
+
+    An arrow would say "this reading moved", and a colour would say "this reading went up".
+    Neither is true of a reading that was never taken.
+    """
+    out = _gauge_helper("_gauge_display")(
+        None, lambda v: f"{v:.1f}", lambda v: "Strong Trend (>25)", "no market_regime row")
+    assert out == {"value": "not measured", "delta": "no market_regime row",
+                   "arrow": "off", "color": "off"}, out
+
+
+def test_a_measured_gauge_publishes_the_reading_and_its_classification():
+    out = _gauge_helper("_gauge_display")(
+        37.5, lambda v: f"{v:.1f}", lambda v: "Strong Trend (>25)", "no market_regime row")
+    assert out["value"] == "37.5", out
+    assert out["delta"] == "Strong Trend (>25)", out
+    assert out["arrow"] == "auto", out
+    assert out["color"] == "normal", out
+
+
+def test_a_gauge_survives_a_formatter_that_raises():
+    def _boom(_value):
+        raise RuntimeError("formatter exploded")
+
+    out = _gauge_helper("_gauge_display")(37.5, _boom, lambda v: "Strong Trend (>25)", "no row")
+    assert out["value"] == "not measured", out
+
+
+def test_a_gauge_survives_a_classifier_that_raises():
+    def _boom(_value):
+        raise RuntimeError("classifier exploded")
+
+    out = _gauge_helper("_gauge_display")(37.5, lambda v: f"{v:.1f}", _boom, "no row")
+    assert out["delta"] == "measured", out
+    assert out["value"] == "37.5", out
+
+
+def test_the_two_dashboards_publish_the_same_regime_and_macro_readings():
+    """scripts/live_dashboard.py is a standalone Streamlit script and cannot import dashboard.py,
+    so it carries its own copies of the four helpers. The copies have to agree, or the same
+    fleet would be shown two different regimes."""
+    cases = [
+        ("_optional_float", ("55.00",), {}),
+        ("_optional_float", (None,), {}),
+        ("_optional_float", ("--",), {}),
+        ("_regime_readings", ({"adx": 37.5, "hurst": 0.61}, {"volatility": 0.44}), {}),
+        ("_regime_readings", (None, None), {}),
+        ("_macro_regime", ("bullish",), {}),
+        ("_macro_regime", (None,), {}),
+        ("_gauge_display", (None, "{:.1f}", "Strong", "no market_regime row"), {}),
+        ("_gauge_display", (37.5, "{:.1f}", "Strong", "no market_regime row"), {}),
+    ]
+    for name, args, _kwargs in cases:
+        main = _gauge_helper(name, DASHBOARD)
+        legacy = _gauge_helper(name, LEGACY_DASHBOARD)
+        assert main(*args) == legacy(*args), (
+            f"the two dashboards disagree about {name}{args}: {main(*args)} != {legacy(*args)}")
+
+
+def test_the_two_dashboards_carry_byte_identical_copies_of_the_four_helpers():
+    """The copies are duplicated on purpose (the legacy script cannot import dashboard.py), so
+    they are pinned to be the same source, not merely to behave the same today."""
+    import ast
+
+    for name in ("_optional_float", "_regime_readings", "_macro_regime", "_gauge_display"):
+        sources = []
+        for path in (DASHBOARD, LEGACY_DASHBOARD):
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=str(path))
+            node = next(n for n in tree.body
+                        if isinstance(n, ast.FunctionDef) and n.name == name)
+            sources.append(ast.get_source_segment(text, node))
+        assert sources[0] == sources[1], (
+            f"{name} differs between the two dashboards, so the same fleet would be shown two "
+            f"different readings")
+
+
+def test_the_dashboard_files_publish_no_stand_in_regime_readings():
+    """The gauges used to fall back on 28.5 (ADX), 0.62 (Hurst), 0.55 (volatility) and 0.40
+    (trend strength) when the regime daemon had published nothing at all."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        numbers = _numeric_constants(_gauge_block(path), filename=str(path))
+        for gone in (28.5, 0.62, 0.55, 0.40):
+            assert gone not in numbers, (
+                f"{path.name} still falls back on the stand-in reading {gone!r} in its regime "
+                f"gauge block")
+        published = _published_strings(path)
+        for gone in ("28.5", "0.62", "0.55"):
+            # "0.40" is deliberately not in this list: dashboard.py publishes "0.40" as the
+            # `ai_regime_trap_risk` default of an unrelated panel (the AI Cognitive Regime
+            # Arbiter), which this dispatch does not touch. The gauge-block check above is
+            # what pins the regime deck itself.
+            assert gone not in published, (
+                f"{path.name} still publishes the stand-in reading {gone!r}")
+
+
+def test_neither_dashboard_publishes_a_macro_default_of_bullish():
+    """The banner used to read REGIME: MACRO BULLISH (LONG ONLY) for a fleet whose macro key
+    had never been written.
+
+    "BULLISH" has to survive as a stance the fleet really publishes, so the guard is on the
+    DEFAULT and not on the word: the key may only be read with an empty default, and the
+    normaliser decides what the fleet's own value means.
+    """
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert '"btc_macro_trend", "BULLISH"' not in src, (
+            f"{path.name} still defaults the macro key to BULLISH, which invents a direction out "
+            "of a reading nobody took")
+        defaults = re.findall(
+            r'query_system_state\(\s*"btc_macro_trend"\s*,\s*"([^"]*)"\s*\)', src)
+        assert defaults == [""], (
+            f"{path.name} reads the macro key with the default(s) {defaults}; only an empty "
+            "default may reach the normaliser")
+
+
+def test_both_dashboards_publish_no_stance_for_an_unknown_macro_direction():
+    """The radar table used to publish SHORT ONLY for an absent macro key — a directional
+    trading stance invented from a reading nobody took."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert '"NO STANCE"' in src, (
+            f"{path.name} must publish NO STANCE for a macro regime it has no reading for")
+        assert "NO STANCE" in _published_strings(path), (
+            f"{path.name} must publish NO STANCE as text a reader can see")
+
+
+def test_the_regime_gauges_and_the_macro_regime_are_wired_to_the_helpers():
+    """Source-text check of the wiring the helper tests cannot reach — see the section note.
+
+    It proves each deck reads its readings through the helpers and renders them through
+    `_gauge_display`. It does not prove Streamlit renders them.
+    """
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        squashed = re.sub(r"\s+", " ", src)
+        assert "readings = _regime_readings(" in src, (
+            f"{path.name} does not read its regime readings through the helper")
+        assert "macro_trend = _macro_regime(" in src, (
+            f"{path.name} does not normalise its macro regime through the helper")
+        assert "_gauge_display(" in src, (
+            f"{path.name} does not render its gauges through the helper")
+        assert ('"Macro Direction": {"BULLISH": "LONG ONLY", "BEARISH": "SHORT ONLY"}'
+                '.get(macro_trend, "NO STANCE")') in squashed, (
+            f"{path.name} still publishes a macro direction it has no reading for")
+
+
+def test_neither_dashboard_still_publishes_the_unconditional_macro_direction():
+    """The old expression turned every non-BULLISH macro reading into SHORT ONLY."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert '"LONG ONLY" if macro_trend == "BULLISH" else "SHORT ONLY"' not in src, (
+            f"{path.name} still publishes a direction for a macro reading it may not have")
+
+
+def test_the_di_spread_is_measured_only_when_both_di_readings_are():
+    """The DI gauge used to fall back on 0.0 for both readings and then classified the pair as
+    "Balanced" — a measured statement about two numbers nobody measured.
+
+    An absent pair is now an absence; a measured pair keeps the "Balanced" classification when
+    both readings are <= 0.
+    """
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert "di_known = plus_di is not None and minus_di is not None" in src, (
+        "the DI spread must be measured only when both DI readings are")
+    assert "spread_di = (plus_di - minus_di) if di_known else None" in src, (
+        "an absent DI pair must not produce a spread of zero")
+    assert 'else "Balanced"' in src, (
+        "a measured pair whose readings are both <= 0 keeps the Balanced classification")
+
+
+def test_a_measured_di_pair_of_zeros_is_still_a_measurement():
+    """The control for the absence above: both DI readings at zero is a measurement."""
+    plus_di, minus_di = 0.0, 0.0
+    classify = (lambda v: f"+DI: {plus_di:.1f} | -DI: {minus_di:.1f}"
+                if (plus_di > 0 or minus_di > 0) else "Balanced")
+    out = _gauge_helper("_gauge_display")(0.0, lambda v: f"{v:+.1f}", classify, "no DI reading")
+    assert out["value"] == "+0.0", out
+    assert out["delta"] == "Balanced", out
+    assert out["arrow"] == "auto", out
+    assert out["color"] == "normal", out
+
+
+def test_the_macro_banner_publishes_a_neutral_regime_and_an_unknown_one_apart():
+    """NEUTRAL is a published state the fleet really writes, so it keeps its own banner; an
+    absent or UNKNOWN reading must not be dressed as a chop regime either."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = path.read_text(encoding="utf-8")
+        assert 'regime_text = "REGIME: RANGE-BOUND CHOP"' in src, (
+            f"{path.name} lost the NEUTRAL banner")
+        assert "REGIME: MACRO UNKNOWN (NO STANCE)" in src, (
+            f"{path.name} has no banner for a macro regime it has no reading for")
+        assert 'elif macro_trend == "NEUTRAL":' in src, (
+            f"{path.name} must tell a measured NEUTRAL apart from an UNKNOWN reading")
+
 
 
