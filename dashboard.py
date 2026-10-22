@@ -961,6 +961,82 @@ def _win_rate_value(win_rate_pct, closed_trade_count) -> str:
     return f"{rate:.1f}% Win Rate"
 
 
+def _calibration_panel_values(c_metrics) -> dict:
+    """Render the calibration panel's three metrics, or say that none of them was measured.
+
+    The panel used to publish `0%`, `0 Trades`, `0.0000` and a `GOOD` grade whenever the tracker
+    had measured nothing -- and a panel with no data at all graded itself GOOD. The `.get(key, 0)`
+    defaults were the defect: a key the tracker never produced and a measured zero looked the same
+    on screen, so a reader could not tell "the model was wrong every time" from "nothing was
+    measured yet".
+
+    `compute_calibration_metrics()` returns three different shapes
+    (`model_calibration_tracker.py:112-160`) and they mean three different things:
+      - `{}` when the calibration log could not be read: every value is absent, so every cell is
+        an absence;
+      - `{"total_samples": 0, "brier_score": 0.0, "bins": []}` when the log holds no rows: the
+        sample count is a real zero (nothing was evaluated), the win rate and the grade are absent
+        keys, and the Brier score is a stand-in for a score with no samples to average over;
+      - the full dict once there are samples: a measured count, a measured rate, a measured score
+        and the grade that score earned.
+
+    So the count of zero is published as the measurement it is, and the rate, the score and the
+    grade are published as absences that name their cause.
+
+    Pure and module-level, like `_win_rate_value` above, so it can be tested without booting this
+    4,500-line script. Never raises: an unreadable metrics dict must not take down the panel.
+    """
+    metrics = c_metrics if isinstance(c_metrics, dict) else {}
+
+    def _number(key):
+        raw = metrics.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _text(key):
+        raw = metrics.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        text = str(raw).strip()
+        return text or None
+
+    samples = _number("total_samples")
+    if samples is None:
+        signals_text = "n/a (calibration metrics unavailable)"
+        absent_reason = "calibration metrics unavailable"
+    elif samples <= 0:
+        # A count of zero is a measurement of zero: nothing was evaluated, and that is the fact.
+        signals_text = "0 Trades"
+        absent_reason = "no signals evaluated yet"
+    else:
+        signals_text = f"{int(samples)} Trades"
+        absent_reason = "not measured"
+
+    # A rate, a score and a grade need a population to be measured over. With no samples there is
+    # none, so they are absences -- never a zero and never a grade nobody earned.
+    measured = samples is not None and samples > 0
+
+    rate = _number("overall_win_rate")
+    win_rate_text = f"{rate:.1f}%" if (measured and rate is not None) else f"n/a ({absent_reason})"
+
+    score = _number("brier_score")
+    brier_text = f"{score:.4f}" if (measured and score is not None) else f"n/a ({absent_reason})"
+
+    grade = _text("calibration_grade")
+    grade_text = grade if (measured and grade is not None) else f"not measured ({absent_reason})"
+
+    return {
+        "signals_evaluated": signals_text,
+        "historical_win_rate": win_rate_text,
+        "brier_score": brier_text,
+        "calibration_grade": grade_text,
+    }
+
+
 # ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
@@ -3674,14 +3750,21 @@ with tab_ai:
         c_metrics = calib_tracker.compute_calibration_metrics()
         
         cal_col1, cal_col2, cal_col3 = st.columns(3)
+        cal_values = _calibration_panel_values(c_metrics)
         with cal_col1:
-            st.metric("Signals Evaluated", f"{c_metrics.get('total_samples', 0)} Trades")
+            st.metric("Signals Evaluated", cal_values["signals_evaluated"])
         with cal_col2:
-            st.metric("Historical Win Rate", f"{c_metrics.get('overall_win_rate', 0)}%")
+            st.metric("Historical Win Rate", cal_values["historical_win_rate"])
         with cal_col3:
-            b_score = c_metrics.get('brier_score', 0)
-            b_grade = c_metrics.get('calibration_grade', 'GOOD')
-            st.metric("Brier Calibration Score", f"{b_score:.4f}", delta=f"Grade: {b_grade}")
+            st.metric(
+                "Brier Calibration Score",
+                cal_values["brier_score"],
+                delta=f"Grade: {cal_values['calibration_grade']}",
+                # The grade is a label, not a direction: an arrow on it means nothing, and on an
+                # absent grade it would dress "not measured" as a result.
+                delta_color="off",
+                delta_arrow="off",
+            )
 
         if c_metrics.get("bins"):
             df_bins = pd.DataFrame(c_metrics["bins"])

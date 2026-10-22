@@ -679,20 +679,24 @@ def test_report_main_block_describes_a_gap_without_claiming_the_file_is_absent()
 # string cannot lie about what it decided; only the rendering one line further out is unverified, and
 # test_panel_wires_the_gap_helper_into_a_warning below is a source-text check of that line, nothing more.
 
-def _dashboard_helper(name):
-    """Compiles ONE pure top-level helper out of dashboard.py and returns it, without booting the app.
+def _dashboard_helper(name, path=DASHBOARD):
+    """Compiles ONE pure top-level helper out of a source file and returns it, without booting it.
 
     dashboard.py cannot be imported in a test (module-level DB reads, HTTP fetches and chart rendering),
     and its rendering cannot be exercised without an AppTest harness this suite does not have. The
     helpers under test are pure and read only module-level constants, so their own AST node — plus any
     module-level assignment they load by name — is compiled in an empty namespace and called for real.
     That executes the shipped body, which is a stronger claim than matching its source text.
+
+    `path` defaults to dashboard.py; the legacy scripts/live_dashboard.py carries its own copies of
+    the same pure renderers (it is a standalone Streamlit script and cannot import dashboard.py),
+    and they are extracted the same way.
     """
     import ast
 
-    tree = ast.parse(DASHBOARD.read_text(encoding="utf-8"), filename=str(DASHBOARD))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     target = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name), None)
-    assert target is not None, f"dashboard.py has no module-level function named {name}"
+    assert target is not None, f"{path.name} has no module-level function named {name}"
 
     loaded = {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
     ns = {}
@@ -701,7 +705,7 @@ def _dashboard_helper(name):
         if isinstance(n, ast.Assign)
         and any(isinstance(t, ast.Name) and t.id in loaded for t in n.targets)
     ]:
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(DASHBOARD), "exec"), ns)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
     fn = ns[name]
     assert callable(fn), f"{name} is not callable after extraction"
     return fn
@@ -1482,3 +1486,234 @@ def test_the_kpi_card_routes_the_win_rate_through_the_helper():
     assert 'value=f"{win_rate_pct:.1f}% Win Rate"' not in src
 
 
+# ---------------------------------------------------------------------------
+# Final fix F-1 — the calibration panel publishes a measurement or an absence
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: `_calibration_panel_values` is a pure function that turns
+# the tracker's metrics dict into the four strings the panel shows, so these tests call the shipped
+# code and check every decision. The `st.metric(...)` calls in dashboard.py's calibration panel are
+# NOT executed by any of them -- the committed suite has no Streamlit AppTest harness, and importing
+# dashboard.py runs a 4,500-line top-level script against the real DB and live price endpoints. A
+# helper that returns a string cannot lie about what it decided; only the rendering one line further
+# out is unverified, and test_the_calibration_panel_routes_through_the_helper below is a source-text
+# check of that line, nothing more.
+#
+# The defect being closed: the panel published `0%`, `0 Trades`, `0.0000` and a `GOOD` grade
+# whenever the tracker had measured nothing, and a panel with no data at all graded itself GOOD.
+
+CALIBRATION_TRACKER = REPO_ROOT / "model_calibration_tracker.py"
+
+_calibration_panel_values = _dashboard_helper("_calibration_panel_values")
+
+
+def _tracker_over(tmp_path):
+    """A calibration tracker whose two databases are temp files, so no repo DB is ever opened.
+
+    The tracker's constructor CREATEs its log table in whatever ledger it is handed, so pointing it
+    at the repo's trading_ledger.db would be a write to a live database. Both paths below live
+    inside tmp_path, and the temp `trades` table is empty so the bootstrap step inserts nothing.
+    """
+    import sqlite3
+
+    from model_calibration_tracker import ModelCalibrationTracker
+
+    ledger = tmp_path / "ledger.db"
+    data = tmp_path / "data.db"
+    with sqlite3.connect(data) as conn:
+        conn.execute(
+            "CREATE TABLE trades (id INTEGER, timestamp TEXT, symbol TEXT, side TEXT, "
+            "pnl REAL, quality REAL, ai_rationale TEXT)")
+        conn.commit()
+    tracker = ModelCalibrationTracker(db_ledger=str(ledger), db_data=str(data))
+    return tracker, ledger, data
+
+
+def test_the_tracker_publishes_no_rate_and_no_grade_for_an_empty_calibration_log(tmp_path):
+    """The producer's own shape for an empty log, driven for real.
+
+    This is the fact the panel has to render: the sample COUNT is there (a measured zero) and the
+    rate and the grade are not there at all -- there is no key for them. The panel's old
+    `.get('overall_win_rate', 0)` and `.get('calibration_grade', 'GOOD')` defaults invented both.
+    """
+    tracker, _, _ = _tracker_over(tmp_path)
+    metrics = tracker.compute_calibration_metrics()
+    assert metrics["total_samples"] == 0, metrics
+    assert "overall_win_rate" not in metrics, (
+        f"an empty log published a win rate nobody measured: {metrics}")
+    assert "calibration_grade" not in metrics, (
+        f"an empty log published a grade nobody earned: {metrics}")
+    # The tracker's brier_score of 0.0 stands in for a score with no samples to average over.
+    assert metrics["brier_score"] == 0.0, metrics
+
+
+def test_the_tracker_measures_a_rate_once_it_has_samples(tmp_path):
+    """The control: the absences above are the absence of a measurement, not constants the
+    producer always publishes. With samples logged there is a rate, a score and a grade."""
+    import sqlite3
+
+    tracker, ledger, _ = _tracker_over(tmp_path)
+    with sqlite3.connect(ledger) as conn:
+        conn.executemany(
+            "INSERT INTO model_calibration_log (predicted_confidence, is_win, actual_pnl) "
+            "VALUES (?, ?, ?)",
+            [(0.8, 1, 1.0), (0.4, 0, -1.0)],
+        )
+        conn.commit()
+    metrics = tracker.compute_calibration_metrics()
+    assert metrics["total_samples"] == 2, metrics
+    assert metrics["overall_win_rate"] == 50.0, metrics
+    assert metrics["brier_score"] == 0.1, metrics
+    assert metrics["calibration_grade"] == "EXCELLENT", metrics
+
+
+def test_the_calibration_panel_publishes_the_sample_count_it_measured():
+    """A count of zero is a measurement: nothing was evaluated, and that is the fact.
+
+    The rate, the score and the grade are different -- they need a population to be measured over,
+    so with none they are absences.
+    """
+    values = _calibration_panel_values({"total_samples": 0, "brier_score": 0.0, "bins": []})
+    assert values["signals_evaluated"] == "0 Trades", values
+    assert values["historical_win_rate"].startswith("n/a"), values
+    assert values["brier_score"].startswith("n/a"), values
+    assert values["calibration_grade"].startswith("not measured"), values
+
+
+def test_the_calibration_panel_publishes_no_fabricated_grade_for_an_empty_log():
+    """The grade used to default to GOOD, so a panel with no data at all graded itself GOOD."""
+    values = _calibration_panel_values({"total_samples": 0, "brier_score": 0.0, "bins": []})
+    assert values["calibration_grade"] != "GOOD", values
+    assert "GOOD" not in values["calibration_grade"], values
+    assert "not measured" in values["calibration_grade"], values
+    assert "no signals evaluated yet" in values["calibration_grade"], values
+
+
+def test_the_calibration_panel_publishes_no_measured_zero_for_an_empty_log():
+    """No cell may carry a number that could be read as a measurement."""
+    values = _calibration_panel_values({"total_samples": 0, "brier_score": 0.0, "bins": []})
+    for key in ("historical_win_rate", "brier_score", "calibration_grade"):
+        assert not any(ch.isdigit() for ch in values[key]), (
+            f"{key} carries a digit where nothing was measured: {values[key]!r}")
+    assert "0%" not in values["historical_win_rate"], values
+    assert "0.0000" not in values["brier_score"], values
+
+
+def test_the_calibration_panel_publishes_an_absence_for_an_unreadable_log():
+    """The tracker's other shape: `{}` when the calibration log could not be read.
+
+    There is not even a count here, so nothing is published as a number -- not even a zero.
+    """
+    values = _calibration_panel_values({})
+    for key, text in values.items():
+        assert not any(ch.isdigit() for ch in text), (
+            f"{key} carries a digit where nothing could be read: {text!r}")
+    assert "unavailable" in values["signals_evaluated"], values
+    assert "unavailable" in values["historical_win_rate"], values
+    assert "unavailable" in values["brier_score"], values
+    assert "unavailable" in values["calibration_grade"], values
+
+
+def test_the_calibration_panel_survives_a_malformed_metrics_dict():
+    """The panel must not take down the tab over a shape it did not expect."""
+    for bad in (None, 5, "metrics", [], {"total_samples": "many"}, {"brier_score": "n/a"}):
+        values = _calibration_panel_values(bad)
+        assert set(values) == {"signals_evaluated", "historical_win_rate", "brier_score",
+                               "calibration_grade"}, values
+
+
+def test_a_measured_calibration_is_published_as_numbers():
+    """The control: with samples, the panel publishes the measurement it has."""
+    values = _calibration_panel_values({
+        "total_samples": 2, "overall_win_rate": 50.0, "brier_score": 0.1,
+        "calibration_grade": "EXCELLENT", "bins": [],
+    })
+    assert values["signals_evaluated"] == "2 Trades", values
+    assert values["historical_win_rate"] == "50.0%", values
+    assert values["brier_score"] == "0.1000", values
+    assert values["calibration_grade"] == "EXCELLENT", values
+
+
+def test_the_calibration_panel_routes_through_the_helper():
+    """Source-text check of the one line the helper tests cannot reach — see the section note.
+
+    It proves the panel publishes the helper's strings and no longer defaults the three values it
+    used to invent. It does not prove Streamlit renders them.
+    """
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert "cal_values = _calibration_panel_values(c_metrics)" in src, (
+        "the panel must publish the helper's strings, not read the metrics dict itself")
+    for gone in ("c_metrics.get('total_samples', 0)", "c_metrics.get('overall_win_rate', 0)",
+                 "c_metrics.get('brier_score', 0)", "c_metrics.get('calibration_grade', 'GOOD')"):
+        assert gone not in src, (
+            f"the panel still defaults {gone}: a key the tracker never produced and a measured "
+            "zero look the same on screen")
+
+
+def _calibration_cli_report(metrics):
+    """Runs model_calibration_tracker.py's own __main__ report block against a stubbed tracker.
+
+    The block is compiled out of the module and executed with a stub in place of
+    ModelCalibrationTracker, so neither trading_ledger.db nor trading_data.db is ever opened: the
+    real constructor CREATEs a table in the ledger, and this dispatch may not write to it. What is
+    exercised is the block's own rendering -- the shipped body, not a paraphrase of it.
+    """
+    import ast
+    import contextlib
+    import io
+
+    src = CALIBRATION_TRACKER.read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=str(CALIBRATION_TRACKER))
+    main_block = next(
+        (n for n in tree.body
+         if isinstance(n, ast.If) and "__main__" in ast.dump(n.test)),
+        None,
+    )
+    assert main_block is not None, "model_calibration_tracker.py has no __main__ report block"
+
+    class _StubTracker:
+        def compute_calibration_metrics(self):
+            return metrics
+
+    ns = {"__name__": "__main__", "ModelCalibrationTracker": _StubTracker}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        exec(compile(ast.Module(body=[main_block], type_ignores=[]),
+                     str(CALIBRATION_TRACKER), "exec"), ns)
+    return buf.getvalue()
+
+
+def test_the_tracker_report_publishes_absences_for_an_empty_log():
+    """The CLI report is the same defect class as the panel: it printed 0% and a 0.0 Brier score
+    (and a N/A grade) for a log that held nothing."""
+    out = _calibration_cli_report({"total_samples": 0, "brier_score": 0.0, "bins": []})
+    assert "Total Evaluated Signals: 0" in out, out
+    assert "Overall Historical Win Rate: n/a (no signals evaluated yet)" in out, out
+    assert "Grade: not measured" in out, out
+    assert "0%" not in out, out
+    assert "GOOD" not in out, out
+
+
+def test_the_tracker_report_publishes_absences_for_an_unreadable_log():
+    out = _calibration_cli_report({})
+    assert "Total Evaluated Signals: n/a" in out, out
+    assert "Overall Historical Win Rate: n/a (calibration metrics unavailable)" in out, out
+    assert "Brier Calibration Score: n/a (calibration metrics unavailable)" in out, out
+
+
+def test_the_tracker_report_publishes_the_measurement_once_it_has_samples():
+    out = _calibration_cli_report({
+        "total_samples": 2, "overall_win_rate": 50.0, "brier_score": 0.1,
+        "calibration_grade": "EXCELLENT", "bins": [],
+    })
+    assert "Total Evaluated Signals: 2" in out, out
+    assert "Overall Historical Win Rate: 50.0%" in out, out
+    assert "Brier Calibration Score: 0.1 (Grade: EXCELLENT)" in out, out
+
+
+def test_the_tracker_report_no_longer_defaults_the_values_it_never_measured():
+    """Source-text check of the shipped CLI block's defaults."""
+    src = CALIBRATION_TRACKER.read_text(encoding="utf-8")
+    for gone in ("metrics.get('overall_win_rate', 0)", "metrics.get('brier_score', 0)",
+                 "metrics.get('calibration_grade', 'N/A')"):
+        assert gone not in src, (
+            f"the report still defaults {gone}: a measurement nobody took printed as a number")

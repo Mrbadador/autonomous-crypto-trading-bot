@@ -162,10 +162,31 @@ class ModelCalibrationTracker:
 if __name__ == "__main__":
     tracker = ModelCalibrationTracker()
     metrics = tracker.compute_calibration_metrics()
+
+    # An empty calibration log is an absence, not a measured zero: the tracker returns
+    # total_samples=0 with no overall_win_rate and no calibration_grade (and a brier_score of
+    # 0.0 standing in for a score with no samples to average over). Printing 0% and 0.0 there
+    # claims a measurement nobody took, so the report says what it does not have instead.
+    samples = metrics.get("total_samples")
+    try:
+        samples = int(samples)
+    except (TypeError, ValueError):
+        samples = None
+    measured = bool(samples) and "overall_win_rate" in metrics
+    if samples is None:
+        absent_reason = "calibration metrics unavailable"
+    elif samples == 0:
+        absent_reason = "no signals evaluated yet"
+    else:
+        absent_reason = "not measured"
     print("\n=== AI MODEL CALIBRATION & RELIABILITY REPORT ===")
-    print(f"Total Evaluated Signals: {metrics.get('total_samples', 0)}")
-    print(f"Overall Historical Win Rate: {metrics.get('overall_win_rate', 0)}%")
-    print(f"Brier Calibration Score: {metrics.get('brier_score', 0)} (Grade: {metrics.get('calibration_grade', 'N/A')})\n")
+    print(f"Total Evaluated Signals: {samples if samples is not None else 'n/a'}")
+    if measured:
+        print(f"Overall Historical Win Rate: {metrics.get('overall_win_rate')}%")
+        print(f"Brier Calibration Score: {metrics.get('brier_score')} (Grade: {metrics.get('calibration_grade', 'not measured')})")
+    else:
+        print(f"Overall Historical Win Rate: n/a ({absent_reason})")
+        print(f"Brier Calibration Score: n/a ({absent_reason}) (Grade: not measured)\n")
     print("Reliability Curve Bins:")
     print(f"{'Bin':<12} | {'Samples':<8} | {'Pred Conf':<10} | {'Obs Win Rate':<12} | {'Calib Gap':<10}")
     print("-" * 60)
