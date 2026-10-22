@@ -1,7 +1,9 @@
 """
 backtest_swing_architect.py — High-Fidelity Multi-Asset Quantitative Backtester for The Swing Architect (4H)
 Replays historical 4H and 1D candles to empirically validate:
-1. Current live strategy rules (Ichimoku Kumo, 1D macro EMA, ADX, RSI, 3x/5x tiered leverage).
+1. Live strategy rules (Ichimoku Kumo, 1D macro EMA, ADX, RSI, 3x/5x tiered leverage); the
+   Ichimoku cloud is an A/B arm -- `--shifted` replays the live engine's 26-bar projected cloud,
+   and the default arm is the unshifted comparison, which the live engine does not use.
 2. Dynamic Trailing stops (Breakeven at +1.5R, ROE Profit Locks at 15%/30%, Kijun trailing).
 3. Realistic Bitget VIP0 fee deduction (0.06% taker per side) + 2 bps slippage + funding drag.
 4. Comparative variants to diagnose exactly what "needs work" in the live engine.
@@ -37,11 +39,14 @@ def compute_4h_indicators(df: pd.DataFrame, shifted_cloud: bool = False) -> pd.D
     span_b_raw = (high.rolling(window=52).max() + low.rolling(window=52).min()) / 2.0
 
     if shifted_cloud:
-        # Classical Ichimoku: Cloud is projected 26 bars forward, so today's cloud was calculated 26 bars ago
+        # Classical Ichimoku: Cloud is projected 26 bars forward, so today's cloud was calculated 26 bars ago.
+        # This is the treatment the live engine uses (swing_trader.py:642-643, quant_validation.py:89-90).
         span_a = span_a_raw.shift(26)
         span_b = span_b_raw.shift(26)
     else:
-        # Current live implementation (unshifted)
+        # Unshifted comparison arm, kept for the A/B against the live treatment: the cloud is read on
+        # the bar that computed it. The live engine does NOT use this arm -- it always shifts 26 bars
+        # (swing_trader.py:642-643, quant_validation.py:89-90).
         span_a = span_a_raw
         span_b = span_b_raw
 
@@ -117,7 +122,7 @@ class SwingArchitectBacktester:
         high_quality_adx: float = 30.0,
         standard_leverage: float = 3.0,
         high_quality_leverage: float = 5.0,
-        use_shifted_cloud: bool = False,
+        use_shifted_cloud: bool = False,  # False = unshifted comparison arm; True = live engine's projected cloud
         require_fresh_breakout: bool = False,
         allow_shorts: bool = True,
         t1_roe: float = 15.0,
