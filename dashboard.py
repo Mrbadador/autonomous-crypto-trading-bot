@@ -105,6 +105,37 @@ def query_system_state(key: str, default: str = "") -> str:
         return str(df.iloc[0]["value"])
     return default
 
+
+@st.cache_data(ttl=4, show_spinner=False)
+def query_system_state_row(key: str) -> tuple:
+    """Fetch one system_state row as ``(value, updated_at)``, or ``("", "")`` when it is absent.
+
+    `query_system_state` above returns the value only, so a panel reading through it cannot see the
+    row's publish instant at all. That is the whole of finding B-1: the Markov deck printed a row
+    `regime_classifier.py:1218-1221` wrote ~35 hours earlier under a heading claiming a live forward
+    filter, while every automated consumer refuses that row beyond `config.REGIME_MAX_AGE_SEC`.
+
+    The signature of `query_system_state` is deliberately left alone: it is called across this whole
+    file, and one panel's age path is not a branch-wide blast radius. Same read-only connection and
+    the same 4s cache as the value-only reader.
+    """
+    try:
+        conn = connect_readonly(TRADING_DATA_DB)
+        try:
+            row = conn.execute(
+                "SELECT value, updated_at FROM system_state WHERE key = ?", (key,)).fetchone()
+        finally:
+            conn.close()
+    except Exception as r_err:
+        FEED_FAILURES[f"read \u2192 {os.path.basename(TRADING_DATA_DB)}:{key}"] = (
+            f"{type(r_err).__name__}: {str(r_err)[:120]}")
+        return "", ""
+    if row is None:
+        return "", ""
+    value = "" if row[0] is None else str(row[0])
+    updated_at = "" if row[1] is None else str(row[1])
+    return value, updated_at
+
 _JUNK_TOKENS = ("", "none", "null", "nan", "n/a", "na", "syncing...", "--")
 
 
@@ -1431,6 +1462,264 @@ def _basis_readings(basis_data, now=None) -> dict:
             age_days = (reference - published_at).total_seconds() / 86400.0
     readings["age_days"] = age_days
     readings["stale"] = bool(age_days is not None and age_days >= _BASIS_STALE_DAYS)
+    return readings
+
+
+# ── Bayesian Markov regime deck: published readings only, never a model's prior ───────────
+# The deck used to read `markov_regime_telemetry` through `query_system_state`, which hands back the
+# value only and so cannot see the row's `updated_at`. A row `regime_classifier.py:1218-1221` wrote
+# ~35 hours earlier therefore printed under a heading claiming a live forward filter, while every
+# automated consumer of the same row -- `super_bot.py:718-736`, `super_bot.py:909-924`,
+# `inflight_shepherd.py:594-615`, `swing_trader.py:928-944` -- refuses it beyond
+# `config.REGIME_MAX_AGE_SEC`. It also instantiated `MarkovRegimeEngine` to fill a missing row, and
+# because that constructor is pure (`markov_regime.py:33-49`: uniform `pi`, the hardcoded prior `P`,
+# no dataset, no DB) every figure out of it was the model's assumption about the world rather than a
+# measurement of this one. Both defects end here: the age is measured from the row's own stamp and
+# absence is published as absence.
+_REGIME_MAX_AGE_FALLBACK_SEC = 900.0
+# The same default the consumers fall back to, not a second threshold number: a HUD with its own
+# softer bound would keep advertising a row the fleet has already stopped trusting.
+
+# The deck's OWN cascade-risk rungs -- the producer publishes a probability, not a verdict -- so the
+# card prints each number beside the label it earned.
+_MARKOV_BD_ALARM_PCT = 0.50
+_MARKOV_BD_WARN_PCT = 0.30
+_MARKOV_BD_HIGH_PCT = 0.60
+_MARKOV_BD_ELEV_PCT = 0.35
+# The entry hysteresis gate the horizon bars are drawn against, and the fee shield the engine's own
+# tradability gate states in `markov_regime.py:329-341`. Named here so the panel never prints a bare
+# threshold.
+_MARKOV_HYSTERESIS_GATE = 0.65
+_MARKOV_FEE_SHIELD_BARS = 3.5
+
+
+def _regime_max_age_sec() -> float:
+    """Return the fleet's own regime-age bound, or the consumers' 900.0 when config cannot answer.
+
+    `config.REGIME_MAX_AGE_SEC` (config.py:109) is the single threshold every automated consumer
+    enforces, so the HUD reads it rather than carrying its own number. A missing, zero, negative or
+    non-numeric value falls back to 900.0 -- the consumers' own default -- and not to 0.0, which
+    would call every row stale, or to a silent pass that would call every row fresh.
+    """
+    try:
+        bound = _optional_float(getattr(config, "REGIME_MAX_AGE_SEC", None))
+    except Exception:
+        return _REGIME_MAX_AGE_FALLBACK_SEC
+    if bound is None or bound <= 0.0:
+        return _REGIME_MAX_AGE_FALLBACK_SEC
+    return float(bound)
+
+
+def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None) -> dict:
+    """Return the Markov deck's figures, each one a measurement or an absence.
+
+    `raw_value` is the `markov_regime_telemetry` row's JSON text (or an already-parsed dict), and
+    `published_at` is that row's own `updated_at`: `regime_classifier.py:1218-1221` writes the row
+    with `datetime.now(UTC).isoformat()` (`:1136`), so the stamp IS the publish instant and the
+    payload carries no timestamp of its own.
+
+    The contract is `markov_regime.py:387 process_bars()`, which publishes exactly ten keys on BOTH
+    its paths (`:398-413` short frame, `:445-460` filtered): `dominant_regime`,
+    `state_probabilities`, `expected_durations_bars`, `breakdown_risk_4step`, `forecast_4step`,
+    `transition_matrix`, `stationary_distribution`, `is_tradable`, `tradability_reason`,
+    `sizing_multiplier`. Two shapes matter. `stationary_distribution` is a LIST of three rounded
+    floats (`:409`, `:456`) -- a dict-shaped value is the shape the deleted fallback invented, so it
+    is an absence here rather than a guess about which slot meant what. And the forecast is published
+    as `forecast_4step` (`:407`, `:454`); the name the deck used to read first is only ever returned
+    inside `forecast_k_steps` (`:360`) and never leaves it into the payload.
+
+    Every figure goes through `_published_number` / `_published_boolean` / `_published_state` on its
+    own, so absence is per field and a missing key never becomes a stand-in. A recorded zero is a
+    fact and stays a reading -- the live row carries `BEAR_CASCADE: 0.0002`, and `float(raw or 0.0)`
+    erases the difference between that and a key nobody wrote. `sizing_multiplier` runs the other
+    way: the producer clamps it into `[0.20, 1.0]` (`markov_regime.py:317-327`), so a measured zero
+    is not a reading it can publish, and an absence must never be defaulted to 1.0 -- the largest
+    figure it can emit, and the riskiest possible stand-in.
+
+    `age_sec` is measured from the row's own stamp and is None when no usable stamp came with it;
+    `stale` compares that age against `config.REGIME_MAX_AGE_SEC`. `now` and `max_age_sec` are
+    injectable so the age path is testable without a clock. Pure and module-level: it boots no
+    Streamlit, opens no database, and imports no model.
+    """
+    # The engine's own regime roster (`markov_regime.py:30-31`), with the short field name the deck
+    # addresses each reading by. Named here rather than spelled out at each call site so the deck's
+    # labels, this reader's fields and the producer's key set have one thing to disagree with.
+    _MARKOV_STATE_KEYS = (
+        ("chop", "CHOP"),
+        ("bull", "BULL_EXPANSION"),
+        ("bear", "BEAR_CASCADE"),
+    )
+
+    data = raw_value if isinstance(raw_value, dict) else {}
+    if isinstance(raw_value, str) and raw_value.strip():
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            data = parsed
+
+    def _from_payload(payload_key):
+        """The value published under `payload_key`, or None when the engine wrote no such key.
+
+        Membership decides, never truthiness and never a two-argument `.get()`: `or` and
+        `.get(key, default)` both overwrite a measured zero with the stand-in that was standing in
+        for it, which is the defect class this reader exists to end.
+        """
+        if payload_key not in data:
+            return None
+        return data[payload_key]
+
+    def _state_map(payload_key, prefix):
+        """One reading per regime state, out of a dict the producer keyed by state name."""
+        raw = _from_payload(payload_key)
+        raw = raw if isinstance(raw, dict) else {}
+        return {
+            f"{prefix}_{short}": _published_number(
+                raw[state] if state in raw else None, f"no {state} in {payload_key}")
+            for short, state in _MARKOV_STATE_KEYS
+        }
+
+    fields = {
+        "dominant_regime": _published_state(
+            _from_payload("dominant_regime"), "no dominant_regime in markov regime telemetry"),
+        "breakdown_risk": _published_number(
+            _from_payload("breakdown_risk_4step"),
+            "no breakdown_risk_4step in markov regime telemetry"),
+        # Tri-state, not a truthiness test: `bool(m_tel.get("is_tradable", True))` turned a missing
+        # key into the green badge, and a published `false` into the same reading as no reading.
+        "is_tradable": _published_boolean(
+            _from_payload("is_tradable"), "no is_tradable in markov regime telemetry"),
+        # The reason is the engine's own alibi, so an absent one is missed, never supplied by the
+        # panel: `m_tel.get("tradability_reason", "Tradable")` put words in the engine's mouth.
+        "tradability_reason": _published_state(
+            _from_payload("tradability_reason"),
+            "no tradability_reason in markov regime telemetry"),
+        "sizing_multiplier": _published_number(
+            _from_payload("sizing_multiplier"),
+            "no sizing_multiplier in markov regime telemetry"),
+    }
+    fields.update(_state_map("state_probabilities", "prob"))
+    fields.update(_state_map("expected_durations_bars", "dur"))
+    fields.update(_state_map("forecast_4step", "fc"))
+
+    # The equilibrium is the published 3-LIST (`markov_regime.py:409`, `:456`) and nothing else.
+    # A short or long list, a dict or a string names no slot, so all three readings are absences
+    # rather than a guess about which entry the producer meant.
+    raw_stat = _from_payload("stationary_distribution")
+    stat_slots = raw_stat if isinstance(raw_stat, (list, tuple)) and len(
+        raw_stat) == len(_MARKOV_STATE_KEYS) else None
+    for index, (short, state) in enumerate(_MARKOV_STATE_KEYS):
+        fields[f"stat_{short}"] = (
+            _published_number(stat_slots[index], f"no {state} in stationary_distribution")
+            if stat_slots is not None else
+            {"value": None, "measured": False,
+             "reason": f"no {state} in stationary_distribution"})
+    stat_values = None
+    if stat_slots is not None:
+        candidate = [_optional_float(one) for one in stat_slots]
+        if all(one is not None for one in candidate):
+            stat_values = candidate
+    fields["equilibrium"] = (
+        {"value": stat_values, "rows": tuple(stat_values), "measured": True, "reason": ""}
+        if stat_values is not None else
+        {"value": None, "rows": (), "measured": False,
+         "reason": ("no equilibrium vector: stationary_distribution was not published as a "
+                    "3-vector")})
+
+    # Two derived figures. Each is a reading only when every figure it is computed from is one:
+    # a maximum over a partial probability set, or a duration looked up under a regime that was
+    # never named, is a guess about the missing entries rather than a measurement.
+    probs_measured = all(fields[f"prob_{short}"]["measured"] for short, _ in _MARKOV_STATE_KEYS)
+    fields["confidence"] = (
+        {"value": max(fields[f"prob_{short}"]["value"] for short, _ in _MARKOV_STATE_KEYS),
+         "measured": True, "reason": ""}
+        if probs_measured else
+        {"value": None, "measured": False,
+         "reason": "no confidence: every state probability has to be measured first"})
+    short_by_state = {state: short for short, state in _MARKOV_STATE_KEYS}
+    dom_st = fields["dominant_regime"]
+    dom_dur_st = (fields.get(f"dur_{short_by_state[str(dom_st['text']).strip()]}")
+                  if dom_st["measured"] else None)
+    fields["dominant_duration"] = (
+        {"value": dom_dur_st["value"], "measured": True, "reason": ""}
+        if dom_dur_st is not None and dom_dur_st["measured"] else
+        {"value": None, "measured": False,
+         "reason": ("no dominant duration: the dominant regime or its expected duration "
+                    "was not measured")})
+
+    # The transition matrix, or no matrix at all. There is no stand-in: `default_P` was a
+    # byte-for-byte copy of the engine's prior (`markov_regime.py:39-43`) which would silently
+    # diverge the day that prior changed, and `process_bars` publishes the estimated matrix on both
+    # paths (`:408`, `:455`), so the only row without one is a row that does not exist.
+    raw_matrix = _from_payload("transition_matrix")
+    matrix_rows = None
+    if isinstance(raw_matrix, (list, tuple)) and len(raw_matrix) == len(_MARKOV_STATE_KEYS):
+        candidate_rows = []
+        for row in raw_matrix:
+            if not isinstance(row, (list, tuple)) or len(row) != len(_MARKOV_STATE_KEYS):
+                candidate_rows = None
+                break
+            numbers = [_optional_float(one) for one in row]
+            if any(one is None for one in numbers):
+                candidate_rows = None
+                break
+            candidate_rows.append(numbers)
+        matrix_rows = candidate_rows
+    fields["transition_matrix"] = (
+        {"value": matrix_rows, "rows": tuple(tuple(one) for one in matrix_rows),
+         "measured": True, "reason": ""}
+        if matrix_rows is not None else
+        {"value": None, "rows": (), "measured": False,
+         "reason": "no 3x3 transition_matrix in markov regime telemetry"})
+
+    readings = dict(fields)
+    readings["field_names"] = tuple(sorted(fields))
+    readings["coverage"] = {
+        "total": len(readings["field_names"]),
+        "unmeasured": sum(1 for name in readings["field_names"] if not fields[name]["measured"]),
+    }
+    readings["unmeasured_fields"] = tuple(
+        name for name in readings["field_names"] if not fields[name]["measured"])
+
+    bound = _REGIME_MAX_AGE_FALLBACK_SEC if max_age_sec is None else _optional_float(max_age_sec)
+    if bound is None or bound <= 0.0:
+        bound = _REGIME_MAX_AGE_FALLBACK_SEC
+    readings["max_age_sec"] = float(bound)
+
+    readings["published_at"] = _published_state(
+        published_at, "no updated_at stamp on the markov regime row")
+    age_sec = None
+    if readings["published_at"]["measured"]:
+        # The fleet's own parse shape: tolerate a `Z` suffix and localise a naive stamp to UTC,
+        # rather than treating a `CURRENT_TIMESTAMP`-shaped row as if it were written right now.
+        raw_ts = str(readings["published_at"]["text"]).strip().replace("Z", "+00:00")
+        try:
+            stamp = datetime.fromisoformat(raw_ts)
+        except (TypeError, ValueError):
+            stamp = None
+        if stamp is not None:
+            if stamp.tzinfo is None:
+                stamp = pytz.utc.localize(stamp)
+            reference = now if isinstance(now, datetime) else datetime.now(pytz.utc)
+            if reference.tzinfo is None:
+                reference = pytz.utc.localize(reference)
+            age_sec = (reference - stamp).total_seconds()
+    readings["age_sec"] = age_sec
+    readings["age_known"] = age_sec is not None
+    readings["stale"] = bool(age_sec is not None and age_sec > float(bound))
+    readings["row_present"] = bool(data)
+    # "Live" needs both a stamp inside the bound the fleet enforces AND a row that measured
+    # something. A fresh row carrying nothing is not a live forward filter either.
+    readings["heading_is_live"] = bool(readings["age_known"] and not readings["stale"]
+                                       and readings["row_present"])
+
+    readings["states"] = tuple(state for _short, state in _MARKOV_STATE_KEYS)
+    readings["by_state"] = tuple(
+        {"short": short, "state": state, "prob": fields[f"prob_{short}"],
+         "dur": fields[f"dur_{short}"], "fc": fields[f"fc_{short}"],
+         "stat": fields[f"stat_{short}"]}
+        for short, state in _MARKOV_STATE_KEYS)
     return readings
 
 
