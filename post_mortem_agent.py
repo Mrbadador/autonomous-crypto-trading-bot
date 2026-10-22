@@ -57,6 +57,20 @@ def init_db():
         """)
     conn.close()
 
+# The only measured safe ranges this fleet has for its tunable knobs. Single source of truth
+# for both the delta path below and the absolute-value path the learner writers use.
+# Knobs deliberately absent (e.g. trail_dist) have no measured band and are refused.
+PARAM_BOUNDS = {
+    "rsi_buy": (10.0, 40.0),
+    "rsi_sell": (60.0, 90.0),
+    "take_profit_pct": (1.001, 1.05),
+    "stop_loss_pct": (0.95, 0.999),
+    "min_nn_confidence": (0.60, 0.95),
+    "vol_gate_mult": (0.8, 3.0),
+    "veto_threshold": (40.0, 95.0),
+}
+
+
 def enforce_parameter_bounds(param_name, current_val, suggested_adj):
     try:
         current_val = float(current_val)
@@ -64,21 +78,25 @@ def enforce_parameter_bounds(param_name, current_val, suggested_adj):
     except (ValueError, TypeError):
         return current_val
     new_val = current_val + suggested_adj
-    if param_name == "rsi_buy":
-        return max(10.0, min(40.0, new_val))
-    elif param_name == "rsi_sell":
-        return max(60.0, min(90.0, new_val))
-    elif param_name == "take_profit_pct":
-        return max(1.001, min(1.05, new_val))
-    elif param_name == "stop_loss_pct":
-        return max(0.95, min(0.999, new_val))
-    elif param_name == "min_nn_confidence":
-        return max(0.60, min(0.95, new_val))
-    elif param_name == "vol_gate_mult":
-        return max(0.8, min(3.0, new_val))
-    elif param_name == "veto_threshold":
-        return max(40.0, min(95.0, new_val))
-    return new_val
+    bounds = PARAM_BOUNDS.get(param_name)
+    if bounds is None:
+        # Unlisted knobs have no measured safe range: refuse rather than write an unbounded value.
+        return current_val
+    lo, hi = bounds
+    return max(lo, min(hi, new_val))
+
+
+def clamp_parameter_value(param_name, value):
+    """Absolute value -> in-band value, or None when the knob has no measured safe range."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    bounds = PARAM_BOUNDS.get(param_name)
+    if bounds is None:
+        return None
+    lo, hi = bounds
+    return max(lo, min(hi, val))
 
 async def analyze_trades():
     conn_ledger = None

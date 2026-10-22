@@ -1046,7 +1046,9 @@ async def red_team_deliberation(
             if os.path.exists(ledger_db):
                 with _sq.connect(ledger_db, timeout=3.0) as _conn:
                     rows = _conn.execute(
-                        "SELECT category, rule_text, confidence FROM learned_rules WHERE confidence >= 0.70 ORDER BY confidence DESC LIMIT 15"
+                        "SELECT category, rule_text, confidence FROM learned_rules "
+                        "WHERE confidence >= 0.70 "
+                        "ORDER BY confidence DESC, created_at DESC, rule_id DESC LIMIT 15"
                     ).fetchall()
                     for row in rows:
                         rules.append(f"[{row[0]}] {row[1]} (conf={row[2]:.0%})")

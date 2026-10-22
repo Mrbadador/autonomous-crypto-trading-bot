@@ -1,9 +1,11 @@
 """
 batch_backtest_learner.py — Micro-Batched Regime Clustering AI Post-Mortem
 
-Runs a fast historical backtest trade extraction, groups historical trades
-into 4 key failure/success regime clusters, and feeds them into Groq LLaMA 3.1
-to synthesize deep institutional trade lessons and auto-optimize bot parameters.
+Hand-written exemplar scenarios used to seed the rule-learning loop.
+
+These are illustrative trades authored in this file — synthetic exemplar data, not
+trades extracted from any backtest or live ledger. Rules distilled from them are
+tagged source='synthetic_exemplar' so they can be told apart from measured lessons.
 """
 
 import os
@@ -20,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 import config
 from ai_engine import query_cloud_llm
+from post_mortem_agent import clamp_parameter_value
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AI_LEARNER] %(message)s")
 log = logging.getLogger("batch_learner")
@@ -89,10 +92,73 @@ def init_tables():
                 VALUES (?, ?, ?, datetime('now'))
             """, (bot, param, val))
 
-def extract_historical_scenarios():
+# ---------------------------------------------------------------------------
+# Shared write hygiene. `scripts/deep_brain_trainer.py` imports these so the two
+# learner writers cannot drift apart; nothing here runs at import time.
+# ---------------------------------------------------------------------------
+
+def normalise_bot_name(bot_name):
+    """Canonical bot key for bot_parameters: lower-case, trimmed, spaces become underscores."""
+    return str(bot_name or "sniper").strip().lower().replace(" ", "_") or "sniper"
+
+
+def ensure_learned_rules_source_column(conn):
+    """Add the provenance column if this database predates it. Never destructive."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(learned_rules)")}
+    if "source" not in cols:
+        conn.execute("ALTER TABLE learned_rules ADD COLUMN source TEXT DEFAULT 'measured'")
+
+
+def write_learned_rule(conn, category, rule_text, confidence, source="synthetic_exemplar"):
+    """Insert one distilled rule, self-labelled with where it came from.
+
+    `ai_engine._get_top_rules_sync` deliberately never selects or filters on `source`, so
+    this is provenance for whoever audits the table later, not a prompt filter.
     """
-    Simulates multi-asset historical trade executions across BTC, ETH, ADA, BNB
-    and segments them into 4 distinct structural clusters.
+    ensure_learned_rules_source_column(conn)
+    conn.execute("""
+        INSERT INTO learned_rules (category, rule_text, confidence, created_at, source)
+        VALUES (?, ?, ?, datetime('now'), ?)
+    """, (category, rule_text, confidence, source))
+
+
+def write_parameter_adjustments(db_path, adjustments):
+    """Persist suggested parameter changes to an explicit trading_data.db path.
+
+    `suggested_value` is an ABSOLUTE target value, not a delta, so it goes through
+    `clamp_parameter_value` and never through `enforce_parameter_bounds` (which would add
+    it to the current value). A knob with no measured band is dropped and logged instead of
+    written, and bot names are normalised so `SNIPER` updates `sniper` rather than creating
+    a shadow row beside it.
+    """
+    with sqlite3.connect(db_path) as conn:
+        for adj in adjustments:
+            bot = normalise_bot_name(adj.get("bot_name", "sniper"))
+            param = adj.get("param_name")
+            raw_val = adj.get("suggested_value")
+            if not param or raw_val is None:
+                continue
+            val = clamp_parameter_value(param, raw_val)
+            if val is None:
+                log.info(
+                    f"  [PARAM REFUSED] {bot} -> {param}: no measured safe range for that "
+                    f"knob, value {raw_val} not written ({adj.get('rationale', '')})"
+                )
+                continue
+            conn.execute("""
+                INSERT INTO bot_parameters (bot_name, param_name, param_value, last_updated)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(bot_name, param_name) DO UPDATE SET param_value=excluded.param_value, last_updated=excluded.last_updated
+            """, (bot, param, float(val)))
+            log.info(f"  [PARAM OPTIMIZED] {bot} -> {param} set to {val} ({adj.get('rationale', '')})")
+
+def exemplar_scenarios():
+    """
+    Return the hand-written synthetic exemplar clusters fed to the LLM.
+
+    These trades are authored illustrations in this file. Nothing here was extracted
+    from a backtest run or from any ledger, so no rule distilled from them should be
+    read as a measured lesson.
     """
     clusters = {
         "CHOP_FAILURES": {
@@ -188,29 +254,16 @@ Output strictly valid JSON with this exact schema:
                 f"[{cluster_key}] {data.get('master_lesson', 'Lesson learned.')}"
             ))
             
-            # Store Defense Rule into learned_rules
-            conn.execute("""
-                INSERT INTO learned_rules (category, rule_text, confidence, created_at)
-                VALUES (?, ?, ?, datetime('now'))
-            """, (
+            # Store Defense Rule into learned_rules, self-labelled as exemplar-derived.
+            write_learned_rule(
+                conn,
                 cluster_key,
                 data.get("defense_rule", "Strict risk management enforced."),
-                float(data.get("confidence_score", 0.90))
-            ))
+                float(data.get("confidence_score", 0.90)),
+            )
             
         # 2. Apply Parameter Adjustments
-        with sqlite3.connect(DATA_DB) as conn:
-            for adj in data.get("parameter_adjustments", []):
-                bot = adj.get("bot_name", "sniper")
-                param = adj.get("param_name")
-                val = adj.get("suggested_value")
-                if param and val is not None:
-                    conn.execute("""
-                        INSERT INTO bot_parameters (bot_name, param_name, param_value, last_updated)
-                        VALUES (?, ?, ?, datetime('now'))
-                        ON CONFLICT(bot_name, param_name) DO UPDATE SET param_value=excluded.param_value, last_updated=excluded.last_updated
-                    """, (bot, param, float(val)))
-                    log.info(f"  [PARAM OPTIMIZED] {bot.upper()} -> {param} set to {val} ({adj.get('rationale', '')})")
+        write_parameter_adjustments(DATA_DB, data.get("parameter_adjustments", []))
 
         return data
     except Exception as e:
@@ -219,7 +272,7 @@ Output strictly valid JSON with this exact schema:
 
 async def run_batch_learning():
     init_tables()
-    clusters = extract_historical_scenarios()
+    clusters = exemplar_scenarios()
     results = []
     
     log.info("=" * 60)
