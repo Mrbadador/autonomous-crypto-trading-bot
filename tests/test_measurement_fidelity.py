@@ -1962,9 +1962,12 @@ def test_the_legacy_daemon_count_is_not_a_fabricated_number():
 # (volatility) and 0.40 (trend strength) whenever the regime daemon had published nothing, so a
 # fleet with no regime row rendered a confident "Trend Strength (ADX) 28.5 / Strong Trend (>25)"
 # deck. The DI pair fell back on 0.0 and was then classified as "Balanced" — a measured statement
-# about two numbers nobody measured. And the macro banner defaulted `btc_macro_trend` to
-# "BULLISH", so a fleet whose macro key had never been written announced "REGIME: MACRO BULLISH
-# (LONG ONLY)" and published "Macro Direction: SHORT ONLY" for the very same absence.
+# about two numbers nobody measured.
+# And the macro banner defaulted `btc_macro_trend` to "BULLISH", so a fleet whose macro key had
+# never been written announced "REGIME: MACRO BULLISH (LONG ONLY)" and published "Macro
+# Direction: LONG ONLY" for the very same absence. The radar's mapping was worse still: it
+# labelled every macro regime that was not "BULLISH" as "SHORT ONLY", so a *measured* NEUTRAL
+# macro regime was dressed as a short-only trading stance.
 
 _GAUGE_HELPERS = {}
 
@@ -1986,8 +1989,11 @@ def _gauge_block(path):
 
     The block runs from the "Quantitative Regime Deck Gauges" marker to the next section break,
     so a stand-in reading anywhere inside it is a stand-in reading the deck publishes.
+
+    The terminators are indentation-tolerant: the legacy app's section rules are not all at
+    column 0, and a column-anchored terminator would let the extraction run past the rule that
+    closes the block and scan a much larger region of the file than the gauge deck.
     """
-    import re
     import textwrap
 
     src = path.read_text(encoding="utf-8")
@@ -1995,11 +2001,39 @@ def _gauge_block(path):
     assert match is not None, f"{path.name} has no regime gauge block"
     tail = src[match.start():]
     stop = len(tail)
-    for marker in ('st.markdown("---")', "\n# ═"):
-        idx = tail.find(marker)
-        if idx != -1:
-            stop = min(stop, idx)
+    for pattern in (r'st\.markdown\(\s*"---"\s*\)', r"\n[ \t]*#\s*═"):
+        match = re.search(pattern, tail)
+        if match is not None:
+            stop = min(stop, match.start())
     return textwrap.dedent(tail[:stop])
+
+
+def _shipped_di_classifier():
+    """The DI classifier dashboard.py actually ships, compiled out of its own gauge block.
+
+    The shipped classifier is a lambda that closes over `plus_di` and `minus_di`, so it cannot
+    be exec'd on its own; its source segment is, with the two readings bound in the namespace.
+    That is the shipped body being called, not a paraphrase of it.
+    """
+    import ast
+
+    block = _gauge_block(DASHBOARD)
+    tree = ast.parse(block, filename=str(DASHBOARD))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_gauge_display" and len(node.args) >= 3):
+            continue
+        classify = node.args[2]
+        if not isinstance(classify, ast.Lambda):
+            continue
+        names = {n.id for n in ast.walk(classify) if isinstance(n, ast.Name)}
+        if {"plus_di", "minus_di"} <= names:
+            segment = ast.get_source_segment(block, classify)
+            namespace = {"plus_di": 0.0, "minus_di": 0.0}
+            exec(f"classify = {segment}", namespace)
+            return namespace["classify"]
+    raise AssertionError(
+        "dashboard.py's regime gauge block has no DI classifier closing over plus_di/minus_di")
 
 
 def _numeric_constants(text, filename="<gauge block>"):
@@ -2171,8 +2205,8 @@ def test_the_two_dashboards_publish_the_same_regime_and_macro_readings():
         ("_regime_readings", (None, None), {}),
         ("_macro_regime", ("bullish",), {}),
         ("_macro_regime", (None,), {}),
-        ("_gauge_display", (None, "{:.1f}", "Strong", "no market_regime row"), {}),
-        ("_gauge_display", (37.5, "{:.1f}", "Strong", "no market_regime row"), {}),
+        ("_gauge_display", (None, lambda v: f"{v:.1f}", lambda v: "Strong", "no market_regime row"), {}),
+        ("_gauge_display", (37.5, lambda v: f"{v:.1f}", lambda v: "Strong", "no market_regime row"), {}),
     ]
     for name, args, _kwargs in cases:
         main = _gauge_helper(name, DASHBOARD)
@@ -2203,11 +2237,18 @@ def test_the_dashboard_files_publish_no_stand_in_regime_readings():
     """The gauges used to fall back on 28.5 (ADX), 0.62 (Hurst), 0.55 (volatility) and 0.40
     (trend strength) when the regime daemon had published nothing at all."""
     for path in (DASHBOARD, LEGACY_DASHBOARD):
-        numbers = _numeric_constants(_gauge_block(path), filename=str(path))
+        block = _gauge_block(path)
+        numbers = _numeric_constants(block, filename=str(path))
         for gone in (28.5, 0.62, 0.55, 0.40):
             assert gone not in numbers, (
                 f"{path.name} still falls back on the stand-in reading {gone!r} in its regime "
                 f"gauge block")
+        # The defect shape is the `or` fallback, not the value 0.0: a measured zero and an
+        # absent reading are told apart by None, so a `or 0.0` fallback invents a reading.
+        # The forbidden list above cannot catch that, because 0.0 == 0 in Python and the
+        # shipped comparison `(plus_di > 0 or minus_di > 0)` carries the integer literal 0.
+        assert not re.search(r"\bor\s+0(?:\.0)?\b", block), (
+            f"{path.name} still falls back on a zero stand-in in its regime gauge block")
         published = _published_strings(path)
         for gone in ("28.5", "0.62", "0.55"):
             # "0.40" is deliberately not in this list: dashboard.py publishes "0.40" as the
@@ -2233,14 +2274,21 @@ def test_neither_dashboard_publishes_a_macro_default_of_bullish():
             "of a reading nobody took")
         defaults = re.findall(
             r'query_system_state\(\s*"btc_macro_trend"\s*,\s*"([^"]*)"\s*\)', src)
-        assert defaults == [""], (
+        assert defaults, (
+            f"{path.name} does not read the macro key through query_system_state at all, so the "
+            "default guard below cannot see it")
+        assert all(default == "" for default in defaults), (
             f"{path.name} reads the macro key with the default(s) {defaults}; only an empty "
             "default may reach the normaliser")
 
 
 def test_both_dashboards_publish_no_stance_for_an_unknown_macro_direction():
-    """The radar table used to publish SHORT ONLY for an absent macro key — a directional
-    trading stance invented from a reading nobody took."""
+    """The radar table turned every macro regime that was not "BULLISH" into SHORT ONLY.
+
+    An absent key was not the case it got wrong — the key defaulted to "BULLISH", so an absence
+    published LONG ONLY. A *measured* NEUTRAL macro regime published SHORT ONLY, which is the
+    worse defect: a reading that was taken was relabelled as a directional trading stance.
+    """
     for path in (DASHBOARD, LEGACY_DASHBOARD):
         src = path.read_text(encoding="utf-8")
         assert '"NO STANCE"' in src, (
@@ -2295,9 +2343,7 @@ def test_the_di_spread_is_measured_only_when_both_di_readings_are():
 
 def test_a_measured_di_pair_of_zeros_is_still_a_measurement():
     """The control for the absence above: both DI readings at zero is a measurement."""
-    plus_di, minus_di = 0.0, 0.0
-    classify = (lambda v: f"+DI: {plus_di:.1f} | -DI: {minus_di:.1f}"
-                if (plus_di > 0 or minus_di > 0) else "Balanced")
+    classify = _shipped_di_classifier()
     out = _gauge_helper("_gauge_display")(0.0, lambda v: f"{v:+.1f}", classify, "no DI reading")
     assert out["value"] == "+0.0", out
     assert out["delta"] == "Balanced", out
@@ -2316,6 +2362,3 @@ def test_the_macro_banner_publishes_a_neutral_regime_and_an_unknown_one_apart():
             f"{path.name} has no banner for a macro regime it has no reading for")
         assert 'elif macro_trend == "NEUTRAL":' in src, (
             f"{path.name} must tell a measured NEUTRAL apart from an UNKNOWN reading")
-
-
-
