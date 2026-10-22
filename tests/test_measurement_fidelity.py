@@ -424,6 +424,76 @@ def test_a_refused_4h_frame_yields_no_candidate_in_either_direction():
     assert cand["near_miss"] is False
 
 
+# The ablation harness had the same defect by a different route: `.shift(26).fillna(span_raw)`
+# back-filled the leading warm-up window with the *unshifted* span, so the arm's opening bars
+# were scored against a cloud built from their own highs and lows. The cloud at bar i is the one
+# projected 26 bars earlier, so a frame of n bars has a cloud on exactly max(0, n - 77) of them.
+@pytest.mark.parametrize(
+    "n, expected_valid_cloud_cells",
+    [
+        (20, 0),    # shorter than the 52-bar span itself
+        (52, 0),    # span_b becomes computable, but it is still 26 bars from being publishable
+        (60, 0),
+        (77, 0),    # the bar immediately below the first publishable one
+        (78, 1),    # the first publishable bar: one projected cell, not two
+        (104, 27),
+        (200, 123),
+    ],
+)
+def test_the_ablation_harness_leaves_the_unprojectable_cloud_window_absent(n, expected_valid_cloud_cells):
+    from backtests.backtest_ablation_harness import precompute_4h_indicators_vectorized
+
+    res = precompute_4h_indicators_vectorized(_frame(_fixture_closes(n)))
+    for col in ("cloud_top", "cloud_bottom"):
+        valid = int(res[col].notna().sum())
+        assert valid == expected_valid_cloud_cells, (
+            f"{col}: a {n}-bar frame published {valid} cloud cells, expected "
+            f"{expected_valid_cloud_cells}. A count above max(0, n - 77) means the leading window "
+            "was back-filled with the unshifted span — the same-bar lookahead the 26-bar "
+            "projection is there to remove."
+        )
+
+
+def test_the_ablation_harness_publishes_the_projected_cloud_not_the_same_bar_cloud():
+    from backtests.backtest_ablation_harness import precompute_4h_indicators_vectorized
+
+    df = _frame(_fixture_closes(200))
+    res = precompute_4h_indicators_vectorized(df)
+
+    high, low = df["high"], df["low"]
+    tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2.0
+    kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2.0
+    span_a_raw = (tenkan + kijun) / 2.0
+    span_b_raw = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
+    projected = np.maximum(span_a_raw.shift(26), span_b_raw.shift(26))
+    same_bar = np.maximum(span_a_raw, span_b_raw)
+    assert res["cloud_top"].iloc[100] == pytest.approx(float(projected.iloc[100]))
+    assert not np.isclose(res["cloud_top"].iloc[100], float(same_bar.iloc[100])), (
+        "the published cloud is the same-bar cloud — the 26-bar projection did not happen"
+    )
+
+
+def test_the_ablation_harness_scores_no_bar_whose_cloud_is_unprojectable():
+    """A bar with no cloud cannot carry a kumo signal, so the leading window contributes no trades.
+
+    The fixture is a steady uptrend, where the same-bar cloud reads as a breakout on every bar.
+    Under the back-filled warm-up window the harness therefore published bullish signals on the
+    26 bars whose cloud contained their own highs and lows; with the window left absent it must
+    publish none of them, while the projected window is unaffected.
+    """
+    from backtests.backtest_ablation_harness import precompute_4h_indicators_vectorized
+
+    n = 200
+    res = precompute_4h_indicators_vectorized(_frame([100.0 * (1.001 ** i) for i in range(n)]))
+    assert res["bullish_kumo"].iloc[:77].sum() == 0, (
+        "the harness published a kumo signal on a bar with no measurable cloud"
+    )
+    assert res["bearish_kumo"].iloc[:77].sum() == 0
+    assert res["bullish_kumo"].iloc[77:].any(), (
+        "the fixture must produce signals on the projected window, or the guard above is vacuous"
+    )
+
+
 @pytest.mark.parametrize("field", ["atr", "cloud_top", "cloud_bottom"])
 def test_swing_entry_gate_treats_a_missing_indicator_as_no_entry(field):
     from dataclasses import replace

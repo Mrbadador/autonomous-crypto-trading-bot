@@ -158,11 +158,19 @@ def precompute_4h_indicators_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     span_a_raw = (tenkan + kijun) / 2.0
     span_b_raw = (h.rolling(52).max() + l.rolling(52).min()) / 2.0
 
-    span_a = span_a_raw.shift(26).fillna(span_a_raw)
-    span_b = span_b_raw.shift(26).fillna(span_b_raw)
+    # Always projected 26 bars, exactly as the live engine does. The `.fillna(span_raw)` that
+    # used to follow the shift back-filled the leading warm-up window with the *unshifted* span,
+    # so the arm's opening bars were scored against a cloud built from their own highs and lows.
+    # Those rows now carry no cloud at all, and a bar with no cloud produces no kumo signal.
+    span_a = span_a_raw.shift(26)
+    span_b = span_b_raw.shift(26)
 
     cloud_top = np.maximum(span_a, span_b)
     cloud_bottom = np.minimum(span_a, span_b)
+    # The cloud is published with the frame so the leading window is visibly absent rather than
+    # silently filled: a reader can see which bars had a measurable cloud at all.
+    res["cloud_top"] = cloud_top
+    res["cloud_bottom"] = cloud_bottom
 
     # True Range & ATR(14)
     prev_close = c.shift(1).fillna(c)
