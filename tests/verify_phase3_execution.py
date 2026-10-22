@@ -3,7 +3,8 @@ verify_phase3_execution.py — Sprint 3 (Phase 3) Verification Suite
 ==================================================================
 Tests and benchmarks:
   1. Bitget UTA Post-Only order mechanics (force="post_only", contract precision, inside-spread pricing).
-  2. Maker queue fill monitor (_monitor_maker_fill) with full fill rebate capture (0.02%).
+  2. Maker queue fill monitor (_monitor_maker_fill) detecting a full fill booked at the maker
+     rate (0.02%) -- a fee the engine pays, not a credit it captures.
   3. Maker monitor adverse OFI shock pre-emption and race-free market fallback.
   4. LivePaperExchange maker fee (0.02%) vs taker fee (0.04%) and zero-slippage queue modeling.
   5. CryptoContagionRadar index calculation, shock response (> 0.85), and sub-10ms event dispatch SLA.
@@ -80,7 +81,7 @@ async def test_1_post_only_order_mechanics():
     return True
 
 
-async def test_2_maker_fill_monitor_rebate_capture():
+async def test_2_maker_fill_monitor_full_fill():
     print(f"\n{INFO} --- Test 2: Maker Queue Fill Monitor - Immediate/Full Fill ---")
     from executor_agent import _monitor_maker_fill
     
@@ -114,7 +115,7 @@ async def test_2_maker_fill_monitor_rebate_capture():
     mock_uta.cancel_order.assert_not_called()
     mock_uta.create_market_order.assert_not_called()
     
-    print(f"{PASS} Maker fill monitor captured rebate (is_maker=True, 0 orphan cancels, resolved in {elapsed_ms:.1f} ms).")
+    print(f"{PASS} Maker fill monitor detected the full maker fill (is_maker=True — booked at the 0.02% maker rate, a fee the engine pays; 0 orphan cancels, resolved in {elapsed_ms:.1f} ms).")
     return True
 
 
@@ -396,7 +397,7 @@ async def main():
     
     tests = [
         test_1_post_only_order_mechanics,
-        test_2_maker_fill_monitor_rebate_capture,
+        test_2_maker_fill_monitor_full_fill,
         test_3_maker_fill_monitor_adverse_shock_fallback,
         test_4_paper_exchange_maker_fee_accounting,
         test_5_crypto_contagion_radar_and_sla,
