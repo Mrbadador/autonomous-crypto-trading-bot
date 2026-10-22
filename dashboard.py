@@ -1322,11 +1322,17 @@ def _absence_note(reason: str) -> str:
 # to a status the engine never claimed. The live telemetry carries five keys for a DISABLED engine,
 # so the HUD was publishing a delta-neutral carry book with a 100% liquidation buffer for a
 # position that does not exist. Each field is now read on its own, and an absent field says so.
-# These three are the panel's OWN thresholds — they are not measurements and are labelled where
-# they are shown.
+# These four economics thresholds are the panel's OWN — they are not measurements and are labelled
+# where they are shown: `panel scale:` on the fee bar, `panel min-buffer threshold:` on the
+# liquidation guard, the `±$… panel threshold` on the net-delta posture, and the green rung
+# `_BASIS_SAFE_BUFFER_PCT` that guard has to clear before it prints an all-clear.
 _BASIS_FEE_SCALE_PCT = 125.0
 _BASIS_MIN_BUFFER_PCT = 20.0
 _BASIS_NEUTRAL_TOL_USD = 1.0
+# The engine publishes its own minimum liquidation buffer as `min_liq_distance_pct`
+# (basis_trader.py:836) and that figure drives the amber rung. Green is the panel's own: sitting at
+# someone's minimum is not the same as being clear of it.
+_BASIS_SAFE_BUFFER_PCT = 30.0
 # Telemetry older than this is reported as stale rather than being allowed to look current.
 _BASIS_STALE_DAYS = 1.0
 
@@ -1336,9 +1342,20 @@ _BASIS_STALE_DAYS = 1.0
 _BASIS_STATE_BADGES = {
     "ACTIVE_DELTA_NEUTRAL": ("#00ff66", "🟢 ACTIVE 1:1 DELTA-NEUTRAL TWIN"),
     "PENDING_PERP_FILL": ("#ffcc00", "⏳ PENDING PERP MAKER FILL (15s GATE)"),
+    # IDLE is the engine's own resting state (`self.state = "IDLE"` at basis_trader.py:155, :161,
+    # :410, :477, :503, :691) — running, evaluating the gate, holding no twin position. It is not
+    # an all-clear, so it wears the parked slate rather than the active green.
+    "IDLE": ("#64748b", "▶️ IDLE — ENGINE RUNNING, NO TWIN POSITION OPEN"),
     "UNWINDING": ("#ff003c", "⚠️ UNWINDING TWIN POSITION"),
     "DISABLED": ("#64748b", "⏸️ PARKED / DISABLED"),
 }
+
+
+# What the coverage headline does NOT count: `age_days` and `stale` are derived from the payload's
+# own timestamp rather than published beside it, and `timestamp` is reported on the age line, so
+# none of the three is an economics field. The roster itself is derived from `_basis_readings`, so a
+# field added there is counted the day it lands instead of waiting for a hand-kept tuple.
+_BASIS_COVERAGE_EXCLUDED = ("age_days", "stale", "timestamp")
 
 
 def _basis_readings(basis_data, now=None) -> dict:
@@ -1390,6 +1407,10 @@ def _basis_readings(basis_data, now=None) -> dict:
         "fee_amortized_pct": _number("fee_amortized_pct"),
         "liquidation_price": _number("liquidation_price"),
         "distance_to_liq_pct": _number("distance_to_liq_pct"),
+        # The engine's own minimum liquidation buffer, published next to the distance above it
+        # (basis_trader.py:836). A published 0.0 is a threshold the engine actually enforces, so it
+        # is read through the same path as every other figure rather than defaulted.
+        "min_liq_distance_pct": _number("min_liq_distance_pct"),
         "basis_spread_usd": _number("basis_spread_usd"),
         "basis_dislocation_pct": _number("basis_dislocation_pct"),
     }
@@ -4090,6 +4111,7 @@ with tab_ai:
         b_fee_amort_st = b_r["fee_amortized_pct"]
         b_liq_price_st = b_r["liquidation_price"]
         b_dist_liq_st = b_r["distance_to_liq_pct"]
+        b_min_liq_st = b_r["min_liq_distance_pct"]
         b_spread_st = b_r["basis_spread_usd"]
         b_disloc_st = b_r["basis_dislocation_pct"]
 
@@ -4113,6 +4135,7 @@ with tab_ai:
         b_fee_amort_text = f"{b_fee_amort_st['value']:.1f}%" if b_fee_amort_st["measured"] else "not measured"
         b_fee_amort_note = "" if b_fee_amort_st["measured"] else _absence_note(b_fee_amort_st["reason"])
         b_fee_target_text = f"${b_fee_target_st['value']:.2f}" if b_fee_target_st["measured"] else "not measured"
+        b_fee_target_note = "" if b_fee_target_st["measured"] else _absence_note(b_fee_target_st["reason"])
         b_liq_price_text = f"${b_liq_price_st['value']:,.2f}" if b_liq_price_st["measured"] else "not measured"
         b_liq_price_note = "" if b_liq_price_st["measured"] else _absence_note(b_liq_price_st["reason"])
         b_dist_liq_text = f"+{b_dist_liq_st['value']:.1f}% Buffer" if b_dist_liq_st["measured"] else "not measured"
@@ -4120,14 +4143,21 @@ with tab_ai:
         b_margin_mode_text = b_margin_mode_st["text"].upper() if b_margin_mode_st["measured"] else "not measured"
         b_margin_mode_note = "" if b_margin_mode_st["measured"] else _absence_note(b_margin_mode_st["reason"])
         b_holding_text = f"{b_holding_st['value']:.1f}d" if b_holding_st["measured"] else "not measured"
+        b_holding_note = "" if b_holding_st["measured"] else _absence_note(b_holding_st["reason"])
         b_min_holding_text = f"{b_min_holding_st['value']:.0f}d" if b_min_holding_st["measured"] else "not measured"
+        b_min_holding_note = "" if b_min_holding_st["measured"] else _absence_note(
+            b_min_holding_st["reason"])
 
         # Net-delta posture: the word "Neutral" used to be hardcoded beside the figure, so the
         # panel asserted a hedged book even when no delta was published. It is now derived from the
-        # published delta only, and says nothing when there is none.
+        # published delta only, and says nothing when there is none. The tolerance it is judged
+        # against is this panel's own pick, so the verdict names it instead of reading as a
+        # property of the book.
         if b_net_delta_st["measured"]:
-            b_delta_posture = ("Neutral" if abs(b_net_delta_st["value"]) <= _BASIS_NEUTRAL_TOL_USD
-                               else "Not neutral")
+            b_delta_posture = (
+                f"Neutral (±${_BASIS_NEUTRAL_TOL_USD:.2f} panel threshold)"
+                if abs(b_net_delta_st["value"]) <= _BASIS_NEUTRAL_TOL_USD
+                else f"Not neutral (±${_BASIS_NEUTRAL_TOL_USD:.2f} panel threshold)")
             delta_color = "#00e5ff"
         else:
             b_delta_posture = "posture not measured"
@@ -4187,10 +4217,25 @@ with tab_ai:
             funding_color = "#00ff66" if b_funding_st["value"] >= 0.0 else "#ff003c"
         else:
             funding_color = "#94a3b8"
+        # The liquidation guard's amber rung is the minimum the ENGINE publishes for itself
+        # (`min_liq_distance_pct`, basis_trader.py:836 — the same figure it checks its own distance
+        # against at `:315`), so the printed threshold is the operative one. The panel's own
+        # `_BASIS_MIN_BUFFER_PCT` only stands in when nothing was published, and the label says
+        # which of the two is in force. Green is always the panel's own safe-clear rung and never
+        # sits below the threshold in force.
+        b_buffer_threshold_pct = (b_min_liq_st["value"] if b_min_liq_st["measured"]
+                                  else _BASIS_MIN_BUFFER_PCT)
+        b_buffer_label = (
+            f"engine min-buffer threshold: {b_buffer_threshold_pct:.1f}%"
+            if b_min_liq_st["measured"] else
+            f"panel min-buffer threshold: {_BASIS_MIN_BUFFER_PCT:.0f}% (panel's own — the engine "
+            f"published no threshold)")
         if b_dist_liq_st["measured"]:
-            liq_color = "#00ff66" if b_dist_liq_st["value"] >= 30.0 else (
-                "#ff9900" if b_dist_liq_st["value"] >= 20.0 else "#ff003c")
-            margin_guard_color = "#00ff66" if b_dist_liq_st["value"] >= 30.0 else "#ff9900"
+            b_buffer_guard_ok = (b_dist_liq_st["value"] >= _BASIS_SAFE_BUFFER_PCT
+                                 and b_dist_liq_st["value"] >= b_buffer_threshold_pct)
+            liq_color = "#00ff66" if b_buffer_guard_ok else (
+                "#ff9900" if b_dist_liq_st["value"] >= b_buffer_threshold_pct else "#ff003c")
+            margin_guard_color = "#00ff66" if b_buffer_guard_ok else "#ff9900"
         else:
             liq_color = "#94a3b8"
             margin_guard_color = "#94a3b8"
@@ -4210,11 +4255,12 @@ with tab_ai:
             if b_harvest_st["measured"] else "#94a3b8"
 
         # One honest headline for a panel whose engine is parked: say how much of it was never
-        # measured, instead of letting each blank look like a zero.
-        b_economics_states = (b_state_st, b_reason_st, b_margin_mode_st, b_funding_st, b_yield_st,
-                              b_hurdle_st, b_unwind_st, b_alloc_st, b_harvest_st, b_net_delta_st,
-                              b_holding_st, b_min_holding_st, b_fee_target_st, b_fee_amort_st,
-                              b_liq_price_st, b_dist_liq_st, b_spread_st, b_disloc_st)
+        # measured, instead of letting each blank look like a zero. The roster is the reader's own
+        # key set minus the age fields, so a field added to `_basis_readings` is counted the day it
+        # lands: a hand-kept tuple is the one way this headline could go on saying "15 of 18" about
+        # a panel that had changed underneath it.
+        b_economics_states = tuple(one_st for one_key, one_st in b_r.items()
+                                   if one_key not in _BASIS_COVERAGE_EXCLUDED)
         b_unmeasured_count = sum(1 for one_st in b_economics_states if not one_st["measured"])
         b_field_count = len(b_economics_states)
         if b_unmeasured_count:
@@ -4247,7 +4293,7 @@ with tab_ai:
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">ANNUALIZED YIELD</span><br>
-                    <b style="color: {yield_color}; font-size: 0.95rem;">{b_yield_text}</b>{b_yield_note} <span style="font-size:0.72rem; color:#64748b;">(Hurdle: {b_hurdle_text}{b_hurdle_note})</span>
+                    <b style="color: {yield_color}; font-size: 0.95rem;">{b_yield_text}</b>{b_yield_note} <span style="font-size:0.72rem; color:#94a3b8;">(Hurdle: {b_hurdle_text}{b_hurdle_note})</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">SPOT VS PERP SPREAD</span><br>
@@ -4271,13 +4317,13 @@ with tab_ai:
                     <div style="width: 100%; background: #1e293b; height: 6px; border-radius: 3px; margin: 5px 0; overflow: hidden;">
                         <div style="width: {fee_bar_width:.1f}%; background: {fee_color}; height: 100%; border-radius: 3px;"></div>
                     </div>
-                    <span style="color: #cbd5e1; font-size: 0.72rem;">Harvested: {b_harvest_text} · Target: {b_fee_target_text} · Hold: {b_holding_text} / {b_min_holding_text}</span>
+                    <span style="color: #cbd5e1; font-size: 0.72rem;">Harvested: {b_harvest_text}{b_harvest_note} · Target: {b_fee_target_text}{b_fee_target_note} · Hold: {b_holding_text}{b_holding_note} / {b_min_holding_text}{b_min_holding_note}</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">PERP SHORT LIQUIDATION GUARD</span><br>
                     <b style="color: {liq_color}; font-size: 0.95rem;">{b_dist_liq_text}</b>{b_dist_liq_note}
                     <span style="color: #94a3b8; font-size: 0.72rem; margin-left: 6px;">(Liq: {b_liq_price_text}{b_liq_price_note})</span><br>
-                    <span style="color: {margin_guard_color}; font-size: 0.72rem;">Margin mode: {b_margin_mode_text}{b_margin_mode_note} · panel min-buffer threshold: {_BASIS_MIN_BUFFER_PCT:.0f}%</span>
+                    <span style="color: {margin_guard_color}; font-size: 0.72rem;">Margin mode: {b_margin_mode_text}{b_margin_mode_note} · {b_buffer_label}</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">EXECUTION STATE MACHINE</span><br>

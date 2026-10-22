@@ -3882,11 +3882,15 @@ def _g5_active_engine_payload():
 
 
 # The fields the panel used to invent and that the live five-key payload does not carry.
+# `min_liq_distance_pct` joined this list when the guard started reading the engine's own published
+# minimum instead of hardcoding a ladder (M-2): the parked path publishes no threshold, and a
+# threshold of `0.0` from a running engine is a legitimate reading, not an absence.
 _G5_ABSENT_IN_LIVE = ("capital_allocated_usd", "hurdle_rate_pct", "distance_to_liq_pct",
                       "margin_mode", "annualized_yield_pct", "unwind_hurdle_pct",
                       "funding_rate_8h", "cumulative_funding_harvested", "liquidation_price",
                       "fee_amortized_pct", "fee_hurdle_target_usd", "holding_days",
-                      "min_holding_days", "basis_spread_usd", "basis_dislocation_pct")
+                      "min_holding_days", "basis_spread_usd", "basis_dislocation_pct",
+                      "min_liq_distance_pct")
 
 # The fields published through `_published_state`, which carry {"text"} instead of {"value"}.
 _G5_TEXT_FIELDS = ("state", "reason", "margin_mode", "timestamp")
@@ -3908,11 +3912,12 @@ _G5_FIELD_OWNERS = {
     "b_harvest_text": "b_harvest_st", "b_harvest_note": "b_harvest_st",
     "b_net_delta_text": "b_net_delta_st", "b_net_delta_note": "b_net_delta_st",
     "b_fee_amort_text": "b_fee_amort_st", "b_fee_amort_note": "b_fee_amort_st",
-    "b_fee_target_text": "b_fee_target_st",
+    "b_fee_target_text": "b_fee_target_st", "b_fee_target_note": "b_fee_target_st",
     "b_liq_price_text": "b_liq_price_st", "b_liq_price_note": "b_liq_price_st",
     "b_dist_liq_text": "b_dist_liq_st", "b_dist_liq_note": "b_dist_liq_st",
     "b_margin_mode_text": "b_margin_mode_st", "b_margin_mode_note": "b_margin_mode_st",
-    "b_holding_text": "b_holding_st", "b_min_holding_text": "b_min_holding_st",
+    "b_holding_text": "b_holding_st", "b_holding_note": "b_holding_st",
+    "b_min_holding_text": "b_min_holding_st", "b_min_holding_note": "b_min_holding_st",
 }
 
 # Every verdict/colour the block derives, and so every one that must be guarded.
@@ -3921,7 +3926,22 @@ _G5_DERIVED_NAMES = frozenset({
     "fee_bar_width", "margin_guard_color", "disloc_color", "harvest_color", "delta_color",
     "b_delta_posture", "b_time_text", "b_time_color", "b_reason_line", "b_coverage_line",
     "b_unmeasured_count", "b_is_stale", "b_age_days",
+    # M-2: the threshold now in force, the label that names where it came from, and the verdict the
+    # green rung rests on. M-7: the roster the coverage headline counts out of, and its length.
+    "b_buffer_threshold_pct", "b_buffer_label", "b_buffer_guard_ok", "b_economics_states",
+    "b_field_count",
 })
+
+# M-6: three verdicts talk about ALL the fields at once, so none of them can read one field's
+# `measured` flag. They are exempt from the structural gate BY SHAPE, and the guard enforces the
+# shape — each must read only `b_r` or another derived verdict and name no field-state variable, so
+# the exemption can never be used to smuggle an ungated single-field verdict past the test.
+_G5_CHAIN_VERDICTS = frozenset({"b_economics_states", "b_field_count", "b_coverage_line"})
+
+
+def _g5_reads_measured_flag(text):
+    """True when `text` reads a published reading's `measured` flag, rather than saying the word."""
+    return re.search(r"\[[\"']measured[\"']\]", text) is not None
 
 
 # ── M-5: a negative scan means CODE, not prose ──────────────────────────────────────────
@@ -3993,6 +4013,25 @@ def _g5_block_code(path=None):
 def _g5_helper_code(name="_basis_readings"):
     """One module-level helper's source, comments removed."""
     return _g5_code_only(_function_source(DASHBOARD, name))
+
+
+def _g5_coverage_excluded():
+    """The panel's own `_BASIS_COVERAGE_EXCLUDED`, read out of dashboard.py's syntax tree.
+
+    The coverage headline counts the reader's keys minus this tuple, so the test has to take the
+    same set from the same place or it is checking a transcription of the roster.
+    """
+    import ast
+
+    src = DASHBOARD.read_text(encoding="utf-8")
+    for node in ast.parse(src, filename=str(DASHBOARD)).body:
+        targets = ([node.target] if isinstance(node, ast.AnnAssign)
+                   else (node.targets if isinstance(node, ast.Assign) else []))
+        if any(isinstance(t, ast.Name) and t.id == "_BASIS_COVERAGE_EXCLUDED" for t in targets):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError(
+        "dashboard.py no longer defines _BASIS_COVERAGE_EXCLUDED, so the coverage headline has no "
+        "stated rule about which entries are not economics fields")
 
 
 class _G5RecordingStreamlit:
@@ -4397,7 +4436,15 @@ def test_g5a_the_replacements_are_present_and_reachable():
     assert "Engine-reported reason: <b style='color: #e2e8f0;'>" \
            "Temporarily parked for account segregation</b>" in html, html
     assert "35d old · ⚠️ STALE TELEMETRY" in html, html
-    assert "15 of 18 economics fields" in html, html
+    # M-7: the headline is now counted out of `_basis_readings`' own key set. It read "15 of 18"
+    # while the tuple and the helper were hand-shadows of each other; the engine's published
+    # minimum buffer joined the roster, so the honest figure for today's five-key payload is 16 of
+    # 19. Pinned against the helper rather than against a literal, so it cannot go stale again.
+    roster = [key for key in _g5_readings(dict(_G5_LIVE_PAYLOAD))
+              if key not in _g5_coverage_excluded()]
+    assert sorted(roster) == sorted(set(_G5_ALL_FIELDS) - {"timestamp"}), roster
+    assert len(roster) == 19, roster
+    assert f"16 of {len(roster)} economics fields" in html, html
     # And the state that was never published really does reach the absence badge.
     no_state = dict(_G5_LIVE_PAYLOAD)
     no_state.pop("state")
@@ -4412,6 +4459,145 @@ def test_g5a_an_unrecognised_published_state_is_not_renamed():
     html, _fake = _g5_render_carry_panel(
         None, payload={**_G5_LIVE_PAYLOAD, "state": "REBALANCING_HALTED"})
     assert "STATE PUBLISHED, UNRECOGNISED: REBALANCING_HALTED" in html, html[:2000]
+
+
+# Group 5b — M-1 to M-4: every number the panel shows says whose number it is.
+def test_g5a_the_neutral_posture_names_the_threshold_it_was_judged_against():
+    """M-1: the header comment claims the panel's own thresholds are labelled where they are shown.
+    Two of them were; a bare `· Neutral` was the third, and it read as a property of the book rather
+    than as a tolerance this HUD picked. The label is interpolated from the constant the verdict
+    actually compares against, so the prose cannot drift away from the number.
+
+    The parked payload's `net_delta: 0.0` stays a reading throughout: a recorded zero is a fact.
+    """
+    block = _g5_block_code()
+    assert '"Neutral (±${_BASIS_NEUTRAL_TOL_USD:.2f} panel threshold)"' in block, (
+        "the posture no longer names the panel threshold it was judged against")
+    assert "(±$1.00" not in block, (
+        "the tolerance is typed into the prose instead of read from the constant that enforces it")
+    html, _fake = _g5_render_carry_panel(None)
+    assert "Neutral (±$1.00 panel threshold)" in html, html[:2500]
+    assert "$+0.00" in html, "the published zero stopped being a reading"
+    html2, _fake2 = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "net_delta": 40.0})
+    assert "Not neutral (±$1.00 panel threshold)" in html2, html2[:2500]
+
+
+@pytest.mark.parametrize("published_min,expected_label", [
+    (20.0, "engine min-buffer threshold: 20.0%"),
+    (0.0, "engine min-buffer threshold: 0.0%"),
+])
+def test_g5a_the_buffer_ladder_is_driven_by_the_threshold_the_engine_publishes(
+        published_min, expected_label):
+    """M-2: the guard went green at a hardcoded 30 % while printing "threshold: 20 %", and the
+    engine's own `min_liq_distance_pct` (`basis_trader.py:836`, the same figure it compares its
+    distance against at `:315`) was never read. The published minimum is now the amber rung and the
+    label names where it came from. A threshold of 0.0 is a threshold the engine enforces, so it
+    stays a reading rather than being read as an absence."""
+    html, _fake = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "distance_to_liq_pct": 24.5,
+                       "min_liq_distance_pct": published_min})
+    assert expected_label in html, html[:2500]
+
+
+def test_g5a_a_book_under_the_published_minimum_is_not_printed_as_clear():
+    """The threshold has to be operative, not decorative: 24.5 % of buffer against an engine that
+    asks for 40 % is an alarm, and it cannot be bought by a panel constant."""
+    html, _fake = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "distance_to_liq_pct": 24.5,
+                       "min_liq_distance_pct": 40.0})
+    assert "engine min-buffer threshold: 40.0%" in html, html[:2500]
+    assert "#ff003c" in html, "a book 15 points under the engine's own minimum wears no alarm"
+
+
+def test_g5a_the_guard_falls_back_to_the_panels_own_number_and_says_so():
+    """Nothing published a threshold, so the panel's own stands in — and the label says which of the
+    two the operator is looking at."""
+    html, _fake = _g5_render_carry_panel(None)
+    assert ("panel min-buffer threshold: 20% (panel's own — the engine published no threshold)"
+            in html), html[:2500]
+
+
+def test_g5a_the_buffer_ladder_has_no_bare_rungs():
+    block = _g5_block_code()
+    for bare in (">= 30.0", ">= 20.0"):
+        assert bare not in block, f"the liquidation ladder still hardcodes {bare}"
+    assert "_BASIS_SAFE_BUFFER_PCT" in block, "the green rung has no name to point at"
+    assert '"min_liq_distance_pct"' in _g5_helper_code(), (
+        "the engine's published minimum buffer is no longer read as a measurement")
+
+
+def test_g5a_the_harvest_line_explains_every_absence_it_shows():
+    """M-3: `Harvested: … · Target: … · Hold: … / …` rendered three published fields as a bare
+    `not measured` while every other field on the panel carried its reason, so the branch's
+    convention was 13-for-18 and the field-owner harness had no entry to defend them."""
+    block = _g5_block_code()
+    for note in ("b_fee_target_note", "b_holding_note", "b_min_holding_note"):
+        assert f"{note} = " in block, f"the harvest line has no {note} any more"
+        assert f"{{{note}}}" in block, f"{note} is built but never rendered"
+    html, _fake = _g5_render_carry_panel(None)
+    for key in ("fee_hurdle_target_usd", "holding_days", "min_holding_days"):
+        assert f"(no {key} in basis trader telemetry)" in html, (key, html[:2500])
+
+
+def test_g5a_the_hurdle_parenthetical_wears_the_absence_grey():
+    """M-4: `(Hurdle: not measured …)` was painted the parked-DISABLED slate, so an absence wore a
+    colour that means something else on this panel."""
+    block = _g5_block_code()
+    assert 'color:#94a3b8;">(Hurdle:' in block, "the hurdle parenthetical is not absence grey"
+    assert 'color:#64748b;">(Hurdle:' not in block, (
+        "the hurdle parenthetical still wears the parked slate")
+
+
+def test_g5a_the_coverage_headline_counts_the_readers_own_fields():
+    """M-7: the headline used to be built from a hand-kept 18-tuple that had to shadow
+    `_basis_readings`. Add a field to the reader, forget it in the tuple, and the panel prints a
+    number about itself that is no longer true — this branch's own defect class, in its own caption.
+
+    The count for today's five-key payload moved from "15 of 18" to "16 of 19" when the engine's
+    published minimum buffer joined the roster: one more field nobody published, counted honestly.
+    """
+    block = _g5_block_code()
+    assert "b_r.items()" in block and "_BASIS_COVERAGE_EXCLUDED" in block, (
+        "the coverage roster is not derived from the reader any more")
+    assert "b_state_st, b_reason_st, b_margin_mode_st" not in block, (
+        "the coverage roster is a hand-shadow of the reader again")
+    excluded = set(_g5_coverage_excluded())
+    assert {"age_days", "stale"} <= excluded, excluded
+    assert excluded <= set(_g5_readings({})), excluded
+    html, _fake = _g5_render_carry_panel(None)
+    assert "16 of 19 economics fields" in html, html[:2500]
+
+
+def test_g5a_a_running_but_scanning_engine_gets_an_honest_badge():
+    """M-8: IDLE is the state the engine holds for most of its life (`basis_trader.py:155`, `:161`,
+    `:410`, `:477`, `:503`, `:691`), and the panel shrugged at it as `STATE PUBLISHED, UNRECOGNISED`.
+    It has its own entry now — and it is not green, because an engine with no twin position has not
+    earned an all-clear."""
+    html, _fake = _g5_render_carry_panel(None, payload={**_G5_LIVE_PAYLOAD, "state": "IDLE"})
+    assert "IDLE — ENGINE RUNNING, NO TWIN POSITION OPEN" in html, html[:2000]
+    assert "STATE PUBLISHED, UNRECOGNISED" not in html, html[:2000]
+    assert "border-left: 3px solid #64748b" in html, "IDLE was promoted to a measured colour"
+
+
+def test_g5a_an_unknown_state_still_shows_as_published():
+    """The IDLE entry must not have become a catch-all: a state this panel has never heard of is
+    still shown as published, never quietly renamed."""
+    html, _fake = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "state": "SOMETHING_ELSE"})
+    assert "STATE PUBLISHED, UNRECOGNISED: SOMETHING_ELSE" in html, html[:2000]
+
+
+def test_g5a_the_panel_still_ignores_the_published_status_key():
+    """`status` is a claim the engine makes about itself (`basis_trader.py:812`) that this panel has
+    never rendered and does not start rendering now: the badge reads `state`, and one field gets one
+    word rather than two opinions about the same engine."""
+    assert '"status"' not in _g5_helper_code(), (
+        "the reader started reading `status`, which renders nowhere on this panel")
+    html, _fake = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "state": "IDLE", "status": "SCANNING_YIELD"})
+    assert "SCANNING_YIELD" not in html, html[:2000]
+    assert "IDLE — ENGINE RUNNING, NO TWIN POSITION OPEN" in html, html[:2000]
 
 
 def test_g5a_the_disabled_engine_keeps_its_dimmed_colour_and_is_not_promoted():
@@ -4433,6 +4619,24 @@ def _function_source(path, name):
     raise AssertionError(f"{path.name} has no module-level function named {name}")
 
 
+def _g5_enclosing_measured_flag_guard(node, parents, block):
+    """Like `_g4_enclosing_measured_guard`, but the gate has to READ a flag, not mention one.
+
+    G-4's version accepts any `measured` in the enclosing `If` test, which a message can supply. For
+    this panel the difference mattered: the coverage headline's own string ends "as not measured, not
+    as readings", so the word in a message was gating a verdict.
+    """
+    import ast
+
+    ancestor = parents.get(id(node))
+    while ancestor is not None:
+        if isinstance(ancestor, ast.If) and _g5_reads_measured_flag(
+                ast.get_source_segment(block, ancestor.test) or ""):
+            return True
+        ancestor = parents.get(id(ancestor))
+    return False
+
+
 def test_g5a_every_derived_verdict_in_the_carry_panel_guards_on_measured():
     """A verdict computed from a reading that can be absent either raises TypeError (the panel then
     publishes NOTHING, which is worse than any stand-in) or publishes an all-clear nobody measured.
@@ -4440,11 +4644,13 @@ def test_g5a_every_derived_verdict_in_the_carry_panel_guards_on_measured():
     Ancestor-walk over the enclosing `If` gates, the approach `test_g4_the_radar_banner_...` uses;
     its known limitation — a bundled gate also has `measured` in its test — is why the field values
     are checked separately and more strictly by `test_g5a_the_carry_panel_keys_each_field_on_its_own_state`.
+
+    M-6: the evidence is now a flag read out of the comment-stripped block, so neither a note nor a
+    message can gate a verdict. The three verdicts that count every field at once are exempt by
+    shape, and the shape is asserted here rather than assumed in a list.
     """
     import ast
 
-    # M-5/M-6: the segments this guard reads are comment-stripped source, so the word "measured"
-    # has to come from the panel's code — a note beside an unguarded verdict no longer satisfies it.
     block = _g5_block_code()
     tree = ast.parse(block, filename="dashboard.py carry panel")
     parents = _g4_parent_map(tree)
@@ -4461,12 +4667,47 @@ def test_g5a_every_derived_verdict_in_the_carry_panel_guards_on_measured():
                 continue
             seen.add(target.id)
             segment = ast.get_source_segment(block, node) or ""
-            assert "measured" in segment or _g4_enclosing_measured_guard(node, parents, block), (
+            if _g5_reads_measured_flag(segment) or _g5_enclosing_measured_flag_guard(
+                    node, parents, block):
+                continue
+            assert target.id in _G5_CHAIN_VERDICTS, (
                 f"the carry panel derives {target.id} from a reading that can be absent: "
                 f"{segment[:160]}")
+            names_state = sorted(set(re.findall(r"\bb_[a-z_]*_st\b", segment)))
+            assert not names_state, (
+                f"{target.id} claims the chain exemption but names field state {names_state}, so it "
+                "is a single-field verdict and has to be gated like every other one")
     missing = sorted(_G5_DERIVED_NAMES - seen)
     assert not missing, (
         f"the carry panel no longer derives {missing}, so this guard has nothing to check")
+
+
+def test_g5a_a_prose_measured_gates_nothing_any_more():
+    """M-6, proved rather than asserted: the coverage headline passes on its gate and its chain, not
+    on the words it prints.
+
+    The headline still says "not measured" — that is the honest sentence an operator reads — but it
+    is no longer evidence of anything. The count underneath it is: it reads each field's own flag,
+    and the `if` lets the line through only when something really went unpublished.
+    """
+    import ast
+
+    block = _g5_block_code()
+    tree = ast.parse(block, filename="dashboard.py carry panel")
+    segments = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            segments.setdefault(node.targets[0].id, ast.get_source_segment(block, node) or "")
+    headline = segments["b_coverage_line"]
+    assert "not measured" in headline, "the honest headline message changed"
+    assert not _g5_reads_measured_flag(headline), (
+        "the coverage headline now reads a flag itself, so the chain exemption no longer describes "
+        "it and the exemption list is stale")
+    assert _g5_reads_measured_flag(segments["b_unmeasured_count"]), (
+        "the count the headline is built from no longer reads each field's own flag, so the "
+        "exemption would be hiding an unguarded verdict")
+    assert "if b_unmeasured_count:" in block, (
+        "the headline has no gate of its own, so it can print a coverage claim nobody measured")
 
 
 @pytest.mark.parametrize("field,own_key", sorted(_G5_FIELD_OWNERS.items()))
