@@ -339,6 +339,36 @@ def test_cloud_is_projected_26_bars_ahead_like_the_live_engine():
     assert df["cloud_top"].iloc[100] != pytest.approx(float(same_bar_cloud_top.iloc[100]))
 
 
+# The projection used to be conditional: `if len(df) >= 78` shifted, `else` published the raw span at
+# the bar that produced it — the same-bar lookahead the shift exists to remove, handed back to every
+# short frame. The guard is gone, so the 26-bar projection must hold at every length: a frame too short
+# to have measured a cloud says so with NaN instead of with a value read off its own bar.
+@pytest.mark.parametrize(
+    "n, expected_valid_cloud_cells",
+    [
+        (20, 0),    # shorter than the 52-bar span itself
+        (52, 0),    # span_b becomes computable on the last bar, so it is still 26 bars from being publishable
+        (60, 0),    # the brief's short frame: no cloud, not a same-bar cloud
+        (77, 0),    # the bar immediately below the deleted guard's threshold
+        (78, 1),    # the threshold bar: one projected cell, not two
+        (104, 27),
+        (200, 123),
+    ],
+)
+def test_the_cloud_is_projected_26_bars_at_every_frame_length(n, expected_valid_cloud_cells):
+    df = _indicator_frame(n)
+    assert len(df) == n, "the fixture must survive indicator preparation intact for this assertion to mean anything"
+    for col in ("cloud_top", "cloud_bottom"):
+        valid = int(df[col].notna().sum())
+        assert valid == expected_valid_cloud_cells, (
+            f"{col}: a {n}-bar frame published {valid} cloud cells, expected {expected_valid_cloud_cells}. "
+            "A count above max(0, n - 77) means the cloud reached the frame unshifted, i.e. the same-bar "
+            "lookahead the 26-bar projection is there to remove."
+        )
+        if expected_valid_cloud_cells == 0:
+            assert df[col].isna().all(), f"{col}: a {n}-bar frame must carry no cloud value at all"
+
+
 @pytest.mark.parametrize("field", ["atr", "cloud_top", "cloud_bottom"])
 def test_swing_entry_gate_treats_a_missing_indicator_as_no_entry(field):
     from dataclasses import replace

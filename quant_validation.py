@@ -83,12 +83,11 @@ def _prepare_indicator_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["kijun"] = (high.rolling(26).max() + low.rolling(26).min()) / 2.0
     span_a_raw = (df["tenkan"] + df["kijun"]) / 2.0
     span_b_raw = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
-    if len(df) >= 78:
-        span_a = span_a_raw.shift(26)
-        span_b = span_b_raw.shift(26)
-    else:
-        span_a = span_a_raw
-        span_b = span_b_raw
+    # Always projected 26 bars like the live engine. The previous `if len(df) >= 78 / else` guard fell back to
+    # the *unshifted* span for short frames, so any frame under 78 bars got the lookahead back; on the
+    # production path such a frame is dropped at the 120-bar check, so the branch bought nothing.
+    span_a = span_a_raw.shift(26)
+    span_b = span_b_raw.shift(26)
     df["cloud_top"] = np.maximum(span_a, span_b)
     df["cloud_bottom"] = np.minimum(span_a, span_b)
 
