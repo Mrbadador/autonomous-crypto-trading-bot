@@ -9,6 +9,7 @@ from datetime import datetime
 from backtests.backtest_ablation_harness import (
     MIN_BOOTSTRAP_TRADES,
     format_ev_ci,
+    format_profit_factor,
     format_sharpe,
     format_sharpe_basis,
     precompute_4h_indicators_vectorized,
@@ -222,7 +223,8 @@ def write_report(all_results, report_path=None):
                 ci = format_ev_ci(r["ev_mean"], r["ev_ci_90"])
                 sharpe_str = format_sharpe(r.get("sharpe"), r.get("n_trades", 0))
                 basis_str = format_sharpe_basis(r.get("sharpe_trades_per_year"), r.get("n_trades", 0))
-                f.write(f"| {r['name']} | {r['n_trades']} | {r['win_rate']:.1f}% | {r['total_return']:+.2f}% | {r['profit_factor']:.2f} | {sharpe_str} | {basis_str} | {ci} |\n")
+                pf_str = format_profit_factor(r.get("profit_factor"), r.get("n_trades", 0))
+                f.write(f"| {r['name']} | {r['n_trades']} | {r['win_rate']:.1f}% | {r['total_return']:+.2f}% | {pf_str} | {sharpe_str} | {basis_str} | {ci} |\n")
             f.write("\n")
             
         # One row lookup per asset: each gate section below reads its OWN ablation arm.

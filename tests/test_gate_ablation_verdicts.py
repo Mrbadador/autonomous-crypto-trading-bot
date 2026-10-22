@@ -6,39 +6,94 @@ verdict strings the report writer used to emit as literals ("KEEP (CRITICAL ALPH
 "KEEP (POSITIVE STATISTICAL FILTER)", "RETAIN AS STRUCTURAL TAIL-RISK BRAKES", "KEEP") no matter
 what the harness's bootstrap found.
 
-Arms are built here as plain dicts, not by running the sweep. ``_arm`` carries the measurement-bearing
-keys a published arm has (n_trades, trades with ``net_pnl``, ev_mean, ev_ci_90, sharpe,
-sharpe_trades_per_year) using the producer's absence conventions — ``ev_ci_90`` is None unless an
-interval was actually estimated — and ``_row`` completes them into a table row (win_rate,
-total_return, profit_factor, gate_fires, name). Nothing in this file runs the multi-minute historical
-sweep, reads ``data/historical/*.csv``, or touches a ``.db``.
+Arms are built here as plain dicts, not by running the sweep. ``_arm`` carries the full key set a
+published arm has (n_trades, win_rate, total_return, profit_factor, sharpe,
+sharpe_trades_per_year, ev_mean, ev_ci_90, gate_fires, trades with ``net_pnl``) using the producer's
+absence conventions and the producer's own bootstrap for the interval — ``ev_ci_90`` is None only
+when the sample is too small to estimate one, and ``profit_factor`` is None only when the series has
+no losing trade. ``_row`` completes an arm into a table row by naming it and supplying the two
+synthetic figures the renderer tests exist to pin (a measured Sharpe and its trades/year basis).
+Nothing in this file runs the multi-minute historical sweep, reads ``data/historical/*.csv``, or
+touches a ``.db``.
 """
 
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
 
 
-def _arm(pnls, ci=None):
-    """A populated arm, shaped like the producer's output: no interval and no ratio are invented.
+@lru_cache(maxsize=None)
+def _ev_ci_90(pnls):
+    """The producer's own per-arm EV interval for this PnL series, or None when it has none.
 
-    ``ci`` stays opt-in because every verdict in this file is computed from the per-trade PnL series,
-    not from the stored interval; the default is the ``None`` the harness writes when there was
-    nothing to bootstrap, never a fabricated zero-width pair. ``sharpe``/``sharpe_trades_per_year``
-    are published as absence here — the fixture has no measured Sharpe to report — and only ``_row``
-    supplies the numbers the table renderer needs.
+    The fixture asks the harness for the interval instead of inventing one, so an arm's
+    ``(ev_mean, ev_ci_90)`` pair is always a pair ``run_ablation_simulation`` could have published:
+    a large arm carries a real interval, a small arm carries the absence. Cached because the file
+    builds the same series repeatedly and the bootstrap runs 1,500 resamples.
     """
-    return {"n_trades": len(pnls), "trades": [{"net_pnl": p} for p in pnls],
-            "ev_mean": 0.0, "ev_ci_90": ci,
-            "sharpe": None, "sharpe_trades_per_year": None}
+    from backtests.backtest_ablation_harness import bootstrap_ev_ci
+
+    return bootstrap_ev_ci(list(pnls))
+
+
+def _arm(pnls):
+    """A populated arm, shaped key-for-key like the producer's output: nothing is invented.
+
+    Every verdict in this file is computed from the per-trade PnL series, never from the stored
+    interval, so the interval's only job is to keep the fixture's shape honest. ``ev_mean`` is the
+    series' real mean in the producer's units (percent of notional per trade, 3dp) and is None for
+    an empty series — hardcoding it to ``0.0`` made every rendered fixture row read
+    ``+0.00% (CI n/a: fewer than 5 trades)`` beside ``Trades (N)=80``, a false reason next to a real
+    count. ``profit_factor`` follows the producer's denominator rule (None for a series with no
+    losing trade), ``ev_ci_90`` is the producer's own bootstrap interval when the sample supports one
+    and None when it does not, and ``sharpe``/``sharpe_trades_per_year`` are published as absence
+    because the fixture replays no bars and therefore measured no elapsed window to annualize over.
+    """
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    gross_loss = abs(sum(losses))
+    return {
+        "n_trades": len(pnls),
+        "win_rate": round(len(wins) / len(pnls) * 100.0, 1) if pnls else 0.0,
+        "total_return": round(sum(pnls) * 100.0, 2) if pnls else 0.0,
+        "profit_factor": round(sum(wins) / gross_loss, 2) if gross_loss > 0 else None,
+        "sharpe": None,
+        "sharpe_trades_per_year": None,
+        "ev_mean": round(float(sum(pnls) / len(pnls)) * 100.0, 3) if pnls else None,
+        "ev_ci_90": _ev_ci_90(tuple(pnls)),
+        "gate_fires": {},
+        "trades": [{"net_pnl": p} for p in pnls],
+    }
 
 
 def test_arm_fixture_matches_the_shape_the_producer_emits():
-    """Guard for Task 4's fixture: the producer stopped emitting (0.0, 0.0), so must the fixture."""
-    arm = _arm([0.1] * 6)
-    assert arm["ev_ci_90"] is None
-    assert "sharpe_trades_per_year" in arm, "the fixture omits a key the published arm carries"
-    assert arm["sharpe"] is None, "the fixture must not default a ratio it never measured to 0.0"
+    """The fixture's keys and its EV/interval pairing follow the harness, not a local convention.
+
+    Guard for Task 4's fixture: the producer stopped emitting a fabricated (0.0, 0.0) interval, so
+    must the fixture. Compared against a real arm dict rather than restated as literals.
+    """
+    import pandas as pd
+
+    from backtests.backtest_ablation_harness import MIN_BOOTSTRAP_TRADES, run_ablation_simulation
+
+    flat = pd.DataFrame({
+        "open": [100.0] * 120, "high": [100.4] * 120, "low": [99.6] * 120,
+        "close": [100.0] * 120, "volume": [100.0] * 120, "timestamp": list(range(120)),
+    })
+    producer = run_ablation_simulation(
+        flat, flat, {k: False for k in ("gate_1d_trend", "gate_wick_exhaustion",
+                                        "gate_divergence", "gate_td9", "gate_volume_profile")})
+    assert set(_arm([0.1] * 6)) == set(producer), (
+        "the fixture and the producer disagree about which keys an arm carries, so a renderer "
+        "reading a key the fixture omitted would pass here and fail on a real run")
+
+    big = _arm([0.1] * 8 + [-0.05] * 8)
+    small = _arm([0.1] * (MIN_BOOTSTRAP_TRADES - 1))
+    assert big["ev_ci_90"] is not None, "a sample the producer can bootstrap gets no interval here"
+    assert small["ev_ci_90"] is None, "the fixture invented an interval for a sample the producer refuses to bootstrap"
+    assert small["ev_mean"] is not None and small["ev_mean"] != 0.0
+    assert _arm([])["ev_mean"] is None, "an empty arm reports an EV it never measured"
 
 
 # The brief's KEEP/RETHINK fixtures were [0.5]*40+[-0.4]*40 vs its mirror: a +10%/trade point
@@ -223,9 +278,10 @@ def _row(name, pnls, fires):
     row = _arm(pnls)
     row.update({
         "name": name,
-        "win_rate": 50.0,
-        "total_return": round(sum(pnls) * 100.0, 2),
-        "profit_factor": 1.2,
+        # The fixture replays no bars, so it measured no elapsed window and therefore no Sharpe.
+        # These two are the synthetic pair the renderer tests below supply on purpose — they pin how
+        # a measured Sharpe and the frequency behind it print side by side — and `_arm` leaves them
+        # as the absence the producer writes when it has nothing to report.
         "sharpe": 1.0,
         "sharpe_trades_per_year": 40.0,
         "gate_fires": fires,
@@ -348,6 +404,28 @@ def test_unmeasurable_sharpe_renders_as_absence_and_does_not_raise(monkeypatch, 
     assert cells[5].startswith("n/a"), zero_row
     assert cells[5] != "0.00"
     assert cells[6] == "n/a (no closed trades)", zero_row
+
+
+def test_rendered_fixture_rows_do_not_print_a_reason_their_trade_count_contradicts(monkeypatch, tmp_path):
+    """The ev_mean/ev_ci pair the fixture carries is the pair its trade count supports.
+
+    With ``ev_mean`` hardcoded to 0.0 and no interval, every fixture row rendered as
+    ``+0.00% (CI n/a: fewer than 5 trades)`` beside ``Trades (N)=80`` — the defect class this branch
+    exists to remove, reproduced by a test.
+    """
+    _, _, text = _render_report(monkeypatch, tmp_path)
+    rows = [ln for ln in text.splitlines() if ln.startswith("| ") and "Trades (N)" not in ln
+            and ":---" not in ln]
+    assert len(rows) == 5, rows
+    for row in rows:
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        n_trades, ev_cell = int(cells[1]), cells[7]
+        if n_trades >= 5:
+            assert "fewer than 5 trades" not in ev_cell, row
+            assert "[" in ev_cell, f"a bootstrappable sample renders no interval: {row}"
+        else:
+            assert "n/a" in ev_cell, row
+        assert not ev_cell.startswith("+0.00% ("), row
 
 
 # ---------------------------------------------------------------------------

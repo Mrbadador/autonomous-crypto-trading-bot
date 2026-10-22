@@ -25,6 +25,11 @@ from indicators import compute_indicators, compute_td_sequential, compute_volume
 
 MIN_BOOTSTRAP_TRADES = 5
 
+# The smallest per-trade dispersion annualized_sharpe will divide by. It is BOTH the refusal floor
+# and (through the max() inside that function) the divisor's guard, so there is no band of std values
+# that clears the guard and then gets scaled by an epsilon.
+SHARPE_MIN_DISPERSION = 1e-9
+
 # One copy of the annual-hours window: annualized_sharpe and the published basis both read it from
 # measured_trades_per_year, so the figure a reader sees can never drift from the factor applied.
 HOURS_PER_YEAR = 365.0 * 24.0
@@ -47,35 +52,56 @@ def measured_trades_per_year(n_trades, bars, hours_per_bar):
 def annualized_sharpe(pnls, bars, hours_per_bar):
     """Annualize a per-trade Sharpe by the trade frequency the run actually produced.
 
-    Returns None when no Sharpe is measurable for the sample: a variance-free trade series (every
-    per-trade PnL identical) has no dispersion to divide by, and dividing by the 1e-9 epsilon instead
-    publishes a ~1e11 number that a reader would take for a measurement.
+    Returns None when no Sharpe is measurable for the sample: fewer closed trades than
+    ``MIN_BOOTSTRAP_TRADES`` (the same minimum the EV axis refuses below), a variance-free trade
+    series (every per-trade PnL identical, so there is no dispersion to divide by), or no elapsed
+    window to annualize over. Publishing a number for any of those would let a reader take an
+    unmeasured ratio for a measurement — including the ~1e6 magnitudes a near-zero denominator
+    produces.
     """
-    if len(pnls) < 2 or bars <= 0:
-        return 0.0
+    if len(pnls) < MIN_BOOTSTRAP_TRADES or bars <= 0:
+        return None
     mean = float(np.mean(pnls))
     std = float(np.std(pnls))
-    # A variance-free series — every per-trade PnL the same number — has no dispersion to divide by.
-    # np.std leaves floating-point noise (~1e-18) on such a series rather than an exact 0.0, so the
-    # floor is scaled to the sample: below it the only thing under the fraction line is the 1e-9
-    # epsilon, and the quotient is a ~1e8 artefact a reader would take for a measured Sharpe.
-    if std <= np.finfo(float).eps * max(abs(mean), 1.0):
+    # ONE threshold serves as both the refusal floor and the divisor's guard, so no band of
+    # dispersion can pass the guard and then be divided by an epsilon. np.std leaves
+    # floating-point noise (~1e-18) on a variance-free series rather than an exact 0.0, so the floor
+    # is scaled to the sample; the absolute part of it closes the 2.2e-16 < std <= 1e-9 band the old
+    # `std + 1e-9` denominator left open.
+    floor = max(SHARPE_MIN_DISPERSION, np.finfo(float).eps * max(abs(mean), 1.0))
+    if std <= floor:
         return None
     trades_per_year = measured_trades_per_year(len(pnls), bars, hours_per_bar)
     if trades_per_year is None:
-        return 0.0
-    return float(mean / (std + 1e-9) * np.sqrt(trades_per_year))
+        return None
+    return float(mean / std * np.sqrt(trades_per_year))
 
 
 def format_sharpe(sharpe, n_trades):
-    """Render an arm's annualized Sharpe, printing absence where no Sharpe was measurable."""
+    """Render an arm's annualized Sharpe, printing absence where no Sharpe was measurable.
+
+    The cause is derived from the arm's own trade count and covers every way `annualized_sharpe`
+    can refuse, so the sentence a reader gets is the one that actually applied.
+    """
     if sharpe is not None:
         return f"{sharpe:.2f}"
     if n_trades == 0:
         return "n/a (no closed trades, Sharpe not measured)"
     if n_trades == 1:
         return "n/a (single closed trade, dispersion not measurable)"
+    if n_trades < MIN_BOOTSTRAP_TRADES:
+        return (f"n/a (only {n_trades} closed trades, below the {MIN_BOOTSTRAP_TRADES}-trade "
+                "minimum for a measurable Sharpe)")
     return "n/a (variance-free trade series, Sharpe has no denominator)"
+
+
+def format_profit_factor(profit_factor, n_trades):
+    """Render an arm's profit factor, printing absence where the ratio has no denominator."""
+    if profit_factor is not None:
+        return f"{profit_factor:.2f}"
+    if n_trades == 0:
+        return "n/a (no closed trades, profit factor not measured)"
+    return "n/a (no losing trade, profit factor has no denominator)"
 
 
 def format_sharpe_basis(trades_per_year, n_trades):
@@ -95,6 +121,25 @@ def format_ev_ci(ev_mean, ev_ci_90):
     if lo == hi:
         return f"{ev_mean:+.2f}% (CI n/a: variance-free sample, interval has no width)"
     return f"{ev_mean:+.2f}% [{lo:+.2f}%, {hi:+.2f}%]"
+
+
+def bootstrap_ev_ci(pnls, n_boot=1500, seed=42):
+    """The iid-bootstrap 90% interval for mean per-trade EV, or None when the sample is too small.
+
+    Too small means the same thing it means for every other per-trade statistic here: fewer than
+    ``MIN_BOOTSTRAP_TRADES`` closed trades. Published in the same units the arm reports EV in, and
+    left un-rounded so the caller applies the arm's own rounding once.
+
+    It is a function rather than inline code because a test fixture has to be able to build an
+    ``(ev_mean, ev_ci_90)`` pair the producer could actually have emitted: an interval for a sample
+    it cannot bootstrap, or the absence of one for a sample it can, both render as a reason beside a
+    count that contradicts it.
+    """
+    if len(pnls) < MIN_BOOTSTRAP_TRADES:
+        return None
+    rng = np.random.default_rng(seed)
+    boot_means = [float(np.mean(rng.choice(pnls, size=len(pnls), replace=True))) for _ in range(n_boot)]
+    return float(np.percentile(boot_means, 5.0)), float(np.percentile(boot_means, 95.0))
 
 
 def precompute_4h_indicators_vectorized(df: pd.DataFrame) -> pd.DataFrame:
@@ -375,7 +420,7 @@ def run_ablation_simulation(
             "n_trades": 0,
             "win_rate": 0.0,
             "total_return": 0.0,
-            "profit_factor": 0.0,
+            "profit_factor": None,
             "sharpe": None,
             "sharpe_trades_per_year": None,
             "ev_mean": None,
@@ -390,35 +435,31 @@ def run_ablation_simulation(
     wr = len(wins) / len(pnls) * 100.0
     tot_ret = sum(pnls) * 100.0
     gross_win = sum(wins)
-    gross_loss = abs(sum(losses)) if losses else 1e-6
-    pf = gross_win / gross_loss if gross_loss > 0 else 999.0
+    gross_loss = abs(sum(losses))
+    # An arm with no losing trade has no denominator. The old code substituted 1e-6 and published
+    # gross_win / 1e-6 — a ratio like 68893.80 in the same row whose EV cell reads "(CI n/a: fewer
+    # than 5 trades to bootstrap)" — while its `> 0` guard made the sentinel cap below it
+    # unreachable, so the branch could never even describe a lossless arm.
+    pf = gross_win / gross_loss if gross_loss > 0 else None
+    # Nothing to add here for the Sharpe: annualized_sharpe refuses samples this code cannot measure
+    # (below MIN_BOOTSTRAP_TRADES trades, variance-free, or with no elapsed window) by returning
+    # None, so the arm publishes the absence rather than masking a degenerate 0.0 of its own.
     sharpe = annualized_sharpe(pnls, bars=total_bars, hours_per_bar=4.0)
-    if len(pnls) < 2:
-        # The pure function returns its degenerate 0.0 here (the brief's pinned contract), but one
-        # closed trade has no dispersion: publishing that 0.0 would print a measured zero for a
-        # statistic this arm never measured.
-        sharpe = None
     trades_per_year = measured_trades_per_year(len(pnls), total_bars, 4.0)
 
     # Bootstrap 90% Confidence Interval for Expected Value (EV) per trade
     ev_mean = float(np.mean(pnls))
-    ev_ci_lo, ev_ci_hi = None, None
-    if len(pnls) >= MIN_BOOTSTRAP_TRADES:
-        rng = np.random.default_rng(42)
-        n_boot = 1500
-        boot_means = [float(np.mean(rng.choice(pnls, size=len(pnls), replace=True))) for _ in range(n_boot)]
-        ev_ci_lo = float(np.percentile(boot_means, 5.0))
-        ev_ci_hi = float(np.percentile(boot_means, 95.0))
+    ev_ci = bootstrap_ev_ci(pnls)
 
     return {
         "n_trades": len(trades),
         "win_rate": round(wr, 1),
         "total_return": round(tot_ret, 2),
-        "profit_factor": round(pf, 2),
+        "profit_factor": None if pf is None else round(pf, 2),
         "sharpe": None if sharpe is None else round(sharpe, 2),
         "sharpe_trades_per_year": None if trades_per_year is None else round(trades_per_year, 2),
         "ev_mean": round(ev_mean * 100.0, 3),
-        "ev_ci_90": None if ev_ci_lo is None else (round(ev_ci_lo * 100.0, 3), round(ev_ci_hi * 100.0, 3)),
+        "ev_ci_90": None if ev_ci is None else (round(ev_ci[0] * 100.0, 3), round(ev_ci[1] * 100.0, 3)),
         "gate_fires": gate_fires,
         "trades": trades
     }
@@ -502,9 +543,10 @@ def main():
         ci_str = format_ev_ci(res["ev_mean"], res["ev_ci_90"])
         sharpe_str = format_sharpe(res["sharpe"], res["n_trades"])
         basis_str = format_sharpe_basis(res["sharpe_trades_per_year"], res["n_trades"])
+        pf_str = format_profit_factor(res["profit_factor"], res["n_trades"])
         gf = res.get("gate_fires", {})
         gf_str = ", ".join(f"{k.replace('gate_', '')}:{v}" for k, v in gf.items() if v > 0) or "none"
-        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {res['profit_factor']:>6.2f} | {sharpe_str:>20} | {basis_str:<24} | {ci_str:<22} | {gf_str}")
+        print(f"{name:<38} | {res['n_trades']:<6} | {res['win_rate']:>7.1f}% | {res['total_return']:>8.2f}% | {pf_str:>6} | {sharpe_str:>20} | {basis_str:<24} | {ci_str:<22} | {gf_str}")
         matrix_rows.append((name, res))
 
     print("\n[SUCCESS] Ablation comparison matrix successfully evaluated against real data.\n")

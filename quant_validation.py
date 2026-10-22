@@ -505,7 +505,10 @@ def run_bootstrap_entry_significance(
         obs_win_rate = float(np.mean(sig_arr > 0) * 100.0)
         gross_win = float(np.sum(sig_arr[sig_arr > 0]))
         gross_loss = abs(float(np.sum(sig_arr[sig_arr < 0])))
-        obs_pf = round(gross_win / gross_loss, 2) if gross_loss > 0 else 2.5
+        # An arm whose sampled signals never lose has no denominator. `2.5` was a fabricated ratio
+        # published as a measurement, so the key now carries the absence (JSON null) and every
+        # renderer of it must be None-aware; nothing reads it as a number today.
+        obs_pf = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
 
         boot_matrix = rng.choice(rand_pool, size=(b_iterations, k_signals), replace=True)
         boot_means = np.mean(boot_matrix, axis=1)

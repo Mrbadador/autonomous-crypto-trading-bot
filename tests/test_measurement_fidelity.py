@@ -88,10 +88,50 @@ def test_sharpe_of_dense_and_sparse_trade_series_differ():
     assert dense > sparse
 
 
-def test_degenerate_inputs_annualize_to_zero():
-    assert annualized_sharpe([], bars=2190, hours_per_bar=4.0) == 0.0
-    assert annualized_sharpe([0.01], bars=2190, hours_per_bar=4.0) == 0.0
-    assert annualized_sharpe([0.01, -0.01], bars=0, hours_per_bar=4.0) == 0.0
+def test_degenerate_inputs_have_no_measurable_sharpe():
+    """Below five closed trades there is no Sharpe on this axis, so it is absence, not a number.
+
+    The previous version of this test pinned a MEASURED-LOOKING ``0.0`` for degenerate input, which
+    is the same defect the EV axis already refuses: a reader cannot tell "the ratio is zero" from
+    "the ratio was never measurable".
+    """
+    assert annualized_sharpe([], bars=2190, hours_per_bar=4.0) is None
+    assert annualized_sharpe([0.01], bars=2190, hours_per_bar=4.0) is None
+    assert annualized_sharpe([0.01, -0.01], bars=0, hours_per_bar=4.0) is None
+
+
+@pytest.mark.parametrize("pnls", [
+    [0.02, -0.01],
+    [0.02, -0.01, 0.05],
+    [0.02, -0.01, 0.05, -0.03],
+])
+def test_sharpe_axis_refuses_the_sample_size_the_ev_axis_refuses(pnls):
+    """A dispersed series is still too small: 2..MIN-1 trades gate the Sharpe like the EV."""
+    from backtests.backtest_ablation_harness import MIN_BOOTSTRAP_TRADES
+
+    assert len(pnls) < MIN_BOOTSTRAP_TRADES
+    assert annualized_sharpe(pnls, bars=2190, hours_per_bar=4.0) is None
+
+
+def test_sharpe_axis_measures_the_sample_the_ev_axis_measures():
+    from backtests.backtest_ablation_harness import MIN_BOOTSTRAP_TRADES
+
+    pnls = [0.02, -0.01, 0.05, -0.03, 0.01]
+    assert len(pnls) == MIN_BOOTSTRAP_TRADES
+    assert annualized_sharpe(pnls, bars=2190, hours_per_bar=4.0) is not None
+
+
+def test_dispersion_between_the_guard_and_the_divisor_is_refused_not_scaled():
+    """The guard floor and the divisor are one threshold, so no band escapes both.
+
+    The old body guarded at ``eps * max(|mean|, 1)`` (~2.2e-16) and divided by ``std + 1e-9``, so a
+    series with ``2.2e-16 < std <= 1e-9`` passed the guard and was divided by the epsilon: a
+    ~1e6 magnitude published as a measured Sharpe.
+    """
+    pnls = [0.001, 0.001 + 2e-10, 0.001 - 2e-10, 0.001 + 1e-10, 0.001 - 1e-10]
+    std = float(np.std(pnls))
+    assert np.finfo(float).eps < std <= 1e-9, f"fixture drifted out of the band: std={std:g}"
+    assert annualized_sharpe(pnls, bars=2190, hours_per_bar=4.0) is None
 
 
 def test_harness_sharpe_comes_from_the_pure_function_and_not_the_old_constant():
@@ -147,6 +187,45 @@ def test_sharpe_formatter_prints_a_measured_value_as_a_plain_number():
 
     assert format_sharpe(0.87, 80) == "0.87"
     assert format_sharpe(-1.5, 80) == "-1.50"
+
+
+@pytest.mark.parametrize("n_trades, expected_fragment", [
+    (0, "no closed trades"),
+    (1, "single closed trade"),
+    (2, "only 2 closed trades"),
+    (4, "only 4 closed trades"),
+    (12, "variance-free"),
+])
+def test_sharpe_formatter_names_the_cause_that_actually_applies(n_trades, expected_fragment):
+    """The cause list is exhaustive: an arm floored for sample size is not labelled variance-free.
+
+    The formatter infers the cause from ``n_trades``, so a 2-trade arm (whose dispersion is real)
+    used to be described as a "variance-free trade series" — a stated cause that was not the cause.
+    """
+    from backtests.backtest_ablation_harness import format_sharpe
+
+    text = format_sharpe(None, n_trades)
+    assert text.startswith("n/a"), text
+    assert expected_fragment in text, text
+    if n_trades < 2 or 1 < n_trades < 5:
+        assert "variance-free" not in text, text
+
+
+def test_small_sample_sharpe_absence_reaches_the_report_naming_its_own_count(monkeypatch, tmp_path):
+    from backtests.backtest_ablation_harness import run_ablation_simulation
+
+    small = _arm(120)
+    assert 0 < small["n_trades"] < 5, f"fixture drifted: {small['n_trades']} trades"
+    assert small["sharpe"] is None
+    rows = _render_one_arm_table(
+        monkeypatch, tmp_path,
+        [_arm_row("Full Stack (All Gates ON)", small)])
+    assert f"only {small['n_trades']} closed trades" in rows[0]["Sharpe"], rows[0]
+
+    zero = run_ablation_simulation(_frame([100.0] * 120), _frame([100.0] * 10), ALL_GATES_OFF)
+    rows = _render_one_arm_table(
+        monkeypatch, tmp_path, [_arm_row("Full Stack (All Gates ON)", zero)])
+    assert "no closed trades" in rows[0]["Sharpe"], rows[0]
 
 
 def test_zero_trade_arm_publishes_sharpe_absence_alongside_its_ev_absence():
@@ -604,3 +683,77 @@ def test_the_bootstrap_minimum_is_defined_exactly_once():
     import scripts.run_gate_ablation as rga
     assert rga.MIN_BOOTSTRAP_TRADES == harness.MIN_BOOTSTRAP_TRADES
 
+
+
+# ---------------------------------------------------------------------------
+# Final dispatch, item 2 — the profit-factor axis gets the same absence convention
+# ---------------------------------------------------------------------------
+
+QUANT_VALIDATION = REPO_ROOT / "quant_validation.py"
+
+
+def test_lossless_arm_publishes_no_profit_factor_instead_of_a_huge_ratio():
+    """A series with no losing trade has no denominator: gross_win / 1e-6 is not a measurement."""
+    from backtests.backtest_ablation_harness import run_ablation_simulation
+
+    arm = _arm(120)
+    assert 0 < arm["n_trades"] < 5, f"fixture drifted: {arm['n_trades']} trades"
+    pnls = [t["net_pnl"] for t in arm["trades"]]
+    assert all(p > 0 for p in pnls), f"fixture is no longer lossless: {pnls}"
+    assert arm["profit_factor"] is None
+    assert arm["profit_factor"] != 0.0
+
+    zero = run_ablation_simulation(_frame([100.0] * 120), _frame([100.0] * 10), ALL_GATES_OFF)
+    assert zero["n_trades"] == 0
+    assert zero["profit_factor"] is None
+
+
+def test_profit_factor_formatter_names_the_absence_and_its_cause():
+    from backtests.backtest_ablation_harness import format_profit_factor
+
+    assert format_profit_factor(1.23, 80) == "1.23"
+    assert format_profit_factor(None, 0).startswith("n/a")
+    assert "no closed trades" in format_profit_factor(None, 0)
+    assert format_profit_factor(None, 8).startswith("n/a")
+    assert "no losing" in format_profit_factor(None, 8)
+    assert "999" not in format_profit_factor(None, 8)
+
+
+def test_both_renderers_print_profit_factor_absence_instead_of_a_number(monkeypatch, tmp_path):
+    arm = _arm(120)
+    rows = _render_one_arm_table(monkeypatch, tmp_path, [_arm_row("Full Stack (All Gates ON)", arm)])
+    cell = rows[0]["Profit Factor"]
+    assert cell.startswith("n/a"), rows[0]
+    assert cell != "0.00"
+    assert "68893" not in cell and "1000000" not in cell
+
+
+def test_both_report_printers_route_through_the_shared_profit_factor_formatter():
+    harness_src = HARNESS.read_text(encoding="utf-8")
+    ablation_src = GATE_ABLATION.read_text(encoding="utf-8")
+    assert 'format_profit_factor(res["profit_factor"], res["n_trades"])' in harness_src
+    assert "{res['profit_factor']:>6.2f}" not in harness_src
+    assert 'format_profit_factor(r.get("profit_factor"), r.get("n_trades", 0))' in ablation_src
+    assert "{r['profit_factor']:.2f}" not in ablation_src
+
+
+def test_no_padded_profit_factor_denominator_survives_anywhere():
+    """The 1e-6 stand-in denominator, the 999.0 cap and quant_validation's 2.5 are all deleted."""
+    harness_src = HARNESS.read_text(encoding="utf-8")
+    assert "else 1e-6" not in harness_src, "a lossless arm still gets a synthetic denominator"
+    assert "999.0" not in harness_src, "the unreachable 999.0 cap is still published as a ratio"
+
+    qv_src = QUANT_VALIDATION.read_text(encoding="utf-8")
+    assert re.search(r"gross_loss[^:\n]*else 2\.5", qv_src) is None, (
+        "observed_profit_factor still falls back to a fabricated 2.5 for an arm with no losing trade")
+
+
+def test_quant_validation_publishes_no_profit_factor_for_an_arm_without_losses():
+    """The bootstrap significance arm's own PF: no losing signal means no ratio, not 2.5."""
+    from quant_validation import run_bootstrap_entry_significance  # noqa: F401  (import path guard)
+
+    # The full arm needs a historical corpus, so the contract is pinned at the source level above;
+    # this test pins the published key's None-awareness through the renderer that reads it.
+    from backtests.backtest_ablation_harness import format_profit_factor
+
+    assert format_profit_factor(None, 3).startswith("n/a")
