@@ -839,6 +839,46 @@ def fetch_ai_usage_stats() -> dict:
         "today_str": today_str
     }
 
+
+def _missing_dataset_warnings(missing_datasets) -> list[str]:
+    """One sentence per arm whose corpus was thinner than it asked for. Absence-tolerant by design.
+
+    ``missing_datasets`` is the quant-validation report's top-level arm -> reasons map
+    (``quant_validation.py:768``, also published per-arm at ``:553``), and a reason covers BOTH
+    datasets that are absent and datasets that were present but unusable. The validation panel used to
+    read that same report and drop the key, so the only human-facing view of a validation run gave no
+    way to learn that an arm's numbers rest on fewer datasets than that arm requested — the CLI prints
+    them (``:795``) and the panel did not.
+
+    The decision lives here, pure and module-level, so it can be tested without booting this 4,500-line
+    script; the panel's ``st.warning`` loop is then the one line this helper cannot prove, and nothing
+    else. Never raises: an unreadable report field must not take down the panel around it.
+    """
+    msgs: list[str] = []
+    if not isinstance(missing_datasets, dict):
+        return msgs
+    for arm, gaps in missing_datasets.items():
+        if not gaps or isinstance(gaps, bool):
+            continue
+        if isinstance(gaps, str):
+            raw = [gaps]
+        elif isinstance(gaps, (list, tuple, set, frozenset)):
+            raw = [str(g) for g in gaps]
+        else:
+            # A bare number or object names no dataset and no cause. Rendering one would put a reason
+            # in front of the reader that the report never actually stated.
+            continue
+        reasons = [r.strip() for r in raw if r.strip().lower() not in _JUNK_TOKENS]
+        if not reasons:
+            continue
+        msgs.append(
+            f"Validation data gap in the {arm} arm — datasets it asked for and did not get: "
+            f"{'; '.join(reasons)}. The numbers shown for this arm cover fewer datasets than it "
+            "requested, so they are not a measurement of the full corpus its name implies."
+        )
+    return msgs
+
+
 # ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
@@ -4483,6 +4523,13 @@ with tab_risk:
                 f"{mc_data.get('reason', 'no recorded trades with a return')}. "
                 "The figures below are not shown because they cannot be measured."
             )
+
+        # A silent subset of the corpus is the one thing this panel used to be able to hide: the
+        # report carries the arm -> reasons map, the CLI prints it, and the panel read the same
+        # object and dropped the key. _missing_dataset_warnings decides what to say; this loop only
+        # prints it, and an empty or absent map prints nothing.
+        for _gap_msg in _missing_dataset_warnings(jv_report.get("missing_datasets")):
+            st.warning(_gap_msg)
     except Exception as jv_err:
         st.caption(f"Validation telemetry note: {jv_err}")
 

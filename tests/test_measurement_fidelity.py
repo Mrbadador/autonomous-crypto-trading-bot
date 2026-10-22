@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HARNESS = REPO_ROOT / "backtests" / "backtest_ablation_harness.py"
 GATE_ABLATION = REPO_ROOT / "scripts" / "run_gate_ablation.py"
 TRIGGER_COMPARISON = REPO_ROOT / "scripts" / "compare_trigger_modes_840k.py"
+DASHBOARD = REPO_ROOT / "dashboard.py"
 
 ALL_GATES_OFF = {
     "gate_1d_trend": False,
@@ -541,6 +542,124 @@ def test_report_main_block_describes_a_gap_without_claiming_the_file_is_absent()
     assert "no dataset found for" not in main_body, (
         "the gap map now also lists datasets that exist but are unusable; printing them as 'no dataset "
         "found' states the opposite of what was measured")
+
+
+# ---------------------------------------------------------------------------
+# Step 7b — the dashboard panel renders the gap map, not only the CLI
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: `_missing_dataset_warnings` is a pure function that turns the
+# report's arm -> reasons map into sentences, so these tests can call the shipped code and check every
+# decision. The `st.warning(...)` loop in dashboard.py's validation panel is NOT executed by any of
+# them — the committed suite has no Streamlit AppTest harness, and importing dashboard.py runs a
+# 4,500-line top-level script against the real DB and live price endpoints. A helper that returns a
+# string cannot lie about what it decided; only the rendering one line further out is unverified, and
+# test_panel_wires_the_gap_helper_into_a_warning below is a source-text check of that line, nothing more.
+
+def _dashboard_helper(name):
+    """Compiles ONE pure top-level helper out of dashboard.py and returns it, without booting the app.
+
+    dashboard.py cannot be imported in a test (module-level DB reads, HTTP fetches and chart rendering),
+    and its rendering cannot be exercised without an AppTest harness this suite does not have. The
+    helpers under test are pure and read only module-level constants, so their own AST node — plus any
+    module-level assignment they load by name — is compiled in an empty namespace and called for real.
+    That executes the shipped body, which is a stronger claim than matching its source text.
+    """
+    import ast
+
+    tree = ast.parse(DASHBOARD.read_text(encoding="utf-8"), filename=str(DASHBOARD))
+    target = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    assert target is not None, f"dashboard.py has no module-level function named {name}"
+
+    loaded = {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    ns = {}
+    for node in [target] + [
+        n for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id in loaded for t in n.targets)
+    ]:
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(DASHBOARD), "exec"), ns)
+    fn = ns[name]
+    assert callable(fn), f"{name} is not callable after extraction"
+    return fn
+
+
+_missing_dataset_warnings = _dashboard_helper("_missing_dataset_warnings")
+
+
+@pytest.mark.parametrize("gap_map", [
+    None,                                             # key absent from the report entirely
+    {},                                               # every arm got everything it asked for
+    {"SWING_4H": []},                                 # an arm whose list is empty
+    {"SWING_4H": None},
+    {"SWING_4H": ""},
+    {"SWING_4H": [None]},                             # JSON nulls are not reasons
+    {"SWING_4H": [None, ""]},
+    {"SWING_4H": 7},                                  # a bare number names no dataset
+    {"SWING_4H": True},
+    "SWING_4H",                                       # the whole map malformed
+    ["SWING_4H"],
+    5,
+    True,
+])
+def test_an_absent_or_malformed_gap_map_prints_nothing(gap_map):
+    """Silence is the only honest output here: a warning about a gap nobody measured would be the same
+    defect class in the other direction."""
+    assert _missing_dataset_warnings(gap_map) == []
+
+
+def test_one_gap_message_names_the_arm_and_the_reason_the_report_recorded():
+    msgs = _missing_dataset_warnings({"SWING_4H": ["SOLUSDT_4h_full.csv"]})
+    assert len(msgs) == 1, msgs
+    assert "SWING_4H" in msgs[0], "the sentence has to name the arm whose numbers are affected"
+    assert "SOLUSDT_4h_full.csv" in msgs[0], "and the dataset it asked for and did not get"
+    assert "fewer datasets" in msgs[0], (
+        f"the panel must say what the gap does to the arm's numbers, not just that data is missing: {msgs[0]}")
+
+
+def test_every_reason_of_an_arm_is_in_that_arms_message():
+    unusable = ("NEARUSDT_4h_full.csv (unusable: 60 bars after indicator preparation, "
+                "below the 120-bar minimum this arm needs)")
+    msgs = _missing_dataset_warnings({"SWING_4H": list(SWING_DATASETS) + [unusable]})
+    assert len(msgs) == 1, msgs
+    for reason in SWING_DATASETS + [unusable]:
+        assert reason in msgs[0], f"{reason} was recorded as a gap and dropped from what the panel says"
+    # Both gap kinds the map carries must be covered by the wording: absent files and present-but-unusable
+    # ones. Asserting only the file names would let the sentence go back to claiming everything is absent.
+    assert "absent" not in msgs[0].lower(), (
+        f"the wording must not assert absence for a file that exists but was unusable: {msgs[0]}")
+
+
+def test_one_message_per_arm_that_has_gaps_and_none_for_arms_without_them():
+    msgs = _missing_dataset_warnings({
+        "SWING_4H": SWING_DATASETS,
+        "SCALP_SHORT": ["BTCUSDT_1h_full.csv"],
+        "CHOP_GRID": [],
+    })
+    assert len(msgs) == 2, f"an arm with no gaps must not be described as having one: {msgs}"
+    swing = next(m for m in msgs if "SWING_4H" in m)
+    scalp = next(m for m in msgs if "SCALP_SHORT" in m)
+    assert "CHOP_GRID" not in swing and "CHOP_GRID" not in scalp
+    assert "SCALP_SHORT" not in swing and "SWING_4H" not in scalp, (
+        "one arm's gap must not be described as another arm's")
+
+
+def test_panel_wires_the_gap_helper_into_a_warning():
+    """Source-text check of the one line the helper tests cannot reach — see the section note above.
+
+    This proves the panel reads the key from the same report object it already loads and feeds the
+    helper's output to st.warning inside the try block. It does not prove Streamlit renders it.
+    """
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert "missing_datasets" in src, (
+        "the panel dropped the report's dataset-gap map, so a reader cannot learn an arm ran on a subset")
+    panel = src[src.index("def _missing_dataset_warnings"):]
+    wired = [ln for ln in panel.splitlines()
+             if "_missing_dataset_warnings(jv_report" in ln and 'get("missing_datasets")' in ln]
+    assert len(wired) == 1, wired
+    call_site = src[src.index(wired[0]):]
+    assert "st.warning(" in call_site.splitlines()[1], (
+        "the helper's sentences must reach the panel as warnings, not be computed and dropped")
+
 
 
 # ---------------------------------------------------------------------------
