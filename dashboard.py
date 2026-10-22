@@ -924,6 +924,43 @@ def _profit_factor_delta(profit_factor, win_count, loss_count) -> str:
             "denominator)")
 
 
+def _win_rate_value(win_rate_pct, closed_trade_count) -> str:
+    """Render the fleet's win rate, or say why there is not one. Absence-tolerant by design.
+
+    The KPI card's win-rate VALUE used to read `0.0% Win Rate` whenever the ledger held no closed
+    trade: a measured zero for a measurement that was never taken -- the same mistake the card's
+    profit-factor delta was making one cell away, and the same one this branch removed from the
+    harness and the backtesters. A win rate is a ratio over closed trades; with none closed there
+    is no population to divide by, so there is no rate to publish.
+
+    `win_rate_pct` is the measured rate, or None when it was never measured. `closed_trade_count`
+    is the population it would have been measured over, and it is what tells the two apart: a
+    fleet that closed trades and won none of them has a real 0.0% win rate, while a fleet that
+    closed none has no rate at all.
+
+    Pure and module-level, like `_profit_factor_delta` above, so it can be tested without
+    booting this 4,500-line script. Never raises: an unreadable trade population must not take
+    down the card around it.
+    """
+    try:
+        closed_trade_count = int(closed_trade_count)
+    except (TypeError, ValueError):
+        closed_trade_count = 0
+
+    rate = None
+    if win_rate_pct is not None:
+        try:
+            rate = float(win_rate_pct)
+        except (TypeError, ValueError):
+            rate = None
+
+    if rate is None:
+        if closed_trade_count <= 0:
+            return "Win Rate not measured (no closed trades)"
+        return "Win Rate not measured"
+    return f"{rate:.1f}% Win Rate"
+
+
 # ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
@@ -1572,7 +1609,10 @@ if not df_all_trades.empty:
     losses_df = df_all_trades[df_all_trades['pnl'].astype(float) <= 0]
     win_count = len(wins_df)
     loss_count = len(losses_df)
-    win_rate_pct = (win_count / total_closed_count) * 100.0 if total_closed_count > 0 else 0.0
+    # No closed trades means no population to divide by, so there is no rate to publish: the card
+    # prints the absence and its cause (see _win_rate_value) instead of a measured 0.0% that was
+    # never measured. A fleet that closed trades and won none of them still has a real 0.0% rate.
+    win_rate_pct = (win_count / total_closed_count) * 100.0 if total_closed_count > 0 else None
     gross_profit = wins_df['pnl'].astype(float).sum()
     gross_loss = abs(losses_df['pnl'].astype(float).sum())
     # No losing trade means no denominator, so there is no ratio to publish: the card prints the
@@ -1581,7 +1621,7 @@ if not df_all_trades.empty:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
     net_realized_pnl = gross_profit - gross_loss
 else:
-    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 0, 0, 0.0, None, 0.0
+    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 0, 0, None, None, 0.0
 
 # Active Positions Query across all 5 fleet sub-engines
 df_open_1 = query_db(TRADING_DATA_DB, "SELECT * FROM open_positions")
@@ -1659,7 +1699,7 @@ with kpi1:
 with kpi2:
     st.metric(
         label="🏆 Fleet Win Rate & PF",
-        value=f"{win_rate_pct:.1f}% Win Rate",
+        value=_win_rate_value(win_rate_pct, total_closed_count),
         delta=_profit_factor_delta(profit_factor, win_count, loss_count),
         # An absent ratio is not a fall from the last reading, so it must not wear the green
         # up-arrow st.metric gives every delta that does not start with "-" (streamlit's

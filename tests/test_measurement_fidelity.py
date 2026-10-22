@@ -1421,3 +1421,64 @@ def test_the_audit_matrix_says_when_a_run_measured_nothing():
     assert "no historical data" in no_data["Win Rate"]
 
 
+# ---------------------------------------------------------------------------
+# Final fix E-3 — the dashboard's win rate is a measurement or an absence
+# ---------------------------------------------------------------------------
+# What is proven below and what is not: `_win_rate_value` is a pure function that turns the KPI
+# card's win rate (a rate, or None when there is no population to divide by) into the text the card
+# shows, so these tests call the shipped code and check every decision. The `st.metric(...)` call in
+# dashboard.py's KPI row is NOT executed by any of them -- the committed suite has no Streamlit
+# AppTest harness, and importing dashboard.py runs a 4,500-line top-level script against the real
+# DB and live price endpoints. The helper's decision is proven; the rendering one line further out
+# is a source-text check, exactly as part D's profit-factor helper was.
+
+_win_rate_value = _dashboard_helper("_win_rate_value")
+
+
+def test_the_card_publishes_no_measured_zero_win_rate():
+    """The card used to read `0.0% Win Rate` whenever nothing had been closed."""
+    out = _win_rate_value(None, 0)
+    assert "not measured" in out.lower(), out
+    assert "no closed trades" in out, out
+    assert "0.0%" not in out, out
+    assert not any(ch.isdigit() for ch in out), (
+        f"an unmeasured win rate must print no number at all, not a stand-in: {out}")
+
+
+def test_a_measured_zero_win_rate_is_still_published_as_a_number():
+    """A fleet that closed trades and won none of them has a real 0.0% win rate."""
+    assert _win_rate_value(0.0, 7) == "0.0% Win Rate"
+    assert _win_rate_value(43.3, 60) == "43.3% Win Rate"
+
+
+def test_the_win_rate_helper_never_raises_on_an_unreadable_population():
+    """The card around it must survive a population it cannot read."""
+    assert "not measured" in _win_rate_value(None, None).lower()
+    assert "not measured" in _win_rate_value(None, "not-a-number").lower()
+    assert _win_rate_value("43.3", 60) == "43.3% Win Rate"
+
+
+def test_the_panel_publishes_no_win_rate_for_an_empty_ledger():
+    """The else branch published 0.0 for the empty ledger; the panel now publishes None."""
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert ("win_rate_pct = (win_count / total_closed_count) * 100.0 if total_closed_count > 0 "
+            "else None") in src
+    assert ("win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = "
+            "0, 0, None, None, 0.0") in src
+
+
+def test_the_kpi_card_routes_the_win_rate_through_the_helper():
+    """Source-text check of the one line the helper tests cannot reach — see the section note above.
+
+    It proves the panel hands the card's value to the helper. It does not prove Streamlit renders
+    it.
+    """
+    src = DASHBOARD.read_text(encoding="utf-8")
+    wired = [ln for ln in src.splitlines()
+             if "value=_win_rate_value(win_rate_pct, total_closed_count)" in ln]
+    assert len(wired) == 1, wired
+    assert wired[0].strip().startswith("value="), (
+        f"the helper's text must be the metric's value argument: {wired[0]!r}")
+    assert 'value=f"{win_rate_pct:.1f}% Win Rate"' not in src
+
+
