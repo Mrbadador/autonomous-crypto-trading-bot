@@ -1717,3 +1717,205 @@ def test_the_tracker_report_no_longer_defaults_the_values_it_never_measured():
                  "metrics.get('calibration_grade', 'N/A')"):
         assert gone not in src, (
             f"the report still defaults {gone}: a measurement nobody took printed as a number")
+
+
+# ---------------------------------------------------------------------------
+# Final fix F-2 — the legacy live dashboard publishes no demo ledger
+# ---------------------------------------------------------------------------
+# scripts/live_dashboard.py is a standalone Streamlit script (it cannot import dashboard.py), so it
+# carries its own copies of the same pure renderers. They are extracted with the same helper, so
+# the shipped bodies are executed here too.
+#
+# The defect being closed: the script's no-data branch published a hardcoded demo ledger (43 wins,
+# 16 losses, 72.9%, 2.62x, $12.18) as if it were telemetry, and the same file carried a demo
+# account balance, four demo holding-time cards and three demo counts.
+
+LEGACY_DASHBOARD = REPO_ROOT / "scripts" / "live_dashboard.py"
+
+_legacy_win_rate_value = _dashboard_helper("_win_rate_value", LEGACY_DASHBOARD)
+_legacy_profit_factor_delta = _dashboard_helper("_profit_factor_delta", LEGACY_DASHBOARD)
+_legacy_calibration_panel_values = _dashboard_helper("_calibration_panel_values", LEGACY_DASHBOARD)
+
+
+def _numeric_literals(path):
+    """Every numeric constant in a module, so a demo figure cannot hide in a computation."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float))
+            and not isinstance(n.value, bool)]
+
+
+def _published_strings(path):
+    """Every string constant in a module except its docstrings.
+
+    A docstring is prose about the module; a string constant is text that can reach a reader. The
+    two have to be told apart, because the fixes below explain themselves in docstrings that quote
+    the very figures they removed.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    docstrings = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and body:
+            first = body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+                    and isinstance(first.value.value, str):
+                docstrings.add(id(first.value))
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and id(n) not in docstrings]
+
+
+def test_the_legacy_no_data_branch_publishes_no_demo_ledger():
+    """The branch that used to publish 43 wins, 16 losses, 72.9%, 2.62x and $12.18."""
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert ("win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = "
+            "0, 0, None, None, None") in src, (
+        "the no-data branch must publish zero trades and no rate, no ratio and no total")
+    assert "profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None" in src, (
+        "no losing trade means no denominator, so the ratio must be the absence of a ratio")
+    assert "else (2.62 if win_count > 0 else 1.0)" not in src, (
+        "the profit factor still falls back to a constant nobody measured")
+
+
+def test_the_legacy_file_publishes_no_demo_telemetry_figures():
+    """An audit of the module's numeric constants: the demo ledger and the demo cards are gone."""
+    numbers = set(_numeric_literals(LEGACY_DASHBOARD))
+    for gone in (72.9, 2.62, 12.18, 155.50, 38.5, 46.2, 27.8, 1.66, 43, 16, 33, 220, 18):
+        assert gone not in numbers, (
+            f"the legacy dashboard still carries the demo figure {gone!r} as a literal")
+
+
+def test_the_legacy_file_publishes_no_demo_telemetry_text():
+    """And an audit of the text it can show: no demo figure survives in a published string."""
+    published = _published_strings(LEGACY_DASHBOARD)
+    for gone in ("72.9", "2.62", "12.18", "155.50", "38.5", "46.2", "27.8", "1.66",
+                 "33 dynamic", "220 Lessons", "18 Background", "72.9%"):
+        hits = [s for s in published if gone in s]
+        assert not hits, (
+            f"the legacy dashboard still publishes {gone!r}: {hits[:3]}")
+
+
+def test_the_legacy_win_rate_card_publishes_an_absence_for_an_empty_ledger():
+    """The card's value used to read 0.0% (or 72.9%) whether or not anything was measured."""
+    out = _legacy_win_rate_value(None, 0)
+    assert "not measured" in out.lower(), out
+    assert "no closed trades" in out, out
+    assert not any(ch.isdigit() for ch in out), (
+        f"an unmeasured win rate must print no number at all: {out}")
+
+
+def test_the_legacy_win_rate_card_publishes_a_measured_rate():
+    out = _legacy_win_rate_value(72.9, 59)
+    assert out == "72.9% Win Rate", out
+    assert _legacy_win_rate_value(0.0, 7) == "0.0% Win Rate", (
+        "a fleet that closed trades and won none of them has a real zero rate")
+
+
+def test_the_legacy_profit_factor_card_publishes_no_constant():
+    """The card's delta used to read 2.62x (or 1.00x) for a fleet with no losing trade."""
+    for win_count, loss_count in [(0, 0), (43, 0), (0, 16), (43, 16)]:
+        out = _legacy_profit_factor_delta(None, win_count, loss_count)
+        assert "2.62" not in out, out
+        assert "1.00" not in out, out
+        assert "not measured" in out.lower(), out
+        assert not any(ch.isdigit() for ch in out), (
+            f"an unmeasured profit factor must print no number at all: {out}")
+
+
+def test_the_legacy_profit_factor_card_publishes_a_measured_ratio():
+    out = _legacy_profit_factor_delta(2.62, 43, 16)
+    assert out == "2.62x Profit Factor (43W / 16L)", out
+
+
+def test_the_legacy_kpi_card_routes_through_the_helpers():
+    """Source-text check of the two lines the helper tests cannot reach.
+
+    It proves the card hands the ledger's numbers to the renderers. It does not prove Streamlit
+    renders them.
+    """
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "value=_win_rate_value(win_rate_pct, total_closed_count)" in src
+    assert "delta=_profit_factor_delta(profit_factor, win_count, loss_count)" in src
+    assert 'value=f"{win_rate_pct:.1f}% Win Rate"' not in src
+    assert 'delta=f"{profit_factor:.2f}x Profit Factor ({win_count}W / {loss_count}L)"' not in src
+
+
+def test_the_legacy_calibration_panel_publishes_the_same_absence_as_the_main_dashboard():
+    """The two panels are the same panel: the legacy script must publish the same strings."""
+    for metrics in ({}, {"total_samples": 0, "brier_score": 0.0, "bins": []},
+                    {"total_samples": 2, "overall_win_rate": 50.0, "brier_score": 0.1,
+                     "calibration_grade": "EXCELLENT", "bins": []}):
+        assert _legacy_calibration_panel_values(metrics) == _calibration_panel_values(metrics), (
+            f"the two dashboards disagree about the same calibration metrics: {metrics}")
+
+
+def test_the_legacy_calibration_panel_publishes_no_fabricated_grade():
+    values = _legacy_calibration_panel_values({"total_samples": 0, "brier_score": 0.0, "bins": []})
+    assert values["calibration_grade"] != "GOOD", values
+    assert "not measured" in values["calibration_grade"], values
+    assert values["historical_win_rate"].startswith("n/a"), values
+    assert values["brier_score"].startswith("n/a"), values
+
+
+def test_the_legacy_calibration_panel_routes_through_the_helper():
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "cal_values = _calibration_panel_values(c_metrics)" in src
+    for gone in ("c_metrics.get('total_samples', 0)", "c_metrics.get('overall_win_rate', 0)",
+                 "c_metrics.get('brier_score', 0)", "c_metrics.get('calibration_grade', 'GOOD')"):
+        assert gone not in src, f"the legacy panel still defaults {gone}"
+
+
+def test_the_legacy_account_balance_is_not_a_demo_balance():
+    """The sidebar used to publish $155.50 for an account it had never read."""
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert 'query_system_state("balance", "")' in src, (
+        "the balance must be read without a demo fallback")
+    assert "not measured (no account balance telemetry)" in src, (
+        "an unreadable balance must be published as an absence")
+    assert "Telemetry Offline" in src
+
+
+def test_the_legacy_margin_block_publishes_no_ratio_without_a_balance():
+    """Margin utilisation and the liquid buffer are ratios against the balance: no balance, no
+    ratio."""
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "margin_measured = live_bal_val is not None and live_bal_val > 0" in src
+    assert 'margin_util_display = f"{margin_util_pct:.1f}%" if margin_measured else ' \
+           '"n/a (no account balance)"' in src
+    assert "n/a (no account balance)" in src
+
+
+def test_the_legacy_holding_time_cards_publish_no_demo_durations():
+    """Four cards used to publish 38.5 mins, 46.2 mins, 27.8 mins and a 1.66x hold ratio that no
+    trade was ever measured against."""
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    for label in ("Avg Fleet Duration", "Avg Winner Duration", "Avg Loser Duration",
+                  "Hold Ratio (Win/Loss)"):
+        assert f'"{label}", "n/a (not measured)"' in src, (
+            f"the {label} card must publish an absence, not a demo duration")
+    assert "Not measured in this view" in src, (
+        "the holding-asymmetry note must not claim an asymmetry nobody measured")
+
+
+def test_the_legacy_rule_and_lesson_counts_are_measured_not_asserted():
+    """The tab used to say '33 dynamic neural rules' and '220 Lessons' without counting."""
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "SELECT COUNT(*) as cnt FROM learned_rules" in src
+    assert "SELECT COUNT(*) as cnt FROM trade_lessons" in src
+    assert "dynamic neural rules active in long-term memory" in src
+    assert "Lessons in Database" in src
+
+
+def test_the_legacy_daemon_count_is_not_a_fabricated_number():
+    """The subsystem header used to claim 18 background processes over a list of 11 rows."""
+    src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert "18 Background Processes" not in src
+    assert "Autonomous Daemon Subsystems (Unified Super Bot Architecture)" in src
+
+

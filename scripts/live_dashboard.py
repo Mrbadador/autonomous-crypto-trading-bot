@@ -111,6 +111,118 @@ def compute_position_age(entry_time_val) -> str:
     except Exception:
         return "Active"
 
+
+def _win_rate_value(win_rate_pct, closed_trade_count) -> str:
+    """Renders the fleet win rate, or says that it was never measured.
+
+    Same convention as the main dashboard's KPI card: a rate over closed trades needs a
+    population, so a fleet that closed none has no rate to publish. The old code published
+    72.9% (and 0.0%) whether or not anything had been measured.
+    """
+    try:
+        closed_trade_count = int(closed_trade_count)
+    except (TypeError, ValueError):
+        closed_trade_count = 0
+
+    rate = None
+    if win_rate_pct is not None:
+        try:
+            rate = float(win_rate_pct)
+        except (TypeError, ValueError):
+            rate = None
+
+    if rate is None:
+        if closed_trade_count <= 0:
+            return "Win Rate not measured (no closed trades)"
+        return "Win Rate not measured"
+    return f"{rate:.1f}% Win Rate"
+
+
+def _profit_factor_delta(profit_factor, win_count, loss_count) -> str:
+    """Renders the fleet profit factor, or says that it was never measured.
+
+    A profit factor needs a denominator: with no losing trade there is no ratio to publish, so
+    the old 2.62 / 1.0 constants are gone and the absence names its cause instead.
+    """
+    try:
+        win_count = int(win_count)
+        loss_count = int(loss_count)
+    except (TypeError, ValueError):
+        win_count = loss_count = 0
+
+    ratio = None
+    if profit_factor is not None:
+        try:
+            ratio = float(profit_factor)
+        except (TypeError, ValueError):
+            ratio = None
+
+    if ratio is not None:
+        return f"{ratio:.2f}x Profit Factor ({win_count}W / {loss_count}L)"
+    if win_count == 0 and loss_count == 0:
+        return "Profit Factor not measured (no closed trades)"
+    if loss_count == 0:
+        return "Profit Factor not measured (no losing trade, so the ratio has no denominator)"
+    return ("Profit Factor not measured (every losing trade was breakeven, so the ratio has no "
+            "denominator)")
+
+
+def _calibration_panel_values(c_metrics) -> dict:
+    """Renders the calibration panel's three metrics, or says that none was measured.
+
+    Same convention as the main dashboard's calibration panel: the tracker returns
+    total_samples=0 with NO overall_win_rate and NO calibration_grade for an empty calibration
+    log (and a brier_score of 0.0 standing in for a score with no samples to average over), so
+    the `.get(key, 0)` defaults used to publish 0%, 0.0000 and a GOOD grade nobody earned.
+    """
+    metrics = c_metrics if isinstance(c_metrics, dict) else {}
+
+    def _number(key):
+        raw = metrics.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _text(key):
+        raw = metrics.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        text = str(raw).strip()
+        return text or None
+
+    samples = _number("total_samples")
+    if samples is None:
+        signals_text = "n/a (calibration metrics unavailable)"
+        absent_reason = "calibration metrics unavailable"
+    elif samples <= 0:
+        signals_text = "0 Trades"
+        absent_reason = "no signals evaluated yet"
+    else:
+        signals_text = f"{int(samples)} Trades"
+        absent_reason = "not measured"
+
+    measured = samples is not None and samples > 0
+
+    rate = _number("overall_win_rate")
+    win_rate_text = f"{rate:.1f}%" if (measured and rate is not None) else f"n/a ({absent_reason})"
+
+    score = _number("brier_score")
+    brier_text = f"{score:.4f}" if (measured and score is not None) else f"n/a ({absent_reason})"
+
+    grade = _text("calibration_grade")
+    grade_text = grade if (measured and grade is not None) else f"not measured ({absent_reason})"
+
+    return {
+        "signals_evaluated": signals_text,
+        "historical_win_rate": win_rate_text,
+        "brier_score": brier_text,
+        "calibration_grade": grade_text,
+    }
+
+
 def calculate_estimated_liquidation(entry_p: float, lev: float, side: str, mmr: float = 0.005) -> float:
     """Calculates estimated isolated liquidation price given leverage and MMR buffer."""
     if entry_p <= 0 or lev <= 0:
@@ -289,20 +401,37 @@ with st.sidebar:
                 st.toast("✅ Force Re-Sync signal dispatched to Reconciliation Engine!")
 
     st.markdown("---")
-    live_bal_val = float(query_system_state("balance", "155.50"))
+    # A missing balance key means the account's equity was never read. The panel says so instead
+    # of publishing a demo balance and a profit that was never measured (the main dashboard reads
+    # the same key the same way).
+    _balance_raw = str(query_system_state("balance", "") or "").strip()
+    try:
+        live_bal_val = float(_balance_raw) if _balance_raw else None
+    except (TypeError, ValueError):
+        live_bal_val = None
     total_deposited = float(query_system_state("user_total_deposit", os.getenv("INITIAL_BALANCE", "137.00")))
     deposit_t1 = float(query_system_state("initial_deposit_tranche_1", "55.00"))
     deposit_t2 = float(query_system_state("topup_deposit_tranche_2", "82.00"))
-    total_profit = live_bal_val - total_deposited
-    total_roi_pct = (total_profit / total_deposited) * 100.0 if total_deposited > 0 else 0.0
+    if live_bal_val is not None:
+        total_profit = live_bal_val - total_deposited
+        total_roi_pct = (total_profit / total_deposited) * 100.0 if total_deposited > 0 else 0.0
+    else:
+        total_profit = 0.0
+        total_roi_pct = 0.0
 
     st.write(f"**Connected Exchange:** Bitget UTA (Live)")
-    st.write(f"**Current Equity:** `${live_bal_val:.2f} USDT`")
+    if live_bal_val is not None:
+        st.write(f"**Current Equity:** `${live_bal_val:.2f} USDT`")
+    else:
+        st.write("**Current Equity:** `⚠️ Telemetry Offline (Syncing...)`")
     st.write(f"**Deposited Capital:** `${total_deposited:.2f} USDT`")
     st.caption(f"↳ Seed: `${deposit_t1:.2f}` | Top-up: `${deposit_t2:.2f}`")
-    profit_sign = "+$" if total_profit >= 0 else "-$"
-    profit_color = "#00ff66" if total_profit >= 0 else "#ff003c"
-    st.markdown(f"**Real Net Profit:** <span style='color:{profit_color}; font-weight:700;'>{profit_sign}{abs(total_profit):.2f} USDT ({total_roi_pct:+.2f}%)</span>", unsafe_allow_html=True)
+    if live_bal_val is not None:
+        profit_sign = "+$" if total_profit >= 0 else "-$"
+        profit_color = "#00ff66" if total_profit >= 0 else "#ff003c"
+        st.markdown(f"**Real Net Profit:** <span style='color:{profit_color}; font-weight:700;'>{profit_sign}{abs(total_profit):.2f} USDT ({total_roi_pct:+.2f}%)</span>", unsafe_allow_html=True)
+    else:
+        st.markdown("**Real Net Profit:** <span style='font-weight:700;'>not measured (no account balance telemetry)</span>", unsafe_allow_html=True)
     local_ip = get_local_ip()
     st.write(f"**Local Mobile URL:** `http://{local_ip}:8501`")
     st.markdown("---")
@@ -379,13 +508,18 @@ if not df_all_trades.empty:
     losses_df = df_all_trades[df_all_trades['pnl'].astype(float) <= 0]
     win_count = len(wins_df)
     loss_count = len(losses_df)
-    win_rate_pct = (win_count / total_closed_count) * 100.0 if total_closed_count > 0 else 0.0
+    win_rate_pct = (win_count / total_closed_count) * 100.0 if total_closed_count > 0 else None
     gross_profit = wins_df['pnl'].astype(float).sum()
     gross_loss = abs(losses_df['pnl'].astype(float).sum())
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (2.62 if win_count > 0 else 1.0)
+    # No losing trade means no denominator, so there is no ratio to publish: the card prints the
+    # absence and its cause (see _profit_factor_delta) instead of a constant that was never
+    # measured.
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
     net_realized_pnl = gross_profit - gross_loss
 else:
-    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 43, 16, 72.9, 2.62, 12.18
+    # Nothing was measured: no trades, and every rate and total an absence. This branch used to
+    # publish a demo ledger (43 wins, 16 losses, 72.9%, 2.62x, $12.18) as if it were telemetry.
+    win_count, loss_count, win_rate_pct, profit_factor, net_realized_pnl = 0, 0, None, None, None
 
 # Active Positions Query across all 5 fleet sub-engines
 df_open_1 = query_db(TRADING_DATA_DB, "SELECT * FROM open_positions")
@@ -424,12 +558,19 @@ if not df_open.empty:
 
 max_coin_slots = int(query_system_state("GLOBAL_MAX_POSITIONS", "5"))
 margin_limit_pct = float(query_system_state("GLOBAL_MARGIN_LIMIT", "70.0"))
-free_cash_buffer = max(0.0, live_bal_val - total_margin_locked)
+bal_for_calc = live_bal_val if live_bal_val is not None else 0.0
+free_cash_buffer = max(0.0, bal_for_calc - total_margin_locked)
 
 # Margin utilization calculation
-margin_util_pct = (total_margin_locked / live_bal_val * 100.0) if live_bal_val > 0 else 0.0
+margin_util_pct = (total_margin_locked / bal_for_calc * 100.0) if bal_for_calc > 0 else 0.0
 margin_bar_width = min(100.0, (margin_util_pct / margin_limit_pct) * 100.0)
-if margin_util_pct < 45.0:
+# The buffer and the utilisation are ratios against the account balance. With no balance there is
+# no denominator, so they are absences rather than zeroes.
+margin_measured = live_bal_val is not None and live_bal_val > 0
+if not margin_measured:
+    margin_color = "#64748b"
+    margin_status = "UNKNOWN (no account balance)"
+elif margin_util_pct < 45.0:
     margin_color = "#00ff66"
     margin_status = "SAFE BUFFER"
 elif margin_util_pct < 65.0:
@@ -438,6 +579,8 @@ elif margin_util_pct < 65.0:
 else:
     margin_color = "#ff003c"
     margin_status = "CRITICAL / NEARING CEILING"
+margin_util_display = f"{margin_util_pct:.1f}%" if margin_measured else "n/a (no account balance)"
+free_cash_display = f"${free_cash_buffer:.2f} USDT" if margin_measured else "n/a (no account balance)"
 
 # ── Hero KPI Cards Grid ──────────────────────────────────────────────────────
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -445,15 +588,20 @@ kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 with kpi1:
     st.metric(
         label="💰 Live Account Equity",
-        value=f"${live_bal_val:.2f} USDT",
-        delta=f"{'+$' if total_profit>=0 else '-$'}{abs(total_profit):.2f} ({total_roi_pct:+.2f}% ROI)"
+        value=f"${live_bal_val:.2f} USDT" if live_bal_val is not None else "Syncing...",
+        delta=(f"{'+$' if total_profit>=0 else '-$'}{abs(total_profit):.2f} ({total_roi_pct:+.2f}% ROI)"
+               if live_bal_val is not None else None),
     )
 
 with kpi2:
     st.metric(
         label="🏆 Fleet Win Rate & PF",
-        value=f"{win_rate_pct:.1f}% Win Rate",
-        delta=f"{profit_factor:.2f}x Profit Factor ({win_count}W / {loss_count}L)"
+        value=_win_rate_value(win_rate_pct, total_closed_count),
+        delta=_profit_factor_delta(profit_factor, win_count, loss_count),
+        # An absent ratio is not a fall from the last reading, so it must not wear the green
+        # up-arrow st.metric gives every delta that does not start with "-".
+        delta_color="off" if profit_factor is None else "normal",
+        delta_arrow="off" if profit_factor is None else "auto",
     )
 
 with kpi3:
@@ -467,7 +615,8 @@ with kpi4:
     st.metric(
         label="⚡ Live Unrealized PnL",
         value=f"{'+$' if total_unrealized_pnl>=0 else '-$'}{abs(total_unrealized_pnl):.2f} USDT",
-        delta=f"${free_cash_buffer:.2f} Free Liquid Cash"
+        delta=(f"${free_cash_buffer:.2f} Free Liquid Cash" if margin_measured
+               else "Free Liquid Cash not measured (no account balance)")
     )
 
 # P0: Global Margin Utilization Visual Progress Bar
@@ -475,10 +624,10 @@ st.markdown(f"""
 <div style="background: #0d121f; border: 1px solid #1e293b; border-radius: 6px; padding: 12px 18px; margin-top: 10px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
     <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; margin-bottom: 8px; flex-wrap: wrap; gap: 6px;">
         <span style="font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em;">
-            🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_pct:.1f}%</b> of {margin_limit_pct:.0f}% Hard Ceiling ({margin_status})
+            🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_display}</b> of {margin_limit_pct:.0f}% Hard Ceiling ({margin_status})
         </span>
         <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #e2e8f0;">
-            Margin Locked: <b style="color: {margin_color};">${total_margin_locked:.2f}</b> | Liquid Buffer: <b style="color: #00e5ff;">${free_cash_buffer:.2f} USDT</b>
+            Margin Locked: <b style="color: {margin_color};">${total_margin_locked:.2f}</b> | Liquid Buffer: <b style="color: #00e5ff;">{free_cash_display}</b>
         </span>
     </div>
     <div style="width: 100%; background: #1e293b; height: 10px; border-radius: 5px; overflow: hidden; position: relative;">
@@ -807,16 +956,23 @@ with tab_ledger:
         st.subheader("⏱️ Trade Duration & Holding Time Analysis")
         
         dur1, dur2, dur3, dur4 = st.columns(4)
+        # These four cards used to publish hardcoded demo figures (38.5 mins, 46.2 mins, 27.8 mins,
+        # a 1.66x hold ratio) that no trade was ever measured against. This view does not carry a
+        # duration column, so there is no holding-time measurement to publish: the cards say so.
         with dur1:
-            st.metric("Avg Fleet Duration", "38.5 mins", delta="Intraday Scalp")
+            st.metric("Avg Fleet Duration", "n/a (not measured)",
+                      delta="this view does not measure holding time")
         with dur2:
-            st.metric("Avg Winner Duration", "46.2 mins", delta="+18.4m longer than losers")
+            st.metric("Avg Winner Duration", "n/a (not measured)",
+                      delta="this view does not measure holding time")
         with dur3:
-            st.metric("Avg Loser Duration", "27.8 mins", delta="Cut quick on SL")
+            st.metric("Avg Loser Duration", "n/a (not measured)",
+                      delta="this view does not measure holding time")
         with dur4:
-            st.metric("Hold Ratio (Win/Loss)", "1.66x", delta="Healthy Asymmetry (>1.0x)")
-            
-        st.info("💡 **Holding Asymmetry Insight:** Winning trades run 1.66x longer than losing trades. This confirms the system's dynamic trailing stops allow winners to expand while hard hardware stops cut losses quickly.")
+            st.metric("Hold Ratio (Win/Loss)", "n/a (not measured)",
+                      delta="this view does not measure holding time")
+
+        st.info("💡 **Holding Asymmetry Insight:** Not measured in this view — the closed-trade ledger carries no duration column here, so the winner/loser holding ratio is not computed and no asymmetry is claimed.")
     else:
         st.info("No closed trades recorded in the database yet.")
 
@@ -852,7 +1008,12 @@ with tab_ai:
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.info("33 dynamic neural rules active in long-term memory.")
+            # The rule count used to be a hardcoded "33": nothing had counted anything.
+            df_rule_total = query_db(TRADING_LEDGER_DB, "SELECT COUNT(*) as cnt FROM learned_rules")
+            if df_rule_total.empty:
+                st.info("Learned-rule count unavailable (ledger unreadable).")
+            else:
+                st.info(f"{int(df_rule_total.iloc[0]['cnt'])} dynamic neural rules active in long-term memory.")
 
     st.markdown("---")
     st.subheader("🎯 AI Model Calibration & Reliability Scorecard (Prediction vs Realized Outcome)")
@@ -862,14 +1023,21 @@ with tab_ai:
         c_metrics = calib_tracker.compute_calibration_metrics()
         
         cal_col1, cal_col2, cal_col3 = st.columns(3)
+        cal_values = _calibration_panel_values(c_metrics)
         with cal_col1:
-            st.metric("Signals Evaluated", f"{c_metrics.get('total_samples', 0)} Trades")
+            st.metric("Signals Evaluated", cal_values["signals_evaluated"])
         with cal_col2:
-            st.metric("Historical Win Rate", f"{c_metrics.get('overall_win_rate', 0)}%")
+            st.metric("Historical Win Rate", cal_values["historical_win_rate"])
         with cal_col3:
-            b_score = c_metrics.get('brier_score', 0)
-            b_grade = c_metrics.get('calibration_grade', 'GOOD')
-            st.metric("Brier Calibration Score", f"{b_score:.4f}", delta=f"Grade: {b_grade}")
+            st.metric(
+                "Brier Calibration Score",
+                cal_values["brier_score"],
+                delta=f"Grade: {cal_values['calibration_grade']}",
+                # The grade is a label, not a direction: an arrow on it means nothing, and on an
+                # absent grade it would dress "not measured" as a result.
+                delta_color="off",
+                delta_arrow="off",
+            )
 
         if c_metrics.get("bins"):
             df_bins = pd.DataFrame(c_metrics["bins"])
@@ -885,7 +1053,13 @@ with tab_ai:
         st.info(f"Model calibration tracker syncing: {c_err}")
 
     st.markdown("---")
-    st.subheader("📖 Post-Trade Forensic Lessons Extracted (220 Lessons in Database)")
+    # The lesson count used to be a hardcoded "220": nothing had counted anything.
+    df_lessons_total = query_db(TRADING_LEDGER_DB, "SELECT COUNT(*) as cnt FROM trade_lessons")
+    if df_lessons_total.empty:
+        st.subheader("📖 Post-Trade Forensic Lessons Extracted")
+    else:
+        total_lessons_db = int(df_lessons_total.iloc[0]['cnt'])
+        st.subheader(f"📖 Post-Trade Forensic Lessons Extracted ({total_lessons_db} Lessons in Database)")
     df_lessons = query_db(TRADING_LEDGER_DB, "SELECT symbol, pnl, lesson, timestamp FROM trade_lessons ORDER BY id DESC LIMIT 5")
     if not df_lessons.empty:
         for _, l in df_lessons.iterrows():
@@ -1047,7 +1221,7 @@ with tab_system:
         """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("⚙️ Autonomous Daemon Subsystems (18 Background Processes)")
+    st.subheader("⚙️ Autonomous Daemon Subsystems (Unified Super Bot Architecture)")
     
     daemon_list = [
         ("Master Coordinator & Launcher", "start_system.py", "Active Background Task (task-6230)"),
