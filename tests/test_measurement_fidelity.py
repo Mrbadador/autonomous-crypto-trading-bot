@@ -7,8 +7,9 @@ warm-up windows that stay NaN instead of being back-filled, and datasets an arm 
 not find being reported as missing instead of silently skipped.
 """
 
+import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -3164,6 +3165,12 @@ _G4_BLOCKS = {
     # reject it; the subheader prefix makes it name one panel.
     "basis": (r'^[ \t]*st\.subheader\(".*BTC Cash-and-Carry Basis Oracle',
               (r'\n[ \t]*st\.markdown\("---"\)',)),
+    # G-5b: the Bayesian Markov regime deck. Its start is the section comment (unique in the file),
+    # and its end is the next section comment — which is also `"micro"`'s end pattern, so both
+    # panels keep naming one region each. The heading text is deliberately NOT an anchor: the whole
+    # point of B-1 is that the heading changes when the row goes stale.
+    "markov": (r"^[ \t]*# .*Bayesian Markov Chain",
+               (r"\n[ \t]*# .*Multi-Asset Fleet Microstructure",)),
 }
 
 _G4_DASHBOARD_BLOCKS = ("macro", "ofi", "micro", "radar", "fleet")
@@ -4034,18 +4041,31 @@ def _g5_coverage_excluded():
         "stated rule about which entries are not economics fields")
 
 
-class _G5RecordingStreamlit:
-    """Captures what the panel emits, so its f-string can be rendered without an app."""
+class _G5RecordingColumn:
+    """One `st.columns(...)` slot: a context manager that records into its owner's lists.
 
-    def __init__(self):
-        self.markdown_calls = []
-        self.infos = []
+    Added for G-5b — the Markov deck lays its six KPI cards out with `st.columns(6)`, and the
+    carry panel never needed it. Markdown emitted inside a column lands in the owner's own
+    `markdown_calls`, so a render test reads the whole panel no matter which column spoke.
+    """
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
 
     def markdown(self, body, **kwargs):
-        self.markdown_calls.append(str(body))
+        self._owner.markdown(body)
 
     def info(self, body, **kwargs):
-        self.infos.append(str(body))
+        self._owner.info(body)
+
+    def plotly_chart(self, fig, **kwargs):
+        self._owner.plotly_chart(fig)
 
     def __getattr__(self, name):
         def _record(*args, **kwargs):
@@ -4053,11 +4073,42 @@ class _G5RecordingStreamlit:
         return _record
 
 
-def _g5_system_state_row(tmp_path, payload=_G5_LIVE_PAYLOAD):
+class _G5RecordingStreamlit:
+    """Captures what the panel emits, so its f-string can be rendered without an app."""
+
+    def __init__(self):
+        self.markdown_calls = []
+        self.infos = []
+        self.charts = []
+
+    def markdown(self, body, **kwargs):
+        self.markdown_calls.append(str(body))
+
+    def info(self, body, **kwargs):
+        self.infos.append(str(body))
+
+    def plotly_chart(self, fig, **kwargs):
+        self.charts.append(fig)
+
+    def columns(self, spec=3, **kwargs):
+        count = spec if isinstance(spec, int) else len(spec)
+        return [_G5RecordingColumn(self) for _ in range(int(count))]
+
+    def __getattr__(self, name):
+        def _record(*args, **kwargs):
+            return None
+        return _record
+
+
+def _g5_system_state_row(tmp_path, payload=_G5_LIVE_PAYLOAD, key="basis_trader_telemetry",
+                         updated_at="2026-09-17T22:45:48.677606+00:00"):
     """Seed one real `system_state` row and hand back the JSON text sqlite stores for it.
 
     Written to a database in `tmp_path` — never to `trading_data.db`, which every test here opens
     read-only or not at all.
+
+    G-5b added `key` and `updated_at`: the Markov deck's whole B-1 claim is about the row's own
+    publish instant, so the fixture has to be able to set it rather than inherit the basis stamp.
     """
     import json as _json
     import sqlite3
@@ -4069,26 +4120,33 @@ def _g5_system_state_row(tmp_path, payload=_G5_LIVE_PAYLOAD):
                      "updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         raw = _json.dumps(payload)
         conn.execute("INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-                     ("basis_trader_telemetry", raw, "2026-09-17T22:45:48.677606+00:00"))
+                     (key, raw, updated_at))
         conn.commit()
         stored = conn.execute("SELECT value FROM system_state WHERE key = ?",
-                              ("basis_trader_telemetry",)).fetchone()[0]
+                              (key,)).fetchone()[0]
     finally:
         conn.close()
     return str(stored)
 
 
-def _g5_panel_namespace(path, raw_value, now=None):
+def _g5_panel_namespace(path, raw_value, now=None, extra_funcs=(), const_prefixes=("_BASIS_",),
+                        extra_ns=None):
     """A namespace holding dashboard.py's own shipped helpers, without booting dashboard.py.
 
     Only stdlib imports, the `_BASIS_*` module constants and the pure renderers the block calls are
     compiled out of the file, in source order. `streamlit` is replaced by a recorder and
     `query_system_state` by the seeded payload text.
+
+    G-5b added the keyword arguments rather than a second harness: the Markov deck needs its own
+    pure reader, its own `_MARKOV_*` constants and a numpy/plotly pair the carry panel never
+    touches, and every one of those is the same compile-out-of-the-file step. The defaults keep
+    G-5a's call sites byte-for-byte as they were.
     """
     import ast
 
     wanted_funcs = {"_optional_float", "_published_number", "_published_boolean",
                     "_published_state", "_absence_note", "utc_to_sast", "_basis_readings"}
+    wanted_funcs |= set(extra_funcs)
     safe_imports = {"json", "html", "pytz", "datetime", "typing", "time"}
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     ns = {}
@@ -4104,7 +4162,7 @@ def _g5_panel_namespace(path, raw_value, now=None):
     for node in tree.body:
         targets = ([node.target] if isinstance(node, ast.AnnAssign)
                    else (node.targets if isinstance(node, ast.Assign) else []))
-        if any(isinstance(t, ast.Name) and t.id.startswith("_BASIS_") for t in targets):
+        if any(isinstance(t, ast.Name) and t.id.startswith(const_prefixes) for t in targets):
             exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
@@ -4117,6 +4175,8 @@ def _g5_panel_namespace(path, raw_value, now=None):
     if now is not None and callable(ns.get("_basis_readings")):
         shipped = ns["_basis_readings"]
         ns["_basis_readings"] = lambda data, _s=shipped, _n=now: _s(data, now=_n)
+    for name, value in (extra_ns or {}).items():
+        ns[name] = value
     return ns, fake
 
 
@@ -4749,20 +4809,24 @@ def test_g5a_the_carry_panel_keys_each_field_on_its_own_state(field, own_key):
             f"{field} is published under a gate on another field's state")
 
 
-def _g5_enclosing_gate_is_bundled(node, parents, block, own_key):
+def _g5_enclosing_gate_is_bundled(node, parents, block, own_key, prefix="b"):
     """True when an enclosing `If` gate reads a state variable other than `own_key`.
 
     The G-4 radar guard (`test_g4_the_radar_banner_keys_each_hawkes_text_on_its_own_state`) only
     excluded one named sibling, so a ternary keyed on its own flag *plus* a sibling's still passed.
     This one asks whether any other field's state is in scope at all.
+
+    `prefix` is the panel's own state-variable prefix — `b_` for the carry panel, `m_` for the
+    Markov deck — so the deck reuses this gate instead of forking a second copy of it.
     """
     import ast
 
+    state_pattern = r"\b%s_[a-z_]*_st\b" % prefix
     ancestor = parents.get(id(node))
     while ancestor is not None:
         if isinstance(ancestor, ast.If):
             gate = ast.get_source_segment(block, ancestor.test) or ""
-            named = set(re.findall(r"\bb_[a-z_]*_st\b", gate))
+            named = set(re.findall(state_pattern, gate))
             if named and named != {own_key}:
                 return True
         ancestor = parents.get(id(ancestor))
@@ -4900,3 +4964,1002 @@ def test_g5a_the_legacy_dashboard_has_no_carry_panel_to_convert():
     with pytest.raises(Exception):
         _g4_block("basis", LEGACY_DASHBOARD)
 
+
+# ---------------------------------------------------------------------------
+# G-5b — the Bayesian Markov regime deck: a 35-hour-old row under "Live Forward Filter"
+# ---------------------------------------------------------------------------
+# Measured at BASE `df30aa3` against `file:trading_data.db?mode=ro`, `system_state`, key
+# `markov_regime_telemetry`: `updated_at = '2026-10-21T14:21:29.139442+00:00'` and the payload
+# carries exactly the ten keys `markov_regime.py::process_bars` publishes (`:398-413` short-frame
+# path, `:445-460` filtered path). The deck read the value only — `query_system_state`
+# (`dashboard.py:101-106`) is `SELECT value FROM system_state WHERE key = ?` and cannot see
+# `updated_at` — grepped its whole window for `stale|STALE|updated_at|age` and found nothing, and
+# printed the heading "(Live Forward Filter)". Every one of the fleet's four automated consumers
+# (`super_bot.py:718-736`, `super_bot.py:909-924`, `inflight_shepherd.py:594-615`,
+# `swing_trader.py:928-944`) refuses a row older than `config.REGIME_MAX_AGE_SEC` (`config.py:109`,
+# default "900"). The HUD was the only consumer that never refused, and the only one a human reads.
+#
+# What is proven below: `_markov_regime_readings` is compiled out of dashboard.py and called for
+# real, and the shipped deck block is exec'd against the seeded row in a namespace built out of
+# dashboard.py's own helpers (the G-5a harness, extended — see `_g5_panel_namespace`). So the age
+# path, the heading word, every absence and every colour is the code the fleet runs, not a
+# paraphrase of it. The two DB readers stay stubbed at their return values because
+# `@st.cache_data`-wrapped functions cannot be extracted; the row is still written into a real
+# `system_state` table and read back out of sqlite first.
+#
+# The producer facts this suite reads against, all from `markov_regime.py`:
+#   `MarkovRegimeEngine.__init__` (`:33-49`) is pure — uniform `pi`, the prior `P`, no dataset —
+#   which is exactly why the deck's instantiate-and-run fallback published a prior as a measurement;
+#   `get_regime_sizing_multiplier` (`:317-327`) bounds the multiplier to `[0.20, 1.0]`, so a
+#   measured `0.0` is unreachable there and no test below claims otherwise; `stationary_distribution`
+#   is a LIST of three rounded floats (`:409`, `:456`); the forecast is published as
+#   `forecast_4step` (`:407`, `:454`) and the name `forecast_probabilities` never leaves
+#   `forecast_k_steps` (`:360`).
+
+MARKOV_REGIME = REPO_ROOT / "markov_regime.py"
+
+_MARKOV_KEY = "markov_regime_telemetry"
+
+# The live row, transcribed from the read-only database on 2026-10-23. Its KEY SET is not taken on
+# trust: `test_g5b_the_fixture_keys_are_the_ten_the_producer_publishes` re-derives it from
+# `markov_regime.py`'s syntax tree and fails this fixture if the two ever disagree.
+_G5B_LIVE_PAYLOAD = {
+    "dominant_regime": "CHOP",
+    "state_probabilities": {"CHOP": 0.8878, "BULL_EXPANSION": 0.112, "BEAR_CASCADE": 0.0002},
+    "expected_durations_bars": {"CHOP": 10.4, "BULL_EXPANSION": 16.5, "BEAR_CASCADE": 16.67},
+    "breakdown_risk_4step": 0.6672,
+    "forecast_4step": {"CHOP": 0.6374, "BULL_EXPANSION": 0.3328, "BEAR_CASCADE": 0.0297},
+    "transition_matrix": [[0.9038461538461539, 0.08653846153846154, 0.009615384615384616],
+                          [0.05757575757575757, 0.9393939393939394, 0.0030303030303030303],
+                          [0.05, 0.01, 0.9399999999999998]],
+    "stationary_distribution": [0.3703, 0.543, 0.0868],
+    "is_tradable": True,
+    "tradability_reason": "Tradable: E[D]=10.4b >= 3.5b",
+    "sizing_multiplier": 0.64,
+}
+
+_G5B_LIVE_UPDATED_AT = "2026-10-21T14:21:29.139442+00:00"
+
+# The live payload exactly as the row's `value` column stores it. Every reader-level test below
+# calls `_markov_regime_readings` with this TEXT, because that is what the row reader hands back —
+# the reader owns the `json.loads`, so a payload that is not JSON is the reader's problem to survive.
+_MARKOV_JSON_TEXT = json.dumps(_G5B_LIVE_PAYLOAD)
+
+# Fixed clock for the age path: 35h 00m after the live row was published, so the live row renders
+# stale at a deterministic age (125999.86s -> "126000s old").
+_G5B_FIX_NOW = datetime(2026, 10, 23, 1, 21, 29, tzinfo=timezone.utc)
+_G5B_FRESH_UPDATED_AT = (_G5B_FIX_NOW - timedelta(seconds=60)).isoformat()
+
+# The twenty-one figures the deck publishes. Every one of them is a state dict; the meta keys are
+# not, and a test below pins that separation so the coverage headline cannot count a meta entry.
+_G5B_PROB_FIELDS = ("prob_chop", "prob_bull", "prob_bear")
+_G5B_DUR_FIELDS = ("dur_chop", "dur_bull", "dur_bear")
+_G5B_FC_FIELDS = ("fc_chop", "fc_bull", "fc_bear")
+_G5B_STAT_FIELDS = ("stat_chop", "stat_bull", "stat_bear")
+_G5B_SCALAR_FIELDS = ("dominant_duration", "confidence", "breakdown_risk", "sizing_multiplier")
+_G5B_TEXT_FIELDS = ("dominant_regime", "tradability_reason")
+_G5B_FLAG_FIELDS = ("is_tradable",)
+_G5B_VECTOR_FIELDS = ("equilibrium", "transition_matrix")
+_G5B_FIELDS = (_G5B_TEXT_FIELDS + _G5B_PROB_FIELDS + _G5B_DUR_FIELDS + _G5B_FC_FIELDS
+               + _G5B_STAT_FIELDS + _G5B_SCALAR_FIELDS + _G5B_FLAG_FIELDS + _G5B_VECTOR_FIELDS)
+# `sizing_multiplier` is deliberately NOT in the measured-zero roster: the producer clamps it to
+# [0.20, 1.0] at `markov_regime.py:327`, so a measured zero is not a reading it can publish.
+_G5B_NUMBER_FIELDS = (_G5B_PROB_FIELDS + _G5B_DUR_FIELDS + _G5B_FC_FIELDS + _G5B_STAT_FIELDS
+                      + ("breakdown_risk",))
+
+# Payload key -> the readings the deck takes from it. Keyed by the producer's own key names, so the
+# roster cannot drift away from `process_bars` without `test_g5b_the_fixture_keys_...` failing.
+_G5B_PAYLOAD_FIELDS = {
+    "dominant_regime": ("dominant_regime",),
+    "state_probabilities": _G5B_PROB_FIELDS,
+    "expected_durations_bars": _G5B_DUR_FIELDS,
+    "forecast_4step": _G5B_FC_FIELDS,
+    "stationary_distribution": _G5B_STAT_FIELDS,
+    "breakdown_risk_4step": ("breakdown_risk",),
+    "transition_matrix": ("transition_matrix",),
+    "is_tradable": ("is_tradable",),
+    "tradability_reason": ("tradability_reason",),
+    "sizing_multiplier": ("sizing_multiplier",),
+}
+
+# The reason each figure prints when nothing was measured, pinned so the deck's parentheticals name
+# the missing reading rather than the panel's own invention.
+_G5B_FIELD_REASONS = {
+    "dominant_regime": "no dominant_regime in markov regime telemetry",
+    "prob_chop": "no CHOP in state_probabilities",
+    "prob_bull": "no BULL_EXPANSION in state_probabilities",
+    "prob_bear": "no BEAR_CASCADE in state_probabilities",
+    "dur_chop": "no CHOP in expected_durations_bars",
+    "dur_bull": "no BULL_EXPANSION in expected_durations_bars",
+    "dur_bear": "no BEAR_CASCADE in expected_durations_bars",
+    "fc_chop": "no CHOP in forecast_4step",
+    "fc_bull": "no BULL_EXPANSION in forecast_4step",
+    "fc_bear": "no BEAR_CASCADE in forecast_4step",
+    "stat_chop": "no CHOP in stationary_distribution",
+    "stat_bull": "no BULL_EXPANSION in stationary_distribution",
+    "stat_bear": "no BEAR_CASCADE in stationary_distribution",
+    "confidence": "no confidence: every state probability has to be measured first",
+    "dominant_duration": ("no dominant duration: the dominant regime or its expected duration "
+                          "was not measured"),
+    "equilibrium": ("no equilibrium vector: stationary_distribution was not published as a "
+                    "3-vector"),
+    "breakdown_risk": "no breakdown_risk_4step in markov regime telemetry",
+    "transition_matrix": "no 3x3 transition_matrix in markov regime telemetry",
+    "is_tradable": "no is_tradable in markov regime telemetry",
+    "tradability_reason": "no tradability_reason in markov regime telemetry",
+    "sizing_multiplier": "no sizing_multiplier in markov regime telemetry",
+}
+
+# (rendered text variable, the one state variable it may read) — the G-5a idiom, one row per field
+# the deck publishes as text.
+_G5B_FIELD_OWNERS = {
+    "m_dom_text": "m_dom_st", "m_dom_note": "m_dom_st",
+    "m_conf_text": "m_conf_st", "m_conf_note": "m_conf_st",
+    "m_domdur_text": "m_domdur_st", "m_domdur_note": "m_domdur_st",
+    "m_sizing_text": "m_sizing_st", "m_sizing_note": "m_sizing_st",
+    "m_bd_text": "m_bd_st", "m_bd_note": "m_bd_st",
+    "m_stat_text": "m_stat_st", "m_stat_note": "m_stat_st",
+    "m_matrix_note": "m_matrix_st",
+}
+
+# Every verdict/colour the deck derives, and so every one that must be guarded.
+_G5B_DERIVED_NAMES = frozenset(set(_G5B_FIELD_OWNERS) | {
+    "m_dom_color", "m_bd_color", "m_bd_label", "m_sizing_color", "m_tradable_color",
+    "m_tradable_badge", "m_reason_line", "m_time_text", "m_time_color", "m_heading",
+    "m_coverage_line", "m_unmeasured_count", "m_field_count", "m_horizon_note", "m_matrix_html",
+    "m_bars_html",
+})
+
+# Derived verdicts that talk about the payload as a whole, or that are the reader's own decision
+# rather than the block's: exempt from the per-field gate BY SHAPE, and the shape is asserted.
+_G5B_CHAIN_VERDICTS = frozenset({"m_heading", "m_coverage_line", "m_unmeasured_count",
+                                 "m_field_count", "m_horizon_note"})
+
+_G5B_STAND_IN_CASES = (
+    ('"is_tradable", True', 'is_tradable = bool(m_tel.get("is_tradable", True))'),
+    ('"sizing_multiplier", 1.0', 'sizing_mult = float(m_tel.get("sizing_multiplier", 1.0))'),
+    ('"tradability_reason", "Tradable"', 'rsn = m_tel.get("tradability_reason", "Tradable")'),
+    ('"dominant_regime", "CHOP"', 'dom_regime = m_tel.get("dominant_regime", "CHOP")'),
+    ('"breakdown_risk_4step", 0.0', 'bd = float(m_tel.get("breakdown_risk_4step", 0.0))'),
+    ('"stationary_distribution", {}', 'stat_dist = m_tel.get("stationary_distribution", {})'),
+    ("or 0.0)", 'bd_risk = float(m_tel.get("breakdown_risk_4step") or 0.0)'),
+    ("or 1.0)", 'sizing_mult = float(m_tel.get("sizing_multiplier") or 1.0)'),
+    ("or 0.333", 'st_chop = float(raw_stat.get("CHOP") or 0.333)'),
+    ('"CHOP": 0.60', 'm_tel = {"state_probabilities": {"CHOP": 0.60}}'),
+    ("0.333, 0.333, 0.333", 'st_chop, st_bull, st_bear = 0.333, 0.333, 0.333'),
+    ("default_P", 'raw_P = m_tel.get("transition_matrix", default_P.tolist())'),
+    ("MarkovRegimeEngine", 'm_eng = MarkovRegimeEngine()'),
+    ("from markov_regime import", 'from markov_regime import MarkovRegimeEngine'),
+    ('"forecast_probabilities"', 'fc_probs = m_tel.get("forecast_probabilities", {})'),
+)
+
+_G5B_PROSE_CLAIMS = (
+    ("(Live Forward Filter)", 'st.markdown("#### ... (Live Forward Filter)")'),
+    ('"TRADABLE"', 'tradable_badge = "TRADABLE"'),
+)
+
+_G5B_ABSENT_COLOUR = "#94a3b8"
+_G5B_ALL_CLEAR_COLOUR = "#00ff66"
+
+
+def _g5b_producer_returns():
+    """The two `return` dict literals of `MarkovRegimeEngine.process_bars`, from the AST.
+
+    Both paths — the `len(df) < 15` short-frame branch and the filtered branch — have to be found,
+    because the contract this suite reads against is "exactly these keys, on both paths".
+    """
+    import ast
+
+    tree = ast.parse(MARKOV_REGIME.read_text(encoding="utf-8"), filename=str(MARKOV_REGIME))
+    engine = next((node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == "MarkovRegimeEngine"), None)
+    assert engine is not None, "markov_regime.py no longer defines MarkovRegimeEngine"
+    process = next((node for node in engine.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "process_bars"), None)
+    assert process is not None, "MarkovRegimeEngine no longer defines process_bars"
+    literal_keys = []
+    for node in ast.walk(process):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            keys = tuple(key.value for key in node.value.keys)
+            assert all(isinstance(key, str) for key in keys), (
+                "process_bars has a non-literal telemetry key, so this suite can no longer read "
+                "the producer's contract off its syntax tree")
+            literal_keys.append(keys)
+    assert len(literal_keys) == 2, (
+        f"process_bars publishes {len(literal_keys)} telemetry literals, expected the short-frame "
+        "and filtered paths; the deck's contract needs re-reading")
+    assert literal_keys[0] == literal_keys[1], (
+        f"the two process_bars paths publish different key sets: {literal_keys}")
+    return literal_keys[0]
+
+
+def _g5b_producer_payload_keys():
+    return frozenset(_g5b_producer_returns())
+
+
+def _g5b_producer_states():
+    """`MarkovRegimeEngine.STATES`, read out of the class body rather than typed in here."""
+    import ast
+
+    tree = ast.parse(MARKOV_REGIME.read_text(encoding="utf-8"), filename=str(MARKOV_REGIME))
+    engine = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                  and node.name == "MarkovRegimeEngine")
+    for node in engine.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "STATES"
+                                                for t in node.targets):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError("MarkovRegimeEngine no longer declares STATES, so the deck's roster of "
+                         "regime names has nothing to be checked against")
+
+
+def _g5b_sizing_bound_from_producer():
+    """The `[low, high]` the producer clamps `sizing_multiplier` into, read out of its AST.
+
+    `markov_regime.py:327` is `round(float(max(0.20, min(1.0, mult))), 2)`. The lower bound is what
+    keeps this suite from writing the test the brief forbids: a deck that "measures" a 0.0 sizing
+    multiplier is describing a producer that cannot publish one.
+    """
+    import ast
+
+    src = MARKOV_REGIME.read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=str(MARKOV_REGIME))
+    getter = next((node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                   and node.name == "get_regime_sizing_multiplier"), None)
+    assert getter is not None, "MarkovRegimeEngine no longer computes a sizing multiplier"
+    numbers = [n.value for n in ast.walk(getter) if isinstance(n, ast.Constant)
+               and isinstance(n.value, float)]
+    assert numbers, "get_regime_sizing_multiplier has no numeric bound to read"
+    return min(numbers), max(numbers)
+
+
+def _g5b_readings(payload, updated_at=_G5B_LIVE_UPDATED_AT, now=_G5B_FIX_NOW,
+                 max_age_sec=None, path=None):
+    """`_markov_regime_readings`, compiled out of the shipped file, called on one row."""
+    helper = _g4_helper("_markov_regime_readings", DASHBOARD if path is None else path)
+    return helper(payload, updated_at, now=now, max_age_sec=max_age_sec)
+
+
+def _g5b_block_code(path=None):
+    """The Markov deck's own source, comments removed: what every scan below actually reads."""
+    return _g5_code_only(_g4_block("markov", DASHBOARD if path is None else path))
+
+
+def _g5b_helper_code(name="_markov_regime_readings"):
+    """One module-level Markov helper's source, comments removed."""
+    return _g5_code_only(_function_source(DASHBOARD, name))
+
+
+def _g5b_panel_namespace(path, raw_value, updated_at, now=None, config_bound=900.0):
+    """The G-5a namespace, plus what only this deck needs: numpy, plotly and the row reader.
+
+    `query_system_state` answers for BOTH telemetry keys so that the pre-fix deck — which read the
+    value through `query_system_state` — renders the same row the post-fix deck reads through
+    `query_system_state_row`. That is what makes the RED runs below evidence about the shipped
+    panel rather than about a stub.
+    """
+    import plotly.graph_objects as go
+
+    extra_funcs = ("_markov_regime_readings", "_regime_max_age_sec", "_stance_color", "num")
+    ns, fake = _g5_panel_namespace(
+        path, raw_value, now=None, extra_funcs=extra_funcs,
+        const_prefixes=("_BASIS_", "_MARKOV_", "_REGIME_"),
+        extra_ns={"np": np, "go": go,
+                  "query_system_state": lambda key, default="": (
+                      raw_value if key in (_MARKOV_KEY, "basis_trader_telemetry") else default),
+                  "query_system_state_row": lambda key: (
+                      (raw_value, updated_at) if key == _MARKOV_KEY else ("", ""))})
+
+    class _Bound:
+        REGIME_MAX_AGE_SEC = config_bound
+
+    ns["config"] = _Bound()
+    if now is not None and callable(ns.get("_markov_regime_readings")):
+        shipped = ns["_markov_regime_readings"]
+        ns["_markov_regime_readings"] = (
+            lambda raw, published_at, _s=shipped, _n=now: _s(raw, published_at, now=_n))
+    return ns, fake
+
+
+def _g5b_render_deck(tmp_path=None, payload=_G5B_LIVE_PAYLOAD, updated_at=_G5B_LIVE_UPDATED_AT,
+                     raw=None, path=None, now=_G5B_FIX_NOW, config_bound=900.0):
+    """Run the shipped Markov deck for one row and return everything it published.
+
+    With a `tmp_path` the payload is seeded as a real `system_state` row carrying that
+    `updated_at`, written into a fixture database and read back out of sqlite, so the JSON the deck
+    parses went through a storage round-trip and the age it computes came from a stored stamp.
+    """
+    import json as _json
+
+    path = DASHBOARD if path is None else path
+    if raw is None:
+        if isinstance(payload, str):
+            raw = payload
+        elif tmp_path is not None and isinstance(payload, dict):
+            raw = _g5_system_state_row(tmp_path, payload=payload, key=_MARKOV_KEY,
+                                       updated_at=updated_at)
+        else:
+            raw = _json.dumps(payload)
+    ns, fake = _g5b_panel_namespace(path, raw, updated_at, now=now, config_bound=config_bound)
+    block = _g4_block("markov", path)
+    exec(compile(block, f"{path.name} markov deck", "exec"), ns)
+    return "\n".join(fake.markdown_calls), fake, ns
+
+
+def _g5b_heading(html):
+    """The deck's `####` heading line, so a test can speak about the heading and nothing else."""
+    lines = [one for one in html.splitlines() if one.strip().startswith("####")]
+    assert lines, f"the deck published no heading:\n{html[:1500]}"
+    return lines[0]
+
+
+def _g5b_payload_without(*keys):
+    """The live payload minus the named keys — the shape a partial publish or an older producer
+    leaves behind, and the only way to ask the deck what it does when a reading is not there."""
+    out = dict(_G5B_LIVE_PAYLOAD)
+    for key in keys:
+        out.pop(key, None)
+    return out
+
+
+# ── B-1: the row's own publish instant, and the word "Live" ──────────────────────────────
+def test_g5b_a_stale_row_is_not_called_live(tmp_path):
+    """The finding that leads the task: the live row is 35h old against a 900s bound, and the deck
+    called it a live forward filter. This is the RED-against-`df30aa3` proof for B-1."""
+    html, _fake, _ns = _g5b_render_deck(tmp_path)
+    heading = _g5b_heading(html)
+    assert "Live" not in heading, (
+        f"a row 35 hours old still wears the live claim: {heading}")
+    assert "(Live Forward Filter)" not in html, html[:1500]
+    assert "STALE" in heading.upper(), f"the heading does not say what it is: {heading}"
+    assert "s old" in html, "the deck never prints the row's age"
+    assert "126000s old" in html, html[:1500]
+    assert "STALE TELEMETRY" in html, html[:1500]
+    assert "900" in html, "the deck does not name the bound the row blew through"
+
+
+def test_g5b_a_fresh_row_is_still_called_a_live_forward_filter(tmp_path):
+    """The other half, or the fix is just the word "Live" deleted. Inside the bound the claim is
+    supported by the measurement and has to stay."""
+    html, _fake, _ns = _g5b_render_deck(tmp_path, updated_at=_G5B_FRESH_UPDATED_AT)
+    heading = _g5b_heading(html)
+    assert "Live Forward Filter" in heading, heading
+    assert "STALE" not in heading.upper(), heading
+    assert "60s old" in html, html[:1500]
+
+
+def test_g5b_an_absent_row_reads_differently_from_a_stale_one(tmp_path):
+    """Absent and stale are different states and may not share a sentence: the fleet refuses a
+    stale row and has nothing at all to refuse when the row was never written."""
+    stale_html = _g5b_render_deck(tmp_path)[0]
+    absent_html = _g5b_render_deck(tmp_path, raw="", updated_at="")[0]
+    assert "Live" not in _g5b_heading(absent_html), _g5b_heading(absent_html)
+    assert "not measured" in absent_html, absent_html[:1500]
+    assert "STALE TELEMETRY" not in absent_html, (
+        "a row that was never published is labelled as one that went stale")
+    assert "126000s old" not in absent_html
+    assert "126000s old" in stale_html
+    assert absent_html != stale_html, "absent and stale render identically"
+
+
+def test_g5b_the_age_is_measured_from_the_rows_own_updated_at():
+    """`regime_classifier.py:1218-1221` writes the row with `updated_at =
+    datetime.now(UTC).isoformat()` (`:1136`), so that stamp is the publish instant and the payload
+    carries no timestamp of its own. Naive stamps and `Z` suffixes are both handled by the fleet's
+    own parser (`inflight_shepherd.py:604-611`), and neither may be read as a live row."""
+    readings = _g5b_readings(_MARKOV_JSON_TEXT)
+    assert readings["age_sec"] is not None
+    assert 125900 <= readings["age_sec"] <= 126100, readings["age_sec"]
+    assert readings["stale"] is True and readings["age_known"] is True
+    assert readings["published_at"]["measured"] is True
+    zulu = _g5b_readings(_MARKOV_JSON_TEXT, updated_at="2026-10-21T14:21:29Z")
+    assert zulu["age_known"] is True and abs(zulu["age_sec"] - 126000.0) < 2.0, zulu["age_sec"]
+    naive = _g5b_readings(_MARKOV_JSON_TEXT, updated_at="2026-10-21 14:21:29")
+    assert naive["age_known"] is True, "a naive stamp is the CURRENT_TIMESTAMP shape"
+    assert abs(naive["age_sec"] - 126000.0) < 2.0, naive["age_sec"]
+    junk = _g5b_readings(_MARKOV_JSON_TEXT, updated_at="syncing...")
+    assert junk["age_sec"] is None and junk["age_known"] is False, junk["age_sec"]
+    assert junk["stale"] is False
+    assert junk["heading_is_live"] is False, "a row with no usable stamp may not claim to be live"
+    missing = _g5b_readings(_MARKOV_JSON_TEXT, updated_at="")
+    assert missing["published_at"]["measured"] is False, missing["published_at"]
+    assert missing["heading_is_live"] is False
+
+
+def test_g5b_the_bound_edges_are_the_fleet_semantics():
+    """Consumers refuse on `age > max_age` (`inflight_shepherd.py:614`), so exactly at the bound is
+    still fresh. The HUD may not be stricter or gentler than the gate that is actually enforced."""
+    at_bound = _g5b_readings(_MARKOV_JSON_TEXT,
+                             updated_at=(_G5B_FIX_NOW - timedelta(seconds=900)).isoformat())
+    assert at_bound["age_sec"] <= 900.0 and at_bound["stale"] is False, at_bound["age_sec"]
+    assert at_bound["heading_is_live"] is True
+    over = _g5b_readings(_MARKOV_JSON_TEXT,
+                         updated_at=(_G5B_FIX_NOW - timedelta(seconds=901)).isoformat())
+    assert over["stale"] is True and over["heading_is_live"] is False
+    assert over["max_age_sec"] == 900.0, over["max_age_sec"]
+
+
+def test_g5b_the_bound_is_the_fleets_constant_and_not_a_second_number():
+    """`config.py:109` is the bound; the four consumers all fall back to the literal 900.0. A panel
+    with its own softer threshold would let a row through that the fleet is refusing."""
+    for relpath in ("config.py", "super_bot.py", "inflight_shepherd.py", "swing_trader.py"):
+        src = (REPO_ROOT / relpath).read_text(encoding="utf-8")
+        assert "REGIME_MAX_AGE_SEC" in src, f"{relpath} no longer names the bound"
+    helper_src = _function_source(DASHBOARD, "_regime_max_age_sec")
+    assert "REGIME_MAX_AGE_SEC" in _g5_code_only(helper_src), (
+        "the deck's bound is not read from config.REGIME_MAX_AGE_SEC")
+
+    resolver = _g4_helper("_regime_max_age_sec")
+
+    class _Stub:
+        def __init__(self, value):
+            self.REGIME_MAX_AGE_SEC = value
+
+    original = resolver.__globals__.get("config")
+    try:
+        resolver.__globals__["config"] = _Stub(1800.0)
+        assert resolver() == 1800.0, "a raised bound must be honoured, not overridden"
+        for bad in ("abc", None, "", 0, -5, float("nan")):
+            resolver.__globals__["config"] = _Stub(bad)
+            assert resolver() == 900.0, (
+                f"a missing/non-numeric REGIME_MAX_AGE_SEC ({bad!r}) must fall back to the "
+                "consumers' 900.0")
+        resolver.__globals__.pop("config", None)
+        assert resolver() == 900.0, "a namespace without config must fall back to 900.0"
+    finally:
+        if original is not None:
+            resolver.__globals__["config"] = original
+
+
+def test_g5b_the_deck_reads_the_row_with_its_updated_at():
+    """`query_system_state` (`dashboard.py:101-106`) returns `value` only, which is why B-1 needs a
+    second reader. Its signature stays alone out of this round — it is called across the file."""
+    block = _g5b_block_code()
+    assert 'query_system_state_row("markov_regime_telemetry")' in block, (
+        "the deck still reads the value without its publish instant")
+    assert 'query_system_state("markov_regime_telemetry"' not in block, (
+        "the deck still takes a value-only read of a row whose age is the finding")
+    reader_src = _g5_code_only(_function_source(DASHBOARD, "query_system_state_row"))
+    assert "SELECT value, updated_at FROM system_state WHERE key = ?" in reader_src, (
+        "the new reader does not select the column the age path needs")
+    assert "value" in reader_src and "updated_at" in reader_src
+
+
+# ── B-2: no model may be run to fill in a missing measurement ────────────────────────────
+@pytest.mark.parametrize("banned,code_line", _G5B_STAND_IN_CASES)
+def test_g5b_no_fallback_or_stand_in_survives_in_the_deck(banned, code_line):
+    hits = _g5_banned_hits(_g5b_block_code(), [banned])
+    assert hits == [], f"the Markov deck still contains {banned!r}"
+
+
+@pytest.mark.parametrize("banned,code_line", _G5B_STAND_IN_CASES + _G5B_PROSE_CLAIMS)
+def test_g5b_a_comment_neither_trips_nor_hides_a_markov_scan(banned, code_line):
+    """Both halves of the comment immunity, on this deck's own tokens: prose about the deleted
+    fallback must not fail the guard, and the same text really in the code must."""
+    prose = (f"def f():\n    # the deck used to publish {banned} here, and {banned} is "
+             f"still what the note says\n    return 1\n")
+    assert _g5_banned_hits(prose, [banned]) == [], (
+        f"a comment quoting {banned!r} failed a negative scan against code that does not "
+        "contain it")
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [banned]) == [banned], (
+        f"{banned!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [banned]) == [banned], (
+        f"a comment beside {banned!r} in the code hid it from the scan")
+
+
+def test_g5b_no_path_in_the_deck_can_construct_a_markov_regime_engine():
+    """`MarkovRegimeEngine.__init__` (`markov_regime.py:33-49`) is pure — uniform `pi`, the prior
+    `P`, no dataset — so every figure the fallback produced was the model's assumption about the
+    world, not a measurement of this one, and it was printed under a live heading."""
+    src = _g5_code_only(DASHBOARD.read_text(encoding="utf-8"))
+    for token in ("MarkovRegimeEngine", "from markov_regime import", "markov_regime import"):
+        assert token not in src, (
+            f"dashboard.py can still reach {token!r}: the deck may not run a model to fill a gap, "
+            "and a second importer would need the same age bound")
+    block = _g5b_block_code()
+    assert len(block.splitlines()) >= 120, (
+        f"the extracted deck is {len(block.splitlines())} lines, so this is not the deck")
+
+
+def test_g5b_an_absent_row_does_not_invent_a_deck(tmp_path):
+    """The literals the fallback asserted, none of which any engine measured: `CHOP 0.60 /
+    BULL 0.25 / BEAR 0.15`, durations 3.33, breakdown risk 0.35, uniform 0.333 equilibrium."""
+    html = _g5b_render_deck(tmp_path, raw="", updated_at="")[0]
+    for invented in ("60.0%", "3.3 Bars", "0.333", "35.0%", "33%/33%/33%", "25.0%", "15.0%"):
+        assert invented not in html, f"the deck still prints the fabricated {invented}"
+    assert "not measured" in html
+    assert _G5B_ABSENT_COLOUR in html, "an absent deck is not dimmed to the absence colour"
+
+
+def test_g5b_the_dashboard_carries_no_copy_of_the_engine_prior():
+    """B-4: `default_P` was a byte-for-byte copy of `markov_regime.py:39-43`, which would silently
+    diverge when the prior changed. `transition_matrix` is published on both producer paths, so the
+    only row without it is a row that does not exist — and that renders one absent state."""
+    src = _g5_code_only(DASHBOARD.read_text(encoding="utf-8"))
+    assert "default_P" not in src, "the deck still names a stand-in transition matrix"
+    assert "0.70, 0.15, 0.15" not in src, (
+        "the engine's prior transition matrix is duplicated in the dashboard")
+    producer_src = MARKOV_REGIME.read_text(encoding="utf-8")
+    assert "0.70, 0.15, 0.15" in producer_src, (
+        "markov_regime.py no longer carries the prior this ban is about, so the scan is vacuous")
+
+
+# ── B-3: the key names and shapes the producer actually publishes ────────────────────────
+def test_g5b_the_fixture_keys_are_the_ten_the_producer_publishes():
+    """Producer-derived fixture, or the whole deck could be pinned to a name nobody writes."""
+    published = _g5b_producer_payload_keys()
+    assert len(published) == 10, sorted(published)
+    assert frozenset(_G5B_LIVE_PAYLOAD) == published, (
+        f"the deck's fixture drifted from process_bars: extra "
+        f"{sorted(set(_G5B_LIVE_PAYLOAD) - published)}, missing "
+        f"{sorted(published - set(_G5B_LIVE_PAYLOAD))}")
+    assert "forecast_probabilities" not in published, (
+        "the deck's dead read key is now a real one, so B-3 needs re-reading")
+    assert "timestamp" not in published, (
+        "the payload now carries its own timestamp, so the row's updated_at is not the only age")
+    assert set(_G5B_PAYLOAD_FIELDS) == published, (
+        "the payload-key to deck-field map no longer covers the producer's contract")
+
+
+def test_g5b_the_regime_names_are_the_engines_own():
+    states = _g5b_producer_states()
+    assert states == ("CHOP", "BULL_EXPANSION", "BEAR_CASCADE"), states
+    roster_src = _g5b_helper_code()
+    for state in states:
+        assert f'"{state}"' in roster_src, (
+            f"the deck no longer reads the {state} probability the producer publishes")
+    declared = re.findall(r'_MARKOV_STATE_KEYS = \((.*?)\n    \)', roster_src, re.S)
+    assert declared, "the deck's regime roster is not a named table this test can read"
+    pairs = re.findall(r'\("([a-z]+)", "([A-Z_]+)"\)', declared[0])
+    assert [state for _, state in pairs] == list(states), (
+        f"the deck's regime names {[s for _, s in pairs]} are not the engine's {states}")
+
+
+def test_g5b_the_deck_reads_the_forecast_key_the_producer_publishes():
+    """`:4779` read `forecast_probabilities`, a name that exists only inside `forecast_k_steps`
+    (`markov_regime.py:360`) and never in the published payload; `process_bars` writes it as
+    `forecast_4step` (`:407`, `:454`)."""
+    block = _g5b_block_code()
+    helper = _g5b_helper_code()
+    assert '"forecast_4step"' in helper, "the reader does not name the published forecast key"
+    for where, label in ((block, "the deck"), (helper, "the reader")):
+        assert '"forecast_probabilities"' not in where, (
+            f"{label} still reads forecast_probabilities, which no producer publishes")
+    assert '"stationary_distribution"' in helper, "the reader stopped naming the equilibrium key"
+    assert '"state_probabilities"' in helper and '"expected_durations_bars"' in helper
+
+
+def test_g5b_a_dict_shaped_stationary_distribution_is_not_read_as_measured():
+    """The producer publishes a LIST of three rounded floats (`markov_regime.py:409`, `:456`). Only
+    the dict branch of the old parser could ever be reached — by the B-2 fallback that invented a
+    dict — so a dict is a shape this deck may not present as a measurement."""
+    as_list = _g5b_readings('{"stationary_distribution": [0.3703, 0.543, 0.0868]}')
+    assert as_list["stat_chop"]["measured"] is True, as_list["stat_chop"]
+    assert as_list["stat_chop"]["value"] == 0.3703, as_list["stat_chop"]
+    assert as_list["equilibrium"]["measured"] is True
+    assert as_list["equilibrium"]["value"] == [0.3703, 0.543, 0.0868], as_list["equilibrium"]
+    as_dict = _g5b_readings('{"stationary_distribution": {"CHOP": 0.4, "BULL_EXPANSION": 0.4,'
+                            ' "BEAR_CASCADE": 0.2}}')
+    for field in _G5B_STAT_FIELDS:
+        assert as_dict[field]["measured"] is False, (field, as_dict[field])
+        assert "stationary_distribution" in as_dict[field]["reason"], as_dict[field]
+    assert as_dict["equilibrium"]["measured"] is False
+    for junk in (None, "", "[]", "[1, 2]", '"0.33"', "7", "{}", '[0.1]', '[[0.1, 0.2]]'):
+        out = _g5b_readings(junk, updated_at=_G5B_LIVE_UPDATED_AT)
+        if "stat_chop" in out:
+            assert out["stat_chop"]["measured"] is False, (junk, out["stat_chop"])
+
+
+# ── B-5: absence is not a zero, and a zero is not an absence ─────────────────────────────
+@pytest.mark.parametrize("field", sorted(_G5B_FIELDS))
+def test_g5b_an_empty_row_publishes_every_figure_as_its_own_absence(field):
+    """Each reason names the missing reading, so the operator learns which key the engine did not
+    write instead of being shown a number nobody took."""
+    state = _g5b_readings("{}")[field]
+    assert state["measured"] is False, (field, state)
+    assert state["reason"] == _G5B_FIELD_REASONS[field], (field, state["reason"])
+    if field in _G5B_VECTOR_FIELDS:
+        assert state.get("rows") in (None, (), []), (field, state)
+    elif field not in _G5B_TEXT_FIELDS and field != "is_tradable":
+        assert state["value"] is None, (field, state)
+
+
+@pytest.mark.parametrize("field", sorted(_G5B_NUMBER_FIELDS))
+def test_g5b_a_measured_zero_probability_stays_a_reading(field):
+    """A probability of 0.0 is reachable — the live row carries `BEAR_CASCADE: 0.0002` — and
+    `float(raw or 0.0)` erases the difference between that and a missing key. `-0.0` is falsy too."""
+    payload = {one_field: 0.0 for one_field in _G5B_NUMBER_FIELDS}
+    state = _g5b_readings(_g5b_payload_for(payload))[field]
+    assert state["measured"] is True, (field, state)
+    assert state["value"] == 0.0, (field, state)
+    signed = _g5b_readings(_g5b_payload_for({field: -0.0}))[field]
+    assert signed["measured"] is True, (field, signed)
+
+
+def _g5b_payload_for(overrides):
+    """A payload carrying exactly the keys the deck reads these fields out of.
+
+    Feeding `{"prob_chop": 0.0}` to the reader would be testing a key the producer never writes;
+    the override map is keyed by DECK field and translated back to payload keys here.
+    """
+    import json as _json
+
+    payload = {}
+    for deck_field, value in overrides.items():
+        payload_field = _G5B_FIELD_TO_PAYLOAD.get(deck_field)
+        assert payload_field, f"{deck_field} is not a field this map can translate"
+        key, state_name = payload_field
+        if isinstance(state_name, int):
+            # `stationary_distribution` is published as a LIST of three rounded floats
+            # (`markov_regime.py:409`, `:456`), so the vector fields are addressed by index. The
+            # generic branch below builds a dict, which is precisely the shape
+            # `test_g5b_a_dict_shaped_stationary_distribution_is_not_read_as_measured` forbids: a
+            # dict-built fixture would have made the zero-reading case pass by reading a shape no
+            # producer publishes. Untouched slots are JSON nulls, i.e. absences, not zeros.
+            slot = payload.setdefault(key, [None, None, None])
+            slot[state_name] = value
+        else:
+            payload.setdefault(key, {})
+            if state_name is None:
+                payload[key] = value
+            else:
+                payload[key][state_name] = value
+    return _json.dumps(payload)
+
+
+_G5B_FIELD_TO_PAYLOAD = {
+    "prob_chop": ("state_probabilities", "CHOP"),
+    "prob_bull": ("state_probabilities", "BULL_EXPANSION"),
+    "prob_bear": ("state_probabilities", "BEAR_CASCADE"),
+    "dur_chop": ("expected_durations_bars", "CHOP"),
+    "dur_bull": ("expected_durations_bars", "BULL_EXPANSION"),
+    "dur_bear": ("expected_durations_bars", "BEAR_CASCADE"),
+    "fc_chop": ("forecast_4step", "CHOP"),
+    "fc_bull": ("forecast_4step", "BULL_EXPANSION"),
+    "fc_bear": ("forecast_4step", "BEAR_CASCADE"),
+    "stat_chop": ("stationary_distribution", 0),
+    "stat_bull": ("stationary_distribution", 1),
+    "stat_bear": ("stationary_distribution", 2),
+    "breakdown_risk": ("breakdown_risk_4step", None),
+    "sizing_multiplier": ("sizing_multiplier", None),
+    "is_tradable": ("is_tradable", None),
+    "dominant_regime": ("dominant_regime", None),
+    "tradability_reason": ("tradability_reason", None),
+    "transition_matrix": ("transition_matrix", None),
+}
+
+
+def test_g5b_the_live_payload_measures_every_figure_the_deck_prints():
+    """The live ten-key row leaves the deck with nothing to disown: an absence shown against this
+    payload is a reading the panel failed to take."""
+    readings = _g5b_readings(_MARKOV_JSON_TEXT)
+    unmeasured = sorted(field for field in readings["field_names"]
+                        if not readings[field]["measured"])
+    assert unmeasured == [], unmeasured
+    assert readings["coverage"] == {"total": len(_G5B_FIELDS), "unmeasured": 0}, readings
+    assert readings["dominant_regime"]["text"] == "CHOP"
+    assert readings["prob_bear"]["value"] == 0.0002, readings["prob_bear"]
+    assert readings["sizing_multiplier"]["value"] == 0.64
+    assert readings["breakdown_risk"]["value"] == 0.6672
+    assert readings["is_tradable"]["value"] is True
+    assert readings["tradability_reason"]["text"] == "Tradable: E[D]=10.4b >= 3.5b"
+    assert readings["confidence"]["value"] == 0.8878, readings["confidence"]
+    assert readings["dominant_duration"]["value"] == 10.4, readings["dominant_duration"]
+
+
+def test_g5b_a_partial_row_loses_only_the_fields_it_loses():
+    """Per-field absence, not a bundled one: dropping the forecast must not disown the probabilities
+    that were published, and must not leave the forecast at a stand-in zero."""
+    readings = _g5b_readings(_json_text_of(_g5b_payload_without("forecast_4step",
+                                                               "stationary_distribution")))
+    for field in _G5B_FC_FIELDS + _G5B_STAT_FIELDS + ("equilibrium",):
+        assert readings[field]["measured"] is False, (field, readings[field])
+    for field in _G5B_PROB_FIELDS + ("breakdown_risk", "sizing_multiplier", "is_tradable"):
+        assert readings[field]["measured"] is True, (field, readings[field])
+    assert readings["coverage"]["unmeasured"] == 7, readings["coverage"]
+
+
+def _json_text_of(payload):
+    import json as _json
+
+    return _json.dumps(payload)
+
+
+def test_g5b_the_sizing_multiplier_is_never_defaulted_to_its_highest_value():
+    """`super_bot.py:919-924` defaults a missing sizing multiplier to 0.50 defensive. The HUD
+    defaulted it to 1.0, which is the largest figure the producer can emit
+    (`markov_regime.py:327` bounds it to [0.20, 1.0]) — the riskiest possible stand-in."""
+    low, high = _g5b_sizing_bound_from_producer()
+    assert (low, high) == (0.2, 1.0), (
+        f"the producer's sizing clamp moved to {(low, high)}; re-read the bound before writing a "
+        "test about what an absence may not be defaulted to")
+    html = _g5b_render_deck(payload=_g5b_payload_without("sizing_multiplier"))[0]
+    assert "1.00x" not in html, "an absent sizing multiplier still prints as the maximum"
+    assert "(no sizing_multiplier in markov regime telemetry)" in html, html[:2000]
+    assert "0.64x" not in html, html[:2000]
+    measured_html = _g5b_render_deck(payload=_G5B_LIVE_PAYLOAD)[0]
+    assert "0.64x" in measured_html, measured_html[:2000]
+
+
+def test_g5b_a_row_that_is_not_a_json_object_publishes_absences_and_never_raises():
+    """`json.loads` hands back a list, a string or an int as readily as a dict, and a crashed panel
+    publishes nothing at all — which the brief counts as worse than an honest absence."""
+    for junk in (None, "", "[]", "[1, 2, 3]", '"CHOP"', "7", "not json at all", "{}"):
+        html = _g5b_render_deck(payload=junk, updated_at=_G5B_LIVE_UPDATED_AT)[0]
+        assert "not measured" in html, (junk, html[:1500])
+        assert "Live" not in _g5b_heading(html), (junk, _g5b_heading(html))
+        assert _G5B_ALL_CLEAR_COLOUR not in html, (junk, html[:1500])
+
+
+# ── B-6: the verdicts may not fail open ──────────────────────────────────────────────────
+def test_g5b_a_payload_without_is_tradable_prints_no_all_clear(tmp_path):
+    """The single most dangerous line in the panel: `bool(m_tel.get("is_tradable", True))` turned a
+    missing key into the green badge, while `super_bot.py:733` logs a key-missing warning and
+    skips. This is the RED-against-`df30aa3` proof for B-6."""
+    html = _g5b_render_deck(tmp_path, payload=_g5b_payload_without("is_tradable"))[0]
+    assert _G5B_ALL_CLEAR_COLOUR not in html, (
+        f"an unmeasured tradability gate still wears the green all-clear: {html[:2000]}")
+    assert "TRADABLE" not in html.replace("UNTRADEABLE", ""), html[:2000]
+    assert "GATE NOT MEASURED" in html, html[:2000]
+    assert _G5B_ABSENT_COLOUR in html, html[:2000]
+    assert "(no is_tradable in markov regime telemetry)" in html, html[:2000]
+
+
+def test_g5b_a_measured_untradable_gate_still_prints_the_red_verdict():
+    """The fix may not be "always grey": a published false is a measurement and keeps its colour."""
+    html = _g5b_render_deck(tmp_path, payload={**_G5B_LIVE_PAYLOAD, "is_tradable": False,
+                                               "tradability_reason":
+                                                   "Expected duration E[D]=2.0b < 3.5b threshold "
+                                                   "(fee churn risk)"})[0]
+    assert "UNTRADEABLE CHURN" in html, html[:2000]
+    assert "#ff003c" in html, "a measured veto lost its alarm colour"
+    assert "E[D]=2.0b &lt; 3.5b" in html or "E[D]=2.0b < 3.5b" in html, html[:2000]
+    assert _G5B_ALL_CLEAR_COLOUR not in html, html[:2000]
+
+
+def test_g5b_a_measured_tradable_gate_prints_the_engines_own_words(tmp_path):
+    html = _g5b_render_deck(tmp_path)[0]
+    assert "TRADABLE" in html, html[:2000]
+    assert _G5B_ALL_CLEAR_COLOUR in html, "a measured all-clear was dimmed away"
+    assert "Tradable: E[D]=10.4b &gt;= 3.5b" in html or "Tradable: E[D]=10.4b >= 3.5b" in html, \
+        html[:2000]
+    assert "(no tradability_reason in markov regime telemetry)" not in html
+
+
+def test_g5b_an_absent_tradability_reason_supplies_no_excuse(tmp_path):
+    """"Tradable" was the panel writing the engine's alibi for it."""
+    html = _g5b_render_deck(tmp_path, payload=_g5b_payload_without("tradability_reason"))[0]
+    assert "reason: not measured" in html, html[:2000]
+    assert "(no tradability_reason in markov regime telemetry)" in html, html[:2000]
+    assert ">Tradable<" not in html and "Tradable: " not in html, (
+        "the panel still puts a tradability excuse in the engine's mouth")
+
+
+def test_g5b_an_absent_breakdown_risk_is_not_a_green_stable_all_clear(tmp_path):
+    """`:4778` defaulted the cascade risk to 0.0 and `:4863-4864` then painted that zero `#00ff66`
+    and labelled it STABLE — an all-clear bought by the absence of a measurement."""
+    html = _g5b_render_deck(tmp_path, payload=_g5b_payload_without("breakdown_risk_4step"))[0]
+    assert "STABLE" not in html, html[:2000]
+    assert "0.0%" not in html, "an absent cascade risk printed as a measured zero"
+    assert _G5B_ABSENT_COLOUR in html
+    assert "(no breakdown_risk_4step in markov regime telemetry)" in html, html[:2000]
+
+
+def test_g5b_a_measured_cascade_risk_keeps_its_own_rung_and_thresholds(tmp_path):
+    html = _g5b_render_deck(tmp_path)[0]
+    assert "66.7%" in html, html[:2000]
+    assert "HIGH" in html, "a 0.6672 cascade risk prints without its label"
+    assert "#ff003c" in html, "the measured cascade risk lost its alarm colour"
+    assert "panel rungs" in html, (
+        "the deck judges the risk against thresholds it does not name")
+
+
+# One row per KPI card: the payload key whose reading owns the card, the colour variable the deck
+# paints that card with, and the colour that card earns when the live row IS measured.
+_G5B_CARD_COLOUR_CASES = (
+    ("dominant_regime", "m_dom_color", "#f59e0b"),
+    ("expected_durations_bars", "m_domdur_color", "#00e5ff"),
+    ("breakdown_risk_4step", "m_bd_color", "#ff003c"),
+    ("sizing_multiplier", "m_sizing_color", "#38bdf8"),
+    ("stationary_distribution", "m_stat_color", "#a855f7"),
+    ("is_tradable", "m_tradable_color", "#00ff66"),
+)
+
+
+@pytest.mark.parametrize("dropped_key,colour_var,live_colour", _G5B_CARD_COLOUR_CASES)
+def test_g5b_a_card_that_lost_its_reading_dims_while_its_neighbours_keep_theirs(
+        tmp_path, dropped_key, colour_var, live_colour):
+    """One reading per card, one colour per reading — proved in both directions per card.
+
+    Rewritten from the inherited `the_live_row_prints_no_measured_colour_on_an_absent_field`, which
+    dropped four keys and then demanded that NO card anywhere wear a measured colour. Two of the
+    cards it scanned (the tradability gate's green and the cascade risk's red) keep their readings
+    in that payload, so the test could only have passed by dimming measured readings — and
+    `test_g5b_a_measured_cascade_risk_keeps_its_own_rung_and_thresholds` demands exactly the opposite
+    of that card. Per card, both halves: absent -> grey, measured -> its own colour.
+    """
+    _html, _fake, absent_ns = _g5b_render_deck(tmp_path, payload=_g5b_payload_without(dropped_key))
+    assert absent_ns[colour_var] == _G5B_ABSENT_COLOUR, (
+        f"the card fed by {dropped_key!r} still wears {absent_ns[colour_var]!r} without its reading")
+    _html2, _fake2, live_ns = _g5b_render_deck(tmp_path)
+    assert live_ns[colour_var] == live_colour, (
+        f"the live row's {dropped_key!r} card lost its measured colour: {live_ns[colour_var]!r}")
+
+
+def test_g5b_an_unpublished_row_wears_no_measured_colour_at_all(tmp_path):
+    """The whole-deck half of the same rule: with nothing published there is no reading to colour,
+    so no card and no verdict may wear green, red, cyan, blue or purple."""
+    html = _g5b_render_deck(tmp_path, raw="", updated_at="")[0]
+    for colour in (_G5B_ALL_CLEAR_COLOUR, "#ff003c", "#00e5ff", "#a855f7", "#38bdf8", "#f59e0b"):
+        assert colour not in html, (colour, html[:2000])
+    assert _G5B_ABSENT_COLOUR in html
+    assert html.count("not measured") >= 6, html[:2000]
+
+
+def test_g5b_the_transition_matrix_is_plotted_only_when_the_engine_published_one(tmp_path):
+    """B-4's rendering half: `raw_P = m_tel.get("transition_matrix", default_P.tolist())` put a
+    hardcoded prior into a heatmap titled as the estimated matrix."""
+    _html, absent_fake, _ns = _g5b_render_deck(tmp_path, raw="", updated_at="")
+    assert not [one for one in absent_fake.charts
+                if any("Heatmap" in str(trace.type) for trace in one.data)], (
+        "an absent row still renders a transition-matrix heatmap")
+    _html2, live_fake, _ns2 = _g5b_render_deck(tmp_path)
+    heatmaps = [one for one in live_fake.charts
+                if any("Heatmap" in str(trace.type) for trace in one.data)]
+    assert len(heatmaps) == 1, len(live_fake.charts)
+    z = [list(row) for row in heatmaps[0].data[0].z]
+    assert z == _G5B_LIVE_PAYLOAD["transition_matrix"], "the plotted matrix is not the published one"
+    assert [0.70, 0.15, 0.15] not in z, "the engine's prior reached the chart"
+
+
+def test_g5b_a_bar_series_is_skipped_rather_than_plotted_at_zero(tmp_path):
+    """A horizon with an unmeasured probability cannot be drawn: a bar at 0.0 would publish the
+    absence as a measured zero, so the series is left out and the skip is named."""
+    _html, fake, _ns = _g5b_render_deck(
+        tmp_path, payload=_g5b_payload_without("stationary_distribution"))
+    bars = [one for one in fake.charts if any("Bar" in str(trace.type) for trace in one.data)]
+    assert len(bars) == 1, len(fake.charts)
+    names = [trace.name for trace in bars[0].data]
+    assert "Equilibrium π*" not in names, names
+    assert "Current π_t" in names and "Forecast π_{t+4}" in names, names
+    _html2, absent_fake, _ns2 = _g5b_render_deck(tmp_path, raw="", updated_at="")
+    assert not [one for one in absent_fake.charts
+                if any("Bar" in str(trace.type) for trace in one.data)]
+
+
+def test_g5b_the_deck_publishes_the_live_readings_it_claims(tmp_path):
+    """The integration claim: the shipped block, run against the live row seeded in a real
+    `system_state` table, prints the row's own figures — and says the row is stale."""
+    raw = _g5_system_state_row(tmp_path, payload=_G5B_LIVE_PAYLOAD, key=_MARKOV_KEY,
+                               updated_at=_G5B_LIVE_UPDATED_AT)
+    import json as _json
+    assert _json.loads(raw) == _G5B_LIVE_PAYLOAD, raw
+    html, fake, _ns = _g5b_render_deck(tmp_path, raw=raw)
+    assert "None" not in html, html[:2000]
+    assert "CHOP" in html and "88.8%" in html, html[:2000]
+    assert "10.4 Bars" in html, html[:2000]
+    assert "66.7%" in html and "0.64x" in html, html[:2000]
+    assert "37%/54%/9%" in html, html[:2000]
+    assert "126000s old" in html, html[:1500]
+    assert fake.charts, "the deck published no chart for a fully measured row"
+
+
+def test_g5b_the_coverage_line_counts_the_readers_own_fields():
+    """Derived from the reader's own roster, never from a tuple kept by hand in the block."""
+    block = _g5b_block_code()
+    assert 'm_r["coverage"]' in block, "the coverage headline is not read from the reader"
+    empty = _g5b_readings("{}")
+    assert empty["field_names"] == tuple(sorted(_G5B_FIELDS)), empty["field_names"]
+    assert empty["coverage"] == {"total": len(_G5B_FIELDS),
+                                 "unmeasured": len(_G5B_FIELDS)}, empty["coverage"]
+    html = _g5b_render_deck(payload="{}")[0]
+    assert f"{len(_G5B_FIELDS)} of {len(_G5B_FIELDS)} published fields" in html, html[:2000]
+    live_html = _g5b_render_deck(payload=_G5B_LIVE_PAYLOAD)[0]
+    assert "published fields" not in live_html, "the live row is being reported as incomplete"
+
+
+# ── structural guards: per-field gating, derived verdicts, one anchor per panel ──────────
+@pytest.mark.parametrize("field,own_key", sorted(_G5B_FIELD_OWNERS.items()))
+def test_g5b_the_deck_keys_each_field_on_its_own_state(field, own_key):
+    """Same rule G-5a landed for the carry panel: a published value may read only its own flag."""
+    import ast
+
+    block = _g5b_block_code()
+    tree = ast.parse(block, filename="dashboard.py markov deck")
+    parents = _g4_parent_map(tree)
+    assigns = [node for node in ast.walk(tree)
+               if isinstance(node, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == field for t in node.targets)]
+    assert assigns, f"the deck no longer publishes {field} at all"
+    keyed = re.compile(own_key + r"\[[^\]]*measured[^\]]*\]")
+    for node in assigns:
+        segment = ast.get_source_segment(block, node) or ""
+        named = set(re.findall(r"\bm_[a-z_]*_st\b", segment))
+        assert named == {own_key}, (
+            f"{field} is keyed on {sorted(named)}; a published field value may read only its own "
+            f"state ({own_key}): {segment[:200]}")
+        assert keyed.search(segment), (
+            f"the deck never keys {field} on {own_key}'s own measured flag: {segment[:200]}")
+        if field.endswith("_note"):
+            assert "_absence_note(" in segment and "reason" in segment, (
+                f"{field} publishes no reason for its own absence: {segment[:200]}")
+        else:
+            assert "not measured" in segment, (
+                f"{field} has no absence for when its own state was never measured: "
+                f"{segment[:200]}")
+        assert not _g5_enclosing_gate_is_bundled(node, parents, block, own_key, prefix="m"), (
+            f"{field} is published under a gate on another field's state")
+
+
+def test_g5b_every_derived_verdict_in_the_deck_guards_on_measured():
+    """An unguarded verdict either raises (and the panel publishes nothing) or paints an absence in
+    a measured colour. The exemptions are by shape, and the shape is asserted here."""
+    import ast
+
+    block = _g5b_block_code()
+    tree = ast.parse(block, filename="dashboard.py markov deck")
+    parents = _g4_parent_map(tree)
+    seen = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if not (isinstance(target, ast.Name) and target.id in _G5B_DERIVED_NAMES):
+                continue
+            seen.add(target.id)
+            segment = ast.get_source_segment(block, node) or ""
+            if _g5_reads_measured_flag(segment) or _g5_enclosing_measured_flag_guard(
+                    node, parents, block):
+                continue
+            assert target.id in _G5B_CHAIN_VERDICTS, (
+                f"the deck derives {target.id} from a reading that can be absent: "
+                f"{segment[:160]}")
+            names_state = sorted(set(re.findall(r"\bm_[a-z_]*_st\b", segment)))
+            assert not names_state, (
+                f"{target.id} claims the chain exemption but names field state {names_state}, so "
+                "it is a single-field verdict and has to be gated like every other one")
+    missing = sorted(_G5B_DERIVED_NAMES - seen)
+    assert not missing, (
+        f"the deck no longer derives {missing}, so this guard has nothing to check")
+
+
+def test_g5b_the_deck_explains_every_absence_it_shows(tmp_path):
+    """`_absence_note` is the house parenthetical; a bare `not measured` tells the operator nothing
+    about which reading went missing."""
+    block = _g5b_block_code()
+    assert block.count("_absence_note(") >= 7, (
+        f"the deck explains only {block.count('_absence_note(')} absences")
+    html = _g5b_render_deck(payload="{}")[0]
+    for field in _G5B_NUMBER_FIELDS:
+        assert _G5B_FIELD_REASONS[field] in html, (field, html[:3000])
+
+
+def test_g5b_the_two_panel_anchors_still_name_one_panel_each():
+    """The deck's start anchor is the section comment G-4's `"micro"` block already ends on, and
+    `"markov"` ends on the next section comment. Both panels must keep extracting exactly one
+    region, or every guard above is scanning an undefined window."""
+    import ast
+
+    micro = _g4_block("micro", DASHBOARD)
+    markov = _g4_block("markov", DASHBOARD)
+    assert "Bayesian Markov Chain" in markov.splitlines()[0], markov.splitlines()[0]
+    assert "Multi-Asset Fleet Microstructure" not in markov, "the end anchor stopped cutting"
+    assert "Bayesian Markov Chain" not in micro, "the micro block ran into the deck"
+    assert "Markov" not in micro, (
+        f"the microstructure block now covers the deck too: {micro.splitlines()[:3]}")
+    ast.parse(markov, filename="dashboard.py markov deck")
+    ast.parse(micro, filename="dashboard.py micro deck")
+
+
+def test_g5b_the_legacy_dashboard_has_no_markov_deck_to_convert():
+    """The brief's scope claim, checked rather than assumed: one file, one deck."""
+    legacy_src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
+    assert _MARKOV_KEY not in legacy_src
+    assert "Markov" not in legacy_src
+    with pytest.raises(Exception):
+        _g4_block("markov", LEGACY_DASHBOARD)
