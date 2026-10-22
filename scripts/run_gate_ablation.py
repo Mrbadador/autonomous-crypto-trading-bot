@@ -48,16 +48,31 @@ GATE_SECTIONS = [
 
 MIN_BOOTSTRAP_TRADES = 5
 
+# Single source of truth for the bootstrap: the report's method description is generated from these,
+# so changing a constant cannot leave the prose describing a run that did not happen.
+BOOTSTRAP_RESAMPLES = 1500
+BOOTSTRAP_SEED = 42
+BOOTSTRAP_ALPHA = 10.0
 
-def _bootstrap_delta_ev(full_pnls, ablated_pnls, n_boot=1500, seed=42, alpha=10.0):
-    """90% bootstrap CI for (mean gate-ON PnL - mean gate-OFF PnL), or (None, None).
 
-    Each arm's closed-trade PnL series is resampled iid 1500 times with a fixed seed, so the
-    same inputs always yield the same interval. The two arms are resampled INDEPENDENTLY even
-    though they replay the same market path, which makes the interval wider than a paired or
-    block bootstrap would give: the design errs toward INCONCLUSIVE rather than toward a false
-    KEEP. Returns (None, None) when either arm is too small to difference.
+def _bootstrap_ci_label():
+    return f"{100.0 - BOOTSTRAP_ALPHA:.0f}%"
+
+
+def _bootstrap_delta_ev(full_pnls, ablated_pnls, n_boot=None, seed=None, alpha=None):
+    """Bootstrap CI for (mean gate-ON PnL - mean gate-OFF PnL), or (None, None).
+
+    Each arm's closed-trade PnL series is resampled iid ``BOOTSTRAP_RESAMPLES`` times with the fixed
+    ``BOOTSTRAP_SEED``, so the same inputs always yield the same interval. The two arms are resampled
+    INDEPENDENTLY even though they replay the same market path, which makes the interval wider than a
+    paired or block bootstrap would give: the design errs toward INCONCLUSIVE rather than toward a
+    false KEEP. Returns (None, None) when either arm is too small to difference. A pair whose resampled
+    differences have no spread comes back with equal bounds; the caller must not read that as a
+    precise interval.
     """
+    n_boot = BOOTSTRAP_RESAMPLES if n_boot is None else n_boot
+    seed = BOOTSTRAP_SEED if seed is None else seed
+    alpha = BOOTSTRAP_ALPHA if alpha is None else alpha
     rng = np.random.default_rng(seed)
     if len(full_pnls) < MIN_BOOTSTRAP_TRADES or len(ablated_pnls) < MIN_BOOTSTRAP_TRADES:
         return None, None
@@ -74,6 +89,12 @@ def verdict_for_gate(full, ablated):
 
     ``full`` and ``ablated`` are arm dicts from run_ablation_simulation (``trades`` is a list of
     dicts carrying ``net_pnl``); either may be None/absent when that arm did not run.
+
+    Rule boundary: KEEP only when the interval's lower bound is strictly above zero and RETHINK only
+    when its upper bound is strictly below zero, so an interval whose bound lands exactly on zero
+    counts as straddling and returns INCONCLUSIVE. That is the conservative direction. A degenerate
+    interval (equal bounds, i.e. a variance-free sample) is likewise INCONCLUSIVE and is never
+    printed as an interval.
     """
     if not full or not ablated:
         if not full and not ablated:
@@ -90,6 +111,7 @@ def verdict_for_gate(full, ablated):
     full_pnls = [t["net_pnl"] for t in full.get("trades", [])]
     ablated_pnls = [t["net_pnl"] for t in ablated.get("trades", [])]
     lo, hi = _bootstrap_delta_ev(full_pnls, ablated_pnls)
+    ci_label = _bootstrap_ci_label()
 
     if lo is None or hi is None:
         # No interval exists, so none is printed: a fabricated [+0.000%, +0.000%] would read as a
@@ -97,21 +119,32 @@ def verdict_for_gate(full, ablated):
         return "INCONCLUSIVE", (
             f"ΔEV is not estimable: the gate-ON arm closed {len(full_pnls)} trades and the gate-OFF arm "
             f"closed {len(ablated_pnls)}, below the {MIN_BOOTSTRAP_TRADES}-per-arm minimum a bootstrap "
-            "difference in means needs. No ΔEV and no 90% interval are reported for this pair."
+            f"difference in means needs. No ΔEV and no {ci_label} interval are reported for this pair."
         )
 
     delta = float(np.mean(full_pnls) - np.mean(ablated_pnls))
+    if lo == hi:
+        # Equal bounds mean one arm's series has no resampling variance, so the "interval" carries no
+        # information about how precisely ΔEV is known. Printing it would claim maximal confidence.
+        return "INCONCLUSIVE", (
+            f"ΔEV (gate ON minus gate OFF) = {delta * 100:+.3f}% per trade over "
+            f"N={len(full_pnls)}/{len(ablated_pnls)} trades, but the {ci_label} bootstrap interval is "
+            "degenerate (lower bound equals upper bound), which means at least one arm's per-trade PnL "
+            "series has no resampling variance. No interval is reported for this pair, and a "
+            "variance-free sample cannot support KEEP or RETHINK."
+        )
+
     evidence = (
         f"ΔEV (gate ON minus gate OFF) = {delta * 100:+.3f}% per trade, "
-        f"90% CI [{lo * 100:+.3f}%, {hi * 100:+.3f}%] "
+        f"{ci_label} CI [{lo * 100:+.3f}%, {hi * 100:+.3f}%] "
         f"over N={len(full_pnls)}/{len(ablated_pnls)} trades"
     )
     if lo > 0:
-        return "KEEP", evidence + "; removing this gate lowers expected value and the 90% CI excludes zero."
+        return "KEEP", evidence + f"; removing this gate lowers expected value and the {ci_label} CI excludes zero."
     if hi < 0:
-        return "RETHINK", evidence + "; removing this gate raises expected value and the 90% CI excludes zero."
+        return "RETHINK", evidence + f"; removing this gate raises expected value and the {ci_label} CI excludes zero."
     return "INCONCLUSIVE", (
-        evidence + "; the 90% CI for ΔEV straddles zero, so this sample cannot measure the gate's contribution."
+        evidence + f"; the {ci_label} CI for ΔEV straddles zero, so this sample cannot measure the gate's contribution."
     )
 
 
@@ -155,8 +188,16 @@ def evaluate_all():
         all_results[sym] = sym_results
 
     # Write report
-    report_path = f"audits/gate_ablation_report_{datetime.now().strftime('%Y-%m-%d')}.md"
-    os.makedirs("audits", exist_ok=True)
+    write_report(all_results)
+
+
+def write_report(all_results, report_path=None):
+    """Render the ablation report. ``report_path`` defaults to audits/gate_ablation_report_<date>.md."""
+    if report_path is None:
+        report_path = f"audits/gate_ablation_report_{datetime.now().strftime('%Y-%m-%d')}.md"
+    report_dir = os.path.dirname(report_path)
+    if report_dir:
+        os.makedirs(report_dir, exist_ok=True)
     
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("# Quantitative Gate Ablation Report & Empirical Verdicts\n\n")
@@ -179,12 +220,13 @@ def evaluate_all():
         f.write("## Statistical Analysis & Empirical Verdicts\n\n")
         f.write(
             "Every verdict in this section is derived from the harness's own per-trade PnL series: a "
-            "1500-resample iid bootstrap (seed 42) of the difference in mean net PnL per trade between the "
-            "full gate stack and that one gate removed, reported as a 90% confidence interval of ΔEV. "
+            f"{BOOTSTRAP_RESAMPLES}-resample iid bootstrap (seed {BOOTSTRAP_SEED}) of the difference in mean "
+            f"net PnL per trade between the full gate stack and that one gate removed, reported as a "
+            f"{_bootstrap_ci_label()} confidence interval of ΔEV. "
             "KEEP requires the interval to lie entirely above zero, RETHINK entirely below it, and anything "
-            "else — including an interval that straddles zero, an arm too small to difference, or an "
-            "ablation arm that never ran — is INCONCLUSIVE. No verdict is written independently of the "
-            "interval it comes from.\n\n"
+            "else — including an interval that straddles zero or touches it, an interval too degenerate to "
+            "measure spread, an arm too small to difference, or an ablation arm that never ran — is "
+            "INCONCLUSIVE. No verdict is written independently of the interval it comes from.\n\n"
         )
 
         for heading, param_name, ablated_name in GATE_SECTIONS:
@@ -197,15 +239,24 @@ def evaluate_all():
                 f.write(f"- **{sym} — Verdict:** **{verdict}**\n")
                 f.write(f"- **{sym} — Empirical Evidence:** {evidence}\n")
                 fires = (full_row or {}).get("gate_fires", {}).get(param_name)
+                # The evidence line carries a CI only when an interval was actually estimated; the
+                # veto-count prose may reference it only in that case.
+                reports_interval = "CI [" in evidence
                 if fires is None:
                     f.write(
                         f"- **{sym} — Veto count in the full stack:** not recorded for `{param_name}`.\n"
                     )
-                elif fires == 0:
+                elif fires == 0 and reports_interval:
                     f.write(
                         f"- **{sym} — Veto count in the full stack:** 0 candidate entries were rejected by "
                         f"`{param_name}`, so turning it off changes no entry decision; the ΔEV above is "
                         f"structural, not a measured estimate of the gate's value.\n"
+                    )
+                elif fires == 0:
+                    f.write(
+                        f"- **{sym} — Veto count in the full stack:** 0 candidate entries were rejected by "
+                        f"`{param_name}`, so turning it off changes no entry decision, and no ΔEV interval "
+                        "was reported above for this pair.\n"
                     )
                 else:
                     noun = "entry" if fires == 1 else "entries"
@@ -223,6 +274,7 @@ def evaluate_all():
         f.write("*Autonomously generated by Quantitative Ablation Harness.*")
 
     print(f"[OK] Report written to {report_path}")
+    return report_path
 
 if __name__ == "__main__":
     evaluate_all()
