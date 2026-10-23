@@ -5232,6 +5232,10 @@ _G5B_UNROSTERED_SHAPES = {
 _G5B_CHAIN_VERDICTS = frozenset({"m_heading", "m_coverage_line", "m_unmeasured_count",
                                  "m_field_count", "m_horizon_note"})
 
+# Provenance, measured (`g5b-roster-fidelity-check.py` against `94cf7fb:dashboard.py`): all 15 tokens
+# occur verbatim in the pre-fix source, and THAT is the fidelity claim this roster carries. The
+# `code_line`s are splice-sized for the reach test -- 8 verbatim, 7 reconstructions written against the
+# reader's own variable names -- so they are synthetic fixtures, not evidence about the pre-fix file.
 _G5B_STAND_IN_CASES = (
     ('"is_tradable", True', 'is_tradable = bool(m_tel.get("is_tradable", True))'),
     ('"sizing_multiplier", 1.0', 'sizing_mult = float(m_tel.get("sizing_multiplier", 1.0))'),
