@@ -5264,24 +5264,49 @@ def _g5b_producer_states():
                          "regime names has nothing to be checked against")
 
 
-def _g5b_sizing_bound_from_producer():
+def _g5b_sizing_bound_from_producer(src=None):
     """The `[low, high]` the producer clamps `sizing_multiplier` into, read out of its AST.
 
-    `markov_regime.py:327` is `round(float(max(0.20, min(1.0, mult))), 2)`. The lower bound is what
-    keeps this suite from writing the test the brief forbids: a deck that "measures" a 0.0 sizing
-    multiplier is describing a producer that cannot publish one.
+    `markov_regime.py:327` is `round(float(max(0.20, min(1.0, mult))), 2)`, so the bound is the one
+    float ARGUMENT of the `max` call and the one float argument of the `min` call. The lower bound is
+    what keeps this suite from writing the test the brief forbids: a deck that "measures" a 0.0
+    sizing multiplier is describing a producer that cannot publish one.
+
+    Finding #10: this used to take `min`/`max` over every float in the getter, which also swept up the
+    posterior weights at `:326` (`1.0`, `0.60`, `0.20`) and the `2` in the rounding — it answered
+    correctly only because those weights happen to sit inside `[0.20, 1.0]`. A producer that widened
+    its weights or narrowed its clamp would have moved one number and hidden the other. `src` lets a
+    test run the same reader over a getter whose weights fall outside the clamp.
     """
     import ast
 
-    src = MARKOV_REGIME.read_text(encoding="utf-8")
-    tree = ast.parse(src, filename=str(MARKOV_REGIME))
+    text = MARKOV_REGIME.read_text(encoding="utf-8") if src is None else src
+    tree = ast.parse(text, filename=str(MARKOV_REGIME))
     getter = next((node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                    and node.name == "get_regime_sizing_multiplier"), None)
     assert getter is not None, "MarkovRegimeEngine no longer computes a sizing multiplier"
-    numbers = [n.value for n in ast.walk(getter) if isinstance(n, ast.Constant)
-               and isinstance(n.value, float)]
-    assert numbers, "get_regime_sizing_multiplier has no numeric bound to read"
-    return min(numbers), max(numbers)
+    clamp = {}
+    for node in ast.walk(getter):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in ("max", "min")):
+            continue
+        literals = [arg.value for arg in node.args
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, float)]
+        assert len(literals) == 1, (
+            f"the producer's {node.func.id}() clamp takes {literals}; this reader needs exactly one "
+            "float argument per clamp call, or the deck's bound has to be re-derived")
+        assert node.func.id not in clamp, (
+            f"the producer clamps twice with {node.func.id}(), so sizing_multiplier has no single "
+            "bound for the deck to quote")
+        clamp[node.func.id] = literals[0]
+    assert set(clamp) == {"max", "min"}, (
+        f"get_regime_sizing_multiplier clamps with {sorted(clamp)}, expected max and min; the deck "
+        "cannot quote a bound it cannot find")
+    low, high = clamp["max"], clamp["min"]
+    assert low <= high, (
+        f"the producer's clamp is [{low}, {high}], which is empty; re-read the bound before testing "
+        "what an absence may not be defaulted to")
+    return low, high
 
 
 def _g5b_readings(payload, updated_at=_G5B_LIVE_UPDATED_AT, now=_G5B_FIX_NOW,
@@ -6076,6 +6101,61 @@ def test_g5b_the_sizing_multiplier_is_never_defaulted_to_its_highest_value():
     assert "0.64x" not in html, html[:2000]
     measured_html = _g5b_render_deck(payload=_G5B_LIVE_PAYLOAD)[0]
     assert "0.64x" in measured_html, measured_html[:2000]
+
+
+# Finding #10 fixture: a producer whose posterior weights sit OUTSIDE its own clamp. It is a string,
+# never written to disk and never imported; it exists so the extractor can be shown to read the
+# clamp rather than every float in the getter.
+_G5B_SIZING_CLAMP_FIXTURE = '''
+class MarkovRegimeEngine:
+
+    def get_regime_sizing_multiplier(self) -> float:
+        """multiplier = pi[BULL]*1.0 + pi[CHOP]*2.50 + pi[BEAR]*-1.25, bounded [0.20, 1.0]."""
+        p_chop = float(self.pi[0])
+        p_bull = float(self.pi[1])
+        p_bear = float(self.pi[2])
+        mult = (p_bull * 1.0) + (p_chop * 2.50) + (p_bear * -1.25)
+        return round(float(max(0.20, min(1.0, mult))), 2)
+'''
+
+
+def test_g5b_the_sizing_bound_is_read_from_the_clamp_not_from_every_float():
+    """Finding #10: `min`/`max` over all the floats in the producer's getter is not its clamp.
+
+    `markov_regime.py:326` weights the posterior with `1.0`, `0.60` and `0.20` and `:327` clamps the
+    result with `max(0.20, min(1.0, mult))`. Reading every float answered correctly today only
+    because each weight happens to fall inside `[0.20, 1.0]`; a producer that widened the weights or
+    narrowed the clamp would have moved one number and hidden the other. The pair now comes off the
+    arguments of the two call nodes, and the fixture pins the difference: for a getter whose weights
+    are `2.50` and `-1.25` the old sweep returns `[0.20, 2.50]` while the clamp is still `[0.20,
+    1.0]`.
+    """
+    import ast
+
+    low, high = _g5b_sizing_bound_from_producer()
+    assert (low, high) == (0.2, 1.0), (
+        f"the producer's clamp reads {(low, high)}, not the [0.20, 1.0] at markov_regime.py:327")
+
+    # The getter really does contain floats that are not the clamp, so a sweep and a clamp-reading
+    # are different numbers on the shipped file, not only on the fixture.
+    tree = ast.parse(MARKOV_REGIME.read_text(encoding="utf-8"), filename=str(MARKOV_REGIME))
+    getter = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                  and node.name == "get_regime_sizing_multiplier")
+    every_float = sorted({n.value for n in ast.walk(getter)
+                          if isinstance(n, ast.Constant) and isinstance(n.value, float)})
+    assert 0.60 in every_float, (
+        "the pi weights this suite used to sweep are gone, so the fixture half has to be re-read")
+    assert 0.60 not in (low, high), (
+        f"the extracted bound {(low, high)} picked up the pi weight 0.60, so it is a sweep of every "
+        "float and not the clamp")
+
+    swept = sorted({n.value for n in ast.walk(ast.parse(_G5B_SIZING_CLAMP_FIXTURE))
+                    if isinstance(n, ast.Constant) and isinstance(n.value, float)})
+    assert (min(swept), max(swept)) != (0.2, 1.0), (
+        "the fixture no longer separates a float sweep from the clamp, so it proves nothing")
+    assert _g5b_sizing_bound_from_producer(_G5B_SIZING_CLAMP_FIXTURE) == (0.2, 1.0), (
+        "the extractor read the fixture's weights instead of its clamp, so a producer-side bound "
+        "change would move the wrong number")
 
 
 def test_g5b_a_row_that_is_not_a_json_object_publishes_absences_and_never_raises():
