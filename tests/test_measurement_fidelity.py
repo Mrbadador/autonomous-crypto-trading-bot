@@ -3987,16 +3987,42 @@ _G5_PROSE_CLAIMS = (
 
 
 def _g5_code_only(src):
-    """`src` with every `tokenize.COMMENT` blanked out.
+    """`src` with every `tokenize.COMMENT` and every docstring blanked out.
 
     Line count and the columns before each comment are preserved, so the result still parses at the
     same positions and `ast.get_source_segment` stays meaningful on it. A comment is prose: it
     cannot put a reading into the panel and it cannot take one out.
+
+    Finding #4 added the docstring pass. Prose is prose wherever it lives, and a scan that a
+    docstring can satisfy is a test that is true by construction: `assert "value" in reader_src and
+    "updated_at" in reader_src` used to pass because the reader's own first docstring line says
+    ``(value, updated_at)``, even if the body had selected no columns at all. Docstrings are blanked
+    from the syntax tree (the first `Expr(Constant)` of a Module, ClassDef, FunctionDef or
+    AsyncFunctionDef body) BEFORE the token pass, and blanked to spaces rather than deleted, so the
+    line-and-column promise above survives. A fragment that will not parse keeps its docstrings and
+    still fails or passes on the token pass exactly as it did: nothing silently becomes "code".
     """
+    import ast
     import io
     import tokenize
 
     text = src if src.endswith("\n") else src + "\n"
+    try:
+        grid = [list(line) for line in text.splitlines(True)]
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                     ast.AsyncFunctionDef)):
+                continue
+            body = getattr(node, "body", None) or []
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                literal = body[0].value
+                _g5_blank_region(grid, (literal.lineno, literal.col_offset),
+                                 (literal.end_lineno, literal.end_col_offset))
+        text = "".join("".join(row) for row in grid)
+    except (SyntaxError, ValueError, AttributeError):
+        pass
+
     lines = text.splitlines(True)
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
@@ -4013,6 +4039,22 @@ def _g5_code_only(src):
     assert len(stripped.splitlines()) == len(text.splitlines()), (
         "comment stripping changed the line count, so scanned positions no longer match the block")
     return stripped
+
+
+def _g5_blank_region(grid, start, end):
+    """Blank the `[start, end)` source region of `grid` (a per-line character list) to spaces.
+
+    Line breaks are never touched, so the caller's line count and every column before the region
+    still line up with the fragment it came from.
+    """
+    (start_row, start_col), (end_row, end_col) = start, end
+    for row in range(start_row, end_row + 1):
+        line = grid[row - 1]
+        from_col = start_col if row == start_row else 0
+        to_col = end_col if row == end_row else len(line)
+        for col in range(from_col, min(to_col, len(line))):
+            if line[col] not in ("\n", "\r"):
+                line[col] = " "
 
 
 def _g5_banned_hits(src, banned):
@@ -5313,8 +5355,12 @@ def _g5b_panel_namespace(path, raw_value, updated_at, now=None, config_bound=900
     ns["config"] = _Bound()
     if now is not None and callable(ns.get("_markov_regime_readings")):
         shipped = ns["_markov_regime_readings"]
+        # `max_age_sec` is forwarded, never swallowed: the whole point of finding #4 is that the
+        # deck passes the fleet's bound through this signature, and a lambda that dropped the
+        # keyword would pin the harness to the fallback and hide the bug again.
         ns["_markov_regime_readings"] = (
-            lambda raw, published_at, _s=shipped, _n=now: _s(raw, published_at, now=_n))
+            lambda raw, published_at, max_age_sec=None, _s=shipped, _n=now:
+            _s(raw, published_at, now=_n, max_age_sec=max_age_sec))
     return ns, fake
 
 
@@ -5446,15 +5492,37 @@ def test_g5b_the_bound_edges_are_the_fleet_semantics():
     assert over["max_age_sec"] == 900.0, over["max_age_sec"]
 
 
-def test_g5b_the_bound_is_the_fleets_constant_and_not_a_second_number():
+def test_g5b_the_bound_is_the_fleets_constant_and_not_a_second_number(tmp_path):
     """`config.py:109` is the bound; the four consumers all fall back to the literal 900.0. A panel
     with its own softer threshold would let a row through that the fleet is refusing."""
     for relpath in ("config.py", "super_bot.py", "inflight_shepherd.py", "swing_trader.py"):
         src = (REPO_ROOT / relpath).read_text(encoding="utf-8")
         assert "REGIME_MAX_AGE_SEC" in src, f"{relpath} no longer names the bound"
-    helper_src = _function_source(DASHBOARD, "_regime_max_age_sec")
-    assert "REGIME_MAX_AGE_SEC" in _g5_code_only(helper_src), (
-        "the deck's bound is not read from config.REGIME_MAX_AGE_SEC")
+
+    # Finding #4: this is where `assert "REGIME_MAX_AGE_SEC" in _g5_code_only(helper_src)` used to
+    # sit. Even with comments stripped it could be satisfied by the helper's docstring or by any other
+    # piece of prose in it, so a helper that stopped consulting `config` entirely could have kept it
+    # green. The pin is behavioural now: a bound the config tightens to 30s has to reach the deck, and
+    # the deck has to refuse a 60-second row because of it. `config_bound` is injected as `config`
+    # into the shipped namespace, so this runs `_regime_max_age_sec`'s own `getattr` path.
+    tight_html, _tight_fake, tight_ns = _g5b_render_deck(
+        tmp_path, updated_at=_G5B_FRESH_UPDATED_AT, config_bound=30.0)
+    assert tight_ns["m_r"]["max_age_sec"] == 30.0, tight_ns["m_r"]["max_age_sec"]
+    assert tight_ns["m_r"]["age_sec"] > 30.0, tight_ns["m_r"]["age_sec"]
+    assert tight_ns["m_r"]["stale"] is True, (
+        "config.REGIME_MAX_AGE_SEC = 30 was ignored and the deck kept a 60s row")
+    assert "STALE" in _g5b_heading(tight_html), _g5b_heading(tight_html)
+    assert "past 30s" in tight_html, (
+        "the deck names a bound it did not read from config: " + tight_html[:1500])
+    assert _G5B_ALL_CLEAR_COLOUR not in tight_html, (
+        "a row the tightened bound refuses still wears the all-clear")
+
+    wide_html, _wide_fake, wide_ns = _g5b_render_deck(
+        tmp_path, updated_at=_G5B_FRESH_UPDATED_AT, config_bound=900.0)
+    assert wide_ns["m_r"]["stale"] is False and wide_ns["m_r"]["max_age_sec"] == 900.0
+    assert "Live Forward Filter" in _g5b_heading(wide_html), _g5b_heading(wide_html)
+    assert _G5B_ALL_CLEAR_COLOUR in wide_html, (
+        "the same 60s row inside the bound lost its measured all-clear")
 
     resolver = _g4_helper("_regime_max_age_sec")
 
@@ -5489,7 +5557,10 @@ def test_g5b_the_deck_reads_the_row_with_its_updated_at():
     reader_src = _g5_code_only(_function_source(DASHBOARD, "query_system_state_row"))
     assert "SELECT value, updated_at FROM system_state WHERE key = ?" in reader_src, (
         "the new reader does not select the column the age path needs")
-    assert "value" in reader_src and "updated_at" in reader_src
+    # Finding #4: the word-membership line this replaced (`assert "value" in reader_src and
+    # "updated_at" in reader_src`) was satisfied by the reader's own first docstring line and proved
+    # nothing; the column pair is now pinned by executing the shipped SELECT against a real row, in
+    # both orders, in `test_g5b_the_shipped_reader_returns_the_value_and_the_stamp_in_that_order`.
 
 
 # ── Finding #3: the shipped row reader is EXECUTED, not described ─────────────────────────
@@ -5590,12 +5661,23 @@ def test_g5b_no_fallback_or_stand_in_survives_in_the_deck(banned, code_line):
 
 @pytest.mark.parametrize("banned,code_line", _G5B_STAND_IN_CASES + _G5B_PROSE_CLAIMS)
 def test_g5b_a_comment_neither_trips_nor_hides_a_markov_scan(banned, code_line):
-    """Both halves of the comment immunity, on this deck's own tokens: prose about the deleted
-    fallback must not fail the guard, and the same text really in the code must."""
+    """Both halves of the prose immunity, on this deck's own tokens: prose about the deleted
+    fallback must not fail the guard, and the same text really in the code must.
+
+    Finding #4 added the docstring halves. A `#` comment was the only prose the scan knew how to
+    ignore, so a docstring naming a banned token could trip a negative scan all by itself — and, the
+    other way round, a scan that a docstring satisfies is a test that cannot fail. Immunity has to
+    mean both kinds of prose, and neither of them may hide real code.
+    """
     prose = (f"def f():\n    # the deck used to publish {banned} here, and {banned} is "
              f"still what the note says\n    return 1\n")
     assert _g5_banned_hits(prose, [banned]) == [], (
         f"a comment quoting {banned!r} failed a negative scan against code that does not "
+        "contain it")
+    documented = (f'def f():\n    """the deck used to publish {banned} here, and {banned} is '
+                  f'still what the note says. """\n    return 1\n')
+    assert _g5_banned_hits(documented, [banned]) == [], (
+        f"a docstring quoting {banned!r} failed a negative scan against code that does not "
         "contain it")
     real = f"def f():\n    {code_line}\n    return 1\n"
     assert _g5_banned_hits(real, [banned]) == [banned], (
@@ -5603,6 +5685,10 @@ def test_g5b_a_comment_neither_trips_nor_hides_a_markov_scan(banned, code_line):
     hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
     assert _g5_banned_hits(hidden, [banned]) == [banned], (
         f"a comment beside {banned!r} in the code hid it from the scan")
+    documented_and_real = (f'def f():\n    """{banned} in the prose. """\n'
+                           f"    {code_line}\n    return 1\n")
+    assert _g5_banned_hits(documented_and_real, [banned]) == [banned], (
+        f"a docstring beside {banned!r} in the code hid it from the scan")
 
 
 def test_g5b_no_path_in_the_deck_can_construct_a_markov_regime_engine():

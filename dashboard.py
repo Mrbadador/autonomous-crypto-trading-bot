@@ -5041,7 +5041,12 @@ with tab_risk:
     # (uniform prior, hardcoded transition matrix, no dataset), so what it printed was the model's
     # assumption about the world, not a measurement of this one.
     markov_raw, markov_published_at = query_system_state_row("markov_regime_telemetry")
-    m_r = _markov_regime_readings(markov_raw, markov_published_at)
+    # The bound has to be PASSED, not merely documented in the comment above. Left at the signature
+    # default, this call aged every row against the helper's own 900s fallback, so a fleet that
+    # tightened `config.REGIME_MAX_AGE_SEC` kept refusing rows the deck still called live. One call
+    # to `_regime_max_age_sec()` here keeps the deck and `inflight_shepherd.py:611` on one number.
+    m_r = _markov_regime_readings(markov_raw, markov_published_at,
+                                  max_age_sec=_regime_max_age_sec())
     m_dom_st = m_r["dominant_regime"]
     m_conf_st = m_r["confidence"]
     m_domdur_st = m_r["dominant_duration"]
