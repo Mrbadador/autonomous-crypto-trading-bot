@@ -5145,13 +5145,28 @@ with tab_risk:
     else:
         m_bd_color = "#94a3b8"
         m_bd_label = "NOT MEASURED"
-    # The tradability gate is the one verdict in the deck that may bundle: it is a verdict, not a
-    # published value, and it keys on its OWN field. An unmeasured gate reads as unmeasured -- the
-    # fleet goes defensive when this key is missing (`super_bot.py:733` logs a key-missing warning
-    # and skips), and the HUD used to go green.
+    # The tradability gate is the deck's COMBINED verdict — "may this row be traded right now" — so
+    # it is the one card allowed to bundle (brief:252), and what it bundles is its own field AND the
+    # row's freshness, exactly as the fleet's four automated consumers do: `inflight_shepherd.py:614`
+    # and `super_bot.py:733` both refuse on `age > max_age`. Two failures therefore reach it: a gate
+    # nobody measured (the HUD used to go green while `super_bot.py:733` logs a key-missing warning
+    # and skips), and a measured `true` carried by a row the fleet refuses. The second one is why the
+    # badge cannot key on `measured` alone -- B-1 asks the heading AND every verdict derived from the
+    # row to say the row is refused. A measured false keeps its alarm red whatever the stamp says:
+    # that verdict is the engine's own, and dimming it would be the same sin in the other direction.
     if m_gate_st["measured"]:
-        m_tradable_color = "#00ff66" if m_gate_st["value"] else "#ff003c"
-        m_tradable_badge = "TRADABLE" if m_gate_st["value"] else "UNTRADEABLE CHURN"
+        if not m_gate_st["value"]:
+            m_tradable_color = "#ff003c"
+            m_tradable_badge = "UNTRADEABLE CHURN"
+        elif m_r["stale"]:
+            m_tradable_color = "#ffcc00"
+            m_tradable_badge = "TRADABLE (STALE ROW)"
+        elif not m_r["age_known"]:
+            m_tradable_color = "#ffcc00"
+            m_tradable_badge = "TRADABLE (FRESHNESS NOT MEASURED)"
+        else:
+            m_tradable_color = "#00ff66"
+            m_tradable_badge = "TRADABLE"
     else:
         m_tradable_color = "#94a3b8"
         m_tradable_badge = "GATE NOT MEASURED"

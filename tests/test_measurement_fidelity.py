@@ -5827,12 +5827,88 @@ def test_g5b_a_measured_untradable_gate_still_prints_the_red_verdict(tmp_path):
 
 
 def test_g5b_a_measured_tradable_gate_prints_the_engines_own_words(tmp_path):
-    html = _g5b_render_deck(tmp_path)[0]
+    """A gate the engine measured true, on a row inside the fleet's age bound, keeps the all-clear.
+
+    The render moved to a fresh stamp for finding #2: `_G5B_LIVE_UPDATED_AT` is ~35 h old and the
+    deck now refuses to paint a stale row green, so this case — which used to run on the stale live
+    stamp and assert the green — could only keep its claim by asking about a row the fleet still
+    trades. Its name and every assertion are otherwise unchanged, and the stale half that replaces
+    the old expectation is `test_g5b_a_stale_row_takes_the_green_off_the_tradability_gate`.
+    """
+    html = _g5b_render_deck(tmp_path, updated_at=_G5B_FRESH_UPDATED_AT)[0]
     assert "TRADABLE" in html, html[:2000]
     assert _G5B_ALL_CLEAR_COLOUR in html, "a measured all-clear was dimmed away"
     assert "Tradable: E[D]=10.4b &gt;= 3.5b" in html or "Tradable: E[D]=10.4b >= 3.5b" in html, \
         html[:2000]
     assert "(no tradability_reason in markov regime telemetry)" not in html
+
+
+def test_g5b_a_stale_row_takes_the_green_off_the_tradability_gate(tmp_path):
+    """Finding #2: brief B-1 requires the heading AND every verdict derived from the row to say the
+    row is refused. The heading obeyed; the gate did not. Rendered with the transcribed live row and
+    its real stamp, the deck printed `(STALE Forward Filter — row past the fleet age bound)` beside
+    `[TRADABLE]` in `#00ff66` with `coverage {'total': 21, 'unmeasured': 0}` — a green all-clear
+    claiming a currency the measurement does not have, on data all four automated consumers refuse
+    (`inflight_shepherd.py:614`, `super_bot.py:733`, both on `age > max_age`).
+
+    This card IS the deck's combined verdict, so the staleness bundling brief:252 allows for a
+    verdict applies here: a true gate on a refused row goes to the stale amber and says so.
+    """
+    html, _fake, ns = _g5b_render_deck(tmp_path)
+    assert ns["m_r"]["stale"] is True, ns["m_r"]["stale"]
+    assert ns["m_gate_st"]["measured"] is True, "the gate must stay measured; only its verdict moves"
+    assert ns["m_tradable_color"] != _G5B_ALL_CLEAR_COLOUR, (
+        f"a row the fleet refuses still wears the all-clear: {ns['m_tradable_color']}")
+    assert _G5B_ALL_CLEAR_COLOUR not in html, (
+        f"the stale deck prints the green all-clear anyway: {html[:2500]}")
+    assert ns["m_tradable_color"] == "#ffcc00", ns["m_tradable_color"]
+    assert "TRADABLE (STALE ROW)" in html, html[:2500]
+    assert "STALE" in _g5b_heading(html), _g5b_heading(html)
+
+
+def test_g5b_a_row_without_a_publish_stamp_does_not_borrow_the_all_clear(tmp_path):
+    """The other freshness failure: with no usable `updated_at` the row's age is unknown, not proven
+    inside the bound, so the verdict it feeds may not wear the colour of a fresh one either."""
+    html, _fake, ns = _g5b_render_deck(tmp_path, updated_at="")
+    assert ns["m_r"]["age_known"] is False, ns["m_r"]["age_known"]
+    assert ns["m_gate_st"]["measured"] is True, ns["m_gate_st"]
+    assert _G5B_ALL_CLEAR_COLOUR not in html, html[:2500]
+    assert ns["m_tradable_color"] == "#ffcc00", ns["m_tradable_color"]
+    assert "TRADABLE (FRESHNESS NOT MEASURED)" in html, html[:2500]
+    assert "TRADABLE (STALE ROW)" not in html, (
+        "a row with no stamp at all is being called stale — those are different states")
+
+
+def test_g5b_a_fresh_row_still_earns_the_green_tradable_all_clear(tmp_path):
+    """The other half, or the fix is just "never print green". Inside the bound a measured true gate
+    keeps `#00ff66` and the bare TRADABLE badge."""
+    html, _fake, ns = _g5b_render_deck(tmp_path, updated_at=_G5B_FRESH_UPDATED_AT)
+    assert ns["m_r"]["stale"] is False and ns["m_r"]["age_known"] is True
+    assert ns["m_tradable_color"] == _G5B_ALL_CLEAR_COLOUR, ns["m_tradable_color"]
+    assert ns["m_tradable_badge"] == "TRADABLE", ns["m_tradable_badge"]
+    assert "STALE ROW" not in html and "FRESHNESS NOT MEASURED" not in html, html[:2500]
+    assert "Live Forward Filter" in _g5b_heading(html), _g5b_heading(html)
+
+
+def test_g5b_a_stale_row_leaves_a_measured_veto_and_an_unmeasured_gate_alone(tmp_path):
+    """The two branches finding #2 must NOT touch: a published false keeps its alarm red, and an
+    absent gate keeps `GATE NOT MEASURED` in the absence grey — on a fresh row as well as a stale
+    one, so the freshness gate cannot become a way to dim a real reading."""
+    veto = {**_G5B_LIVE_PAYLOAD, "is_tradable": False,
+            "tradability_reason": "Expected duration E[D]=2.0b < 3.5b threshold (fee churn risk)"}
+    for stamp in (_G5B_LIVE_UPDATED_AT, _G5B_FRESH_UPDATED_AT):
+        html, _fake, ns = _g5b_render_deck(tmp_path, payload=veto, updated_at=stamp)
+        assert ns["m_tradable_color"] == "#ff003c", (stamp, ns["m_tradable_color"])
+        assert "UNTRADEABLE CHURN" in html, (stamp, html[:2000])
+        assert "STALE ROW)" not in html, (stamp, html[:2000])
+        assert _G5B_ALL_CLEAR_COLOUR not in html, html[:2000]
+    for stamp in (_G5B_LIVE_UPDATED_AT, _G5B_FRESH_UPDATED_AT):
+        html, _fake, ns = _g5b_render_deck(
+            tmp_path, payload=_g5b_payload_without("is_tradable"), updated_at=stamp)
+        assert ns["m_tradable_color"] == _G5B_ABSENT_COLOUR, (stamp, ns["m_tradable_color"])
+        assert "GATE NOT MEASURED" in html, (stamp, html[:2000])
+        assert _G5B_ALL_CLEAR_COLOUR not in html, html[:2000]
+        assert "(no is_tradable in markov regime telemetry)" in html, (stamp, html[:2000])
 
 
 def test_g5b_an_absent_tradability_reason_supplies_no_excuse(tmp_path):
@@ -5890,7 +5966,12 @@ def test_g5b_a_card_that_lost_its_reading_dims_while_its_neighbours_keep_theirs(
     _html, _fake, absent_ns = _g5b_render_deck(tmp_path, payload=_g5b_payload_without(dropped_key))
     assert absent_ns[colour_var] == _G5B_ABSENT_COLOUR, (
         f"the card fed by {dropped_key!r} still wears {absent_ns[colour_var]!r} without its reading")
-    _html2, _fake2, live_ns = _g5b_render_deck(tmp_path)
+    # Finding #2 moved this half onto a fresh stamp: the tradability gate is the deck's combined
+    # verdict and now also keys on the row's freshness, so the stale live stamp (`_G5B_LIVE_UPDATED_AT`,
+    # ~35 h old) legitimately dims it even with a measured `true`. A row the fleet still trades is the
+    # honest reference for "a measured reading keeps its own colour" — and `#00ff66` on the stale row
+    # is exactly what `test_g5b_a_stale_row_takes_the_green_off_the_tradability_gate` now forbids.
+    _html2, _fake2, live_ns = _g5b_render_deck(tmp_path, updated_at=_G5B_FRESH_UPDATED_AT)
     assert live_ns[colour_var] == live_colour, (
         f"the live row's {dropped_key!r} card lost its measured colour: {live_ns[colour_var]!r}")
 
