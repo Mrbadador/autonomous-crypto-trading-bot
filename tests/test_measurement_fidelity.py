@@ -5449,7 +5449,14 @@ def test_g5b_a_fresh_row_is_still_called_a_live_forward_filter(tmp_path):
 
 def test_g5b_an_absent_row_reads_differently_from_a_stale_one(tmp_path):
     """Absent and stale are different states and may not share a sentence: the fleet refuses a
-    stale row and has nothing at all to refuse when the row was never written."""
+    stale row and has nothing at all to refuse when the row was never written.
+
+    Finding #8 extended this rather than replacing it: a row that EXISTS and is not a regime
+    telemetry object (`'[1,2,3]'`, `'not json at all'`) blames the producer, while no row at all
+    blames the scheduler, and until this fix all three malformed shapes plus the empty object
+    printed the absent row's sentence, because `readings["row_present"] = bool(data)` cannot tell
+    them apart. Still no green anywhere in the family.
+    """
     stale_html = _g5b_render_deck(tmp_path)[0]
     absent_html = _g5b_render_deck(tmp_path, raw="", updated_at="")[0]
     assert "Live" not in _g5b_heading(absent_html), _g5b_heading(absent_html)
@@ -5459,6 +5466,32 @@ def test_g5b_an_absent_row_reads_differently_from_a_stale_one(tmp_path):
     assert "126000s old" not in absent_html
     assert "126000s old" in stale_html
     assert absent_html != stale_html, "absent and stale render identically"
+
+    # Same family, with a usable stamp so the heading has to speak about the ROW and not about it.
+    absent_row = _g5b_render_deck(tmp_path, raw="", updated_at=_G5B_FRESH_UPDATED_AT)[0]
+    malformed_row = _g5b_render_deck(tmp_path, raw="[1,2,3]", updated_at=_G5B_FRESH_UPDATED_AT)[0]
+    not_json_row = _g5b_render_deck(tmp_path, raw="not json at all",
+                                    updated_at=_G5B_FRESH_UPDATED_AT)[0]
+    empty_object_row = _g5b_render_deck(tmp_path, raw="{}", updated_at=_G5B_FRESH_UPDATED_AT)[0]
+
+    assert "no row" in _g5b_heading(absent_row), _g5b_heading(absent_row)
+    assert "not a regime telemetry object" not in _g5b_heading(absent_row), (
+        "a row nobody wrote is being blamed on a producer that never ran")
+    assert "not a regime telemetry object" in _g5b_heading(malformed_row), (
+        _g5b_heading(malformed_row))
+    assert _g5b_heading(not_json_row) == _g5b_heading(malformed_row), (
+        "two rows that are not objects should read the same way")
+    assert "not a regime telemetry object" not in _g5b_heading(empty_object_row), (
+        _g5b_heading(empty_object_row))
+    assert _g5b_heading(empty_object_row) != _g5b_heading(malformed_row), (
+        "a published empty object and a row of garbage are one sentence")
+    assert _g5b_heading(empty_object_row) != _g5b_heading(absent_row), (
+        "the row that exists is read as the row that does not")
+    for name, one in (("absent", absent_row), ("malformed", malformed_row),
+                      ("not-json", not_json_row), ("empty object", empty_object_row)):
+        assert "Live" not in _g5b_heading(one), (name, _g5b_heading(one))
+        assert _G5B_ALL_CLEAR_COLOUR not in one, (name, one[:2000])
+        assert _G5B_ABSENT_COLOUR in one, (name, one[:2000])
 
 
 def test_g5b_the_age_is_measured_from_the_rows_own_updated_at():

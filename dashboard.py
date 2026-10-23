@@ -1553,6 +1553,12 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
     )
 
     data = raw_value if isinstance(raw_value, dict) else {}
+    # Finding #8: `bool(data)` alone called three different situations by one name. Whether the row
+    # carries anything at all, and whether what it carries IS a telemetry object, are separate
+    # measurements -- and they blame different culprits (the scheduler vs the producer).
+    row_written = (isinstance(raw_value, dict)
+                   or bool(isinstance(raw_value, str) and raw_value.strip()))
+    row_is_object = isinstance(raw_value, dict)
     if isinstance(raw_value, str) and raw_value.strip():
         try:
             parsed = json.loads(raw_value)
@@ -1560,6 +1566,7 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
             parsed = None
         if isinstance(parsed, dict):
             data = parsed
+            row_is_object = True
 
     def _from_payload(payload_key):
         """The value published under `payload_key`, or None when the engine wrote no such key.
@@ -1742,6 +1749,8 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
         readings["age_absence_reason"] = readings["published_at"]["reason"]
     readings["stale"] = bool(readings["age_sec"] is not None and readings["age_sec"] > float(bound))
     readings["row_present"] = bool(data)
+    readings["row_written"] = bool(row_written)
+    readings["row_is_telemetry_object"] = bool(row_is_object)
     # "Live" needs both a stamp inside the bound the fleet enforces AND a row that measured
     # something. A fresh row carrying nothing is not a live forward filter either.
     readings["heading_is_live"] = bool(readings["age_known"] and not readings["stale"]
@@ -5079,6 +5088,9 @@ with tab_risk:
     # The heading is the claim, so it is the first thing the age has to agree with. A row past the
     # bound the fleet refuses is not a live forward filter, and a row that measured nothing -- or
     # carries a stamp that cannot be read, or one that reads from the future -- is not one either.
+    # The no-telemetry tail is three states, not one (finding #8): no row at all is the scheduler's
+    # failure, a row that is not a telemetry object is the producer's, and a row that is an object
+    # but published no fields is neither -- all in the deck's absence grey, none of them "Live".
     if m_r["heading_is_live"]:
         m_heading = "Live Forward Filter"
     elif m_r["stale"]:
@@ -5087,6 +5099,11 @@ with tab_risk:
         m_heading = "Forward Filter NOT MEASURED — publish stamp is ahead of this clock"
     elif not m_r["age_known"]:
         m_heading = "Forward Filter NOT MEASURED — no usable publish stamp"
+    elif not m_r["row_written"]:
+        m_heading = "Forward Filter NOT MEASURED — no row under this key"
+    elif not m_r["row_is_telemetry_object"]:
+        m_heading = ("Forward Filter NOT MEASURED — row present but not a regime telemetry "
+                     "object")
     else:
         m_heading = "Forward Filter NOT MEASURED — row carries no regime telemetry"
     st.markdown(f"#### 🎲 Bayesian Markov Regime Engine & Transition Matrix ({m_heading})")
