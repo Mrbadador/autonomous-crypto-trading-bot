@@ -321,8 +321,13 @@ def _deck_color(read, measured_color: str) -> str:
 
 
 def _deck_chart_level(read) -> float:
-    """A measured level for the candle chart, or 0.0 — its own 'draw nothing' encoding, never a
-    number for the chart to substitute a print for."""
+    """A measured level for the candle chart, or 0.0 — the chart's own "draw no level" encoding.
+
+    0.0 is never a print the chart substitutes for a level the deck did not measure: for the stop,
+    the liquidation price and the target it means no line is drawn, and for the mark it means no
+    "Live Mark" line is drawn — the last candle close is drawn under its own name, in the absence
+    grey, not as a stand-in for the mark.
+    """
     return _deck_value_or(read, 0.0)
 
 
