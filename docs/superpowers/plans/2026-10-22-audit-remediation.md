@@ -59,16 +59,42 @@ written, and is not in this plan's task numbering.** It repairs the same "label 
 measurement supports" pattern in the dashboard and the remaining analytics surfaces. Read the ledger for
 it; nothing in this plan describes it.
 
-G-series state as of 2026-10-23, so a fresh session cannot re-derive or mis-rank it: **G-1 … G-5a landed**.
-Still queued, one implementation dispatch at a time, in this order —
+G-series state as of 2026-10-23, so a fresh session cannot re-derive or mis-rank it: **G-1 … G-5a
+landed; G-5b landed (`888bf0c`…`df8b186`) and is in its fix-round re-review.** Still queued, one
+implementation dispatch at a time, in this order —
 
 | Task | What it owns | Severity, verified |
 |---|---|---|
-| G-5b | Markov regime deck: stale telemetry labelled live, untrained-engine fallback | display/authority |
 | G-5c | position deck: fabricated hard SL, leverage-fed margin/liquidation, flat-green PnL, funding `(Neutral)` | display |
 | G-5d | ghost/spoof all-clear fabricated by the producer and consumed by the **live** in-flight shepherd, which can `modify_strategy_order` | **P0 live exit path** |
 | G-5f | shepherd's invented RSI/ADX/ATR feeding the same ratchet's mute guard | live exit path |
-| G-5e | MTF confluence `or 50.0`, hedge `GREEN_SHIELD`, POC/VAH/VAL priced from `curr_p` | display |
+| G-5e | MTF confluence `or 50.0`, hedge `GREEN_SHIELD`, the volume-profile gate that clears itself, unlabelled `(1,500 Requests/Day Allowance)` | display |
+| G-5h | volume-profile producer fabricates POC/VAH/VAL from the close; the **live** swing gate reads them | **live entry path** |
+| G-5g | AI asset avoid list vetoes live entries on stale, partly invented telemetry (`system_state.ai_asset_avoid`) | live entry path |
+
+**G-5e/G-5h file ownership (this split is load-bearing — both touch the same defect and would collide in
+one dispatch):** G-5e owns the *consumers* in `dashboard.py` only. G-5h owns the *producer*
+`indicators.compute_volume_profile` (`indicators.py:462`, `:477`, `:501`, `:535`) and the live gate that
+reads it (`swing_trader.py:1180-1218`, called from `swing_trader.py:3299`). Neither may edit the other's
+files.
+
+G-5e's mechanism is **not** "POC/VAH/VAL priced from `curr_p`", which an earlier draft of this table
+claimed. The consumer sites do read `vp_info.get("poc", curr_p)`, but the default can never fire: every
+return path of `compute_volume_profile` carries all of `poc`, `vah` and `val`. The fabricated price comes
+from the producer — `curr_close` on the `flat_range` and `zero_vol` paths, `0.0` on `insufficient_data` —
+so the defect is a producer that invents its own output and a consumer that cannot tell. In the fleet alpha
+matrix that makes the breakout gate self-clearing (`dashboard.py:675` computes `curr_p >= vah * 0.998`, and
+with `vah == curr_p` that is unconditionally true, so `vp_pass = True`), and in the live swing gate it makes
+the value-area veto a no-op — `swing_trader.py:1199` reads `SWING_VOLUME_PROFILE_VAH_TOLERANCE`, 0.985 by
+default at `config.py:172` and documented as permitting "breakout builds within 1.5% of VAH", which the
+stand-in silently defeats — exactly when the profile could not be computed, while logging
+`[VOLUME-PROFILE-GATE] [PASS]`. A fix that only changes `.get("poc", curr_p)` to `.get("poc")` fixes nothing.
+
+G-5g has no brief yet, deliberately: it is written only after G-5c and G-5d land, because both touch the
+same `system_state` readers. Its step 1 must instrument how often the leader gate actually vetoes before
+any sentence about PnL is written — the veto is returned as a dict and logged
+(`conviction_filter.py:384-391`), not persisted to a rejection table, so there is currently **no measured
+count** and no basis for a harm estimate.
 
 G-5d's ranking is the one worth not losing: the programmatic veto consumer
 (`microstructure_guard.evaluate_pre_trade_veto`) is **dead** — the guard is instantiated only under
