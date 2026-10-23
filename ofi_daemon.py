@@ -537,6 +537,57 @@ class MultiSymbolOFIDaemon:
         await asyncio.to_thread(_write)
 
 
+# ---------------------------------------------------------------------------
+# Ghost/spoof persist gates (G-5d dispatch A, finding D-2).
+#
+# Pure module-level functions so the shipped decision can be executed by the test suite without
+# booting the daemon, the WebSocket, or a database. `ai_engine.detect_spoof_and_ghost_walls` now
+# publishes a `measured` marker on every payload it returns, measured or absent; these are the two
+# questions the persister asks of it, and they are asked per field, never by `bool(payload)`.
+# ---------------------------------------------------------------------------
+
+
+def _ghost_is_result(ghost_walls) -> bool:
+    """Did Engine 2 hand back a payload this cycle? This is the persist gate.
+
+    Deliberately NOT `if ghost_walls:`. Truthiness is a property of the dict's size, not of what it
+    reports: it happened to pass an absence payload only because the absence is a non-empty dict, and
+    it would equally pass a marker-less stand-in that no reader can tell measured from absent. A
+    result here is a payload that *declares whether it measured anything*, so an unknown shape is
+    refused rather than written into `system_state` where a default-coloured reader would wear it as
+    a verdict.
+    """
+    return isinstance(ghost_walls, dict) and "measured" in ghost_walls
+
+
+def _ghost_is_measured(ghost_walls) -> bool:
+    """Was the payload a reading? Strict `is True`, so a truthy string or 1 is not a measurement.
+
+    The row is written either way — the ruling for this dispatch is "keep writing the row, publish
+    the marker", because suppressing the write would make "engine down" and "no row ever"
+    indistinguishable and would leave the row's `updated_at` lying in the other direction.
+    """
+    return isinstance(ghost_walls, dict) and ghost_walls.get("measured") is True
+
+
+def _ghost_wall_log_line(ghost_walls) -> str:
+    """One line of log per cycle: the readings, or the absence in words.
+
+    With the absence payload the old f-string printed
+    `Spoof=None | Side=None | Advisory=None | Risk=None%`. `None` is not a fabricated value, so it
+    did not repeat the defect, but the branch's convention is that an absence is published in words —
+    a `None` in a percentage's place reads like a broken print, and the next operator on shift has to
+    re-derive which of the three kinds of "no number" they are looking at.
+    """
+    if _ghost_is_measured(ghost_walls):
+        return (f"[GHOST-WALL] Spoof={ghost_walls.get('spoof_detected')} | "
+                f"Side={ghost_walls.get('spoof_side')} | "
+                f"Advisory={ghost_walls.get('execution_advisory')} | "
+                f"Risk={ghost_walls.get('manipulation_risk_pct')}%")
+    return (f"[GHOST-WALL] NOT MEASURED (reason={ghost_walls.get('reason')}) — no spoof verdict this cycle. "
+            "The row is written as an absence, not as a clean order book.")
+
+
 async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
     """
     Feature 2 & Engine 2: Order Flow Tape Whisperer & Ghost Wall / Spoofing Detector.
@@ -599,7 +650,12 @@ async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
                         "primary_symbol": "BTCUSDT",
                         "best_bid": primary.get("best_bid", 0.0),
                         "best_ask": primary.get("best_ask", 0.0),
-                        "mean_residence_time_ms": primary.get("mean_residence_time_ms", 250.0),
+                        # Engine 2's fast path treats a missing residence time as "not measured" and
+                        # publishes an absence. A 250.0 defaulted HERE would have re-invented the
+                        # stand-in one layer below the fix, because 250.0 is the value that passes the
+                        # sub-300ms half of the spoof condition. A recorded reading passes through
+                        # untouched, including a recorded 0.0.
+                        "mean_residence_time_ms": primary.get("mean_residence_time_ms"),
                         "order_additions_count": primary.get("order_additions_count", 0),
                         "order_cancellations_count": primary.get("order_cancellations_count", 0),
                         "cancel_counts_per_level": primary.get("cancel_counts", [0.0] * 10),
@@ -621,9 +677,9 @@ async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
                         daemon.latest_tape_intel = tape_intel
                         log.info(f"[TAPE-WHISPERER] Condition={tape_intel.get('tape_condition')} | Side={tape_intel.get('absorption_side')} | Veto={tape_intel.get('execution_veto')} | Conf={tape_intel.get('confidence')}")
 
-                    if ghost_walls:
+                    if _ghost_is_result(ghost_walls):
                         daemon.latest_ghost_walls = ghost_walls
-                        log.info(f"[GHOST-WALL] Spoof={ghost_walls.get('spoof_detected')} | Side={ghost_walls.get('spoof_side')} | Advisory={ghost_walls.get('execution_advisory')} | Risk={ghost_walls.get('manipulation_risk_pct')}%")
+                        log.info(_ghost_wall_log_line(ghost_walls))
 
                     # Persist to databases
                     def _db_write():
@@ -637,7 +693,7 @@ async def _ai_tape_whisperer_loop(daemon: MultiSymbolOFIDaemon):
                                             INSERT OR REPLACE INTO system_state (key, value, updated_at)
                                             VALUES ('order_flow_tape_intel', ?, ?)
                                         """, (json.dumps(tape_intel), now_iso))
-                                    if ghost_walls:
+                                    if _ghost_is_result(ghost_walls):
                                         conn.execute("""
                                             INSERT OR REPLACE INTO system_state (key, value, updated_at)
                                             VALUES ('ai_ghost_walls', ?, ?)

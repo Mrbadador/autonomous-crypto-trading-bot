@@ -9015,6 +9015,142 @@ def test_g5d_the_fast_paths_arithmetic_is_unchanged(spoof, res, veto, ofi, detec
 
 
 # ---------------------------------------------------------------------------
+# D-2 — the persister
+# ---------------------------------------------------------------------------
+
+def _g5d_ghost_guards(path=OFI_DAEMON):
+    """Every `If` in the daemon that touches ghost_walls, as (guard source, body source).
+
+    Read out of the shipped tree so a guard cannot hide in a comment, and so a guard that has moved
+    elsewhere in the file is not mistaken for the one that writes the row.
+    """
+    import ast
+
+    src = path.read_text(encoding="utf-8")
+    guards = []
+    for node in ast.walk(ast.parse(src, filename=str(path))):
+        if not isinstance(node, ast.If):
+            continue
+        test = ast.get_source_segment(src, node.test) or ""
+        body = "\n".join(ast.get_source_segment(src, stmt) or "" for stmt in node.body)
+        if "ghost_walls" in test or "ghost_walls" in body:
+            guards.append((test, body))
+    assert guards, f"{path.name} no longer guards anything about ghost_walls"
+    return guards
+
+
+def _g5d_packet_value(path, packet_name, key):
+    """The source of one key of a module-scope dict literal built inside a function."""
+    import ast
+
+    src = path.read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(src, filename=str(path))):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", "") == packet_name
+                and isinstance(node.value, ast.Dict)):
+            for k, v in zip(node.value.keys, node.value.values):
+                if isinstance(k, ast.Constant) and k.value == key:
+                    return ast.get_source_segment(src, v)
+    raise AssertionError(f"{path.name} builds no {packet_name} with a {key!r} key")
+
+
+def test_g5d_the_persister_gate_keys_on_measured_not_on_truthiness():
+    """Case 4, the behaviour half: the gate asks a question about the payload, not about its size.
+
+    An absence payload is a non-empty dict, so plain truthiness happened to let it through — an
+    accident, not a decision, and one that would equally have waved through a marker-less stand-in no
+    reader could tell measured from absent.
+    """
+    is_result = _g5d_daemon_helper("_ghost_is_result")
+    is_measured = _g5d_daemon_helper("_ghost_is_measured")
+    absence = _g5d_engine_helper("_ghost_absence_payload")("no_llm_response")
+    measured = _g5d_engine_helper("_ghost_deterministic_verdict")({
+        "hawkes_veto": False, "hawkes_spoof_index": 0.0,
+        "mean_residence_time_ms": 400.0, "normalized_ofi": 0.0})
+
+    assert bool(absence) is True, "the absence is a non-empty dict — truthiness was never the gate"
+    assert is_result(absence) is True, absence
+    assert is_measured(absence) is False, absence
+    assert is_result(measured) is True and is_measured(measured) is True, measured
+
+    # What the explicit gate refuses: not a payload at all, and a payload that does not declare
+    # whether it measured anything — an unknown shape is exactly what must not reach the row.
+    for not_a_result in (None, {}, {"spoof_detected": False}, "", "measured", 0):
+        assert is_result(not_a_result) is False, not_a_result
+        assert is_measured(not_a_result) is False, not_a_result
+    # A truthy marker that is not the bool is not a measurement either.
+    assert is_result({"measured": "yes"}) is True and is_measured({"measured": "yes"}) is False
+    assert is_result({"measured": 1}) is True and is_measured({"measured": 1}) is False
+    # A payload that declares itself absent is still a result: the row must keep being written.
+    assert is_result({"measured": False}) is True
+
+
+def test_g5d_the_ghost_row_is_written_for_an_absence_with_the_attempts_timestamp():
+    """Case 4, the shipped half: both persist channels gate on `_ghost_is_result`, and neither gate
+    is truthiness or `measured`.
+
+    Suppressing the write would make "engine down" and "no row ever" indistinguishable and would turn
+    the row's own `updated_at` into a lie in the other direction, so the absence goes to the database
+    with the attempt's real timestamp and the marker that says it measured nothing.
+    """
+    guards = _g5d_ghost_guards()
+    assert [test for test, _body in guards if test == "ghost_walls"] == [], (
+        "a bare `if ghost_walls:` still gates a ghost write")
+    explicit = [(test, body) for test, body in guards
+                if test == "_ghost_is_result(ghost_walls)"]
+    assert len(explicit) == 2, [test for test, _b in guards]
+    for test, _body in explicit:
+        assert "_ghost_is_measured" not in test, test
+
+    bodies = "\n".join(body for _t, body in explicit)
+    assert "daemon.latest_ghost_walls = ghost_walls" in bodies, bodies
+    assert "ai_ghost_walls" in bodies and "INSERT OR REPLACE INTO system_state" in bodies, bodies
+    assert "(json.dumps(ghost_walls), now_iso)" in bodies, (
+        "the ghost row is no longer stamped with the attempt's own timestamp")
+
+    # The whisperer loop's own sentence goes through the gate helper, so the log cannot print a
+    # reading the payload does not carry.
+    loop_src = _g5d_function_source(OFI_DAEMON, "_ai_tape_whisperer_loop")
+    assert "_ghost_wall_log_line(ghost_walls)" in loop_src, loop_src[:400]
+
+
+def test_g5d_the_ghost_log_line_publishes_an_absence_in_words():
+    """The brief's unnamed site: `ofi_daemon.py:626` printed `Spoof=None | … | Risk=None%`.
+
+    `None` is not a fabricated value, so it did not repeat the defect, but an absence published as a
+    `None` in a percentage's place reads like a broken print. The measured sentence is unchanged.
+    """
+    line = _g5d_daemon_helper("_ghost_wall_log_line")
+    absence = _g5d_engine_helper("_ghost_absence_payload")("no_llm_response")
+    measured = _g5d_engine_helper("_ghost_deterministic_verdict")({
+        "hawkes_veto": True, "hawkes_spoof_index": 0.8,
+        "mean_residence_time_ms": 120.0, "normalized_ofi": -0.4})
+
+    absent_text = line(absence)
+    assert "NOT MEASURED" in absent_text, absent_text
+    assert "no_llm_response" in absent_text, absent_text
+    assert "None" not in absent_text, absent_text
+    assert "Spoof=None" not in absent_text and "Risk=None%" not in absent_text, absent_text
+    assert "clean order book" in absent_text, absent_text
+
+    measured_text = line(measured)
+    assert "Spoof=True" in measured_text and "Side=ASK" in measured_text, measured_text
+    assert "Advisory=VETO_SELL_SPOOF" in measured_text and "Risk=80.0%" in measured_text, \
+        measured_text
+    assert "NOT MEASURED" not in measured_text, measured_text
+
+
+def test_g5d_the_depth_packet_no_longer_invents_a_residence_time():
+    """The same stand-in one layer up: the daemon used to build `depth_packet` with
+    `primary.get("mean_residence_time_ms", 250.0)`, which would have re-invented the number the
+    producer had just been fixed to refuse, and made the key never absent in the live path.
+    """
+    value = _g5d_packet_value(OFI_DAEMON, "depth_packet", "mean_residence_time_ms")
+    assert value == 'primary.get("mean_residence_time_ms")', value
+    assert "250.0" not in value, value
+
+
+# ---------------------------------------------------------------------------
 # Negative scans over the producer and the persister (both halves each)
 # ---------------------------------------------------------------------------
 
@@ -9050,3 +9186,16 @@ def test_g5d_a_comment_neither_trips_nor_hides_that_producer_scan(banned, code_l
     assert _g5_banned_hits(hidden, [banned]) == [banned]
 
 
+def test_g5d_the_persister_no_longer_prints_ghost_values_it_did_not_measure():
+    """The loop's own sentence must come from the gate helper.
+
+    Scan is on `_ai_tape_whisperer_loop` alone: the `[GHOST-WALL] Spoof=` literal belongs in
+    `_ghost_wall_log_line`'s measured branch, which is where the reading is actually available, and a
+    scan that covered the helper would fail on correct code.
+    """
+    loop_code = _g5_code_only(_g5d_function_source(OFI_DAEMON, "_ai_tape_whisperer_loop"))
+    assert "_ghost_wall_log_line(ghost_walls)" in loop_code, loop_code[:400]
+    assert "[GHOST-WALL] Spoof=" not in loop_code, (
+        "the whisperer loop prints ghost values again by itself, outside the measured branch")
+    for banned in ("Spoof=None", "Risk=None%"):
+        assert banned not in loop_code, banned
