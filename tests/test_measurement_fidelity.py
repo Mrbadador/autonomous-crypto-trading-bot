@@ -5157,7 +5157,8 @@ _G5B_FIELD_REASONS = {
 }
 
 # (rendered text variable, the one state variable it may read) — the G-5a idiom, one row per field
-# the deck publishes as text.
+# the deck publishes as text. Finding #9: `m_gate_note` was the one per-field text with no owner, so
+# a future edit could have keyed the gate's own absence note on another card's state unnoticed.
 _G5B_FIELD_OWNERS = {
     "m_dom_text": "m_dom_st", "m_dom_note": "m_dom_st",
     "m_conf_text": "m_conf_st", "m_conf_note": "m_conf_st",
@@ -5166,15 +5167,65 @@ _G5B_FIELD_OWNERS = {
     "m_bd_text": "m_bd_st", "m_bd_note": "m_bd_st",
     "m_stat_text": "m_stat_st", "m_stat_note": "m_stat_st",
     "m_matrix_note": "m_matrix_st",
+    "m_gate_note": "m_gate_st",
 }
 
-# Every verdict/colour the deck derives, and so every one that must be guarded.
+# Every verdict/colour the deck derives, and so every one that must be guarded. Finding #9 made this
+# list exhaustive in BOTH directions — `test_g5b_every_name_the_deck_derives_is_rostered_or_explained`
+# fails if the deck derives an `m_*` name that is not listed here, in `_G5B_FIELD_OWNERS`, in
+# `_G5B_READER_ALIASES` or explained in `_G5B_UNROSTERED_SHAPES`, and fails if a listed name stops
+# being derived. The four colours (`m_conf_color`, `m_domdur_color`, `m_stat_color`,
+# `m_matrix_color`), `m_stamp_text` and the two cascade-card rungs (`m_bd_rungs`, `m_bd_alarm`) were
+# all derived verdicts that no roster pinned.
 _G5B_DERIVED_NAMES = frozenset(set(_G5B_FIELD_OWNERS) | {
-    "m_dom_color", "m_bd_color", "m_bd_label", "m_sizing_color", "m_tradable_color",
+    "m_dom_color", "m_conf_color", "m_domdur_color", "m_stat_color", "m_matrix_color",
+    "m_bd_color", "m_bd_label", "m_sizing_color", "m_tradable_color",
     "m_tradable_badge", "m_reason_line", "m_time_text", "m_time_color", "m_heading",
     "m_coverage_line", "m_unmeasured_count", "m_field_count", "m_horizon_note", "m_matrix_html",
-    "m_bars_html",
+    "m_bars_html", "m_stamp_text",
+    # Finding #9: two verdicts the deck publishes on the cascade card, both keyed on `m_bd_st` and
+    # neither in a roster until now — exactly the "a future verdict could go unpinmarked" hole.
+    "m_bd_rungs", "m_bd_alarm",
 })
+
+# The deck's own aliases of the reader's per-field states. They read exactly one key out of `m_r` and
+# invent nothing; `test_g5b_the_reader_aliases_are_bare_lookups_into_the_reading_dict` pins that
+# shape, because a line like `m_bd_st = m_r["breakdown_risk"] or {"measured": True, "value": 0.0}`
+# would otherwise be a stand-in hiding inside a name the guards treat as a reading.
+_G5B_READER_ALIASES = frozenset({
+    "m_r", "m_dom_st", "m_conf_st", "m_domdur_st", "m_gate_st", "m_rsn_st", "m_sizing_st",
+    "m_bd_st", "m_stat_st", "m_matrix_st",
+})
+
+# Names the deck assigns that are NOT single-field verdicts and so are deliberately absent from the
+# rosters above. Finding #9 required the exclusion to be stated rather than implied, and the test
+# below pins each entry's shape, so this comment cannot rot into a loophole: `m_series_specs` and
+# `m_series_colors` are a label->reader-key tuple and a label->colour literal that read no
+# measurement at all; `m_series_states` is the reader's own per-series aggregate (it folds the
+# per-field `measured` flags, it does not invent one); `m_drawn_series` is that same aggregate
+# filtered on `measured`, which is why an incomplete series cannot reach the plot;
+# `m_horizon_absent` is a list of the reader's own absence reasons, consumed only by the chain
+# verdict `m_horizon_note`. Each value is (why it is unrostered, substrings its assignment must
+# contain, substrings it must not).
+_G5B_UNROSTERED_SHAPES = {
+    "m_series_specs": (
+        "a label->reader-key tuple: it reads no measurement and paints no verdict",
+        ('("Current π_t", "prob")', '"fc"', '"stat"'),
+        ("measured", "m_r[", "_st[")),
+    "m_series_colors": (
+        "a label->colour literal: the colour is chosen per series, never per reading",
+        ('"#00e5ff"', '"#a855f7"', '"#64748b"'),
+        ("measured", "m_r[", "_st[")),
+    "m_series_states": (
+        "the reader's own per-series aggregate: it folds the per-field flags, invents none",
+        ('"measured": all(', 'm_r["by_state"]'), ()),
+    "m_drawn_series": (
+        "that same aggregate filtered on measured, so an incomplete series never reaches the plot",
+        ("m_series_states", 'one["measured"]'), ()),
+    "m_horizon_absent": (
+        "the reader's own absence reasons, consumed only by the chain verdict `m_horizon_note`",
+        ('not m_r[one]["measured"]', '["reason"]'), ()),
+}
 
 # Derived verdicts that talk about the payload as a whole, or that are the reader's own decision
 # rather than the block's: exempt from the per-field gate BY SHAPE, and the shape is asserted.
@@ -5359,6 +5410,34 @@ def _g5b_block_code(path=None):
 def _g5b_helper_code(name="_markov_regime_readings"):
     """One module-level Markov helper's source, comments removed."""
     return _g5_code_only(_function_source(DASHBOARD, name))
+
+
+def _g5b_deck_and_helper_code(helper=None):
+    """The deck block AND the reader helper, comments and docstrings removed (finding #9).
+
+    B-5 moved the payload reads out of the block and into `_markov_regime_readings`, so a scan of the
+    block alone no longer sees the code that decides what the deck prints — which is how a stand-in
+    could have come back inside the reader unnoticed. Every `_G5B_STAND_IN_CASES` guard reads this.
+    `helper` replaces the helper half so a test can feed the same target a seeded reader and prove
+    the widening is real rather than a concatenation that quietly drops it.
+    """
+    return _g5b_block_code() + "\n" + (_g5b_helper_code() if helper is None else helper)
+
+
+def _g5b_helper_seeded_with(code_line):
+    """The SHIPPED reader helper's own source with `code_line` spliced into the top of its body.
+
+    This is the second half of the widened scan: a stand-in has to be caught where the reads actually
+    live, so the seed goes into the real function text rather than into a stub that merely has the
+    same name. The `def` line is asserted to be the first line, so the splice cannot silently drift
+    into an outer scope if the signature is ever re-wrapped.
+    """
+    helper = _g5b_helper_code()
+    lines = helper.splitlines(True)
+    assert lines and lines[0].startswith("def _markov_regime_readings"), (
+        f"the reader helper no longer starts with its own def line, so this seed proves nothing: "
+        f"{lines[:1]}")
+    return lines[0] + "    " + code_line.strip() + "\n" + "".join(lines[1:])
 
 
 def _g5b_panel_namespace(path, raw_value, updated_at, now=None, config_bound=900.0):
@@ -5797,8 +5876,37 @@ def test_g5b_the_shipped_reader_opens_read_only_and_creates_no_database(tmp_path
 # ── B-2: no model may be run to fill in a missing measurement ────────────────────────────
 @pytest.mark.parametrize("banned,code_line", _G5B_STAND_IN_CASES)
 def test_g5b_no_fallback_or_stand_in_survives_in_the_deck(banned, code_line):
-    hits = _g5_banned_hits(_g5b_block_code(), [banned])
+    """Finding #9: the target is the deck block AND the reader helper.
+
+    B-5 moved every payload read out of the block and into `_markov_regime_readings`, so scanning the
+    block alone left the code that actually decides what the deck prints unswept: the gap was latent
+    (the reviewer hand-checked all 15 tokens against the helper and none is present today), and a
+    `m_tel.get("is_tradable", True)` written into the reader tomorrow would have kept this green.
+    """
+    hits = _g5_banned_hits(_g5b_deck_and_helper_code(), [banned])
     assert hits == [], f"the Markov deck still contains {banned!r}"
+
+
+@pytest.mark.parametrize("banned,code_line", _G5B_STAND_IN_CASES)
+def test_g5b_the_stand_in_scan_reaches_the_reader_helper(banned, code_line):
+    """Both halves of the widening: the shipped deck is clean, and the same token seeded into the
+    shipped reader helper's own body is caught by the target the guard above actually uses.
+
+    The second assertion is the one that makes the first mean anything — a scan over a concatenation
+    that quietly dropped the helper would look identical from the outside. It also records the defect
+    it repaired: the block alone did not see a stand-in written into the reader.
+    """
+    seeded = _g5b_helper_seeded_with(code_line)
+    assert banned not in _g5b_block_code(), (
+        f"{banned!r} is in the deck block itself, so the block-only half below proves nothing")
+    assert _g5_banned_hits(_g5b_block_code(), [banned]) == [], (
+        f"the block-only scan already trips on {banned!r}; this is not the pre-fix gap being closed")
+    assert _g5_banned_hits(_g5b_deck_and_helper_code(), [banned]) == [], (
+        f"the shipped deck or its reader helper still contains {banned!r}")
+    hits = _g5_banned_hits(_g5b_deck_and_helper_code(helper=seeded), [banned])
+    assert hits == [banned], (
+        f"a stand-in written into the reader helper's body is invisible to the deck-wide scan, so "
+        f"the {banned!r} guard is still block-only")
 
 
 @pytest.mark.parametrize("banned,code_line", _G5B_STAND_IN_CASES + _G5B_PROSE_CLAIMS)
@@ -6634,6 +6742,114 @@ def test_g5b_every_derived_verdict_in_the_deck_guards_on_measured():
     missing = sorted(_G5B_DERIVED_NAMES - seen)
     assert not missing, (
         f"the deck no longer derives {missing}, so this guard has nothing to check")
+
+
+def _g5b_deck_assignments():
+    """Every `m_`-prefixed name the deck block assigns, mapped to the source of each assignment.
+
+    Finding #9 needed the OTHER direction of the roster check: the guards below used to walk the
+    roster and confirm each name still appears in the deck, which says nothing about a name the deck
+    derives and the roster never heard of. This walks the deck.
+    """
+    import ast
+
+    block = _g5b_block_code()
+    tree = ast.parse(block, filename="dashboard.py markov deck")
+    segments = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id.startswith("m_"):
+                segments.setdefault(target.id, []).append(
+                    ast.get_source_segment(block, node) or "")
+    return segments
+
+
+def test_g5b_every_name_the_deck_derives_is_rostered_or_explained():
+    """Finding #9: a verdict added to the deck in the wrong place used to be invisible to every guard.
+
+    Both directions are pinned. An `m_*` name the deck assigns and no roster knows is a derived
+    verdict nobody guards, and a rostered name the deck no longer assigns is a claim about the deck
+    that has stopped being true — either way the structural pin has to say so rather than pass.
+    """
+    assigned = set(_g5b_deck_assignments())
+    accounted = (set(_G5B_FIELD_OWNERS) | set(_G5B_DERIVED_NAMES) | set(_G5B_READER_ALIASES)
+                 | set(_G5B_UNROSTERED_SHAPES))
+    unexplained = sorted(assigned - accounted)
+    assert not unexplained, (
+        f"the deck derives {unexplained} and no roster names them, so the per-field gate and the "
+        "guarded-verdict sweep never look at them: add each to _G5B_FIELD_OWNERS (a single field's "
+        "published text), _G5B_DERIVED_NAMES (a verdict or colour that must guard on measured), "
+        "_G5B_READER_ALIASES (a bare lookup into the reader's dict) or _G5B_UNROSTERED_SHAPES "
+        "(with the shape that justifies leaving it out)")
+    gone = sorted(accounted - assigned)
+    assert not gone, (
+        f"the rosters still name {gone}, which the deck no longer assigns; a guard over a name that "
+        "left the panel is a test that cannot fail")
+    overlap = ((set(_G5B_UNROSTERED_SHAPES)
+                & (set(_G5B_FIELD_OWNERS) | set(_G5B_DERIVED_NAMES)
+                   | set(_G5B_READER_ALIASES)))
+               | (set(_G5B_READER_ALIASES)
+                  & (set(_G5B_FIELD_OWNERS) | set(_G5B_DERIVED_NAMES))))
+    assert not overlap, (
+        f"{sorted(overlap)} is both guarded and excused, which is neither")
+
+
+@pytest.mark.parametrize("name", sorted(_G5B_UNROSTERED_SHAPES))
+def test_g5b_each_unrostered_deck_name_is_excluded_for_the_stated_shape(name):
+    """The exclusion list is only honest while each entry still has the shape it was excused for.
+
+    Every reason in `_G5B_UNROSTERED_SHAPES` is pinned to text that has to be in the deck's own
+    assignment (and, for the two literal maps, to text that must NOT be), so an entry cannot survive
+    as a comment that stopped describing the code — and a name that starts reading a measurement
+    cannot stay excused.
+    """
+    why, must, must_not = _G5B_UNROSTERED_SHAPES[name]
+    assert name not in _G5B_FIELD_OWNERS and name not in _G5B_DERIVED_NAMES, (
+        f"{name} is rostered as well as excused")
+    segments = _g5b_deck_assignments().get(name) or []
+    assert segments, (
+        f"the deck no longer assigns {name}, so the roster comment excusing it as {why!r} is stale")
+    joined = "\n".join(segments)
+    for token in must:
+        assert token in joined, (
+            f"{name} is excused as {why!r}, but its assignment no longer contains {token!r}: "
+            f"{joined[:220]}")
+    for token in must_not:
+        assert token not in joined, (
+            f"{name} now reads {token!r}, so it is a verdict derived from a reading and belongs in "
+            f"_G5B_DERIVED_NAMES, not in the unrostered list ({why})")
+
+
+def test_g5b_the_reader_aliases_are_bare_lookups_into_the_reading_dict():
+    """Finding #9: the roster that says "these names are the reader's own states" has to be true.
+
+    An alias is allowed to skip the per-field gate precisely because it cannot invent a measurement.
+    `m_bd_st = m_r["breakdown_risk"] or {"measured": True, "value": 0.0}` would keep the name and put
+    the stand-in back, so each alias is pinned to one subscript of `m_r` — and `m_r` itself to the
+    shipped reader call.
+    """
+    import re
+
+    assignments = _g5b_deck_assignments()
+    for name in sorted(_G5B_READER_ALIASES):
+        segments = assignments.get(name) or []
+        assert segments, f"{name} is rostered as a reader alias but the deck no longer assigns it"
+        for segment in segments:
+            if name == "m_r":
+                shape = r"m_r = _markov_regime_readings\([\s\S]*\)"
+                claim = "it is the shipped reader's own return value, nothing else"
+            else:
+                shape = r'%s = m_r\["[a-z_0-9]+"\]' % re.escape(name)
+                claim = "it is one subscript of the reader's dict and folds no fallback"
+            assert re.fullmatch(shape, segment), (
+                f"{name} is rostered as a reader alias, but its code is {segment[:200]!r}; the "
+                f"guard relies on {claim}")
 
 
 def test_g5b_the_deck_explains_every_absence_it_shows(tmp_path):
