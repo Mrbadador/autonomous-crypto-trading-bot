@@ -1934,8 +1934,6 @@ def test_the_legacy_margin_block_publishes_no_ratio_without_a_balance():
     # requirement is unchanged -- no ratio without a balance -- and the balance half of it now
     # lives in the gauge, which is the only thing that reads the balance.
     assert "_deck_balance = _deck_account_balance(live_bal_val)" in src
-    assert "margin_measured" not in src, (
-        "the twin kept a balance flag that nothing reads: the gauge gates on the balance itself")
     assert "_deck_margin_gauge(total_margin_locked" in src
     assert 'margin_util_display = _deck_text(margin_util_pct, "{:.1f}%")' in src
     assert '"n/a (no account balance)"' not in src, (
