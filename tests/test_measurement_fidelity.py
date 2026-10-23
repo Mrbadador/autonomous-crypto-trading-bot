@@ -5956,8 +5956,10 @@ def test_g5b_the_matrix_caption_claims_publication_not_estimation(tmp_path):
     deck_code = _g5b_block_code() + "\n" + _g5b_helper_code()
     assert _g5_banned_hits(deck_code, ["estimated from labelled bars"]) == [], (
         "the deck still claims a matrix provenance the row cannot support")
-    assert _g5_banned_hits(deck_code, ["publishes the estimated matrix"]) == [], (
-        "the block comment still claims both paths publish an estimated matrix")
+    # What guards the caption's provenance claim is the code-layer ban above -- the shipped caption
+    # is a string literal, so it is code -- plus the rendered-caption assertions below. It is not
+    # guarded by a scan of comment prose: `_g5_code_only` blanks comments by design (finding #4), so
+    # such a scan could never fire and an honest comment about the old caption must stay legal.
 
     html, _fake, ns = _g5b_render_deck(tmp_path, payload=_G5B_LIVE_PAYLOAD)
     assert ns["m_matrix_st"]["measured"] is True, "this case must be the measured-matrix branch"
