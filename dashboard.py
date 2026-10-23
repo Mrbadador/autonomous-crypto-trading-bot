@@ -335,11 +335,15 @@ def _deck_account_balance(live_bal_val) -> dict:
     """The equity the utilization gauge divides by.
 
     `live_bal_val` is None until the balance syncs; the pre-fix gauge substituted 0.0 and printed a
-    0.0% utilization in the all-clear green for an account it cannot see.
+    0.0% utilization in the all-clear green for an account it cannot see. A balance that synced to
+    zero is a recorded zero, not a failed sync: it is still no denominator, but the reason says so
+    instead of blaming a sync that happened.
     """
     value = _optional_float(live_bal_val)
-    if value is None or value <= 0.0:
+    if value is None:
         return _deck_absence("no account balance synced")
+    if value <= 0.0:
+        return _deck_absence("recorded account balance is not a margin denominator")
     return _deck_reading(value)
 
 

@@ -8264,6 +8264,25 @@ def test_g5c_ceiling_an_unread_margin_limit_is_an_absence_not_a_silent_70(stored
         assert "70" not in line and "30%" not in line, line
 
 
+@pytest.mark.parametrize("recorded", [0.0, -5.0], ids=["zero", "negative"])
+def test_g5c_a_synced_zero_balance_says_what_it_is_instead_of_blaming_the_sync(recorded):
+    """`live_bal_val` is None until the balance syncs, so "no account balance synced" is the truth
+    for an account that has not reported one. A balance that synced to zero is a recorded zero, not
+    a failed sync: it is still no denominator, but the reason must not blame a sync that happened.
+    The negative case is here because an exchange can report one, and it is still not a
+    denominator."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        balance = _g4_helper("_deck_account_balance", path)
+        unsynced = balance(None)
+        assert _deck_absent(unsynced), unsynced
+        assert unsynced["reason"] == "no account balance synced", unsynced
+        zero = balance(recorded)
+        assert _deck_absent(zero), zero
+        assert zero["reason"] == "recorded account balance is not a margin denominator", zero
+        assert "sync" not in zero["reason"], zero
+        assert balance(10000.0) == {"value": 10000.0, "measured": True, "reason": ""}
+
+
 @pytest.mark.parametrize("stored,ceiling,buffer",
                          [("70.0", "70.0", "30"), ("55.0", "55.0", "45"),
                           ("80.0", "80.0", "20"), ("42.5", "42.5", "58")],
