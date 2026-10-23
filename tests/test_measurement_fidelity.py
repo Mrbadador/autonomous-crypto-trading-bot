@@ -5694,6 +5694,112 @@ def test_g5b_a_row_that_is_not_a_json_object_publishes_absences_and_never_raises
         assert _G5B_ALL_CLEAR_COLOUR not in html, (junk, html[:1500])
 
 
+# ── Finding #1 (Critical): the same claim, per PUBLISHED KEY ──────────────────────────────
+# The battery above could never reach the crash, because every one of its payloads fails to parse as
+# a dict, so `dominant_regime` was never measured and the reader never looked anything up under it.
+# These rows ARE dicts and their fields ARE published — they just hold values no producer can write.
+_G5B_JUNK_PER_KEY_VALUES = (7, "x", [], {}, None, ["CHOP"], {"a": 1}, "RANGE")
+
+# Each card's colour variable and the one reading that may earn it. `_G5B_PAYLOAD_FIELDS` is pinned
+# against `markov_regime.py`'s AST by `test_g5b_the_fixture_keys_are_the_ten_the_producer_publishes`,
+# so this battery runs over the producer's real contract and not over a transcription of it.
+_G5B_COLOUR_TO_FIELD = (
+    ("m_dom_color", "dominant_regime"),
+    ("m_conf_color", "confidence"),
+    ("m_domdur_color", "dominant_duration"),
+    ("m_sizing_color", "sizing_multiplier"),
+    ("m_stat_color", "equilibrium"),
+    ("m_matrix_color", "transition_matrix"),
+    ("m_bd_color", "breakdown_risk"),
+    ("m_tradable_color", "is_tradable"),
+)
+
+
+@pytest.mark.parametrize("payload_key,junk_value", [
+    (one_key, one_junk)
+    for one_key in sorted(_G5B_PAYLOAD_FIELDS)
+    for one_junk in _G5B_JUNK_PER_KEY_VALUES
+])
+def test_g5b_a_junk_value_under_any_published_key_publishes_absences_and_never_raises(
+        payload_key, junk_value):
+    """Finding #1: one published key holding junk may not take the panel down.
+
+    The reader looked the dominant regime's duration up with a subscript
+    (`short_by_state[str(dom_st["text"]).strip()]`), so a row whose `dominant_regime` parses as a
+    measured state string that names none of the engine's three states raised `KeyError` before any
+    card was built — and the pre-fix code it replaced (`durations.get(dom_regime, 3.3)`) could not
+    raise at all, so the fix traded a stand-in for a crash. Brief constraint 9: a crashed Streamlit
+    panel publishes nothing, which is worse than an honest absence, and the `with tab_risk:` block
+    aborting costs the other panels in the same run their feed too, with no `FEED_FAILURES` entry to
+    say why.
+
+    Both halves, for each of the producer's ten keys against each junk value: the reader returns and
+    the shipped deck renders. The render then wears no green all-clear, no `TRADABLE`, no `Live`, and
+    no measured colour on any field it did not measure — a junk value that really is a number (a
+    `sizing_multiplier` of 7) keeps its own colour, because dimming a published reading is the
+    defect `test_g5b_a_measured_cascade_risk_keeps_its_own_rung_and_thresholds` forbids.
+
+    The stamp is the stale live one throughout, so the "no Live" half is a claim about the junk row
+    and not about freshness; freshness has its own tests above and below.
+    """
+    import json as _json
+
+    row = {payload_key: junk_value}
+    text = _json.dumps(row)
+    readings = _g5b_readings(text, updated_at=_G5B_LIVE_UPDATED_AT)
+    assert readings["dominant_duration"]["measured"] is False, (text, readings["dominant_duration"])
+    assert "dominant_regime" in readings["dominant_duration"]["reason"] or \
+        "duration" in readings["dominant_duration"]["reason"], readings["dominant_duration"]
+    assert readings["coverage"]["unmeasured"] >= 1, readings["coverage"]
+
+    html, _fake, deck_ns = _g5b_render_deck(payload=row, updated_at=_G5B_LIVE_UPDATED_AT)
+    assert "not measured" in html, (text, html[:1500])
+    assert "Live" not in _g5b_heading(html), (text, _g5b_heading(html))
+    assert "(Live Forward Filter)" not in html, text
+    assert _G5B_ALL_CLEAR_COLOUR not in html, (text, html[:2000])
+    assert "TRADABLE" not in html.replace("UNTRADEABLE", ""), (text, html[:2000])
+    for colour_var, field in _G5B_COLOUR_TO_FIELD:
+        if not readings[field]["measured"]:
+            assert deck_ns[colour_var] == _G5B_ABSENT_COLOUR, (
+                f"{field} was never measured from {text!r}, yet the deck paints its card with "
+                f"{deck_ns[colour_var]!r}")
+
+
+def test_g5b_an_unknown_dominant_regime_names_its_own_absence_reason():
+    """Finding #1's other half: the three ways `dominant_duration` can fail must not collapse into
+    one sentence. A row that never named a regime points at the producer's key set; a row that named
+    a state the engine does not define points at the producer's vocabulary; a row that named a real
+    state but published no duration for it points at the duration map. Only the second of those used
+    to raise, and an absence the operator cannot tell the others apart from is no use at all."""
+    unknown = _g5b_readings('{"dominant_regime": "RANGE", "state_probabilities": '
+                            '{"CHOP": 0.4, "BULL_EXPANSION": 0.3, "BEAR_CASCADE": 0.3}}')
+    assert unknown["dominant_regime"]["measured"] is True, unknown["dominant_regime"]
+    assert unknown["dominant_duration"]["measured"] is False, unknown["dominant_duration"]
+    assert "names none of the engine's states" in unknown["dominant_duration"]["reason"], \
+        unknown["dominant_duration"]
+    assert "dominant_duration" in unknown["unmeasured_fields"], unknown["unmeasured_fields"]
+    assert "dominant_regime" not in unknown["unmeasured_fields"], unknown["unmeasured_fields"]
+
+    no_regime = _g5b_readings("{}")
+    assert no_regime["dominant_duration"]["reason"] == (
+        _G5B_FIELD_REASONS["dominant_duration"]), no_regime["dominant_duration"]
+
+    named_but_no_duration = _g5b_readings('{"dominant_regime": "CHOP"}')
+    assert named_but_no_duration["dominant_duration"]["measured"] is False
+    assert named_but_no_duration["dominant_duration"]["reason"] == (
+        _G5B_FIELD_REASONS["dominant_duration"]), named_but_no_duration["dominant_duration"]
+
+    measured = _g5b_readings(_MARKOV_JSON_TEXT)
+    assert measured["dominant_duration"] == {"value": 10.4, "measured": True, "reason": ""}, \
+        measured["dominant_duration"]
+
+    html = _g5b_render_deck(payload='{"dominant_regime": "RANGE"}',
+                            updated_at=_G5B_LIVE_UPDATED_AT)[0]
+    assert "names none of the engine&#x27;s states" in html or \
+        "names none of the engine's states" in html, html[:2000]
+    assert "not measured" in html and _G5B_ALL_CLEAR_COLOUR not in html, html[:2000]
+
+
 # ── B-6: the verdicts may not fail open ──────────────────────────────────────────────────
 def test_g5b_a_payload_without_is_tradable_prints_no_all_clear(tmp_path):
     """The single most dangerous line in the panel: `bool(m_tel.get("is_tradable", True))` turned a

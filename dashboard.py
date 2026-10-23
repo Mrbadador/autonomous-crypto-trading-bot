@@ -1639,14 +1639,28 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
          "reason": "no confidence: every state probability has to be measured first"})
     short_by_state = {state: short for short, state in _MARKOV_STATE_KEYS}
     dom_st = fields["dominant_regime"]
-    dom_dur_st = (fields.get(f"dur_{short_by_state[str(dom_st['text']).strip()]}")
-                  if dom_st["measured"] else None)
-    fields["dominant_duration"] = (
-        {"value": dom_dur_st["value"], "measured": True, "reason": ""}
-        if dom_dur_st is not None and dom_dur_st["measured"] else
-        {"value": None, "measured": False,
-         "reason": ("no dominant duration: the dominant regime or its expected duration "
-                    "was not measured")})
+    # `.get`, never a subscript. A row whose `dominant_regime` parses as a measured state string yet
+    # names none of the engine's three states -- "RANGE", 7, ["CHOP"], the shapes `json.loads` hands
+    # back -- has no duration to look up, and it must publish that as an absence rather than raise
+    # `KeyError` and take the whole `tab_risk` block down with it: brief constraint 9 counts a
+    # crashed panel as worse than an honest absence, and the crash would leave no `FEED_FAILURES`
+    # entry either. The absence reason names WHICH of the three causes applies, so the operator is
+    # pointed at the producer (a state the engine never defines) and not at the scheduler.
+    dom_short = short_by_state.get(str(dom_st["text"]).strip()) if dom_st["measured"] else None
+    dom_dur_st = fields.get(f"dur_{dom_short}") if dom_short is not None else None
+    if dom_dur_st is not None and dom_dur_st["measured"]:
+        fields["dominant_duration"] = {"value": dom_dur_st["value"], "measured": True, "reason": ""}
+    elif dom_st["measured"] and dom_short is None:
+        fields["dominant_duration"] = (
+            {"value": None, "measured": False,
+             "reason": ("no dominant duration: dominant_regime names none of the engine's states "
+                        "(" + " / ".join(one_state for _one_short, one_state
+                                         in _MARKOV_STATE_KEYS) + ")")})
+    else:
+        fields["dominant_duration"] = (
+            {"value": None, "measured": False,
+             "reason": ("no dominant duration: the dominant regime or its expected duration "
+                        "was not measured")})
 
     # The transition matrix, or no matrix at all. There is no stand-in: `default_P` was a
     # byte-for-byte copy of the engine's prior (`markov_regime.py:39-43`) which would silently
