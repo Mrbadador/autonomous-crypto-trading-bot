@@ -734,6 +734,33 @@ def _position_mark(live_prices, symbol: str, clean_symbol: str = "") -> dict:
     return _deck_absence("no live price for this symbol in the current fetch")
 
 
+def _position_funding(funding_map, symbol: str, clean_symbol: str = "") -> dict:
+    """The accrued funding the telemetry reports for this position, or an absence — never a verdict.
+
+    `fetch_live_position_funding` returns {} when `system_state` carries no `live_position_funding`
+    row and the Bitget UTA fallback fails, which is every symbol today (contract item 9). The deck
+    read that empty map through `num(..., 0.0)`, so "nothing reported" became a recorded zero,
+    printed "(Neutral)" beside it and was added to PnL. A funding of exactly 0.0 IS a measurement —
+    the position neither paid nor received — and stays a reading.
+    """
+    table = funding_map if isinstance(funding_map, dict) else {}
+    raw = str(symbol)
+    base = raw.split(":")[0]
+    keys = []
+    for candidate in (clean_symbol, base.upper().replace("/", "").replace("-", ""), raw, base):
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    for key in keys:
+        info = table.get(key)
+        if not isinstance(info, dict) or "total_funding" not in info:
+            continue
+        value = _optional_float(info.get("total_funding"))
+        if value is None:
+            return _deck_absence(f"the funding telemetry's total_funding for {key} is not a number")
+        return _deck_reading(value)
+    return _deck_absence("no funding telemetry for this symbol")
+
+
 def _position_unrealized_pnl(curr_p: dict, entry_p: dict, qty: dict, side: str) -> dict:
     """Mark-to-market PnL: publishable only when the mark, the entry and the size were all read.
 
@@ -826,6 +853,7 @@ def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
     hard_sl = _position_hard_sl(row)
     est_liq = _position_liquidation(entry_p, lev, side)
     mark = _position_mark(live_prices, symbol, clean_symbol)
+    funding = _position_funding(funding_map, symbol, clean_symbol)
     tp = _column("take_profit")
     sl = _column("stop_loss")
     unr_pnl = _position_unrealized_pnl(mark, entry_p, qty, side)
@@ -843,6 +871,7 @@ def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
         "est_liq": est_liq,
         "mark": mark,
         "unr_pnl": unr_pnl,
+        "funding": funding,
         "unr_roi": _position_roi(unr_pnl, margin),
         "dist_liq": _position_liq_buffer(mark, est_liq, side),
         "dist_tp": _position_level_distance(mark, tp, side, "tp"),

@@ -3204,6 +3204,11 @@ _G4_BLOCKS = {
     # The legacy twin has no funding banner at all, so this one resolves for dashboard.py only.
     "position_strip": (r"^[ \t]*# Fleet Accrued Funding Summary Banner",
                        (r"\n[ \t]*# Render visual metric cards",)),
+    # G-5c C-4: the hero card's funding delta and the margin bar's "Active Funding:" badge sit in
+    # the gap between `position_hero`'s terminator and the funding banner, so the funding total had
+    # no guard that could reach them. Additive: nothing above changes region or semantics.
+    "position_funding_bar": (r"^# P0: Global Margin Utilization Visual Progress Bar",
+                             (r"\n# .* Main Tabbed Navigation",)),
 }
 
 _G4_DASHBOARD_BLOCKS = ("macro", "ofi", "micro", "radar", "fleet")
@@ -7725,3 +7730,277 @@ def test_g5c_the_twin_helpers_are_byte_identical_and_read_the_same_price():
         dashboard_read = _g4_helper(name, DASHBOARD)(*args)
         legacy_read = _g4_helper(name, LEGACY_DASHBOARD)(*args)
         assert dashboard_read == legacy_read, (name, dashboard_read, legacy_read)
+
+
+# ── C-4: absent funding rendered "$0.0000 (Neutral)" and was then ADDED to PnL ──────────────
+
+# Banned text plus one line that genuinely contains it, so the prose-immunity half below is a
+# second proof rather than a restatement of the first.
+_G5C_FUNDING_STAND_IN_CASES = (
+    ('num(f_info.get("total_funding"), 0.0)',
+     'pos_funding = num(f_info.get("total_funding"), 0.0)'),
+    ('total_live_funding += num(',
+     'total_live_funding += num(f_info.get("total_funding"), 0.0)'),
+    ('total_live_funding = 0.0', 'total_live_funding = 0.0'),
+    ('(Neutral)', 'pos_funding_str = "$0.0000 (Neutral)"'),
+    ('else "Neutral"',
+     'fund_status = "Gained" if total_live_funding > 0 else ("Paid" if total_live_funding < 0 else "Neutral")'),
+    ('_deck_reading(pos_funding)',
+     'true_net_pnl = _deck_sum(unr_pnl, _deck_reading(pos_funding))'),
+    ('_deck_reading(total_live_funding)',
+     'true_portfolio_net = _deck_sum(total_unrealized_pnl, _deck_reading(total_live_funding))'),
+    ('"#00ff66" if total_live_funding >= 0',
+     'fund_badge_color = "#00ff66" if total_live_funding >= 0 else "#ffaa00"'),
+)
+
+# `_position_funding` is a dependency of the byte-identical `_position_deck_readings`, so the
+# legacy twin carries the same bytes. The funding *renderers* below speak to panels the twin does
+# not have (it has no funding banner, no per-position funding line and no fleet funding total), so
+# they live only in dashboard.py and this suite only asks for them there.
+_G5C_FUNDING_SHARED_HELPERS = ("_position_funding", "_position_deck_readings", "_deck_sum",
+                                "_deck_signed_money", "_deck_text", "_deck_note", "_deck_color",
+                                "_deck_pnl_color", "_deck_is_absent", "_deck_reading",
+                                "_deck_absence")
+_G5C_FUNDING_DASHBOARD_HELPERS = ("_deck_funding_word", "_deck_funding_color",
+                                  "_deck_funding_text", "_deck_funding_total")
+
+
+def _g5c_funding_code(path=DASHBOARD):
+    """The C-4 surface: the aggregate, the hero card, the funding bar, the funding banner, the
+    per-position cards, and every helper that decides what a funding figure prints."""
+    parts = [_g5c_block("agg", path), _g5c_block("hero", path), _g5c_block("cards", path)]
+    names = list(_G5C_FUNDING_SHARED_HELPERS)
+    if path == DASHBOARD:
+        parts += [_g5c_block("funding_bar", path), _g5c_block("strip", path)]
+        names += list(_G5C_FUNDING_DASHBOARD_HELPERS)
+    parts += [_g5c_helper_code(name, path) for name in names]
+    return "\n".join(parts)
+
+
+def _g5c_funding_entry(value):
+    """One telemetry entry in the shape `fetch_live_position_funding` writes: the same dict under
+    the raw symbol, the `/USDT` spelling and the clean form."""
+    info = {"total_funding": value, "open_fee_total": 0.01, "close_fee_total": 0.0,
+            "cur_realised_pnl": 0.0, "unrealised_pnl": 0.0}
+    return {"BTCUSDT": info, "BTC/USDT": info, "BTC": info}
+
+
+# Every shape that means "the funding map says nothing about this position". `live_position_funding`
+# is `{}` in trading_data.db today (contract item 9), so the first one is the shape the fleet runs
+# with for every symbol.
+_G5C_UNMEASURED_FUNDING_MAPS = (
+    ("map missing", None),
+    ("empty map", {}),
+    ("other symbol only", {"ETHUSDT": {"total_funding": 1.5}}),
+    ("empty entry", {"BTCUSDT": {}}),
+    ("no total_funding key", {"BTCUSDT": {"open_fee_total": 0.01}}),
+    ("null funding", {"BTCUSDT": {"total_funding": None}}),
+    ("placeholder funding", {"BTCUSDT": {"total_funding": "syncing..."}}),
+    ("nan funding", {"BTCUSDT": {"total_funding": float("nan")}}),
+    ("entry not a dict", {"BTCUSDT": "0.42"}),
+)
+
+
+@pytest.mark.parametrize(
+    "funding_map", [m for _, m in _G5C_UNMEASURED_FUNDING_MAPS],
+    ids=[label for label, _ in _G5C_UNMEASURED_FUNDING_MAPS])
+def test_g5c_an_unmeasured_funding_is_an_absence_and_not_a_zero_verdict(funding_map):
+    """C-4's headline: with `live_position_funding` = {} the deck printed `$0.0000 (Neutral)` for
+    every symbol. Absence is not a verdict, so it renders the house absence and never the green."""
+    read = _g4_helper("_position_funding", DASHBOARD)(funding_map, "BTC/USDT", "BTCUSDT")
+    assert _deck_absent(read), read
+    assert read["value"] is None and read["measured"] is False, read
+    assert read["reason"], "an absence must carry the reason the deck renders"
+    text = _g4_helper("_deck_funding_text", DASHBOARD)(read)
+    assert text == "not measured", text
+    assert "0.0000" not in text and "Neutral" not in text, text
+    assert _g4_helper("_deck_funding_word", DASHBOARD)(read) == "not measured"
+    colour = _g4_helper("_deck_funding_color", DASHBOARD)(read)
+    assert colour == "#94a3b8", colour
+    assert colour != "#00ff66", "an unmeasured funding may not wear the all-clear"
+    note = _g4_helper("_deck_note", DASHBOARD)(read)
+    assert note and "Neutral" not in note, note
+    assert _g4_helper("_deck_signed_money", DASHBOARD)(read) == "not measured"
+
+
+@pytest.mark.parametrize("stored", [0.0, 0, "0.0", -0.0],
+                         ids=["zero", "int zero", "zero string", "negative zero"])
+def test_g5c_a_recorded_zero_funding_is_a_reading_and_stays_green(stored):
+    """The asymmetry the mark rule already pins, mirrored for funding: a recorded 0.0 IS a
+    measurement — it says the position paid and received nothing — so it keeps its number, its
+    "(Flat)" word, the all-clear green and no absence note."""
+    read = _g4_helper("_position_funding", DASHBOARD)(_g5c_funding_entry(stored),
+                                                      "BTC/USDT", "BTCUSDT")
+    assert read == {"value": 0.0, "measured": True, "reason": ""}, read
+    assert _g4_helper("_deck_funding_text", DASHBOARD)(read) == "+$0.0000 (Flat)"
+    assert _g4_helper("_deck_funding_color", DASHBOARD)(read) == "#00ff66"
+    assert _g4_helper("_deck_note", DASHBOARD)(read) == ""
+    assert "not measured" not in _g4_helper("_deck_funding_text", DASHBOARD)(read)
+
+
+def test_g5c_a_measured_funding_keeps_its_sign_its_word_and_its_colour():
+    """Gained and Paid stay the two verdicts the exchange's own print supports — nothing about an
+    unread symbol can reach either branch."""
+    for value, word, colour in ((0.4210, "Gained", "#00ff66"), (-0.4210, "Paid", "#ffaa00")):
+        read = _g4_helper("_position_funding", DASHBOARD)(_g5c_funding_entry(value),
+                                                          "BTC/USDT", "BTCUSDT")
+        assert read["measured"] is True, read
+        assert _g4_helper("_deck_funding_text", DASHBOARD)(read) == \
+            f"{_g4_helper('_deck_signed_money', DASHBOARD)(read)} ({word})", read
+        assert _g4_helper("_deck_funding_color", DASHBOARD)(read) == colour, read
+
+
+def test_g5c_the_funding_reading_survives_the_spellings_the_producer_writes():
+    """`fetch_live_position_funding` keys one entry three ways; the deck looks the position up
+    under the clean symbol and then the raw one, and both spellings are the same reading."""
+    funding_map = _g5c_funding_entry(1.25)
+    for symbol, clean in (("BTCUSDT", ""), ("BTC/USDT", "BTCUSDT"), ("BTC:USDT", "BTCUSDT"),
+                          ("btc", "BTCUSDT")):
+        read = _g4_helper("_position_funding", DASHBOARD)(funding_map, symbol, clean)
+        assert read["measured"] is True, (symbol, clean, read)
+        assert read["value"] == pytest.approx(1.25), (symbol, clean, read)
+
+
+def test_g5c_true_net_pnl_refuses_to_publish_when_funding_was_never_measured():
+    """C-4's arithmetic half. The panel wrapped an unmeasured funding in `_deck_reading(...)` and
+    added it to PnL, dressing it as a measurement at the one call site that was otherwise correct.
+    Decision: SUPPRESS, not label — see the comment at the card's `true_net_pnl` site."""
+    helper = _g4_helper("_deck_sum", DASHBOARD)
+    unr = _g4_helper("_deck_reading", DASHBOARD)(12.5)
+    absent = _g4_helper("_position_funding", DASHBOARD)({}, "BTCUSDT", "BTCUSDT")
+    net = helper(unr, absent)
+    assert _deck_absent(net), net
+    assert "funding" in net["reason"], net
+    assert _g4_helper("_deck_pnl_color", DASHBOARD)(net) == "#94a3b8", net
+    assert _g4_helper("_deck_signed_money", DASHBOARD)(net) == "not measured"
+    measured = _g4_helper("_position_funding", DASHBOARD)(_g5c_funding_entry(2.5),
+                                                          "BTCUSDT", "BTCUSDT")
+    assert helper(unr, measured)["value"] == pytest.approx(15.0), helper(unr, measured)
+    zero = _g4_helper("_position_funding", DASHBOARD)(_g5c_funding_entry(0.0),
+                                                      "BTCUSDT", "BTCUSDT")
+    flat = helper(unr, zero)
+    assert flat["measured"] is True and flat["value"] == pytest.approx(12.5), flat
+    # and the other addend still gates it: a measured funding cannot rescue an absent mark PnL
+    blind = _g4_helper("_deck_absence", DASHBOARD)("no live price for this symbol in the current fetch")
+    suppressed = helper(blind, measured)
+    assert _deck_absent(suppressed) and "live price" in suppressed["reason"], suppressed
+
+
+def test_g5c_the_fleet_funding_total_is_an_absence_when_no_symbol_reported_funding():
+    """`total_live_funding` started at 0.0 and `+=`'d each row's stand-in, so an empty telemetry
+    map summed to a printed `+$0.0000 (Neutral)`. The aggregate now has its own measured-or-absent
+    state and says how many positions are missing it."""
+    total = _g4_helper("_deck_funding_total", DASHBOARD)
+    readings = _g4_helper("_position_funding", DASHBOARD)
+    absent = readings({}, "BTCUSDT", "BTCUSDT")
+    aggregate = total([absent, absent])
+    assert _deck_absent(aggregate), aggregate
+    assert aggregate["reason"] == "2 of 2 positions report no funding", aggregate
+    assert "0.0000" not in _g4_helper("_deck_funding_text", DASHBOARD)(aggregate)
+    assert _g4_helper("_deck_funding_color", DASHBOARD)(aggregate) == "#94a3b8"
+    mixed = total([readings(_g5c_funding_entry(0.5), "BTCUSDT", "BTCUSDT"), absent])
+    assert _deck_absent(mixed) and mixed["reason"] == "1 of 2 positions report no funding", mixed
+    all_read = total([readings(_g5c_funding_entry(0.5), "BTCUSDT", "BTCUSDT"),
+                      readings({"ETHUSDT": {"total_funding": -0.25}}, "ETHUSDT", "ETHUSDT"),
+                      readings(_g5c_funding_entry(0.0), "BTCUSDT", "BTCUSDT")])
+    assert all_read["measured"] is True and all_read["value"] == pytest.approx(0.25), all_read
+    empty = total([])
+    assert _deck_absent(empty) and "no open positions" in empty["reason"], empty
+
+
+def test_g5c_a_seeded_position_carries_its_funding_reading_into_the_deck(tmp_path):
+    """The reading reaches the deck through the shipped frame, the shipped SELECTs and the shipped
+    `_position_deck_readings` — not through a float the panel defaulted."""
+    row = _g5c_seeded_row(tmp_path, leverage=5)
+    prices = {"BTCUSDT": 105000.0}
+    funded = _g4_helper("_position_deck_readings", DASHBOARD)(
+        row, prices, _g5c_funding_entry(0.75))
+    assert funded["funding"] == {"value": 0.75, "measured": True, "reason": ""}, funded
+    blind = _g4_helper("_position_deck_readings", DASHBOARD)(row, prices, {})
+    assert _deck_absent(blind["funding"]), blind
+    net = _g4_helper("_deck_sum", DASHBOARD)(blind["unr_pnl"], blind["funding"])
+    assert _deck_absent(net) and "funding" in net["reason"], net
+    rollup = _g4_helper("_deck_funding_total", DASHBOARD)([blind["funding"]])
+    assert _deck_absent(rollup) and rollup["reason"] == "1 of 1 positions report no funding", rollup
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_FUNDING_STAND_IN_CASES)
+def test_g5c_no_zero_funding_stand_in_survives_in_the_deck(banned, code_line):
+    """No `num(..., 0.0)` on the funding map, no `+=` into a float total, no `_deck_reading()`
+    wrapper dressing an unmeasured funding, no green-at-zero funding colour — in the panels or in
+    the helpers behind them, in either file."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        hits = _g5_banned_hits(_g5c_deck_code(path), [banned])
+        assert hits == [], f"{path.name}'s deck blocks still contain {banned!r}"
+        hits = _g5_banned_hits(_g5c_funding_code(path), [banned])
+        assert hits == [], f"{path.name}'s funding surface still contains {banned!r}"
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_FUNDING_STAND_IN_CASES)
+def test_g5c_a_comment_neither_trips_nor_hides_a_funding_scan(banned, code_line):
+    """Both halves on C-4's own tokens."""
+    prose = f"def f():\n    # the deck used to publish {banned} here\n    return 1\n"
+    assert _g5_banned_hits(prose, [banned]) == []
+    documented = f'def f():\n    """the deck used to publish {banned} here. """\n    return 1\n'
+    assert _g5_banned_hits(documented, [banned]) == []
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [banned]) == [banned], (
+        f"{banned!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [banned]) == [banned]
+
+
+def test_g5c_the_card_and_the_table_print_the_funding_reading_or_nothing():
+    """The render sites consume the reading: the card's badge, the "Funding (Live)" column and the
+    True Net line all come from the helpers, none of them from a defaulted float."""
+    cards = _g5c_block("cards", DASHBOARD)
+    assert 'pos_funding = p_read["funding"]' in cards
+    assert "pos_funding_str = _deck_funding_text(pos_funding)" in cards
+    assert 'pos_fund_color = _deck_funding_color(pos_funding)' in cards
+    assert '"Funding (Live)": pos_funding_str' in cards
+    assert "💸 Live Funding: {pos_funding_badge}" in cards
+    assert "true_net_pnl = _deck_sum(unr_pnl, pos_funding)" in cards
+    assert "_deck_reading(pos_funding)" not in cards
+    assert "pos_funding_badge" in cards and "_deck_note(pos_funding)" in cards
+
+
+def test_g5c_the_hero_the_bar_and_the_banner_render_the_total_through_the_helpers():
+    """The aggregate is published through the same measured-or-absent helpers as a per-position
+    figure, so an unmeasured fleet funding cannot come back as `+$0.0000 (Neutral)` in green."""
+    agg = _g5c_block("agg", DASHBOARD)
+    assert "total_live_funding = _deck_funding_total(" in agg
+    assert "total_live_funding += " not in agg
+    hero = _g5c_block("hero", DASHBOARD)
+    assert 'delta=f"Funding: {_deck_funding_text(total_live_funding)}"' in hero
+    assert '_deck_is_absent(total_live_funding)' in hero
+    bar = _g5c_block("funding_bar", DASHBOARD)
+    assert "fund_badge_color = _deck_funding_color(total_live_funding)" in bar
+    assert "Active Funding: <b style=\"color: {fund_badge_color};\">" \
+           "{_deck_funding_text(total_live_funding)}</b>{_deck_note(total_live_funding)}" in bar
+    strip = _g5c_block("strip", DASHBOARD)
+    assert "total_fund_color = _deck_funding_color(total_live_funding)" in strip
+    assert "_deck_sum(total_unrealized_pnl, total_live_funding)" in strip
+    assert "_deck_note(true_portfolio_net)" in strip
+
+
+def test_g5c_the_twin_carries_the_funding_reader_and_none_of_the_funding_panels():
+    """`scripts/live_dashboard.py` has no funding deck (measured, not assumed), so it carries only
+    the shared reader — byte-identical, answering the same — and the funding-only renderers stay
+    where the panels that call them are."""
+    assert _g5c_helper_code("_position_funding", DASHBOARD) == \
+        _g5c_helper_code("_position_funding", LEGACY_DASHBOARD)
+    for funding_map in (None, {}, _g5c_funding_entry(0.75), _g5c_funding_entry(0.0)):
+        dashboard_read = _g4_helper("_position_funding", DASHBOARD)(funding_map, "BTC/USDT",
+                                                                    "BTCUSDT")
+        legacy_read = _g4_helper("_position_funding", LEGACY_DASHBOARD)(funding_map, "BTC/USDT",
+                                                                        "BTCUSDT")
+        assert dashboard_read == legacy_read, (funding_map, dashboard_read, legacy_read)
+    row = pd.Series({"symbol": "BTCUSDT", "side": "long", "entry_price": 100000.0, "qty": 0.01,
+                     "leverage": 5.0})
+    for funding_map in ({}, _g5c_funding_entry(0.75)):
+        assert _g4_helper("_position_deck_readings", DASHBOARD)(row, {}, funding_map) == \
+            _g4_helper("_position_deck_readings", LEGACY_DASHBOARD)(row, {}, funding_map)
+    legacy_src = _g5_code_only(LEGACY_DASHBOARD.read_text(encoding="utf-8"))
+    for name in _G5C_FUNDING_DASHBOARD_HELPERS:
+        assert f"def {name}(" not in legacy_src, (
+            f"{name} was added to the twin, which has no panel that calls it")

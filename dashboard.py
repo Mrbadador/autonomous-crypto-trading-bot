@@ -503,6 +503,33 @@ def _position_mark(live_prices, symbol: str, clean_symbol: str = "") -> dict:
     return _deck_absence("no live price for this symbol in the current fetch")
 
 
+def _position_funding(funding_map, symbol: str, clean_symbol: str = "") -> dict:
+    """The accrued funding the telemetry reports for this position, or an absence — never a verdict.
+
+    `fetch_live_position_funding` returns {} when `system_state` carries no `live_position_funding`
+    row and the Bitget UTA fallback fails, which is every symbol today (contract item 9). The deck
+    read that empty map through `num(..., 0.0)`, so "nothing reported" became a recorded zero,
+    printed "(Neutral)" beside it and was added to PnL. A funding of exactly 0.0 IS a measurement —
+    the position neither paid nor received — and stays a reading.
+    """
+    table = funding_map if isinstance(funding_map, dict) else {}
+    raw = str(symbol)
+    base = raw.split(":")[0]
+    keys = []
+    for candidate in (clean_symbol, base.upper().replace("/", "").replace("-", ""), raw, base):
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    for key in keys:
+        info = table.get(key)
+        if not isinstance(info, dict) or "total_funding" not in info:
+            continue
+        value = _optional_float(info.get("total_funding"))
+        if value is None:
+            return _deck_absence(f"the funding telemetry's total_funding for {key} is not a number")
+        return _deck_reading(value)
+    return _deck_absence("no funding telemetry for this symbol")
+
+
 def _position_unrealized_pnl(curr_p: dict, entry_p: dict, qty: dict, side: str) -> dict:
     """Mark-to-market PnL: publishable only when the mark, the entry and the size were all read.
 
@@ -573,6 +600,48 @@ def _deck_sum(*reads: dict) -> dict:
     return _deck_reading(sum(values)) if values else _deck_absence("nothing to total")
 
 
+def _deck_funding_word(read) -> str:
+    """Gained, Paid or Flat for a funding figure the deck read; no verdict at all for one it did not."""
+    if _deck_is_absent(read):
+        return _DECK_ABSENT_TEXT
+    value = read["value"]
+    return "Gained" if value > 0.0 else ("Paid" if value < 0.0 else "Flat")
+
+
+def _deck_funding_color(read) -> str:
+    """Green or orange only for a measured funding figure.
+
+    The pre-fix badge compared the 0.0 it had substituted for telemetry against zero, so an unread
+    funding came back in the all-clear green.
+    """
+    if _deck_is_absent(read):
+        return _DECK_ABSENT_COLOR
+    return "#00ff66" if read["value"] >= 0.0 else "#ffaa00"
+
+
+def _deck_funding_text(read) -> str:
+    """`+$0.4210 (Gained)` for a measured funding figure; the house absence for an unread one."""
+    if _deck_is_absent(read):
+        return _DECK_ABSENT_TEXT
+    return f"{_deck_signed_money(read)} ({_deck_funding_word(read)})"
+
+
+def _deck_funding_total(reads) -> dict:
+    """The fleet's accrued funding: a total only when every position reported one (C-4).
+
+    `total_live_funding` was a float initialised to 0.0 that each row added its funding stand-in to,
+    so a book with no telemetry summed to a printed figure. Summing only the measured rows would be
+    the same claim with a smaller number behind it, so the total says who is missing.
+    """
+    readings = list(reads)
+    if not readings:
+        return _deck_absence("no open positions to total funding")
+    missing = [read for read in readings if _deck_is_absent(read)]
+    if missing:
+        return _deck_absence(f"{len(missing)} of {len(readings)} positions report no funding")
+    return _deck_reading(sum(float(read["value"]) for read in readings))
+
+
 def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
     """Every figure the deck publishes for one open position row, measured or absent.
 
@@ -595,6 +664,7 @@ def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
     hard_sl = _position_hard_sl(row)
     est_liq = _position_liquidation(entry_p, lev, side)
     mark = _position_mark(live_prices, symbol, clean_symbol)
+    funding = _position_funding(funding_map, symbol, clean_symbol)
     tp = _column("take_profit")
     sl = _column("stop_loss")
     unr_pnl = _position_unrealized_pnl(mark, entry_p, qty, side)
@@ -612,6 +682,7 @@ def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
         "est_liq": est_liq,
         "mark": mark,
         "unr_pnl": unr_pnl,
+        "funding": funding,
         "unr_roi": _position_roi(unr_pnl, margin),
         "dist_liq": _position_liq_buffer(mark, est_liq, side),
         "dist_tp": _position_level_distance(mark, tp, side, "tp"),
@@ -2885,7 +2956,6 @@ else:
 
 # Clean distinct active coins
 active_coins_set = set()
-total_live_funding = 0.0
 live_prices = fetch_live_market_prices()
 funding_telemetry_map = fetch_live_position_funding()
 
@@ -2894,16 +2964,13 @@ _deck_positions = [_position_deck_readings(row, live_prices, funding_telemetry_m
 _deck_totals = _fleet_position_rollup(_deck_positions)
 total_margin_locked = _deck_totals["margin_locked"]
 total_unrealized_pnl = _deck_totals["unrealized_pnl"]
+# C-4: an unread funding is not a zero to add. The fleet total is a reading only when every
+# position reported one, and an absence from then on.
+total_live_funding = _deck_funding_total([p["funding"] for p in _deck_positions])
 
 if not df_open.empty:
     for p in _deck_positions:
         active_coins_set.add(p["clean_symbol"])
-
-    for _, row in df_open.iterrows():
-        s = str(row['symbol']).upper().replace("/", "").replace("-", "")
-
-        f_info = funding_telemetry_map.get(s, {}) or funding_telemetry_map.get(str(row['symbol']), {})
-        total_live_funding += num(f_info.get("total_funding"), 0.0)
 
 max_coin_slots = int(num(query_system_state("GLOBAL_MAX_POSITIONS", "5"), 5.0))
 margin_limit_pct = state_num("GLOBAL_MARGIN_LIMIT", 70.0)
@@ -2955,22 +3022,26 @@ with kpi3:
     )
 
 with kpi4:
-    fund_sign = "+$" if total_live_funding >= 0 else "-$"
-    fund_status = "Gained" if total_live_funding > 0 else ("Paid" if total_live_funding < 0 else "Neutral")
-    fund_delta = f"Funding: {fund_sign}{abs(total_live_funding):.4f} ({fund_status})"
+    _fund_help = (f"Cumulative Accrued Funding Fee: {total_live_funding['value']:+,.4f} USDT"
+                  if not _deck_is_absent(total_live_funding) else
+                  f"Cumulative Accrued Funding Fee: {_DECK_ABSENT_TEXT} — "
+                  f"{total_live_funding['reason']}")
     _unreal_help = (f"Unrealized Mark PnL: {_DECK_ABSENT_TEXT} — {total_unrealized_pnl['reason']}"
                     if _deck_is_absent(total_unrealized_pnl) else
                     f"Unrealized Mark PnL: ${total_unrealized_pnl['value']:+,.4f} USDT")
     st.metric(
         label="⚡ Live Unrealized PnL",
         value=f"{_deck_signed_money(total_unrealized_pnl, 2)} USDT",
-        delta=fund_delta,
-        help=(f"{_unreal_help} | Cumulative Accrued Funding Fee: "
-              f"{fund_sign}{abs(total_live_funding):.4f} USDT")
+        delta=f"Funding: {_deck_funding_text(total_live_funding)}",
+        # An unmeasured funding is not a flat one, so it may not arrive as a delta with an
+        # up-arrow: grey and no arrow, the kpi2 precedent.
+        delta_color="off" if _deck_is_absent(total_live_funding) else "normal",
+        delta_arrow="off" if _deck_is_absent(total_live_funding) else "auto",
+        help=f"{_unreal_help} | {_fund_help}"
     )
 
 # P0: Global Margin Utilization Visual Progress Bar
-fund_badge_color = "#00ff66" if total_live_funding >= 0 else ("#ffaa00" if total_live_funding < 0 else "#94a3b8")
+fund_badge_color = _deck_funding_color(total_live_funding)
 margin_util_display = _deck_text(margin_util_pct, "{:.1f}%")
 margin_locked_display = _deck_text(total_margin_locked, "${:,.2f}")
 free_cash_display = _deck_text(free_cash_buffer, "${:,.2f}")
@@ -2981,7 +3052,7 @@ st.markdown(f"""
             🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_display}</b>{_deck_note(margin_util_pct)} of {margin_limit_pct:.0f}% Hard Ceiling ({margin_status})
         </span>
         <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #e2e8f0;">
-            Margin Locked: <b style="color: {margin_color};">{margin_locked_display}</b>{_deck_note(total_margin_locked)} | Liquid Buffer: <b style="color: {_deck_color(free_cash_buffer, "#00e5ff")};">{free_cash_display} USDT</b>{_deck_note(free_cash_buffer)} | Active Funding: <b style="color: {fund_badge_color};">{'+$' if total_live_funding>=0 else '-$'}{abs(total_live_funding):.4f}</b>
+            Margin Locked: <b style="color: {margin_color};">{margin_locked_display}</b>{_deck_note(total_margin_locked)} | Liquid Buffer: <b style="color: {_deck_color(free_cash_buffer, "#00e5ff")};">{free_cash_display} USDT</b>{_deck_note(free_cash_buffer)} | Active Funding: <b style="color: {fund_badge_color};">{_deck_funding_text(total_live_funding)}</b>{_deck_note(total_live_funding)}
         </span>
     </div>
     <div style="width: 100%; background: #1e293b; height: 10px; border-radius: 5px; overflow: hidden; position: relative;">
@@ -3210,10 +3281,10 @@ with tab_live:
     
     if not df_open.empty:
         # Fleet Accrued Funding Summary Banner
-        total_fund_sign = "+$" if total_live_funding >= 0 else "-$"
-        total_fund_color = "#00ff66" if total_live_funding >= 0 else ("#ffaa00" if total_live_funding < 0 else "#94a3b8")
-        total_fund_action = "Gained / Received" if total_live_funding > 0 else ("Paid to Counterparties" if total_live_funding < 0 else "Neutral")
-        true_portfolio_net = _deck_sum(total_unrealized_pnl, _deck_reading(total_live_funding))
+        total_fund_color = _deck_funding_color(total_live_funding)
+        # C-4 decision: SUPPRESS, never label. A "True Net (Mark + Funding)" that quietly left an
+        # unmeasured funding out would still publish under a name that says the funding is in it.
+        true_portfolio_net = _deck_sum(total_unrealized_pnl, total_live_funding)
         true_port_color = _deck_pnl_color(true_portfolio_net)
 
         st.markdown(f"""
@@ -3221,8 +3292,7 @@ with tab_live:
             <div>
                 <span style="color: #94a3b8; font-size: 0.80rem; text-transform: uppercase; letter-spacing: 0.05em;">Live Portfolio Funding & Carry Telemetry</span><br>
                 <span style="font-size: 0.95rem; font-weight: bold; color: #ffffff;">Fleet Accrued Funding: </span>
-                <span style="font-size: 1.05rem; font-weight: 800; font-family: 'JetBrains Mono', monospace; color: {total_fund_color};">{total_fund_sign}{abs(total_live_funding):.4f} USDT</span>
-                <span style="color: {total_fund_color}; font-size: 0.78rem; font-weight: 600;">({total_fund_action})</span>
+                <span style="font-size: 1.05rem; font-weight: 800; font-family: 'JetBrains Mono', monospace; color: {total_fund_color};">{_deck_funding_text(total_live_funding)}</span>{_deck_note(total_live_funding)}
             </div>
             <div style="text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem;">
                 <span style="color: #94a3b8;">Unrealized Mark PnL: <b style="color: {_deck_pnl_color(total_unrealized_pnl)};">{_deck_signed_money(total_unrealized_pnl, 2)}</b>{_deck_note(total_unrealized_pnl)}</span><br>
@@ -3261,21 +3331,17 @@ with tab_live:
             unr_pnl = p_read["unr_pnl"]
             unr_roi = p_read["unr_roi"]
 
-            # Live Position Funding Telemetry
-            f_info = funding_telemetry_map.get(sym_clean, {}) or funding_telemetry_map.get(sym, {})
-            pos_funding = num(f_info.get("total_funding"), 0.0)
-            if pos_funding < 0:
-                pos_funding_str = f"-${abs(pos_funding):.4f} (Paid)"
-                pos_funding_badge = f"<b style='color: #ffaa00;'>-${abs(pos_funding):.4f} USDT</b> <span style='color: #ffaa00; font-size: 0.72rem;'>(Paid)</span>"
-            elif pos_funding > 0:
-                pos_funding_str = f"+${pos_funding:.4f} (Gained)"
-                pos_funding_badge = f"<b style='color: #00ff66;'>+${pos_funding:.4f} USDT</b> <span style='color: #00ff66; font-size: 0.72rem;'>(Gained)</span>"
-            else:
-                pos_funding_str = "$0.0000 (Neutral)"
-                pos_funding_badge = "<b style='color: #94a3b8;'>$0.0000</b> <span style='color: #94a3b8; font-size: 0.72rem;'>(Neutral)</span>"
+            # Live Position Funding Telemetry: the reading the map gives for this symbol, or an
+            # absence naming the map it could not read.
+            pos_funding = p_read["funding"]
+            pos_funding_str = _deck_funding_text(pos_funding)
+            pos_fund_color = _deck_funding_color(pos_funding)
+            pos_funding_badge = (f"<b style='color: {pos_fund_color};'>{pos_funding_str}</b>"
+                                 f"{_deck_note(pos_funding)}")
 
-            # True Net PnL (Mark PnL + Funding)
-            true_net_pnl = _deck_sum(unr_pnl, _deck_reading(pos_funding))
+            # True Net PnL (Mark PnL + Funding). C-4 decision: SUPPRESSED when either addend is
+            # unmeasured, not published as "mark only" — the label would still claim the netting.
+            true_net_pnl = _deck_sum(unr_pnl, pos_funding)
             true_net_roi = _position_roi(true_net_pnl, margin)
             true_net_str = (f"{_deck_signed_money(true_net_pnl)} "
                             f"({_deck_text(true_net_roi, '{:+.2f}%')}{_deck_note(true_net_roi)})")
