@@ -1536,8 +1536,10 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
     is not a reading it can publish, and an absence must never be defaulted to 1.0 -- the largest
     figure it can emit, and the riskiest possible stand-in.
 
-    `age_sec` is measured from the row's own stamp and is None when no usable stamp came with it;
-    `stale` compares that age against `config.REGIME_MAX_AGE_SEC`. `now` and `max_age_sec` are
+    `age_sec` is measured from the row's own stamp and is None when no usable stamp came with it --
+    including when the stamp is ahead of this clock, which is refused rather than clamped, so
+    `stamp_is_future` and `age_absence_reason` say which failure happened. `stale` compares that age
+    against `config.REGIME_MAX_AGE_SEC`. `now` and `max_age_sec` are
     injectable so the age path is testable without a clock. Pure and module-level: it boots no
     Streamlit, opens no database, and imports no model.
     """
@@ -1723,9 +1725,22 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
             if reference.tzinfo is None:
                 reference = pytz.utc.localize(reference)
             age_sec = (reference - stamp).total_seconds()
-    readings["age_sec"] = age_sec
-    readings["age_known"] = age_sec is not None
-    readings["stale"] = bool(age_sec is not None and age_sec > float(bound))
+    # Finding #7 (controller ruling): a stamp AHEAD of the clock is refused, not clamped. The fleet
+    # folds the negative away (`inflight_shepherd.py:611 age = max(0.0, ...)`) which is safe for a
+    # veto but would here print a fabricated "0s old" freshness claim -- the defect class this panel
+    # was rebuilt to end -- so the deck is DELIBERATELY STRICTER than the fleet on future stamps.
+    readings["stamp_is_future"] = bool(age_sec is not None and age_sec < 0.0)
+    readings["age_sec"] = None if readings["stamp_is_future"] else age_sec
+    readings["age_known"] = readings["age_sec"] is not None
+    if readings["stamp_is_future"]:
+        readings["age_absence_reason"] = ("stamp is in the future — age not measurable")
+    elif readings["age_known"]:
+        readings["age_absence_reason"] = ""
+    elif readings["published_at"]["measured"]:
+        readings["age_absence_reason"] = ("stamp is not a parseable instant — age not measurable")
+    else:
+        readings["age_absence_reason"] = readings["published_at"]["reason"]
+    readings["stale"] = bool(readings["age_sec"] is not None and readings["age_sec"] > float(bound))
     readings["row_present"] = bool(data)
     # "Live" needs both a stamp inside the bound the fleet enforces AND a row that measured
     # something. A fresh row carrying nothing is not a live forward filter either.
@@ -5063,11 +5078,13 @@ with tab_risk:
 
     # The heading is the claim, so it is the first thing the age has to agree with. A row past the
     # bound the fleet refuses is not a live forward filter, and a row that measured nothing -- or
-    # carries a stamp that cannot be read -- is not one either.
+    # carries a stamp that cannot be read, or one that reads from the future -- is not one either.
     if m_r["heading_is_live"]:
         m_heading = "Live Forward Filter"
     elif m_r["stale"]:
         m_heading = "STALE Forward Filter — row past the fleet age bound"
+    elif m_r["stamp_is_future"]:
+        m_heading = "Forward Filter NOT MEASURED — publish stamp is ahead of this clock"
     elif not m_r["age_known"]:
         m_heading = "Forward Filter NOT MEASURED — no usable publish stamp"
     else:
@@ -5075,17 +5092,23 @@ with tab_risk:
     st.markdown(f"#### 🎲 Bayesian Markov Regime Engine & Transition Matrix ({m_heading})")
 
     # The age line, in the house shape: the stamp, the age, and the bound it blew through by name.
+    # No age at all is an absence, so it wears the absence grey and says which failure left it blank;
+    # a negative number is never printed as if it measured the row's youth (`age_sec` is None for
+    # future stamps precisely so that this line cannot render one).
     if m_r["published_at"]["measured"]:
         m_stamp_text = utc_to_sast(m_r["published_at"]["text"])
         if m_r["age_sec"] is None:
-            m_time_text = f"published {m_stamp_text} · age not measurable from that stamp"
+            m_time_text = (f"published {m_stamp_text} · age not measured"
+                           + _absence_note(m_r["age_absence_reason"]))
+            m_time_color = "#94a3b8"
         elif m_r["stale"]:
             m_time_text = (f"{m_stamp_text} · {m_r['age_sec']:.0f}s old · ⚠️ STALE TELEMETRY — the "
                            f"fleet's consumers refuse this row past {m_r['max_age_sec']:.0f}s")
+            m_time_color = "#ffcc00"
         else:
             m_time_text = (f"{m_stamp_text} · {m_r['age_sec']:.0f}s old · within the "
                            f"{m_r['max_age_sec']:.0f}s bound")
-        m_time_color = "#ffcc00" if m_r["stale"] else "#64748b"
+            m_time_color = "#64748b"
     else:
         m_time_text = ("row publish stamp: not measured"
                        + _absence_note(m_r["published_at"]["reason"]))

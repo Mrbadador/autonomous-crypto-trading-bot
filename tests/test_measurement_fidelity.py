@@ -6194,6 +6194,51 @@ def test_g5b_a_stale_row_leaves_a_measured_veto_and_an_unmeasured_gate_alone(tmp
         assert "(no is_tradable in markov regime telemetry)" in html, (stamp, html[:2000])
 
 
+def test_g5b_a_stamp_from_the_future_is_refused_not_clamped(tmp_path):
+    """Finding #7, with the controller's ruling: a stamp ahead of the clock gets a refusal, NOT the
+    fleet's `max(0.0, ...)` clamp.
+
+    `inflight_shepherd.py:611` folds a negative age into zero before comparing, which is safe for a
+    veto but would let this panel print "0s old" — a fabricated freshness claim, the exact defect
+    class this branch exists to end. The deck is therefore DELIBERATELY STRICTER than the fleet on
+    future stamps (see the report's close-out list): the age is not measured, the card wears the
+    absence grey with a reason naming the cause, the heading loses "Live", and no negative age is
+    ever printed as if it were an age.
+    """
+    ahead = (_G5B_FIX_NOW + timedelta(seconds=45)).isoformat()
+    html, _fake, ns = _g5b_render_deck(tmp_path, updated_at=ahead)
+    m_r = ns["m_r"]
+    assert m_r["published_at"]["measured"] is True, (
+        "the stamp itself IS measured — it is the age it should have yielded that is not")
+    assert m_r["stamp_is_future"] is True, dict(m_r)
+    assert m_r["age_sec"] is None and m_r["age_known"] is False, m_r["age_sec"]
+    assert m_r["stale"] is False, "a stamp ahead of the clock is not a stale row either"
+    assert m_r["heading_is_live"] is False, m_r["heading_is_live"]
+    assert "Live" not in _g5b_heading(html), _g5b_heading(html)
+    assert _G5B_ALL_CLEAR_COLOUR not in html, html[:2500]
+    assert ns["m_time_color"] == _G5B_ABSENT_COLOUR, ns["m_time_color"]
+    assert "s old" not in ns["m_time_text"], ns["m_time_text"]
+    assert "future" in ns["m_time_text"], ns["m_time_text"]
+    assert re.search(r"-\d+(\.\d+)?s\b", ns["m_time_text"]) is None, ns["m_time_text"]
+
+    # The other half, or the fix is just "never print an age".
+    fresh_html, _fresh_fake, fresh_ns = _g5b_render_deck(
+        tmp_path, updated_at=_G5B_FRESH_UPDATED_AT)
+    assert fresh_ns["m_r"]["stamp_is_future"] is False, fresh_ns["m_r"]["stamp_is_future"]
+    assert fresh_ns["m_r"]["age_sec"] == pytest.approx(60.0), fresh_ns["m_r"]["age_sec"]
+    assert "Live Forward Filter" in _g5b_heading(fresh_html), _g5b_heading(fresh_html)
+    assert fresh_ns["m_time_color"] != _G5B_ABSENT_COLOUR, fresh_ns["m_time_text"]
+    assert "s old" in fresh_ns["m_time_text"], fresh_ns["m_time_text"]
+
+    # And the two unmeasurable-stamp branches stay distinguishable: a stamp that is not an instant
+    # at all must not borrow the future stamp's reason.
+    junk_html, _junk_fake, junk_ns = _g5b_render_deck(tmp_path, updated_at="not a timestamp")
+    assert junk_ns["m_r"]["stamp_is_future"] is False, junk_ns["m_r"]["stamp_is_future"]
+    assert junk_ns["m_r"]["age_known"] is False
+    assert "future" not in junk_ns["m_time_text"], junk_ns["m_time_text"]
+    assert junk_ns["m_time_color"] == _G5B_ABSENT_COLOUR, junk_ns["m_time_text"]
+
+
 def test_g5b_an_absent_tradability_reason_supplies_no_excuse(tmp_path):
     """"Tradable" was the panel writing the engine's alibi for it."""
     html = _g5b_render_deck(tmp_path, payload=_g5b_payload_without("tradability_reason"))[0]
