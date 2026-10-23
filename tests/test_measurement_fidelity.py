@@ -3180,6 +3180,15 @@ _G4_BLOCKS = {
     # point of B-1 is that the heading changes when the row goes stale.
     "markov": (r"^[ \t]*# .*Bayesian Markov Chain",
                (r"\n[ \t]*# .*Multi-Asset Fleet Microstructure",)),
+    # G-5c: the fleet active-position deck. It is three loops over one frame, so all three are
+    # registered — the aggregation strip, the per-position cards and the chart-tab builder. The
+    # legacy twin has no chart-tab builder, so only the first two resolve there.
+    "position_agg": (r"^# Active Positions Query across all 5 fleet sub-engines",
+                     (r"\nmax_coin_slots = ",)),
+    "position_cards": (r"^[ \t]*# Render visual metric cards for each live position",
+                       (r'\n[ \t]*st\.markdown\(".*Detailed Active Position',)),
+    "position_chart": (r"^[ \t]*# Build dynamic tabs: one tab for each coin currently open",
+                       (r"\n[ \t]*# .*1\.3 Continuous AI In-Flight",)),
 }
 
 _G4_DASHBOARD_BLOCKS = ("macro", "ofi", "micro", "radar", "fleet")
@@ -6928,3 +6937,322 @@ def test_g5b7_the_harvest_absence_is_explained_once():
     assert f"{book['cumulative_funding_harvested']:+.4f}" in live_html, (
         "a measured harvest stopped printing its own figure")
     assert note not in live_html
+
+
+# ===========================================================================
+# G-5c — the fleet active-position deck (findings C-1 … C-6)
+# ===========================================================================
+# C-6 first: the deck renders five engine tables, every one of which is empty in the live
+# database today, so no behavioural test here can run against `trading_data.db`. The fixture
+# below recreates those tables in a tmp database from their REAL column lists (PRAGMA, never
+# hand-typed), seeds rows into them, and rebuilds `df_open` with the five SELECTs the shipped
+# deck runs. Every G-5c test then calls the shipped helpers for real.
+
+_G5C_POSITION_TABLES = ("open_positions", "berserker_open_positions", "marl_live_open_positions",
+                        "mean_reversion_open_positions", "swing_open_positions")
+_G5C_TRADING_DATA_DB = REPO_ROOT / "trading_data.db"
+
+# Every figure in this deck used to have a stand-in. Each pair is the banned text plus one line of
+# code that genuinely contains it, which is what makes the second half of the prose-immunity test
+# below more than a restatement of the first.
+_G5C_STAND_IN_CASES = (
+    ("1.0 - 0.035", "hard_sl = entry_p * (1.0 - 0.035)"),
+    ("1.0 + 0.035", "hard_sl = entry_p * (1.0 + 0.035)"),
+    ("(Exchange)", 'card = f\'Hard SL: ${hard_sl:,.4f} (Exchange)<br>\''),
+    ("Hard SL (Bitget)", 'row = {"Hard SL (Bitget)": f"${hard_sl:,.4f}"}'),
+)
+
+
+def _g5c_schema_columns(table):
+    """One position table's column list, read off the shipped schema with `PRAGMA table_info`.
+
+    The fixture's columns come from the database the fleet writes, never typed into this file:
+    C-1 rests on `swing_open_positions` having no `hard_sl` column while `open_positions` does,
+    and a hand-written column list would only assert that the transcription agrees with itself.
+
+    Opened `mode=ro`, and `tests/conftest.py` redirects even that to the read-only quarantine
+    copy of the schema, so no G-5c test touches `trading_data.db` or its `-shm` sidecar.
+    """
+    import sqlite3
+
+    uri = f"file:{_G5C_TRADING_DATA_DB.as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    try:
+        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+    finally:
+        conn.close()
+    assert cols, (f"{table} is not in the shipped trading_data.db schema, so the deck fixture "
+                  "cannot be derived from it")
+    return cols
+
+
+def _g5c_seed_position_db(tmp_path, rows):
+    """Create all five deck tables in a tmp DB with their real columns and seed `rows` into them.
+
+    `rows` is a list of `{"table": name, **column_values}`. A column a row omits is stored as
+    NULL, which is exactly how a writer that never set that field appears to the deck.
+    """
+    import sqlite3
+
+    db = tmp_path / "positions_fixture.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        for table in _G5C_POSITION_TABLES:
+            cols = _g5c_schema_columns(table)
+            conn.execute(f'CREATE TABLE {table} ({", ".join(cols)})')
+        for row in rows:
+            payload = dict(row)
+            table = payload.pop("table")
+            cols = _g5c_schema_columns(table)
+            unknown = sorted(set(payload) - set(cols))
+            assert not unknown, (
+                f"{table} has no column(s) {unknown}; the fixture may only seed columns the "
+                "producer's own schema has")
+            names = [c for c in cols if c in payload]
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(names)}) "
+                f"VALUES ({', '.join('?' * len(names))})",
+                [payload[c] for c in names])
+        conn.commit()
+    finally:
+        conn.close()
+    return db
+
+
+def _g5c_deck_sql(path=DASHBOARD):
+    """The five open-position SELECTs the deck runs, read out of the shipped source.
+
+    Extracted from the assignment nodes rather than retyped, so the swing query's column list —
+    the one that cannot and does not name `hard_sl` — is the file's own claim.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    sqls = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and re.fullmatch(r"df_open_[0-9]", t.id)
+                   for t in node.targets):
+            continue
+        call = node.value
+        assert isinstance(call, ast.Call) and getattr(call.func, "id", "") == "query_db", (
+            "the deck's position frame is no longer built from literal query_db() calls, so this "
+            "fixture no longer runs the shipped SQL")
+        assert len(call.args) == 2, (
+            "the deck's position query gained arguments this fixture ignores")
+        sql = call.args[1]
+        assert isinstance(sql, ast.Constant) and isinstance(sql.value, str), (
+            "the deck's position query is no longer a literal string this fixture can run")
+        sqls.append(sql.value)
+    assert len(sqls) == 5, f"expected the five deck queries, found {len(sqls)}: {sqls}"
+    return sqls
+
+
+def _g5c_deck_frame(db_path, path=DASHBOARD):
+    """`df_open` as the deck builds it: the shipped five queries, concat, keep-last de-dup."""
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True, timeout=5.0)
+    try:
+        frames = [pd.read_sql_query(sql, conn) for sql in _g5c_deck_sql(path)]
+    finally:
+        conn.close()
+    kept = [frame for frame in frames if not frame.empty]
+    if not kept:
+        return pd.DataFrame()
+    return pd.concat(kept, ignore_index=True).drop_duplicates(subset=["symbol"], keep="last")
+
+
+def _g5c_block(part, path=DASHBOARD):
+    return _g4_block(f"position_{part}", path)
+
+
+def _g5c_helper_code(name, path=DASHBOARD):
+    return _function_source(path, name)
+
+
+def _g5c_deck_code(path=DASHBOARD):
+    """Every deck block this finding touches, comments and docstrings removed."""
+    parts = [_g5c_block("agg", path), _g5c_block("cards", path)]
+    if path == DASHBOARD:
+        parts.append(_g5c_block("chart", path))
+    return "\n".join(parts)
+
+
+def _g5c_hard_sl_code(path=DASHBOARD):
+    """Deck blocks plus the helpers that decide what the hard-SL line prints (C-6)."""
+    return "\n".join([_g5c_deck_code(path),
+                      _g5c_helper_code("_position_hard_sl", path),
+                      _g5c_helper_code("_position_deck_readings", path)])
+
+
+# ── C-6: the testbed itself ──────────────────────────────────────────────────────────────
+
+def test_g5c_the_fixture_columns_come_from_the_shipped_schema():
+    """The producer contract C-1 rests on, pinned off PRAGMA rather than off this file.
+
+    `swing_open_positions` — the table the live fleet writes (super_bot.py:1282,
+    swing_trader.py:2116) — has no `hard_sl` column to read. `open_positions`, which the
+    reconciliation recovery path writes (reconciliation_engine.py:830), does.
+    """
+    swing = _g5c_schema_columns("swing_open_positions")
+    assert "hard_sl" not in swing, f"the swing table grew a hard_sl: {swing}"
+    assert "leverage" in swing and "size" in swing, swing
+    for table in ("open_positions", "berserker_open_positions", "marl_live_open_positions",
+                  "mean_reversion_open_positions"):
+        cols = _g5c_schema_columns(table)
+        assert "hard_sl" in cols and "leverage" in cols, f"{table} lost a column: {cols}"
+
+
+def test_g5c_the_deck_cannot_and_does_not_ask_a_swing_row_for_a_hard_sl():
+    """The swing SELECT is the deck's own text; it names no `hard_sl`, so those rows cannot carry
+    one even in principle."""
+    swing_sql = [s for s in _g5c_deck_sql() if "swing_open_positions" in s]
+    assert len(swing_sql) == 1, swing_sql
+    assert "hard_sl" not in swing_sql[0], swing_sql[0]
+
+
+def test_g5c_a_swing_row_reaches_the_deck_with_no_hard_sl_to_read(tmp_path):
+    """The fabrication C-1 removed fired for EVERY position the live fleet can open, not for an
+    edge case: `pd.concat` leaves a swing row's hard_sl as NaN and `num()` turns NaN into 0.0."""
+    db = _g5c_seed_position_db(tmp_path, [{
+        "table": "swing_open_positions", "symbol": "BTCUSDT", "side": "long",
+        "entry_price": 100000.0, "size": 0.01, "leverage": 5, "stop_loss": 97000.0,
+        "take_profit": 110000.0, "opened_at": "2026-10-22T10:00:00+00:00", "status": "OPEN"}])
+    frame = _g5c_deck_frame(db)
+    assert len(frame) == 1, "the seeded swing row never reached the deck's frame"
+    row = next(r for _, r in frame.iterrows())
+    read = _g4_helper("_position_hard_sl", DASHBOARD)(row)
+    assert read == {"value": None, "measured": False,
+                    "reason": "no hard SL recorded for this position"}, read
+    assert _g4_helper("_deck_text", DASHBOARD)(read, "${:,.4f}") == "not measured"
+
+
+@pytest.mark.parametrize("stored", [None, 0.0, -12.5, "syncing...", float("nan")],
+                         ids=["null", "zero", "negative", "placeholder", "nan"])
+def test_g5c_no_hard_sl_shape_renders_a_price(tmp_path, stored):
+    """A table that HAS the column can still hold no stop: NULL, the column's 0.0 default, a
+    negative, placeholder text or NaN. None of them may print as a price under any label."""
+    db = _g5c_seed_position_db(tmp_path, [{
+        "table": "open_positions", "symbol": "ETHUSDT", "side": "long",
+        "entry_price": 4000.0, "qty": 1.0, "leverage": 5, "hard_sl": stored}])
+    row = next(r for _, r in _g5c_deck_frame(db).iterrows())
+    read = _g4_helper("_position_hard_sl", DASHBOARD)(row)
+    assert read["measured"] is False, f"{stored!r} was published as a reading: {read}"
+    assert read["value"] is None
+    assert _g4_helper("_deck_text", DASHBOARD)(read, "${:,.4f}") == "not measured"
+
+
+def test_g5c_a_recorded_hard_sl_stays_a_reading_unchanged(tmp_path):
+    """The other half: a row that DOES carry a stop publishes exactly the stored number, with no
+    absence note beside it."""
+    db = _g5c_seed_position_db(tmp_path, [{
+        "table": "open_positions", "symbol": "ETHUSDT", "side": "long",
+        "entry_price": 4000.0, "qty": 1.0, "leverage": 5, "hard_sl": 3777.5}])
+    row = next(r for _, r in _g5c_deck_frame(db).iterrows())
+    read = _g4_helper("_position_hard_sl", DASHBOARD)(row)
+    assert read == {"value": 3777.5, "measured": True, "reason": ""}, read
+    assert _g4_helper("_deck_text", DASHBOARD)(read, "${:,.4f}") == "$3,777.5000"
+    assert _g4_helper("_deck_note", DASHBOARD)(read) == ""
+
+
+def test_g5c_a_mixed_book_keeps_the_recorded_stop_and_publishes_the_missing_one(tmp_path):
+    """One swing row (no such column) plus one reconciled row (recorded stop) in the frame the
+    deck builds: the recorded stop survives, the missing one becomes an absence, and neither
+    borrows the other's value or gets an invented level."""
+    db = _g5c_seed_position_db(tmp_path, [
+        {"table": "swing_open_positions", "symbol": "BTCUSDT", "side": "long",
+         "entry_price": 100000.0, "size": 0.01, "leverage": 5, "stop_loss": 97000.0},
+        {"table": "mean_reversion_open_positions", "symbol": "ETHUSDT", "side": "short",
+         "entry_price": 4000.0, "qty": 2.0, "leverage": 3, "hard_sl": 4120.0}])
+    frame = _g5c_deck_frame(db)
+    assert len(frame) == 2 and "hard_sl" in frame.columns, list(frame.columns)
+    reads = {str(r["symbol"]): _g4_helper("_position_hard_sl", DASHBOARD)(r)
+             for _, r in frame.iterrows()}
+    assert reads["BTCUSDT"]["measured"] is False, reads["BTCUSDT"]
+    assert reads["ETHUSDT"] == {"value": 4120.0, "measured": True, "reason": ""}, reads["ETHUSDT"]
+
+
+def test_g5c_the_deck_builds_the_frame_the_fixture_builds():
+    """The fixture's concat is the deck's own shape; if the deck's de-dup rule moves, this fails
+    instead of quietly testing a different frame."""
+    src = DASHBOARD.read_text(encoding="utf-8")
+    assert "df_open = pd.concat(open_dfs, ignore_index=True)" in src
+    assert "df_open = df_open.drop_duplicates(subset=['symbol'], keep='last')" in src
+    assert "open_dfs = [d for d in [df_open_1, df_open_2, df_open_3, df_open_4, df_open_5]" in src
+
+
+# ── C-1: a panel-invented stop published under the exchange's name ─────────────────────────
+
+@pytest.mark.parametrize("banned,code_line", _G5C_STAND_IN_CASES)
+def test_g5c_no_invented_stop_survives_in_the_deck(banned, code_line):
+    """The ±3.5% stand-in and both authority labels are gone from every deck block, and from the
+    helper that replaced the three copies — in dashboard.py and in its twin.
+
+    Checked in two halves so a failure says which one moved: the panel that renders, then the
+    helper that decides what it renders.
+    """
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        hits = _g5_banned_hits(_g5c_deck_code(path), [banned])
+        assert hits == [], f"{path.name}'s deck blocks still contain {banned!r}"
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        hits = _g5_banned_hits(_g5c_hard_sl_code(path), [banned])
+        assert hits == [], f"{path.name}'s hard-SL helper still contains {banned!r}"
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_STAND_IN_CASES)
+def test_g5c_a_comment_neither_trips_nor_hides_a_position_deck_scan(banned, code_line):
+    """Both halves of prose immunity on this deck's own tokens: prose about the deleted stand-in
+    passes, and the same text really in the code fails."""
+    prose = f"def f():\n    # the deck used to publish {banned} here\n    return 1\n"
+    assert _g5_banned_hits(prose, [banned]) == [], (
+        f"a comment quoting {banned!r} failed a negative scan against code without it")
+    documented = f'def f():\n    """the deck used to publish {banned} here. """\n    return 1\n'
+    assert _g5_banned_hits(documented, [banned]) == [], (
+        f"a docstring quoting {banned!r} failed a negative scan against code without it")
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [banned]) == [banned], (
+        f"{banned!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [banned]) == [banned], (
+        f"a comment beside {banned!r} in the code hid it from the scan")
+
+
+def test_g5c_the_hard_sl_the_card_prints_is_the_reading_and_nothing_else():
+    """Each render site reads the helper's output, so what the operator sees is the reading and
+    the reason that came with it — never a number the loop built."""
+    cards = _g5c_block("cards", DASHBOARD)
+    assert "hard_sl = p_read[\"hard_sl\"]" in cards
+    assert '_deck_text(hard_sl, "${:,.4f}")' in cards
+    assert "_deck_note(hard_sl)" in cards
+    legacy_cards = _g5c_block("cards", LEGACY_DASHBOARD)
+    assert "hard_sl = _position_hard_sl(row)" in legacy_cards
+    assert '_deck_text(hard_sl, "${:,.4f}")' in legacy_cards
+
+
+def test_g5c_the_chart_draws_no_hard_sl_it_cannot_measure():
+    """An absent level reaches the chart as 0.0, which is the chart's own 'draw nothing' encoding
+    (the same honesty its `est_liq: float = 0.0` default already had); a measured level is drawn
+    unchanged."""
+    measured = _g4_helper("_deck_reading", DASHBOARD)(3777.5)
+    absent = _g4_helper("_deck_absence", DASHBOARD)("no hard SL recorded for this position")
+    level = _g4_helper("_deck_chart_level", DASHBOARD)
+    assert level(measured) == 3777.5
+    assert level(absent) == 0.0
+    block = _g5c_block("chart", DASHBOARD)
+    assert block.count("hard_sl=_deck_chart_level(p[\"hard_sl\"])") == 2, (
+        "both chart-tab call sites must hand the chart the reading, not the raw entry")
+
+
+def test_g5c_the_twin_helpers_are_byte_identical_and_read_the_same_row():
+    """scripts/live_dashboard.py cannot import dashboard.py, so the convention is a byte-identical
+    twin. Pinned as text AND as behaviour on one row."""
+    for name in ("_deck_absence", "_deck_reading", "_deck_is_absent", "_deck_text", "_deck_note",
+                 "_deck_chart_level", "_position_hard_sl", "_position_deck_readings"):
+        assert _g5c_helper_code(name, DASHBOARD) == _g5c_helper_code(name, LEGACY_DASHBOARD), name
+    row = pd.Series({"symbol": "BTCUSDT", "side": "long", "entry_price": 100000.0})
+    dashboard_read = _g4_helper("_position_hard_sl", DASHBOARD)(row)
+    legacy_read = _g4_helper("_position_hard_sl", LEGACY_DASHBOARD)(row)
+    assert dashboard_read == legacy_read == {
+        "value": None, "measured": False, "reason": "no hard SL recorded for this position"}

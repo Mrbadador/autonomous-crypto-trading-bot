@@ -500,6 +500,85 @@ def calculate_liq_distance_pct(curr_p: float, liq_p: float, side: str) -> float:
     else:
         return max(0.0, ((liq_p - curr_p) / curr_p) * 100.0)
 
+# ── Fleet active-position deck: one measured-or-absent reading per row ──────────────────
+# The deck renders five engine tables as one frame and then computes risk figures off it. It
+# used to invent every input it could not read — a ±3.5% stop the row never carried, printed as
+# "(Exchange)" — and each invention was re-typed in the aggregation loop, the card loop and the
+# chart-tab loop. One row now produces one reading, shared by all three, and an unmeasured input
+# publishes an absence instead of a number.
+_DECK_ABSENT_TEXT = "not measured"
+_DECK_ABSENT_COLOR = "#94a3b8"
+
+
+def _deck_absence(reason: str) -> dict:
+    """A figure the deck could not read: no value, and the reason it says on screen."""
+    return {"value": None, "measured": False, "reason": str(reason)}
+
+
+def _deck_reading(value: float) -> dict:
+    """A figure the deck did read. A recorded zero is a fact and stays a reading."""
+    return {"value": float(value), "measured": True, "reason": ""}
+
+
+def _deck_is_absent(read) -> bool:
+    return not isinstance(read, dict) or not read.get("measured") or read.get("value") is None
+
+
+def _deck_text(read, fmt: str = "{:,.4f}") -> str:
+    """One reading's on-screen value, or the house absence."""
+    if _deck_is_absent(read):
+        return _DECK_ABSENT_TEXT
+    try:
+        return fmt.format(read["value"])
+    except (TypeError, ValueError):
+        return _DECK_ABSENT_TEXT
+
+
+def _deck_note(read) -> str:
+    """The dimmed reason beside an absent figure; nothing beside a measured one."""
+    return "" if not _deck_is_absent(read) else _absence_note(read.get("reason", ""))
+
+
+def _deck_chart_level(read) -> float:
+    """A measured level for the candle chart, or 0.0 — its own 'draw nothing' encoding."""
+    return 0.0 if _deck_is_absent(read) else float(read["value"])
+
+
+def _position_hard_sl(row) -> dict:
+    """The hard stop the row records, or an absence — never a price the panel estimated.
+
+    `open_positions` carries a `hard_sl` column and the reconciliation recovery path computes one
+    (reconciliation_engine.py:811-842); `swing_open_positions` has no such column at all
+    (verified with PRAGMA table_info), so after `pd.concat` every swing row reads NaN, `num()`
+    turns that into 0.0 and the deck's ±3.5% stand-in rendered a panel-invented price under the
+    label "(Exchange)" for every position the fleet can open today.
+
+    A 0.0 or negative here is an absence, not a reading: a stop is a price and this column's DDL
+    default is 0.0, so zero is "the engine that opened this position never recorded a stop".
+    """
+    value = _optional_float(row.get("hard_sl") if hasattr(row, "get") else None)
+    if value is None:
+        return _deck_absence("no hard SL recorded for this position")
+    if value <= 0.0:
+        return _deck_absence("recorded hard SL is not a price")
+    return _deck_reading(value)
+
+
+def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
+    """Every figure the deck publishes for one open position row, measured or absent.
+
+    Shared by the aggregation loop, the card loop and the chart-tab loop, which each used to
+    re-derive the same numbers — and re-type the same inventions.
+    """
+    symbol = str(row["symbol"]) if hasattr(row, "__getitem__") else str(row.get("symbol", ""))
+    clean_symbol = symbol.upper().replace("/", "").replace("-", "")
+    return {
+        "symbol": symbol,
+        "clean_symbol": clean_symbol,
+        "side": str(row.get("side") or "long").lower(),
+        "hard_sl": _position_hard_sl(row),
+    }
+
 def get_local_ip() -> str:
     """Detects local LAN IP for Wi-Fi mobile browsing."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -955,7 +1034,7 @@ with tab_live:
             entry_p = float(row.get('entry_price') or 0.0)
             sl = float(row.get('stop_loss') or 0.0)
             tp = float(row.get('take_profit') or 0.0)
-            hard_sl = float(row.get('hard_sl') or 0.0)
+            hard_sl = _position_hard_sl(row)
             lev = float(row.get('leverage') or (10.0 if "BTC" in sym_clean else 5.0))
             margin = (qty * entry_p) / lev if lev > 0 else (qty * entry_p)
             curr_p = float(live_prices.get(sym_clean, entry_p) or entry_p)
@@ -963,10 +1042,6 @@ with tab_live:
             pos_age = compute_position_age(entry_time_raw)
             sl_breach_raw = row.get('sl_breach_time')
             has_flash_breach = bool(sl_breach_raw and str(sl_breach_raw).strip() not in ("", "None", "0", "N/A"))
-
-            # Fallback Hard SL if not explicitly set in database
-            if hard_sl <= 0.0 and entry_p > 0:
-                hard_sl = entry_p * (1.0 - 0.035) if side == 'long' else entry_p * (1.0 + 0.035)
 
             # Liquidation estimation
             est_liq = calculate_estimated_liquidation(entry_p, lev, side)
@@ -1009,7 +1084,7 @@ with tab_live:
                     f'⏱️ Age: <b style="color: #e2e8f0;">{pos_age}</b> | Locked: <b style="color: #e2e8f0;">${margin:.2f}</b><br>'
                     f'🎯 Target: <b style="color: #00ff66;">{tp_str} (${tp:,.4f})</b><br>'
                     f'🛡️ Soft SL: <b style="color: #ff9900;">${sl:,.4f} ({sl_str})</b><br>'
-                    f'🧱 Hard SL: <b style="color: #94a3b8;">${hard_sl:,.4f} (Exchange)</b><br>'
+                    f'🧱 Hard SL: <b style="color: #94a3b8;">{_deck_text(hard_sl, "${:,.4f}")}</b>{_deck_note(hard_sl)}<br>'
                     f'☠️ Est. Liq: <b style="color: #ff003c;">${est_liq:,.4f} (+{dist_liq_pct:.1f}% safety)</b>'
                     f'{flash_timer_badge}'
                     f'</div>'
@@ -1027,7 +1102,7 @@ with tab_live:
                 "Unrealized PnL": f"{'+$' if unr_pnl>=0 else '-$'}{abs(unr_pnl):.4f}",
                 "ROI (%)": f"{unr_roi:+.2f}%",
                 "Soft SL": f"${sl:,.4f}",
-                "Hard SL (Bitget)": f"${hard_sl:,.4f}",
+                "Hard SL (recorded)": _deck_text(hard_sl, "${:,.4f}"),
                 "Est. Liq Price": f"${est_liq:,.4f}",
                 "Liq Safety Buffer": f"+{dist_liq_pct:.1f}%",
                 "Age": pos_age,
