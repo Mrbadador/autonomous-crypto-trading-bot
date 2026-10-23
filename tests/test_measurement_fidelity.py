@@ -5202,6 +5202,12 @@ _G5B_STAND_IN_CASES = (
 _G5B_PROSE_CLAIMS = (
     ("(Live Forward Filter)", 'st.markdown("#### ... (Live Forward Filter)")'),
     ('"TRADABLE"', 'tradable_badge = "TRADABLE"'),
+    # Finding #5: the caption the deck used to print under a measured matrix. It is prose in the
+    # sense that a comment may quote it without failing the ban, but it is a CLAIM in the sense
+    # that the only way to print it is a string literal in the code -- so the scan that kills it
+    # reads code only, and this pair keeps the scan honest in both directions.
+    ("estimated from labelled bars",
+     'm_matrix_html = "<div>matrix the engine published (estimated from labelled bars)</div>"'),
 )
 
 _G5B_ABSENT_COLOUR = "#94a3b8"
@@ -5689,6 +5695,42 @@ def test_g5b_a_comment_neither_trips_nor_hides_a_markov_scan(banned, code_line):
                            f"    {code_line}\n    return 1\n")
     assert _g5_banned_hits(documented_and_real, [banned]) == [banned], (
         f"a docstring beside {banned!r} in the code hid it from the scan")
+
+
+def test_g5b_the_matrix_caption_claims_publication_not_estimation(tmp_path):
+    """Finding #5: `process_bars` has two publish paths and only one of them estimates.
+
+    The short-frame path (`markov_regime.py:393-413`) emits `self.P.tolist()` (`:408`) — the prior
+    from `:39-43`, the very `0.70/0.15/0.15` object B-4 deleted — and never calls
+    `estimate_transition_matrix`, which runs only on the >=15-bar path (`:416`). Nothing in the row
+    says which path wrote it, so a measured matrix cannot claim to have been estimated from labelled
+    bars. The deck may say it published; it may not say how it came to be.
+
+    Banned over the deck block AND the reader helper together, with docstrings stripped (fix #4),
+    so neither a caption string nor a piece of prose about the old caption can satisfy it.
+    """
+    deck_code = _g5b_block_code() + "\n" + _g5b_helper_code()
+    assert _g5_banned_hits(deck_code, ["estimated from labelled bars"]) == [], (
+        "the deck still claims a matrix provenance the row cannot support")
+    assert _g5_banned_hits(deck_code, ["publishes the estimated matrix"]) == [], (
+        "the block comment still claims both paths publish an estimated matrix")
+
+    html, _fake, ns = _g5b_render_deck(tmp_path, payload=_G5B_LIVE_PAYLOAD)
+    assert ns["m_matrix_st"]["measured"] is True, "this case must be the measured-matrix branch"
+    captions = [one for one in html.splitlines() if "Transition matrix" in one]
+    assert captions, f"the deck published no matrix caption:\n{html[:1500]}"
+    for one in captions:
+        assert "estimated" not in one.lower(), one
+    assert "not recoverable" in "\n".join(captions), (
+        "the caption names neither the provenance nor its absence: " + "\n".join(captions))
+
+
+def test_g5b_an_unmeasured_matrix_still_says_so(tmp_path):
+    """The other half of the caption: with no matrix published the deck must not print the
+    publication sentence at all, recoverable or otherwise."""
+    html = _g5b_render_deck(tmp_path, payload={**_G5B_LIVE_PAYLOAD, "transition_matrix": None})[0]
+    assert "not recoverable" not in html, "a caption about a published matrix printed without one"
+    assert "Transition matrix not measured" in html, html[:1500]
 
 
 def test_g5b_no_path_in_the_deck_can_construct_a_markov_regime_engine():

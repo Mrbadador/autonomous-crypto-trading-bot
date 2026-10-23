@@ -1664,8 +1664,12 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
 
     # The transition matrix, or no matrix at all. There is no stand-in: `default_P` was a
     # byte-for-byte copy of the engine's prior (`markov_regime.py:39-43`) which would silently
-    # diverge the day that prior changed, and `process_bars` publishes the estimated matrix on both
-    # paths (`:408`, `:455`), so the only row without one is a row that does not exist.
+    # diverge the day that prior changed, and `process_bars` puts A matrix in the payload on both
+    # paths (`:408`, `:455`), so the only row without one is a row that does not exist. Which
+    # matrix is not knowable from the row: the short-frame path hands back `self.P.tolist()` --
+    # that same hardcoded prior -- without ever running `estimate_transition_matrix` (`:416`), so
+    # a measured matrix may be estimated from labelled bars or may be the default, and the deck's
+    # caption therefore claims publication only.
     raw_matrix = _from_payload("transition_matrix")
     matrix_rows = None
     if isinstance(raw_matrix, (list, tuple)) and len(raw_matrix) == len(_MARKOV_STATE_KEYS):
@@ -5286,8 +5290,13 @@ with tab_risk:
                        "Equilibrium π*": "#64748b"}
 
     if m_matrix_st["measured"]:
+        # The row says a matrix was published; it cannot say where the matrix came from.
+        # `process_bars` emits `self.P.tolist()` -- the prior at `markov_regime.py:39-43` -- on the
+        # short-frame path (`:408`) without calling `estimate_transition_matrix`, which runs only on
+        # the >=15-bar path (`:416`), so no consumer can tell an estimated matrix from the default.
         m_matrix_html = (f"<div style=\"color: {m_matrix_color}; font-size: 0.72rem;\">Transition "
-                         f"matrix the engine published (estimated from labelled bars)</div>")
+                         f"matrix the engine published (its estimating path is not recoverable "
+                         f"from the row)</div>")
     else:
         m_matrix_html = ("<div style=\"color: #94a3b8; font-size: 0.72rem;\">Transition matrix not "
                          f"measured{m_matrix_note}</div>")
