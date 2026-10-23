@@ -5297,14 +5297,15 @@ _G5B_FIXTURE_DB_NAME = "telemetry_fixture.db"
 def _g5b_extract_row_reader():
     """`query_system_state_row`, compiled out of dashboard.py with its decorator satisfied.
 
-    Finding #3: this is the only new SQL on the branch, and every render test injected a lambda
-    instead of running it, so a swapped SELECT list, a `row[0]` used twice, or an absent shape of
+    Finding #3: this is the only new SQL on the branch, and every render test used to inject a lambda
+    in its place, so a swapped SELECT list, a `row[0]` used twice, or an absent shape of
     `(None, None)` would have kept the whole focused file green while the deck computed an age from
     the regime JSON. The excuse the previous round offered — a `@st.cache_data`-wrapped function
     cannot be extracted — does not hold: the cache is a decorator, and `_G5RecordingStreamlit` now
     answers it with the identity function, so what runs below is the shipped body including its own
     `connect_readonly` (pulled in by the same dependency walk every other extracted helper uses).
-    What stays unexercised is Streamlit's real 4s TTL cache, not the SELECT.
+    What stays unexercised is Streamlit's real 4s TTL cache, not the SELECT. Finding #6 made this the
+    route every `tmp_path` render takes, not a special case a single test opts into.
     """
     return _dashboard_helper("query_system_state_row", DASHBOARD,
                              extra_ns={"st": _G5RecordingStreamlit()})
@@ -5372,33 +5373,59 @@ def _g5b_panel_namespace(path, raw_value, updated_at, now=None, config_bound=900
 
 def _g5b_render_deck(tmp_path=None, payload=_G5B_LIVE_PAYLOAD, updated_at=_G5B_LIVE_UPDATED_AT,
                      raw=None, path=None, now=_G5B_FIX_NOW, config_bound=900.0,
-                     use_shipped_reader=False):
+                     use_shipped_reader=False, seed_updated_at=None):
     """Run the shipped Markov deck for one row and return everything it published.
 
-    By default the payload round-trips through sqlite (`_g5_system_state_row` writes a real
-    `system_state` row into `tmp_path`) while the STAMP is injected: the namespace's
-    `query_system_state_row` is a lambda that hands back `(raw, updated_at)`. Only
-    `use_shipped_reader=True` runs the shipped reader, so the deck's `updated_at` then comes out of
-    the stored row as well. Finding #3 is exactly the gap the default used to claim closed: a docstring
-    here once said the age "came from a stored stamp" for every call, which the injection made false.
+    Which route the row takes, exactly (finding #6 rewrote this docstring after it had claimed a
+    storage round-trip for the stamp that the harness never performed — only `value` went through
+    sqlite while `updated_at` reached the deck as an argument of an injected lambda, which is the
+    branch's own defect class inside the suite and is why finding #3 went unnoticed):
+
+    * `payload=` dict with `tmp_path` — the row is WRITTEN to a `tmp_path` `system_state` by
+      `_g5_system_state_row`, and the deck reads it back through the shipped
+      `query_system_state_row` extracted from `dashboard.py` (fix #3). Both columns the deck parses
+      and ages come out of the database, and the helper asserts the stored pair equals the pair the
+      fixture wrote. `seed_updated_at` writes a stamp that disagrees with `updated_at`, so a harness
+      that still injected the argument cannot pass as a round-trip.
+    * `raw=`, or `payload=` str with no `tmp_path` — NO row is written, so there is nothing stored:
+      the injected lambda answers with the text handed in. The sibling test further down that says
+      `still_says_so` pins this exception is real rather than aspirational.
+    * `use_shipped_reader=True` — forces the first route's reader even when the caller passed `raw=`,
+      which is how `test_g5b_the_shipped_reader_hands_back_the_stored_stamp_the_deck_ages` proves the
+      reader's own SELECT is what the deck aged.
+
+    `updated_at` seeds the row in the first route; in the other two it is the injected stamp. The
+    value-only `query_system_state` stand-in still answers for both Markov and basis keys, which is
+    what lets a pre-fix `path=` render read the same row as the shipped one.
     """
     import json as _json
 
     path = DASHBOARD if path is None else path
+    row_written = False
     if raw is None:
         if isinstance(payload, str):
             raw = payload
         elif tmp_path is not None and isinstance(payload, dict):
             raw = _g5_system_state_row(tmp_path, payload=payload, key=_MARKOV_KEY,
-                                       updated_at=updated_at)
+                                       updated_at=(updated_at if seed_updated_at is None
+                                                   else seed_updated_at))
+            row_written = True
         else:
             raw = _json.dumps(payload)
     ns, fake = _g5b_panel_namespace(path, raw, updated_at, now=now, config_bound=config_bound)
-    if use_shipped_reader:
+    if use_shipped_reader or row_written:
         assert tmp_path is not None, (
             "the shipped-reader route has to point dashboard.py's own SQL at a tmp database")
         reader = _g5b_extract_row_reader()
         _g5b_bind_reader(reader, tmp_path / _G5B_FIXTURE_DB_NAME)
+        if row_written:
+            stored_value, stored_stamp = reader(_MARKOV_KEY)
+            assert stored_value == raw, (
+                "finding #6: the value the deck reads from sqlite is not the value the fixture "
+                "wrote into it")
+            assert stored_stamp == (updated_at if seed_updated_at is None else seed_updated_at), (
+                "finding #6: the stamp the deck reads from sqlite is not the stamp the fixture "
+                "wrote into it")
         ns["query_system_state_row"] = reader
     block = _g4_block("markov", path)
     exec(compile(block, f"{path.name} markov deck", "exec"), ns)
@@ -5641,6 +5668,57 @@ def test_g5b_the_shipped_reader_hands_back_the_stored_stamp_the_deck_ages(tmp_pa
     assert "STALE" in _g5b_heading(html), _g5b_heading(html)
     assert "88.8%" in html and "0.64x" in html, html[:2000]
     assert fake.charts, "the deck published no chart off a row it read from sqlite"
+
+
+def test_g5b_the_default_route_ages_the_deck_from_the_stored_stamp(tmp_path):
+    """Finding #6: the render helper claimed its default route proved a stored stamp; it did not,
+    because the deck's `updated_at` came from an injected lambda rather than from the row.
+
+    This is that claim made true instead of reworded: the row in `tmp_path` is written with a stamp
+    126000 s before the fixture clock while the `updated_at` ARGUMENT says 60 s. Only storage can
+    produce the age the deck prints, so a harness that still injects the argument fails here — and
+    the shipped `query_system_state_row` extracted out of `dashboard.py` has to be the callable the
+    deck actually used, with its own `TRADING_DATA_DB` pointing at this test's database.
+    """
+    stored = (_G5B_FIX_NOW - timedelta(seconds=126000)).isoformat()
+    injected = _G5B_FRESH_UPDATED_AT
+    html, _fake, ns = _g5b_render_deck(tmp_path, updated_at=injected, seed_updated_at=stored)
+
+    assert ns["m_r"]["age_sec"] == pytest.approx(126000.0), (
+        "the deck aged " + str(ns["m_r"]["age_sec"]) + "s while the stored row says " + stored
+        + " — the stamp came from the harness, not from sqlite")
+    assert ns["m_r"]["published_at"]["text"] == stored, ns["m_r"]["published_at"]
+    assert "126000s old" in html, html[:2000]
+    assert "60s old" not in html, "the injected stamp was printed as if it were the row's"
+    assert "STALE" in _g5b_heading(html), _g5b_heading(html)
+    assert "Live" not in _g5b_heading(html), _g5b_heading(html)
+
+    reader = ns["query_system_state_row"]
+    assert getattr(reader, "__name__", "") == "query_system_state_row", (
+        "the deck read the row through an injected stand-in, not through the shipped reader")
+    assert reader.__globals__.get("TRADING_DATA_DB") == str(tmp_path / _G5B_FIXTURE_DB_NAME), (
+        "the shipped reader was bound to some other database")
+    value_text, stamp_back = reader(_MARKOV_KEY)
+    assert stamp_back == stored, reader(_MARKOV_KEY)
+    assert json.loads(value_text) == _G5B_LIVE_PAYLOAD, value_text[:200]
+
+
+def test_g5b_a_route_that_writes_no_row_still_says_so(tmp_path):
+    """The other half of finding #6, so the fix cannot become "the harness always reads a database".
+
+    A caller that hands `raw=` text writes no `system_state` row at all: there is nothing stored for
+    the deck to read, so the stamp stays an argument of the injected reader, and the render helper's
+    docstring is allowed to say so. What this test pins is that the documented exception is real —
+    the deck renders the row it was handed and the reader is the stand-in, not the shipped function.
+    """
+    html, _fake, ns = _g5b_render_deck(tmp_path, raw=json.dumps(_G5B_LIVE_PAYLOAD),
+                                       updated_at=_G5B_FRESH_UPDATED_AT)
+    reader = ns["query_system_state_row"]
+    assert getattr(reader, "__name__", "") != "query_system_state_row", (
+        "the documented injection-only route silently became a database read")
+    assert reader(_MARKOV_KEY)[1] == _G5B_FRESH_UPDATED_AT, reader(_MARKOV_KEY)
+    assert "60s old" in html, html[:1500]
+    assert "Live Forward Filter" in _g5b_heading(html), _g5b_heading(html)
 
 
 def test_g5b_the_shipped_reader_returns_two_empty_strings_for_an_absent_key(tmp_path):
