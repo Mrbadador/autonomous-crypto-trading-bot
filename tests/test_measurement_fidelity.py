@@ -3740,9 +3740,10 @@ def test_g4_no_absence_is_painted_in_a_measured_colour():
     """Neutral grey is the only colour an absence may wear. Green, amber, red, cyan and blue are
     reserved for readings the fleet actually took.
 
-    Scoped to the panels G-4 rewrote. The capital block in the legacy app has a legitimate
-    `if not margin_measured:` / `elif …` ladder whose else-branch is the *measured* side, so a
-    file-wide walk reads it backwards; that panel is G-2's and is pinned by its own tests.
+    Scoped to the panels G-4 rewrote. The walk visits the named G-4 blocks — the macro, ofi,
+    micro, radar and fleet panels of dashboard.py, and the macro and ofi panels the legacy app
+    carries — and not the whole file; the panels outside that scope are pinned by their own
+    tests.
     """
     import ast
 
