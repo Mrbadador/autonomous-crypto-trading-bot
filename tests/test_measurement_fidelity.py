@@ -7767,12 +7767,46 @@ def test_g5c_the_strip_and_the_hero_card_render_the_rollup_not_a_sum():
 
 
 def test_g5c_the_chart_draws_no_series_off_a_mark_it_does_not_have():
-    """The chart's own `curr_p: float = 0.0` default falls back to the last candle close — a real
-    exchange print — instead of the panel's entry-price stand-in, at both call sites."""
+    """A mark the deck never read reaches the chart as 0.0, and 0.0 means DRAW NOTHING. The builder
+    gates its Live Mark annotation on `curr_p > 0`, so an absent mark puts no mark line on the
+    figure and no green-or-red PnL colour derived from one. The last candle close is a real print,
+    but it is not the mark: it keeps its own name and the deck's absence grey, so it can never be
+    read as the thing the header of that same tab says was `not measured`."""
     block = _g5c_block("chart", DASHBOARD)
     assert block.count('curr_p=_deck_chart_level(p["curr"])') == 2
     assert 'curr_p=p["curr"],' not in block
     assert "Mark: `{_deck_text(p['curr'], '${:,.4f}')}`" in block
+
+    # The builder itself, code-only so prose about the old bug cannot trip it or hide it.
+    code = _g5_code_only(_g5c_helper_code("build_position_candlestick_chart", DASHBOARD))
+    # the substituted variable is gone, which makes the fall-through impossible rather than
+    # merely discouraged — nothing left that a close could be renamed into
+    assert "mark_price" not in code, "the builder still names a stand-in after the mark float"
+    assert "mark_price = curr_p if curr_p > 0 else" not in code
+    # the Live Mark annotation sits under a gate on the very float it claims to show
+    assert "if curr_p > 0:" in code, "the Live Mark annotation is no longer gated on the mark"
+    assert code.index("if curr_p > 0:") < code.index('"Live Mark:')
+    # and each overlay is one add_hline call, so a call's own colour can be checked
+    calls = code.split("fig.add_hline(")
+    mark_calls = [c for c in calls if '"Live Mark:' in c]
+    assert len(mark_calls) == 1, mark_calls
+    close_calls = [c for c in calls if '"Last Close:' in c]
+    assert len(close_calls) == 1, (
+        "the close keeps exactly one overlay, drawn in the absence grey with no verdict on it")
+    assert "line_color=_DECK_ABSENT_COLOR" in close_calls[0], close_calls[0]
+    assert "_DECK_ABSENT_COLOR" in close_calls[0]
+    for colour in ("#00ff66", "#ff003c", "#ff9900"):
+        assert colour not in close_calls[0], (
+            f"the close overlay is dressed in the reading colour {colour}")
+
+
+def test_g5c_the_chart_level_helper_says_what_zero_means():
+    """`_deck_chart_level` is what the chart tabs are handed, so its own promise is the contract
+    the builder has to keep: 0.0 is "draw nothing", never "draw a substitute"."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        src = _g5c_helper_code("_deck_chart_level", path)
+        assert "draw nothing" in src, (path.name, src)
+        assert "never" in src, (path.name, src)
 
 
 def test_g5c_the_twin_helpers_are_byte_identical_and_read_the_same_price():

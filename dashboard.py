@@ -321,7 +321,8 @@ def _deck_color(read, measured_color: str) -> str:
 
 
 def _deck_chart_level(read) -> float:
-    """A measured level for the candle chart, or 0.0 — its own 'draw nothing' encoding."""
+    """A measured level for the candle chart, or 0.0 — its own 'draw nothing' encoding, never a
+    number for the chart to substitute a print for."""
     return _deck_value_or(read, 0.0)
 
 
@@ -1110,18 +1111,29 @@ def build_position_candlestick_chart(
             row=1, col=1
         )
 
-    # 9. Overlays: Current Mark Price
-    mark_price = curr_p if curr_p > 0 else (num(df["close"].iloc[-1], 0.0) if not df.empty else 0.0)
-    if mark_price > 0:
-        curr_is_profit = ((side == "long" and mark_price >= entry_p) or (side == "short" and mark_price <= entry_p)) if entry_p > 0 else True
+    # 9. Overlays: Current Mark Price. A mark the deck never read is not drawn as a mark: the
+    # last candle close is a real print, but calling it "Live Mark" would dress it in an
+    # authority it does not have, so it is drawn under its own name in the absence grey.
+    if curr_p > 0:
+        curr_is_profit = ((side == "long" and curr_p >= entry_p) or (side == "short" and curr_p <= entry_p)) if entry_p > 0 else True
         curr_color = "#00ff66" if curr_is_profit else "#ff003c"
         fig.add_hline(
-            y=mark_price, line_dash="dot", line_color=curr_color, line_width=1.3,
-            annotation_text=f"Live Mark: ${mark_price:,.4f}",
+            y=curr_p, line_dash="dot", line_color=curr_color, line_width=1.3,
+            annotation_text=f"Live Mark: ${curr_p:,.4f}",
             annotation_position="top right",
             annotation_font=dict(color=curr_color, size=11, family="JetBrains Mono"),
             row=1, col=1
         )
+    elif not df.empty:
+        last_close = num(df["close"].iloc[-1], 0.0)
+        if last_close > 0:
+            fig.add_hline(
+                y=last_close, line_dash="dot", line_color=_DECK_ABSENT_COLOR, line_width=1.3,
+                annotation_text=f"Last Close: ${last_close:,.4f}",
+                annotation_position="top right",
+                annotation_font=dict(color=_DECK_ABSENT_COLOR, size=11, family="JetBrains Mono"),
+                row=1, col=1
+            )
 
     # 10. Overlays: Estimated Liquidation Price (if visible near price range)
     if est_liq > 0:

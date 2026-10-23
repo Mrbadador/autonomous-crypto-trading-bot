@@ -552,7 +552,8 @@ def _deck_color(read, measured_color: str) -> str:
 
 
 def _deck_chart_level(read) -> float:
-    """A measured level for the candle chart, or 0.0 — its own 'draw nothing' encoding."""
+    """A measured level for the candle chart, or 0.0 — its own 'draw nothing' encoding, never a
+    number for the chart to substitute a print for."""
     return _deck_value_or(read, 0.0)
 
 
