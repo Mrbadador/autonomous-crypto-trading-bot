@@ -511,6 +511,10 @@ _DECK_ABSENT_COLOR = "#94a3b8"
 # The maintenance margin the deck's liquidation model assumes. No producer publishes an MMR and no
 # column stores one, so every figure built on it is labelled as the panel's own model where it shows.
 _PANEL_LIQ_MODEL_MMR = 0.005
+# The utilization gauge's own colour rungs. No producer publishes them and no `system_state` key
+# stores them, so both thresholds are named on screen wherever a rung word is printed.
+_DECK_MARGIN_SAFE_RUNG_PCT = 45.0
+_DECK_MARGIN_ELEVATED_RUNG_PCT = 65.0
 
 
 def _deck_absence(reason: str) -> dict:
@@ -569,6 +573,31 @@ def _deck_account_balance(live_bal_val) -> dict:
     return _deck_reading(value)
 
 
+def _deck_margin_limit(stored) -> dict:
+    """The margin ceiling the fleet recorded, or an absence — never config.py:237's default.
+
+    The deck read this key through a defaulted reader — `state_num(key, 70.0)` in one file,
+    `float(query_system_state(key, "70.0"))` in the other — and a defaulted reader answers with its
+    default when the row is missing: a ceiling nobody recorded printed 70%, implied a 30% cash
+    buffer from it, and measured utilization against both. A non-positive or over-100% value is an
+    absence too, because the gauge divides by this number and a wall at 0% is not a configured
+    ceiling.
+    """
+    value = _optional_float(stored)
+    if value is None:
+        return _deck_absence("no GLOBAL_MARGIN_LIMIT row recorded in system_state")
+    if value <= 0.0 or value > 100.0:
+        return _deck_absence("recorded GLOBAL_MARGIN_LIMIT is not a usable percentage ceiling")
+    return _deck_reading(value)
+
+
+def _deck_cash_buffer_pct(limit: dict) -> dict:
+    """The cash buffer a ceiling implies: 100% minus the read limit, absent when the limit is."""
+    if _deck_is_absent(limit):
+        return _deck_absence("no cash buffer without a measured margin limit")
+    return _deck_reading(100.0 - limit["value"])
+
+
 def _deck_margin_gauge(margin_locked: dict, balance: dict, limit: dict) -> dict:
     """Utilization, bar width and free buffer as readings: absent if any input is absent.
 
@@ -590,15 +619,42 @@ def _deck_margin_gauge(margin_locked: dict, balance: dict, limit: dict) -> dict:
 
 
 def _deck_margin_rung(util: dict) -> dict:
-    """Colour and status words for one utilization figure — grey and no verdict for an absence."""
+    """Colour and status words for one utilization figure — grey and no verdict for an absence.
+
+    The two thresholds are the panel's own (`_DECK_MARGIN_SAFE_RUNG_PCT`,
+    `_DECK_MARGIN_ELEVATED_RUNG_PCT`) and `_deck_margin_rung_label` names them wherever these
+    status words are printed, so an all-clear is never earned by a gate the operator cannot see.
+    """
     if _deck_is_absent(util):
         return {"color": _DECK_ABSENT_COLOR, "status": "NOT MEASURED"}
     value = util["value"]
-    if value < 45.0:
+    if value < _DECK_MARGIN_SAFE_RUNG_PCT:
         return {"color": "#00ff66", "status": "SAFE BUFFER"}
-    if value < 65.0:
+    if value < _DECK_MARGIN_ELEVATED_RUNG_PCT:
         return {"color": "#ff9900", "status": "ELEVATED EXPOSURE"}
     return {"color": "#ff003c", "status": "CRITICAL / NEARING CEILING"}
+
+
+def _deck_margin_rung_label(util: dict) -> str:
+    """The rungs the colour came from, spelled out beside the status word that shows them.
+
+    Nothing beside an unread utilization: an absence has no rung to name, and naming the rungs
+    under a grey "NOT MEASURED" would imply a verdict the gauge withheld.
+    """
+    if _deck_is_absent(util):
+        return ""
+    return (f" · panel utilization rungs: safe under {_DECK_MARGIN_SAFE_RUNG_PCT:.0f}%, "
+            f"elevated under {_DECK_MARGIN_ELEVATED_RUNG_PCT:.0f}%, critical at or above "
+            f"{_DECK_MARGIN_ELEVATED_RUNG_PCT:.0f}% (panel's own)")
+
+
+def _deck_margin_limit_line(limit: dict, buffer: dict) -> str:
+    """The ceiling sentence: the limit that was read and the cash buffer it implies."""
+    if _deck_is_absent(limit):
+        return f"{_DECK_ABSENT_TEXT} Ceiling{_deck_note(limit)}"
+    if _deck_is_absent(buffer):
+        return f"{limit['value']:.1f}% Ceiling{_deck_note(buffer)}"
+    return f"{limit['value']:.1f}% Ceiling ({buffer['value']:.0f}% Cash Buffer)"
 
 
 def _position_hard_sl(row) -> dict:
@@ -1253,7 +1309,8 @@ if not df_open.empty:
         active_coins_set.add(p["clean_symbol"])
 
 max_coin_slots = int(query_system_state("GLOBAL_MAX_POSITIONS", "5"))
-margin_limit_pct = float(query_system_state("GLOBAL_MARGIN_LIMIT", "70.0"))
+margin_limit = _deck_margin_limit(query_system_state("GLOBAL_MARGIN_LIMIT", ""))
+margin_cash_buffer_pct = _deck_cash_buffer_pct(margin_limit)
 bal_for_calc = live_bal_val if live_bal_val is not None else 0.0
 # The buffer and the utilisation are ratios against the account balance. With no balance there is
 # no denominator, so they are absences rather than zeroes — and with no measured margin total
@@ -1262,13 +1319,18 @@ _deck_balance = _deck_account_balance(live_bal_val)
 margin_measured = not _deck_is_absent(_deck_balance)
 _margin_gauge = _deck_margin_gauge(total_margin_locked,
                                   _deck_balance,
-                                  _deck_reading(margin_limit_pct))
+                                  margin_limit)
 margin_util_pct = _margin_gauge["utilization"]
 margin_bar_width = _margin_gauge["bar_width"]
 free_cash_buffer = _margin_gauge["buffer"]
 _margin_rung = _deck_margin_rung(margin_util_pct)
 margin_color = _margin_rung["color"]
 margin_status = _margin_rung["status"]
+margin_limit_display = _deck_text(margin_limit, "{:.0f}%")
+margin_ceiling_display = (
+    f"{margin_limit_display}% Hard Ceiling" if not _deck_is_absent(margin_limit)
+    else f"Hard Ceiling {_DECK_ABSENT_TEXT}")
+margin_rung_label = _deck_margin_rung_label(margin_util_pct)
 margin_util_display = _deck_text(margin_util_pct, "{:.1f}%")
 margin_locked_display = _deck_text(total_margin_locked, "${:,.2f}")
 free_cash_display = _deck_text(free_cash_buffer, "${:,.2f} USDT")
@@ -1318,7 +1380,7 @@ st.markdown(f"""
 <div style="background: #0d121f; border: 1px solid #1e293b; border-radius: 6px; padding: 12px 18px; margin-top: 10px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
     <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; margin-bottom: 8px; flex-wrap: wrap; gap: 6px;">
         <span style="font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em;">
-            🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_display}</b>{_deck_note(margin_util_pct)} of {margin_limit_pct:.0f}% Hard Ceiling ({margin_status})
+            🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_display}</b>{_deck_note(margin_util_pct)} of {margin_ceiling_display}{_deck_note(margin_limit)} ({margin_status}{margin_rung_label})
         </span>
         <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #e2e8f0;">
             Margin Locked: <b style="color: {margin_color};">{margin_locked_display}</b>{_deck_note(total_margin_locked)} | Liquid Buffer: <b style="color: {_deck_color(free_cash_buffer, "#00e5ff")};">{free_cash_display}</b>{_deck_note(free_cash_buffer)}
@@ -1775,7 +1837,8 @@ with tab_risk:
         st.write(f"• **Dynamic Leverage:** {lev_text}{lev_note} *(regime classifier)*", unsafe_allow_html=True)
         st.write(f"• **Core Allocation:** 2 Reserved Slots for BTC/ETH")
         st.write(f"• **Altcoin Ceiling:** 3 Coins Max Concurrent (out of {max_coin_slots})")
-        st.write(f"• **Global Margin Limit:** {margin_limit_pct:.1f}% Ceiling (30% Cash Buffer)")
+        margin_limit_line = _deck_margin_limit_line(margin_limit, margin_cash_buffer_pct)
+        st.write(f"• **Global Margin Limit:** {margin_limit_line}", unsafe_allow_html=True)
         st.write(f"• **Max Entries per Coin:** 2 Positions Max")
 
     with rcol2:

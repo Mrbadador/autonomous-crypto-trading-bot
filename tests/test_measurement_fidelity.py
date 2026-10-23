@@ -3209,6 +3209,15 @@ _G4_BLOCKS = {
     # no guard that could reach them. Additive: nothing above changes region or semantics.
     "position_funding_bar": (r"^# P0: Global Margin Utilization Visual Progress Bar",
                              (r"\n# .* Main Tabbed Navigation",)),
+    # G-5c C-5: the risk tab's "Margin, Leverage & Allocation" column prints the read ceiling and
+    # the cash buffer it implies. It sits in no block above, so the strip had no guard that could
+    # reach it. Additive: nothing above changes region or semantics.
+    "position_limits": (r'^[ \t]*st\.markdown\("#### .*Margin, Leverage & Allocation',
+                        (r"\n[ \t]*with rcol2:",)),
+    # C-5's briefing card is dashboard-only: the legacy twin has no executive-briefing tab, so this
+    # anchor resolves for dashboard.py alone and no C-5 guard asks it of the twin.
+    "position_briefing": (r"^[ \t]*# 4 Executive KPI Metric Cards",
+                          (r'\n[ \t]*st\.markdown\("---"\)',)),
 }
 
 _G4_DASHBOARD_BLOCKS = ("macro", "ofi", "micro", "radar", "fleet")
@@ -8002,5 +8011,274 @@ def test_g5c_the_twin_carries_the_funding_reader_and_none_of_the_funding_panels(
             _g4_helper("_position_deck_readings", LEGACY_DASHBOARD)(row, {}, funding_map)
     legacy_src = _g5_code_only(LEGACY_DASHBOARD.read_text(encoding="utf-8"))
     for name in _G5C_FUNDING_DASHBOARD_HELPERS:
+        assert f"def {name}(" not in legacy_src, (
+            f"{name} was added to the twin, which has no panel that calls it")
+
+
+# ── C-5: the deck states limits it did not read ────────────────────────────────────────────────
+
+# The ceiling the gauge is measured against, the cash buffer it implies and the two colour rungs
+# under the status word were all invented by the panel: `state_num(key, 70.0)` returns 70.0 when the
+# row is absent, "(Ceiling: 70%)" and "(30% Cash Buffer)" were literals, and neither 45 nor 65 was
+# ever rendered. Each pair is the banned text plus one line that genuinely contains it, so the
+# prose-immunity half below is a second proof rather than a restatement of the first.
+_G5C_CEILING_STAND_IN_CASES = (
+    ('state_num("GLOBAL_MARGIN_LIMIT", 70.0)',
+     'margin_limit_pct = state_num("GLOBAL_MARGIN_LIMIT", 70.0)'),
+    ('query_system_state("GLOBAL_MARGIN_LIMIT", "70.0")',
+     'margin_limit_pct = float(query_system_state("GLOBAL_MARGIN_LIMIT", "70.0"))'),
+    ('(Ceiling: 70%)', 'delta = f"{b_margin_display} locked (Ceiling: 70%)"'),
+    ('(70% Max)', 'label = "Margin Utilized (70% Max)"'),
+    ('Ceiling (30% Cash Buffer)',
+     'text = f"Margin Limit: {margin_limit_pct:.1f}% Ceiling (30% Cash Buffer)"'),
+    ('_deck_reading(margin_limit_pct)',
+     'gauge = _deck_margin_gauge(total, balance, _deck_reading(margin_limit_pct))'),
+    ('margin_limit_pct:', 'text = f"{margin_limit_pct:.0f}%"'),
+    ('value < 45.0', 'low_rung = value < 45.0'),
+    ('value < 65.0', 'mid_rung = value < 65.0'),
+)
+
+# `_deck_ceiling_card` speaks to the executive-briefing card, which exists only in dashboard.py —
+# the legacy twin has no briefing tab, so it carries no ceiling card either.
+_G5C_CEILING_SHARED_HELPERS = ("_deck_margin_limit", "_deck_cash_buffer_pct",
+                               "_deck_margin_limit_line", "_deck_margin_gauge",
+                               "_deck_margin_rung", "_deck_margin_rung_label", "_deck_reading",
+                               "_deck_absence", "_deck_is_absent", "_deck_text", "_deck_note",
+                               "_deck_color", "_deck_value_or", "_optional_float")
+_G5C_CEILING_DASHBOARD_HELPERS = ("_deck_ceiling_card",)
+
+
+def _g5c_ceiling_code(path=DASHBOARD):
+    """The C-5 surface: the limit read, the gauge, the bar, the briefing card, the risk strip and
+    every helper that decides what a ceiling or a rung prints."""
+    parts = [_g5c_block("agg", path), _g5c_block("hero", path),
+             _g5c_block("funding_bar", path), _g5c_block("limits", path)]
+    if path == DASHBOARD:
+        parts.append(_g5c_block("briefing", path))
+    names = list(_G5C_CEILING_SHARED_HELPERS)
+    if path == DASHBOARD:
+        names += list(_G5C_CEILING_DASHBOARD_HELPERS)
+    parts += [_g5c_helper_code(name, path) for name in names]
+    return "\n".join(parts)
+
+
+def _g5c_gauge_limit_arg(path=DASHBOARD):
+    """The third argument the shipped panel hands `_deck_margin_gauge`, unparsed from its own tree.
+
+    Whether that argument is a reading or a defaulted float wrapped as one is the whole of C-5's
+    gauge half, and a text match on a wrapped multi-line call is not a check of anything.
+    """
+    import ast
+
+    calls = [node for node in ast.walk(ast.parse(_g5c_block("hero", path)))
+             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_deck_margin_gauge"]
+    assert len(calls) == 1, (
+        f"{path.name}'s hero block no longer calls the gauge exactly once: {len(calls)} calls")
+    assert len(calls[0].args) == 3, ast.unparse(calls[0])
+    return ast.unparse(calls[0].args[2])
+
+
+_G5C_UNREAD_LIMIT_SHAPES = (
+    ("absent row", ""),
+    ("null", None),
+    ("placeholder", "syncing..."),
+    ("not a number", "aggressive"),
+    ("nan", "nan"),
+    ("zero percent", "0.0"),
+    ("negative", "-5.0"),
+    ("above the wallet", "101.5"),
+)
+
+
+@pytest.mark.parametrize("stored", [s for _, s in _G5C_UNREAD_LIMIT_SHAPES],
+                         ids=[label for label, _ in _G5C_UNREAD_LIMIT_SHAPES])
+def test_g5c_ceiling_an_unread_margin_limit_is_an_absence_not_a_silent_70(stored):
+    """C-5's headline: `query_system_state` hands back its default when the row is missing, so an
+    absent `GLOBAL_MARGIN_LIMIT` silently became 70.0 and every ceiling sentence downstream was a
+    restatement of `config.py:237`'s in-tree default, not a reading."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        read = _g4_helper("_deck_margin_limit", path)(stored)
+        assert _deck_absent(read), (path.name, stored, read)
+        assert read["value"] is None and read["measured"] is False, read
+        assert read["reason"], "an absence must carry the reason the deck renders"
+        assert _g4_helper("_deck_text", path)(read, "{:.0f}%") == "not measured"
+        colour = _g4_helper("_deck_color", path)(read, "#00ff66")
+        assert colour == "#94a3b8", colour
+        assert colour != "#00ff66", "an unread ceiling may not wear the all-clear"
+        assert _g4_helper("_deck_note", path)(read) != ""
+        line = _g4_helper("_deck_margin_limit_line", path)(
+            read, _g4_helper("_deck_cash_buffer_pct", path)(read))
+        assert "not measured" in line, line
+        assert "70" not in line and "30%" not in line, line
+
+
+@pytest.mark.parametrize("stored,ceiling,buffer",
+                         [("70.0", "70.0", "30"), ("55.0", "55.0", "45"),
+                          ("80.0", "80.0", "20"), ("42.5", "42.5", "58")],
+                         ids=["as default", "lower", "higher", "fractional"])
+def test_g5c_ceiling_the_cash_buffer_is_derived_from_the_limit_that_was_read(stored, ceiling,
+                                                                            buffer):
+    """"(30% Cash Buffer)" was only ever true while the limit was 70. The buffer is now 100% minus
+    the read ceiling, and a limit of 70 still prints the sentence it printed before."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        limit = _g4_helper("_deck_margin_limit", path)(stored)
+        assert limit == {"value": float(stored), "measured": True, "reason": ""}, limit
+        read = _g4_helper("_deck_cash_buffer_pct", path)(limit)
+        assert read["measured"] is True and read["value"] == pytest.approx(100.0 - float(stored))
+        line = _g4_helper("_deck_margin_limit_line", path)(limit, read)
+        assert line == f"{ceiling}% Ceiling ({buffer}% Cash Buffer)", line
+
+
+def test_g5c_ceiling_the_limit_holds_its_own_shape():
+    """A percentage ceiling is a usable-or-not gate, and the sentence keeps a stored 0.0 out of the
+    gauge's denominator rather than printing 0% as if the fleet had configured a wall at zero."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        zero = _g4_helper("_deck_margin_limit", path)("0.0")
+        assert _deck_absent(zero) and "0" not in _g4_helper("_deck_text", path)(zero), zero
+        assert _g4_helper("_deck_cash_buffer_pct", path)(zero)["measured"] is False
+        assert _g4_helper("_deck_margin_limit", path)("00.5")["measured"] is True
+
+
+def test_g5c_ceiling_a_recorded_limit_still_drives_the_ratio_and_the_bar():
+    """No over-withholding: with a stored ceiling the utilization, the bar width and the rung are
+    the shipped arithmetic, and the bar is measured against the number on screen beside it."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        margin = _g4_helper("_deck_reading", path)(2000.0)
+        balance = _g4_helper("_deck_account_balance", path)(10000.0)
+        for stored, bar in (("70.0", 20.0 / 70.0 * 100.0), ("40.0", 50.0), ("25.0", 80.0)):
+            gauge = _g4_helper("_deck_margin_gauge", path)(
+                margin, balance, _g4_helper("_deck_margin_limit", path)(stored))
+            assert gauge["utilization"]["measured"] is True, (stored, gauge)
+            assert gauge["utilization"]["value"] == pytest.approx(20.0), (stored, gauge)
+            assert gauge["bar_width"]["value"] == pytest.approx(bar), (stored, gauge)
+            assert gauge["buffer"]["value"] == pytest.approx(8000.0), (stored, gauge)
+
+
+def test_g5c_ceiling_an_absent_limit_greys_the_gauge_instead_of_earning_a_green_bar():
+    """The gauge that depends on the ceiling renders the absence: no ratio, no bar, no verdict, and
+    never the green all-clear for a wall nobody recorded."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        gauge = _g4_helper("_deck_margin_gauge", path)(
+            _g4_helper("_deck_reading", path)(2000.0),
+            _g4_helper("_deck_account_balance", path)(10000.0),
+            _g4_helper("_deck_margin_limit", path)(""))
+        for key in ("utilization", "bar_width", "buffer"):
+            assert _deck_absent(gauge[key]), (key, gauge)
+            assert "margin limit" in gauge[key]["reason"], (key, gauge[key])
+        rung = _g4_helper("_deck_margin_rung", path)(gauge["utilization"])
+        assert rung["color"] == "#94a3b8" and rung["status"] == "NOT MEASURED", rung
+        assert _g4_helper("_deck_value_or", path)(gauge["bar_width"]) == 0.0, (
+            "a gauge with no ceiling must draw nothing, not a full bar")
+        assert _g4_helper("_deck_margin_rung_label", path)(gauge["utilization"]) == "", (
+            "an unread utilization has no rung to name")
+
+
+@pytest.mark.parametrize("util,colour,status",
+                         [(0.0, "#00ff66", "SAFE BUFFER"), (44.9, "#00ff66", "SAFE BUFFER"),
+                          (45.0, "#ff9900", "ELEVATED EXPOSURE"),
+                          (64.9, "#ff9900", "ELEVATED EXPOSURE"),
+                          (65.0, "#ff003c", "CRITICAL / NEARING CEILING")])
+def test_g5c_ceiling_the_rung_that_coloured_the_bar_is_named_where_it_is_read(util, colour,
+                                                                              status):
+    """The status words were the only label, and 45/65 lived nowhere on screen. Each rung keeps its
+    colour and its words exactly as they were and gains a name the operator can read."""
+    safe = _g5c_module_constant("_DECK_MARGIN_SAFE_RUNG_PCT")
+    elevated = _g5c_module_constant("_DECK_MARGIN_ELEVATED_RUNG_PCT")
+    assert _g5c_module_constant("_DECK_MARGIN_SAFE_RUNG_PCT",
+                                LEGACY_DASHBOARD) == safe, "the twin's rungs drifted"
+    assert _g5c_module_constant("_DECK_MARGIN_ELEVATED_RUNG_PCT",
+                                LEGACY_DASHBOARD) == elevated, "the twin's rungs drifted"
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        read = _g4_helper("_deck_reading", path)(util)
+        assert _g4_helper("_deck_margin_rung", path)(read) == {"color": colour, "status": status}
+        label = _g4_helper("_deck_margin_rung_label", path)(read)
+        assert f"{safe:.0f}%" in label and f"{elevated:.0f}%" in label, label
+        assert "(panel's own)" in label, label
+        assert "SAFE BUFFER" not in label and status not in label, (
+            f"the rung label must name thresholds, not repeat the verdict: {label}")
+
+
+def test_g5c_ceiling_the_panel_reads_the_key_without_a_default_in_both_files():
+    """The two reader shapes differ (`state_num` in dashboard.py, `float(query_system_state(...))`
+    in the twin) and both are replaced by the same measured-or-absent read of the same key."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        hero = _g5c_block("hero", path)
+        assert 'margin_limit = _deck_margin_limit(query_system_state("GLOBAL_MARGIN_LIMIT", ""))' \
+            in hero, f"{path.name} no longer reads the ceiling with no default"
+        assert "margin_cash_buffer_pct = _deck_cash_buffer_pct(margin_limit)" in hero
+        assert "margin_limit_display = _deck_text(margin_limit, " in hero
+        assert _g5c_gauge_limit_arg(path) == "margin_limit", (
+            f"{path.name} feeds the gauge something other than the read ceiling")
+
+
+def test_g5c_ceiling_the_bar_and_the_risk_strip_render_the_reading():
+    """Both render sites consume the helpers, and the twin's strip answers with the same sentence as
+    dashboard.py's — the residue was asymmetric, so each file is pinned on its own."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        bar = _g5c_block("funding_bar", path)
+        assert "of {margin_ceiling_display}{_deck_note(margin_limit)}" in bar
+        assert "({margin_status}{margin_rung_label})" in bar
+        limits = _g5c_block("limits", path)
+        assert "margin_limit_line = _deck_margin_limit_line(margin_limit, margin_cash_buffer_pct)" \
+            in limits
+        assert 'st.write(f"• **Global Margin Limit:** {margin_limit_line}", ' \
+               "unsafe_allow_html=True)" in limits
+
+
+def test_g5c_ceiling_the_briefing_card_prints_the_ceiling_it_read():
+    """Behavioural half of defect (a): a stored 55 cannot render "Ceiling: 70%" two lines from the
+    strip that says 55%, and an unread ceiling says so instead of naming the config default."""
+    card = _g4_helper("_deck_ceiling_card", DASHBOARD)
+    for stored, ceiling in (("70.0", "70"), ("55.0", "55"), ("80.0", "80")):
+        out = card(_g4_helper("_deck_margin_limit", DASHBOARD)(stored))
+        assert out == {"label": f"{ceiling}% Max", "delta": f"Ceiling: {ceiling}%"}, (stored, out)
+    unread = card(_g4_helper("_deck_margin_limit", DASHBOARD)(""))
+    assert "not measured" in unread["label"] and "not measured" in unread["delta"], unread
+    assert "70" not in str(unread) and "30" not in str(unread), unread
+    briefing = _g5c_block("briefing", DASHBOARD)
+    assert "margin_card = _deck_ceiling_card(margin_limit)" in briefing
+    assert 'Margin Utilized ({margin_card["label"]})' in briefing
+    assert 'locked ({margin_card["delta"]})' in briefing
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_CEILING_STAND_IN_CASES)
+def test_g5c_no_invented_ceiling_or_unlabelled_rung_survives_in_the_deck(banned, code_line):
+    """No defaulted ceiling read, no `_deck_reading()` wrapper dressing one, no hardcoded 70% card,
+    no 30% buffer literal, no bare 45/65 rung comparison — in either file, panel or helper."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        hits = _g5_banned_hits(_g5c_deck_code(path), [banned])
+        assert hits == [], f"{path.name}'s deck blocks still contain {banned!r}"
+        hits = _g5_banned_hits(_g5c_ceiling_code(path), [banned])
+        assert hits == [], f"{path.name}'s ceiling surface still contains {banned!r}"
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_CEILING_STAND_IN_CASES)
+def test_g5c_a_comment_neither_trips_nor_hides_a_ceiling_scan(banned, code_line):
+    """Both halves on C-5's own tokens."""
+    prose = f"def f():\n    # the deck used to publish {banned} here\n    return 1\n"
+    assert _g5_banned_hits(prose, [banned]) == []
+    documented = f'def f():\n    """the deck used to publish {banned} here. """\n    return 1\n'
+    assert _g5_banned_hits(documented, [banned]) == []
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [banned]) == [banned], (
+        f"{banned!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [banned]) == [banned]
+
+
+def test_g5c_ceiling_the_twin_carries_the_shared_ceiling_readers_and_no_briefing_card():
+    """`scripts/live_dashboard.py` cannot import dashboard.py, so the readers are duplicated and
+    pinned byte-for-byte; the briefing card it does not have keeps its card helper out of it."""
+    for name in _G5C_CEILING_SHARED_HELPERS:
+        assert _g5c_helper_code(name, DASHBOARD) == _g5c_helper_code(name, LEGACY_DASHBOARD), name
+    for stored in ("", "70.0", "55.0", "0.0", "syncing..."):
+        assert _g4_helper("_deck_margin_limit", DASHBOARD)(stored) == \
+            _g4_helper("_deck_margin_limit", LEGACY_DASHBOARD)(stored), stored
+    assert _g4_helper("_deck_margin_rung_label", DASHBOARD)(
+        _g4_helper("_deck_reading", DASHBOARD)(50.0)) == \
+        _g4_helper("_deck_margin_rung_label", LEGACY_DASHBOARD)(
+            _g4_helper("_deck_reading", LEGACY_DASHBOARD)(50.0))
+    legacy_src = _g5_code_only(LEGACY_DASHBOARD.read_text(encoding="utf-8"))
+    for name in _G5C_CEILING_DASHBOARD_HELPERS:
         assert f"def {name}(" not in legacy_src, (
             f"{name} was added to the twin, which has no panel that calls it")
