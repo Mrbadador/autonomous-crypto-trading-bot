@@ -1543,7 +1543,7 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
     injectable so the age path is testable without a clock. Pure and module-level: it boots no
     Streamlit, opens no database, and imports no model.
     """
-    # The engine's own regime roster (`markov_regime.py:30-31`), with the short field name the deck
+    # The engine's own regime roster (`markov_regime.py:29-31`), with the short field name the deck
     # addresses each reading by. Named here rather than spelled out at each call site so the deck's
     # labels, this reader's fields and the producer's key set have one thing to disagree with.
     _MARKOV_STATE_KEYS = (
