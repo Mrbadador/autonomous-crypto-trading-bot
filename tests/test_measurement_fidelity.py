@@ -7315,6 +7315,12 @@ _G5C_MARK_STAND_IN_CASES = (
     ("'#00ff66' if total_unrealized_pnl>=0", "colors = {'#00ff66' if total_unrealized_pnl>=0 else '#ff003c'}"),
     ('"#00ff66" if true_portfolio_net >= 0',
      'true_port_color = "#00ff66" if true_portfolio_net >= 0 else "#ff003c"'),
+    # C-3 r1 finding 1: the fixed green/amber on the two target lines painted `not measured` as an
+    # all-clear. The colour must come from `_deck_color` on the same distance the label came from.
+    ('<b style="color: #00ff66;">{tp_str',
+     'f\'🎯 Target: <b style="color: #00ff66;">{tp_str} (${tp:,.4f})</b><br>\''),
+    ('<b style="color: #ff9900;">${sl:,.4f} ({sl_str})',
+     'f\'🛡️ Soft SL: <b style="color: #ff9900;">${sl:,.4f} ({sl_str})</b><br>\''),
 )
 
 _G5C_C3_HELPERS = ("_position_mark", "_position_unrealized_pnl", "_deck_pnl_color",
@@ -7700,6 +7706,48 @@ def test_g5c_the_mark_the_card_and_the_table_print_is_the_feed_or_nothing():
     assert '_deck_text(curr_p, "${:,.4f}")' in legacy_cards
     assert '"Live Price": _deck_text(curr_p, "${:,.4f}")' in legacy_cards
     assert "pnl_color = _deck_pnl_color(unr_pnl)" in legacy_cards
+
+
+def test_g5c_an_absent_target_distance_is_labelled_and_coloured_as_an_absence():
+    """C-3 r1 finding 1, behaviourally: the card's Target/Soft SL spans printed `not measured (tp)`
+    in the fixed all-clear green. The shipped helpers already say what an absent distance looks
+    like and which colour it gets, so this runs them rather than trusting this file's text."""
+    absent_text = _g5c_module_constant("_DECK_ABSENT_TEXT", DASHBOARD)
+    absent_color = _g5c_module_constant("_DECK_ABSENT_COLOR", DASHBOARD)
+    blind_mark = _g4_helper("_position_mark", DASHBOARD)({}, "BTCUSDT", "BTCUSDT")
+    tp_level = _g4_helper("_deck_reading", DASHBOARD)(110000.0)
+    sl_level = _g4_helper("_deck_reading", DASHBOARD)(97000.0)
+    dist_tp = _g4_helper("_position_level_distance", DASHBOARD)(blind_mark, tp_level, "long", "tp")
+    dist_sl = _g4_helper("_position_level_distance", DASHBOARD)(blind_mark, sl_level, "long", "sl")
+    # the absence names the input that is missing, which is why its colour must be grey
+    assert "live price" in dist_tp["reason"], dist_tp
+    assert (_g4_helper("_position_target_label", DASHBOARD)(dist_tp, "long", "tp"),
+            _g4_helper("_deck_color", DASHBOARD)(dist_tp, "#00ff66")) \
+        == (f"{absent_text} (tp)", absent_color)
+    assert (_g4_helper("_position_target_label", DASHBOARD)(dist_sl, "long", "sl"),
+            _g4_helper("_deck_color", DASHBOARD)(dist_sl, "#ff9900")) \
+        == (f"{absent_text} (sl)", absent_color)
+    assert absent_color != "#00ff66" and absent_color != "#ff9900"
+    # the other half: a measured distance keeps the colour the span has always had
+    live_mark = _g4_helper("_position_mark", DASHBOARD)({"BTCUSDT": 105000.0}, "BTCUSDT", "BTCUSDT")
+    live_tp = _g4_helper("_position_level_distance", DASHBOARD)(live_mark, tp_level, "long", "tp")
+    live_sl = _g4_helper("_position_level_distance", DASHBOARD)(live_mark, sl_level, "long", "sl")
+    assert (_g4_helper("_position_target_label", DASHBOARD)(live_tp, "long", "tp"),
+            _g4_helper("_deck_color", DASHBOARD)(live_tp, "#00ff66")) == ("+4.76% to TP", "#00ff66")
+    assert (_g4_helper("_position_target_label", DASHBOARD)(live_sl, "long", "sl"),
+            _g4_helper("_deck_color", DASHBOARD)(live_sl, "#ff9900")) == ("7.62% above SL", "#ff9900")
+
+
+def test_g5c_the_card_target_lines_take_their_colour_from_their_own_distance():
+    """C-3 r1 finding 1, at the render site: each target span asks `_deck_color` about the very
+    reading its label was built from, in both twins — so the colour cannot outlive the measurement."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        cards = _g5c_block("cards", path)
+        assert 'style="color: {_deck_color(p_read["dist_tp"], "#00ff66")};"' in cards, path.name
+        assert 'style="color: {_deck_color(p_read["dist_sl"], "#ff9900")};"' in cards, path.name
+        # the label still comes from the same reading, so label and colour can never disagree
+        assert 'tp_str = (_position_target_label(p_read["dist_tp"]' in cards, path.name
+        assert 'sl_str = (_position_target_label(p_read["dist_sl"]' in cards, path.name
 
 
 def test_g5c_the_strip_and_the_hero_card_render_the_rollup_not_a_sum():
