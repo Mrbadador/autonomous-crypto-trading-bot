@@ -701,10 +701,10 @@ def _position_leverage(row) -> dict:
     value, `super_bot.py:1282-1289` writes `self.grid_leverage` (config.GRID_LEVERAGE) and
     `swing_trader.py:2116-2118` writes `pos_record["leverage"]`. The deck's default
     (`10.0 if "BTC" else 5.0`) applied wherever the column was NULL or missing, which is a live
-    path — no INSERT exists anywhere for `berserker_open_positions`, `marl_live_open_positions` or
-    `mean_reversion_open_positions` — and 10x is double the highest leverage the repo's own config
-    defaults at (`config.py:142` 5, `config.py:269-274` 5; `.env` may raise either), so it halved
-    the margin it printed.
+    path — no live engine inserts into `berserker_open_positions`, `marl_live_open_positions` or
+    `mean_reversion_open_positions` (the deck's own test fixture does, under `tmp_path`) — and 10x
+    is double the highest leverage the repo's own config defaults at (`config.py:142` 5,
+    `config.py:269-274` 5; `.env` may raise either), so it halved the margin it printed.
 
     A 0 or negative leverage is an absence too: it is not a leverage the exchange can open a
     position at, and dividing margin by it is undefined. The `or` this replaces treated a measured
