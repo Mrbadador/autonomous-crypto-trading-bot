@@ -7301,8 +7301,9 @@ _G5C_LEVERAGE_STAND_IN_CASES = (
 
 _G5C_C2_HELPERS = ("_position_leverage", "_position_margin", "_position_liquidation",
                    "_position_roi", "_position_liq_buffer", "_position_deck_readings",
-                   "_fleet_position_rollup", "_deck_label", "_deck_value_or",
-                   "_deck_account_balance", "_deck_margin_gauge", "_deck_margin_rung")
+                   "_fleet_position_rollup", "_deck_missing_names", "_deck_label",
+                   "_deck_value_or", "_deck_account_balance", "_deck_margin_gauge",
+                   "_deck_margin_rung")
 
 # ── C-3: an absent live price rendered flat-and-green with the entry price under "Mark" ────────
 
@@ -7452,7 +7453,7 @@ def test_g5c_the_gauge_never_counts_a_margin_it_did_not_measure(tmp_path):
     readings = [measured, invented]
     rollup = _g4_helper("_fleet_position_rollup", DASHBOARD)(readings)
     assert _deck_absent(rollup["margin_locked"]), rollup
-    assert rollup["margin_locked"]["reason"] == "1 of 2 positions report no margin", rollup
+    assert rollup["margin_locked"]["reason"] == "1 of 2 positions report no margin (ETHUSDT)", rollup
     assert rollup["margin_unmeasured"] == 1
     # A measured ceiling, so this case is only ever about the margin total: the rung's second
     # argument is the ceiling, and handing it one keeps "NOT MEASURED" here the answer to the
@@ -7659,7 +7660,7 @@ def test_g5c_the_portfolio_pnl_is_absent_when_any_position_has_no_mark():
                    "leverage": 4.0}), {}, {})
     rollup = _g4_helper("_fleet_position_rollup", DASHBOARD)([fed, blind])
     assert _deck_absent(rollup["unrealized_pnl"]), rollup
-    assert rollup["unrealized_pnl"]["reason"] == "1 of 2 positions report no mark PnL", rollup
+    assert rollup["unrealized_pnl"]["reason"] == "1 of 2 positions report no mark PnL (ETHUSDT)", rollup
     assert rollup["unr_pnl_unmeasured"] == 1
     assert _g4_helper("_deck_pnl_color", DASHBOARD)(rollup["unrealized_pnl"]) == "#94a3b8"
     net = _g4_helper("_deck_sum", DASHBOARD)(
@@ -7670,6 +7671,48 @@ def test_g5c_the_portfolio_pnl_is_absent_when_any_position_has_no_mark():
         pd.Series({"symbol": "ETHUSDT", "side": "long", "entry_price": 4000.0, "qty": 2.0,
                    "leverage": 4.0}), {"ETHUSDT": 4100.0}, {})])
     assert both["unrealized_pnl"]["value"] == pytest.approx(50.0 + 200.0), both
+
+
+def test_g5c_a_withheld_total_names_the_positions_it_could_not_read():
+    """A grey total that says "2 of 3" is a count the operator has to go and match by hand, one card
+    at a time. The reason names the rows instead — at most two of them and then how many more,
+    because it is printed inside a metric's help line and a long symbol list would bury the number."""
+    reads = _g4_helper("_position_deck_readings", DASHBOARD)
+    rollup = _g4_helper("_fleet_position_rollup", DASHBOARD)
+
+    def _row(symbol, price):
+        return reads(pd.Series({"symbol": symbol, "side": "long", "entry_price": 100000.0,
+                                "qty": 0.01, "leverage": 5.0}), price, {})
+
+    fed = _row("BTCUSDT", {"BTCUSDT": 105000.0})
+    blind_eth = _row("ETHUSDT", {})
+    blind_sol = _row("SOLUSDT", {})
+    three = rollup([fed, blind_eth, blind_sol])
+    assert _deck_absent(three["unrealized_pnl"]), three
+    assert three["unrealized_pnl"]["reason"] == \
+        "2 of 3 positions report no mark PnL (ETHUSDT, SOLUSDT)", three
+    assert three["unr_pnl_unmeasured"] == 2, three
+    five = rollup([fed, blind_eth, blind_sol, _row("XRPUSDT", {}),
+                   _row("DOGEUSDT", {"DOGEUSDT": 105000.0})])
+    assert five["unrealized_pnl"]["reason"] == \
+        "3 of 5 positions report no mark PnL (ETHUSDT, SOLUSDT +1 more)", five
+    assert "XRPUSDT" not in five["unrealized_pnl"]["reason"], (
+        "the cap is the point: the reason names two rows and says how many more")
+    # The twin carries the same bytes and must render the same reason, or its deck would print a
+    # count the operator cannot act on.
+    legacy = _g4_helper("_fleet_position_rollup", LEGACY_DASHBOARD)
+    assert legacy([fed, blind_eth, blind_sol])["unrealized_pnl"]["reason"] == \
+        three["unrealized_pnl"]["reason"]
+    # And the naming helper on its own: one name, two names, and the overflow count.
+    names = _g4_helper("_deck_missing_names", DASHBOARD)
+    assert names([{"symbol": "BTCUSDT"}]) == "BTCUSDT"
+    assert names([{"symbol": "BTCUSDT"}, {"symbol": "ETHUSDT"}]) == "BTCUSDT, ETHUSDT"
+    assert names([{"symbol": "BTCUSDT"}, {"symbol": "ETHUSDT"},
+                  {"symbol": "SOLUSDT"}]) == "BTCUSDT, ETHUSDT +1 more"
+    assert names([{"symbol": "BTCUSDT"}, {"symbol": "ETHUSDT"},
+                  {"symbol": "SOLUSDT"}, {"symbol": "XRPUSDT"}]) == \
+        "BTCUSDT, ETHUSDT +2 more"
+    assert names([{}]) == "?", names([{}])
 
 
 @pytest.mark.parametrize("banned,code_line", _G5C_MARK_STAND_IN_CASES)
@@ -7976,23 +8019,50 @@ def test_g5c_true_net_pnl_refuses_to_publish_when_funding_was_never_measured():
 def test_g5c_the_fleet_funding_total_is_an_absence_when_no_symbol_reported_funding():
     """`total_live_funding` started at 0.0 and `+=`'d each row's stand-in, so an empty telemetry
     map summed to a printed `+$0.0000 (Neutral)`. The aggregate now has its own measured-or-absent
-    state and says how many positions are missing it."""
+    state, says how many positions are missing it, and names them."""
     total = _g4_helper("_deck_funding_total", DASHBOARD)
     readings = _g4_helper("_position_funding", DASHBOARD)
-    absent = readings({}, "BTCUSDT", "BTCUSDT")
-    aggregate = total([absent, absent])
+    absent_btc = readings({}, "BTCUSDT", "BTCUSDT")
+    absent_eth = readings({}, "ETHUSDT", "ETHUSDT")
+    aggregate = total([{"symbol": "BTCUSDT", "funding": absent_btc},
+                       {"symbol": "ETHUSDT", "funding": absent_eth}])
     assert _deck_absent(aggregate), aggregate
-    assert aggregate["reason"] == "2 of 2 positions report no funding", aggregate
+    assert aggregate["reason"] == "2 of 2 positions report no funding (BTCUSDT, ETHUSDT)", aggregate
     assert "0.0000" not in _g4_helper("_deck_funding_text", DASHBOARD)(aggregate)
     assert _g4_helper("_deck_funding_color", DASHBOARD)(aggregate) == "#94a3b8"
-    mixed = total([readings(_g5c_funding_entry(0.5), "BTCUSDT", "BTCUSDT"), absent])
-    assert _deck_absent(mixed) and mixed["reason"] == "1 of 2 positions report no funding", mixed
-    all_read = total([readings(_g5c_funding_entry(0.5), "BTCUSDT", "BTCUSDT"),
-                      readings({"ETHUSDT": {"total_funding": -0.25}}, "ETHUSDT", "ETHUSDT"),
-                      readings(_g5c_funding_entry(0.0), "BTCUSDT", "BTCUSDT")])
+    measured_btc = readings(_g5c_funding_entry(0.5), "BTCUSDT", "BTCUSDT")
+    mixed = total([{"symbol": "BTCUSDT", "funding": measured_btc},
+                   {"symbol": "ETHUSDT", "funding": absent_eth}])
+    assert _deck_absent(mixed) and mixed["reason"] == "1 of 2 positions report no funding (ETHUSDT)", mixed
+    all_read = total([{"symbol": "BTCUSDT", "funding": measured_btc},
+                      {"symbol": "ETHUSDT", "funding": readings(
+                          {"ETHUSDT": {"total_funding": -0.25}}, "ETHUSDT", "ETHUSDT")},
+                      {"symbol": "BTCUSDT", "funding": readings(
+                          _g5c_funding_entry(0.0), "BTCUSDT", "BTCUSDT")}])
     assert all_read["measured"] is True and all_read["value"] == pytest.approx(0.25), all_read
     empty = total([])
     assert _deck_absent(empty) and "no open positions" in empty["reason"], empty
+
+
+def test_g5c_the_funding_total_names_the_positions_that_reported_no_funding():
+    """The fleet total is handed the positions themselves, so its reason can name the ones it could
+    not read — the same contract its sibling roll-up has. Nothing else about it moves: a fully
+    measured book still sums, and an empty book still has nothing to total."""
+    total = _g4_helper("_deck_funding_total", DASHBOARD)
+    absent = _g4_helper("_deck_absence", DASHBOARD)("no funding telemetry for this symbol")
+    reading = _g4_helper("_deck_reading", DASHBOARD)
+
+    one = total([{"symbol": "ETHUSDT", "funding": absent}])
+    assert _deck_absent(one), one
+    assert one["reason"] == "1 of 1 positions report no funding (ETHUSDT)", one
+    two = total([{"symbol": "BTCUSDT", "funding": absent},
+                 {"symbol": "SOLUSDT", "funding": absent}])
+    assert two["reason"] == "2 of 2 positions report no funding (BTCUSDT, SOLUSDT)", two
+    summed = total([{"symbol": "BTCUSDT", "funding": reading(0.75)},
+                    {"symbol": "ETHUSDT", "funding": reading(-0.25)}])
+    assert summed["measured"] is True and summed["value"] == pytest.approx(0.5), summed
+    empty = total([])
+    assert _deck_absent(empty) and empty["reason"] == "no open positions to total funding", empty
 
 
 def test_g5c_a_seeded_position_carries_its_funding_reading_into_the_deck(tmp_path):
@@ -8007,8 +8077,8 @@ def test_g5c_a_seeded_position_carries_its_funding_reading_into_the_deck(tmp_pat
     assert _deck_absent(blind["funding"]), blind
     net = _g4_helper("_deck_sum", DASHBOARD)(blind["unr_pnl"], blind["funding"])
     assert _deck_absent(net) and "funding" in net["reason"], net
-    rollup = _g4_helper("_deck_funding_total", DASHBOARD)([blind["funding"]])
-    assert _deck_absent(rollup) and rollup["reason"] == "1 of 1 positions report no funding", rollup
+    rollup = _g4_helper("_deck_funding_total", DASHBOARD)([blind])
+    assert _deck_absent(rollup) and rollup["reason"] == "1 of 1 positions report no funding (BTCUSDT)", rollup
 
 
 @pytest.mark.parametrize("banned,code_line", _G5C_FUNDING_STAND_IN_CASES)
@@ -8056,6 +8126,10 @@ def test_g5c_the_hero_the_bar_and_the_banner_render_the_total_through_the_helper
     figure, so an unmeasured fleet funding cannot come back as `+$0.0000 (Neutral)` in green."""
     agg = _g5c_block("agg", DASHBOARD)
     assert "total_live_funding = _deck_funding_total(" in agg
+    # The fleet total is handed the positions themselves, not the bare funding readings: its
+    # reason names the rows it could not read, and it can only do that if it can see a symbol.
+    assert "total_live_funding = _deck_funding_total(_deck_positions)" in agg
+    assert '_deck_funding_total([p["funding"]' not in agg
     assert "total_live_funding += " not in agg
     hero = _g5c_block("hero", DASHBOARD)
     assert 'delta=f"Funding: {_deck_funding_text(total_live_funding)}"' in hero

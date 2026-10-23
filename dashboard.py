@@ -706,20 +706,21 @@ def _deck_funding_text(read) -> str:
     return f"{_deck_signed_money(read)} ({_deck_funding_word(read)})"
 
 
-def _deck_funding_total(reads) -> dict:
+def _deck_funding_total(positions) -> dict:
     """The fleet's accrued funding: a total only when every position reported one (C-4).
 
     `total_live_funding` was a float initialised to 0.0 that each row added its funding stand-in to,
     so a book with no telemetry summed to a printed figure. Summing only the measured rows would be
-    the same claim with a smaller number behind it, so the total says who is missing.
+    the same claim with a smaller number behind it, so the total says who is missing, and names them.
     """
-    readings = list(reads)
-    if not readings:
+    rows = list(positions)
+    if not rows:
         return _deck_absence("no open positions to total funding")
-    missing = [read for read in readings if _deck_is_absent(read)]
+    missing = [p for p in rows if _deck_is_absent(p.get("funding"))]
     if missing:
-        return _deck_absence(f"{len(missing)} of {len(readings)} positions report no funding")
-    return _deck_reading(sum(float(read["value"]) for read in readings))
+        return _deck_absence(f"{len(missing)} of {len(rows)} positions report no funding"
+                             f" ({_deck_missing_names(missing)})")
+    return _deck_reading(sum(float(p["funding"]["value"]) for p in rows))
 
 
 def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
@@ -770,6 +771,18 @@ def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
     }
 
 
+def _deck_missing_names(rows) -> str:
+    """Up to two symbols for an absence reason, then `+N more`.
+
+    A total that says "3 of 9 report no mark PnL" is a count the operator cannot act on without
+    scrolling the deck; naming the first two makes the withholding findable. Two, because this
+    reason is printed inside a metric's help line and a long symbol list would bury the number.
+    """
+    names = [str(p.get("symbol") or "?") for p in rows]
+    shown = ", ".join(names[:2])
+    return f"{shown} +{len(names) - 2} more" if len(names) > 2 else shown
+
+
 def _fleet_position_rollup(positions) -> dict:
     """The deck's portfolio totals, each one a measurement only when every addend was one.
 
@@ -790,7 +803,8 @@ def _fleet_position_rollup(positions) -> dict:
             rollup[f"{key}_unmeasured"] = 0
         elif missing:
             rollup[total_key] = _deck_absence(
-                f"{len(missing)} of {counts} positions report no {noun}")
+                f"{len(missing)} of {counts} positions report no {noun}"
+                f" ({_deck_missing_names(missing)})")
             rollup[f"{key}_unmeasured"] = len(missing)
         else:
             rollup[total_key] = _deck_reading(
@@ -3057,7 +3071,7 @@ total_margin_locked = _deck_totals["margin_locked"]
 total_unrealized_pnl = _deck_totals["unrealized_pnl"]
 # C-4: an unread funding is not a zero to add. The fleet total is a reading only when every
 # position reported one, and an absence from then on.
-total_live_funding = _deck_funding_total([p["funding"] for p in _deck_positions])
+total_live_funding = _deck_funding_total(_deck_positions)
 
 if not df_open.empty:
     for p in _deck_positions:

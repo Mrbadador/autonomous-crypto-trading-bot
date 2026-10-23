@@ -948,6 +948,18 @@ def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
     }
 
 
+def _deck_missing_names(rows) -> str:
+    """Up to two symbols for an absence reason, then `+N more`.
+
+    A total that says "3 of 9 report no mark PnL" is a count the operator cannot act on without
+    scrolling the deck; naming the first two makes the withholding findable. Two, because this
+    reason is printed inside a metric's help line and a long symbol list would bury the number.
+    """
+    names = [str(p.get("symbol") or "?") for p in rows]
+    shown = ", ".join(names[:2])
+    return f"{shown} +{len(names) - 2} more" if len(names) > 2 else shown
+
+
 def _fleet_position_rollup(positions) -> dict:
     """The deck's portfolio totals, each one a measurement only when every addend was one.
 
@@ -968,7 +980,8 @@ def _fleet_position_rollup(positions) -> dict:
             rollup[f"{key}_unmeasured"] = 0
         elif missing:
             rollup[total_key] = _deck_absence(
-                f"{len(missing)} of {counts} positions report no {noun}")
+                f"{len(missing)} of {counts} positions report no {noun}"
+                f" ({_deck_missing_names(missing)})")
             rollup[f"{key}_unmeasured"] = len(missing)
         else:
             rollup[total_key] = _deck_reading(
