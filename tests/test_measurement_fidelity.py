@@ -681,7 +681,7 @@ def test_report_main_block_describes_a_gap_without_claiming_the_file_is_absent()
 # string cannot lie about what it decided; only the rendering one line further out is unverified, and
 # test_panel_wires_the_gap_helper_into_a_warning below is a source-text check of that line, nothing more.
 
-def _dashboard_helper(name, path=DASHBOARD):
+def _dashboard_helper(name, path=DASHBOARD, extra_ns=None):
     """Compiles ONE pure top-level helper out of a source file and returns it, without booting it.
 
     dashboard.py cannot be imported in a test (module-level DB reads, HTTP fetches and chart rendering),
@@ -697,6 +697,13 @@ def _dashboard_helper(name, path=DASHBOARD):
     `path` defaults to dashboard.py; the legacy scripts/live_dashboard.py carries its own copies of
     the same pure renderers (it is a standalone Streamlit script and cannot import dashboard.py),
     and they are extracted the same way.
+
+    `extra_ns` (added for G-5b fix #3) is injected AFTER the file's top-level imports and before the
+    helper's own node is exec'd. A decorated function needs its decorator present at exec time —
+    `query_system_state_row` is `@st.cache_data`-wrapped, so the walk could not extract it while the
+    namespace's `st` was the module-level `import streamlit as st`, if that import happens to resolve.
+    Injecting after the imports also means the caller's stand-in is never silently replaced by one of
+    the file's own import bindings.
     """
     import ast
 
@@ -726,6 +733,8 @@ def _dashboard_helper(name, path=DASHBOARD):
                 exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
             except Exception:
                 pass
+    for _injected, _value in (extra_ns or {}).items():
+        ns[_injected] = _value
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in needed for t in node.targets):
             try:
@@ -4094,6 +4103,19 @@ class _G5RecordingStreamlit:
         count = spec if isinstance(spec, int) else len(spec)
         return [_G5RecordingColumn(self) for _ in range(int(count))]
 
+    def cache_data(self, *args, **kwargs):
+        """`@st.cache_data(...)` as the identity decorator, so a wrapped reader can be extracted.
+
+        Added for G-5b fix #3: `query_system_state_row` is the only new SQL on the branch and was
+        pinned by a text scan only, on the excuse that a `@st.cache_data`-wrapped function cannot be
+        compiled out of the file. It can — the cache is a decorator, and this is the decorator, so
+        what the test then calls is the shipped body, not a transcription of it. The 4s TTL and its
+        keying are the real Streamlit's behaviour and stay unexercised; that is stated, not hidden.
+        """
+        def _identity(func):
+            return func
+        return _identity
+
     def __getattr__(self, name):
         def _record(*args, **kwargs):
             return None
@@ -5221,6 +5243,40 @@ def _g5b_readings(payload, updated_at=_G5B_LIVE_UPDATED_AT, now=_G5B_FIX_NOW,
     return helper(payload, updated_at, now=now, max_age_sec=max_age_sec)
 
 
+_G5B_FIXTURE_DB_NAME = "telemetry_fixture.db"
+
+
+def _g5b_extract_row_reader():
+    """`query_system_state_row`, compiled out of dashboard.py with its decorator satisfied.
+
+    Finding #3: this is the only new SQL on the branch, and every render test injected a lambda
+    instead of running it, so a swapped SELECT list, a `row[0]` used twice, or an absent shape of
+    `(None, None)` would have kept the whole focused file green while the deck computed an age from
+    the regime JSON. The excuse the previous round offered — a `@st.cache_data`-wrapped function
+    cannot be extracted — does not hold: the cache is a decorator, and `_G5RecordingStreamlit` now
+    answers it with the identity function, so what runs below is the shipped body including its own
+    `connect_readonly` (pulled in by the same dependency walk every other extracted helper uses).
+    What stays unexercised is Streamlit's real 4s TTL cache, not the SELECT.
+    """
+    return _dashboard_helper("query_system_state_row", DASHBOARD,
+                             extra_ns={"st": _G5RecordingStreamlit()})
+
+
+def _g5b_bind_reader(reader, db_path):
+    """Point one extracted reader at a fixture database and hand back its fresh `FEED_FAILURES`.
+
+    The namespace `_dashboard_helper` builds never gets `TRADING_DATA_DB` or `FEED_FAILURES` bound:
+    the first is an `os.path.join(BASE_DIR, ...)` whose `BASE_DIR` the walk cannot resolve, and the
+    second is an AnnAssign, which the walk does not compile at all. Both are set explicitly here so
+    each test reads exactly one `tmp_path` database and can see what the reader recorded when it
+    could not.
+    """
+    failures = {}
+    reader.__globals__["TRADING_DATA_DB"] = str(db_path)
+    reader.__globals__["FEED_FAILURES"] = failures
+    return failures
+
+
 def _g5b_block_code(path=None):
     """The Markov deck's own source, comments removed: what every scan below actually reads."""
     return _g5_code_only(_g4_block("markov", DASHBOARD if path is None else path))
@@ -5263,12 +5319,16 @@ def _g5b_panel_namespace(path, raw_value, updated_at, now=None, config_bound=900
 
 
 def _g5b_render_deck(tmp_path=None, payload=_G5B_LIVE_PAYLOAD, updated_at=_G5B_LIVE_UPDATED_AT,
-                     raw=None, path=None, now=_G5B_FIX_NOW, config_bound=900.0):
+                     raw=None, path=None, now=_G5B_FIX_NOW, config_bound=900.0,
+                     use_shipped_reader=False):
     """Run the shipped Markov deck for one row and return everything it published.
 
-    With a `tmp_path` the payload is seeded as a real `system_state` row carrying that
-    `updated_at`, written into a fixture database and read back out of sqlite, so the JSON the deck
-    parses went through a storage round-trip and the age it computes came from a stored stamp.
+    By default the payload round-trips through sqlite (`_g5_system_state_row` writes a real
+    `system_state` row into `tmp_path`) while the STAMP is injected: the namespace's
+    `query_system_state_row` is a lambda that hands back `(raw, updated_at)`. Only
+    `use_shipped_reader=True` runs the shipped reader, so the deck's `updated_at` then comes out of
+    the stored row as well. Finding #3 is exactly the gap the default used to claim closed: a docstring
+    here once said the age "came from a stored stamp" for every call, which the injection made false.
     """
     import json as _json
 
@@ -5282,6 +5342,12 @@ def _g5b_render_deck(tmp_path=None, payload=_G5B_LIVE_PAYLOAD, updated_at=_G5B_L
         else:
             raw = _json.dumps(payload)
     ns, fake = _g5b_panel_namespace(path, raw, updated_at, now=now, config_bound=config_bound)
+    if use_shipped_reader:
+        assert tmp_path is not None, (
+            "the shipped-reader route has to point dashboard.py's own SQL at a tmp database")
+        reader = _g5b_extract_row_reader()
+        _g5b_bind_reader(reader, tmp_path / _G5B_FIXTURE_DB_NAME)
+        ns["query_system_state_row"] = reader
     block = _g4_block("markov", path)
     exec(compile(block, f"{path.name} markov deck", "exec"), ns)
     return "\n".join(fake.markdown_calls), fake, ns
@@ -5424,6 +5490,95 @@ def test_g5b_the_deck_reads_the_row_with_its_updated_at():
     assert "SELECT value, updated_at FROM system_state WHERE key = ?" in reader_src, (
         "the new reader does not select the column the age path needs")
     assert "value" in reader_src and "updated_at" in reader_src
+
+
+# ── Finding #3: the shipped row reader is EXECUTED, not described ─────────────────────────
+def test_g5b_the_shipped_reader_returns_the_value_and_the_stamp_in_that_order(tmp_path):
+    """`query_system_state_row` is B-1's input and the only new SQL on the branch. Until now every
+    render test injected a lambda in its place, so nothing pinned which element of the tuple is the
+    regime JSON and which is the publish stamp — swap the SELECT list, or return `row[0]` twice, and
+    the deck would compute an age out of the JSON while all 625 focused cases stayed green.
+
+    The shipped body runs here: extracted out of `dashboard.py` with its `@st.cache_data` answered by
+    the identity decorator, pointed at a `tmp_path` database, through its own `connect_readonly`.
+    """
+    value_text = '{"is_tradable": true}'
+    stamp = "2026-10-21T14:21:29.139442+00:00"
+    seeded = _g5_system_state_row(tmp_path, payload={"is_tradable": True}, key=_MARKOV_KEY,
+                                  updated_at=stamp)
+    assert seeded == value_text, seeded
+    db = tmp_path / _G5B_FIXTURE_DB_NAME
+    assert db.exists(), "the fixture database the shipped reader must open was never written"
+
+    reader = _g5b_extract_row_reader()
+    failures = _g5b_bind_reader(reader, db)
+    got = reader(_MARKOV_KEY)
+    assert isinstance(got, tuple) and len(got) == 2, f"the row shape is not a 2-tuple: {got!r}"
+    assert got[0] == value_text, f"element 0 is not `value`: {got!r}"
+    assert got[1] == stamp, f"element 1 is not `updated_at`: {got!r}"
+    assert got[0] != got[1], f"the reader returned one column twice: {got!r}"
+    assert failures == {}, f"a clean read recorded a feed failure: {failures}"
+
+
+def test_g5b_the_shipped_reader_hands_back_the_stored_stamp_the_deck_ages(tmp_path):
+    """The round-trip the render helper's docstring used to claim for every test: with the shipped
+    reader wired in, the stamp the deck prints its age from comes OUT OF THE DATABASE, not out of an
+    injected lambda argument. Delete the reader's `updated_at` from its SELECT and this fails."""
+    stamp = (_G5B_FIX_NOW - timedelta(seconds=126000)).isoformat()
+    html, fake, ns = _g5b_render_deck(tmp_path, updated_at=stamp, use_shipped_reader=True)
+    assert ns["query_system_state_row"](_MARKOV_KEY)[1] == stamp, "the deck is not reading this row"
+    assert "126000s old" in html, html[:1500]
+    assert "STALE" in _g5b_heading(html), _g5b_heading(html)
+    assert "88.8%" in html and "0.64x" in html, html[:2000]
+    assert fake.charts, "the deck published no chart off a row it read from sqlite"
+
+
+def test_g5b_the_shipped_reader_returns_two_empty_strings_for_an_absent_key(tmp_path):
+    """An absent row is `("", "")` — not `(None, None)`, which the deck's `published_at` parse would
+    read as a present-but-unusable stamp instead of nothing at all."""
+    _g5_system_state_row(tmp_path, payload={"is_tradable": True}, key=_MARKOV_KEY,
+                         updated_at=_G5B_LIVE_UPDATED_AT)
+    reader = _g5b_extract_row_reader()
+    failures = _g5b_bind_reader(reader, tmp_path / _G5B_FIXTURE_DB_NAME)
+    got = reader("markov_regime_telemetry_nobody_writes")
+    assert got == ("", ""), f"the absent shape drifted from the two empty strings: {got!r}"
+    assert all(isinstance(one, str) for one in got), got
+    assert failures == {}, failures
+
+
+def test_g5b_the_shipped_reader_records_the_failure_it_cannot_read(tmp_path):
+    """The `except` path, executed: a database with no `system_state` table must come back as the
+    same `("", "")` absence AND announce itself in `FEED_FAILURES`, because a quiet absence is how
+    the deck ended up printing a 35-hour-old row as a live forward filter."""
+    import sqlite3
+
+    db = tmp_path / "no_system_state_table.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("CREATE TABLE other_things (n INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    reader = _g5b_extract_row_reader()
+    failures = _g5b_bind_reader(reader, db)
+    assert reader(_MARKOV_KEY) == ("", ""), "a read that raised did not degrade to the absent shape"
+    assert len(failures) == 1, f"the failed read recorded {len(failures)} feed failures: {failures}"
+    feed_key = next(iter(failures))
+    assert feed_key == f"read \u2192 {db.name}:{_MARKOV_KEY}", feed_key
+    assert "OperationalError" in failures[feed_key], failures[feed_key]
+
+
+def test_g5b_the_shipped_reader_opens_read_only_and_creates_no_database(tmp_path):
+    """`connect_readonly` opens `file:...?mode=ro`, so a path with no database behind it is an
+    absence, not a file the test just created. This is the one half of "the artefacts are untouched"
+    a reader test can actually prove: the live `trading_data.db` is never the path under test."""
+    missing = tmp_path / "was_never_created.db"
+    reader = _g5b_extract_row_reader()
+    failures = _g5b_bind_reader(reader, missing)
+    assert reader(_MARKOV_KEY) == ("", ""), "a missing database did not degrade to an absence"
+    assert not missing.exists(), "the reader CREATED a database, so its open is not read-only"
+    assert len(failures) == 1, f"an unreadable database was not announced: {failures}"
 
 
 # ── B-2: no model may be run to fill in a missing measurement ────────────────────────────
