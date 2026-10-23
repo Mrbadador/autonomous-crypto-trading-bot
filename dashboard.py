@@ -4514,11 +4514,15 @@ with tab_ai:
         # sits below the threshold in force.
         b_buffer_threshold_pct = (b_min_liq_st["value"] if b_min_liq_st["measured"]
                                   else _BASIS_MIN_BUFFER_PCT)
+        # B-7: that green rung used to live only in the code, so the all-clear was earned by a gate
+        # the operator could not see while the header comment claimed it was labelled. It is printed
+        # beside the threshold it is measured against, and it is named as the panel's own.
         b_buffer_label = (
             f"engine min-buffer threshold: {b_buffer_threshold_pct:.1f}%"
             if b_min_liq_st["measured"] else
             f"panel min-buffer threshold: {_BASIS_MIN_BUFFER_PCT:.0f}% (panel's own — the engine "
-            f"published no threshold)")
+            f"published no threshold)") + (
+            f" · panel safe-clear rung: {_BASIS_SAFE_BUFFER_PCT:.0f}% (panel's own)")
         if b_dist_liq_st["measured"]:
             b_buffer_guard_ok = (b_dist_liq_st["value"] >= _BASIS_SAFE_BUFFER_PCT
                                  and b_dist_liq_st["value"] >= b_buffer_threshold_pct)
@@ -4606,7 +4610,7 @@ with tab_ai:
                     <div style="width: 100%; background: #1e293b; height: 6px; border-radius: 3px; margin: 5px 0; overflow: hidden;">
                         <div style="width: {fee_bar_width:.1f}%; background: {fee_color}; height: 100%; border-radius: 3px;"></div>
                     </div>
-                    <span style="color: #cbd5e1; font-size: 0.72rem;">Harvested: {b_harvest_text}{b_harvest_note} · Target: {b_fee_target_text}{b_fee_target_note} · Hold: {b_holding_text}{b_holding_note} / {b_min_holding_text}{b_min_holding_note}</span>
+                    <span style="color: #cbd5e1; font-size: 0.72rem;">Harvested: {b_harvest_text} · Target: {b_fee_target_text}{b_fee_target_note} · Hold: {b_holding_text}{b_holding_note} / {b_min_holding_text}{b_min_holding_note}</span>
                 </div>
                 <div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 4px;">
                     <span style="color: #94a3b8; font-size: 0.72rem;">PERP SHORT LIQUIDATION GUARD</span><br>

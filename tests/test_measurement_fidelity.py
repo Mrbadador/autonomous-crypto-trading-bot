@@ -5965,3 +5965,38 @@ def test_g5b_the_legacy_dashboard_has_no_markov_deck_to_convert():
     assert "Markov" not in legacy_src
     with pytest.raises(Exception):
         _g4_block("markov", LEGACY_DASHBOARD)
+
+
+# ── B-7: the two carry-panel residues G-5a's re-review left, one line each ───────────────
+# They are rendered claims, so they are proved on the shipped carry block, in the G-5a idiom, and
+# each half is checked: the claim the panel now makes, and the claim it may not make again.
+
+def test_g5b7_the_safe_clear_rung_is_named_on_both_threshold_branches():
+    """An all-clear was earned by a 30% gate that lived only inside the comparison, while the header
+    comment claimed every threshold the panel prints was labelled. It is printed now, and named as
+    the panel's own, on the branch that actually shows the green."""
+    html, _fake = _g5_render_carry_panel(None)
+    assert "panel safe-clear rung: 30% (panel's own)" in html, html[:2500]
+    measured_html, _fake2 = _g5_render_carry_panel(
+        None, payload={**_G5_LIVE_PAYLOAD, "min_liq_distance_pct": 40.0})
+    assert "engine min-buffer threshold: 40.0%" in measured_html, measured_html[:2500]
+    assert "panel safe-clear rung: 30% (panel's own)" in measured_html, (
+        "the rung is named only beside the panel's own fallback threshold, so the branch a measured "
+        "book clears on is still the one that prints an unlabelled all-clear")
+
+
+def test_g5b7_the_harvest_absence_is_explained_once():
+    """`b_harvest_note` was interpolated in the harvest card and again in the harvest line, so one
+    absent reading printed the same parenthetical twice side by side."""
+    book = _g5_active_engine_payload()
+    assert "cumulative_funding_harvested" in book, sorted(book)
+    html, _fake = _g5_render_carry_panel(
+        None, payload={k: v for k, v in book.items() if k != "cumulative_funding_harvested"})
+    note = "(no cumulative_funding_harvested in basis trader telemetry)"
+    assert note in html, html[:2500]
+    assert html.count(note) == 1, (
+        f"the harvest absence is printed {html.count(note)} times, not once")
+    live_html, _fake2 = _g5_render_carry_panel(None, payload=book)
+    assert f"{book['cumulative_funding_harvested']:+.4f}" in live_html, (
+        "a measured harvest stopped printing its own figure")
+    assert note not in live_html
