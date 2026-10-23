@@ -369,40 +369,52 @@ def _deck_cash_buffer_pct(limit: dict) -> dict:
 
 
 def _deck_margin_gauge(margin_locked: dict, balance: dict, limit: dict) -> dict:
-    """Utilization, bar width and free buffer as readings: absent if any input is absent.
+    """Utilization, bar width and free buffer as readings, each gated only by what it uses.
 
     A ratio whose numerator came from an assumed leverage is not a utilization, and a buffer
-    subtracted from a balance that was never read is not a buffer.
+    subtracted from a balance that was never read is not a buffer. The ceiling is the bar's
+    denominator and nothing else: utilization is the margin over the balance and the buffer is the
+    balance minus the margin, so an unrecorded wall withholds the bar alone and leaves the two
+    figures that never divided by it still measured.
     """
-    for read, name in ((margin_locked, "margin total"), (balance, "account balance"),
-                       (limit, "margin limit")):
+    for read, name in ((margin_locked, "margin total"), (balance, "account balance")):
         if _deck_is_absent(read):
             return {"utilization": _deck_absence(f"no utilization without a measured {name}"),
                     "bar_width": _deck_absence(f"no gauge without a measured {name}"),
                     "buffer": _deck_absence(f"no buffer without a measured {name}")}
     util = margin_locked["value"] / balance["value"] * 100.0
+    bar_width = (_deck_absence("no gauge without a measured margin limit")
+                 if _deck_is_absent(limit)
+                 else _deck_reading(min(100.0, (util / limit["value"]) * 100.0)))
     return {
         "utilization": _deck_reading(util),
-        "bar_width": _deck_reading(min(100.0, (util / limit["value"]) * 100.0)),
+        "bar_width": bar_width,
         "buffer": _deck_reading(max(0.0, balance["value"] - margin_locked["value"])),
     }
 
 
-def _deck_margin_rung(util: dict) -> dict:
+def _deck_margin_rung(util: dict, limit: dict) -> dict:
     """Colour and status words for one utilization figure — grey and no verdict for an absence.
 
     The two thresholds are the panel's own (`_DECK_MARGIN_SAFE_RUNG_PCT`,
     `_DECK_MARGIN_ELEVATED_RUNG_PCT`) and `_deck_margin_rung_label` names them wherever these
     status words are printed, so an all-clear is never earned by a gate the operator cannot see.
+    When the ceiling itself was never recorded, the words stop claiming a distance to a wall the
+    panel has just called absent — "SAFE BUFFER" and "NEARING CEILING" both describe that wall. The
+    colour stays: a measured 20% is still a measured 20%, and dimming it would buy the honesty
+    with a reading the fleet did take.
     """
     if _deck_is_absent(util):
         return {"color": _DECK_ABSENT_COLOR, "status": "NOT MEASURED"}
     value = util["value"]
+    ceiling_known = not _deck_is_absent(limit)
     if value < _DECK_MARGIN_SAFE_RUNG_PCT:
-        return {"color": "#00ff66", "status": "SAFE BUFFER"}
+        return {"color": "#00ff66",
+                "status": "SAFE BUFFER" if ceiling_known else "LOW UTILIZATION"}
     if value < _DECK_MARGIN_ELEVATED_RUNG_PCT:
         return {"color": "#ff9900", "status": "ELEVATED EXPOSURE"}
-    return {"color": "#ff003c", "status": "CRITICAL / NEARING CEILING"}
+    return {"color": "#ff003c",
+            "status": "CRITICAL / NEARING CEILING" if ceiling_known else "CRITICAL UTILIZATION"}
 
 
 def _deck_margin_rung_label(util: dict) -> str:
@@ -3061,7 +3073,7 @@ _margin_gauge = _deck_margin_gauge(total_margin_locked,
 margin_util_pct = _margin_gauge["utilization"]
 margin_bar_width = _margin_gauge["bar_width"]
 free_cash_buffer = _margin_gauge["buffer"]
-_margin_rung = _deck_margin_rung(margin_util_pct)
+_margin_rung = _deck_margin_rung(margin_util_pct, margin_limit)
 margin_color = _margin_rung["color"]
 margin_status = _margin_rung["status"]
 margin_limit_display = _deck_text(margin_limit, "{:.0f}%")

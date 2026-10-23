@@ -1931,10 +1931,11 @@ def test_the_legacy_margin_block_publishes_no_ratio_without_a_balance():
     # G-5c moved this gate into the twin helper `_deck_account_balance` (an unreadable or zero
     # balance is an absence) and routed the ratio itself through `_deck_margin_gauge`, so a margin
     # total built on an assumed leverage is now a second way for the gauge to say nothing. The
-    # requirement is unchanged -- no ratio without a balance -- and `margin_measured` survives as
-    # the balance half of it.
+    # requirement is unchanged -- no ratio without a balance -- and the balance half of it now
+    # lives in the gauge, which is the only thing that reads the balance.
     assert "_deck_balance = _deck_account_balance(live_bal_val)" in src
-    assert "margin_measured = not _deck_is_absent(_deck_balance)" in src
+    assert "margin_measured" not in src, (
+        "the twin kept a balance flag that nothing reads: the gauge gates on the balance itself")
     assert "_deck_margin_gauge(total_margin_locked" in src
     assert 'margin_util_display = _deck_text(margin_util_pct, "{:.1f}%")' in src
     assert '"n/a (no account balance)"' not in src, (
@@ -7453,11 +7454,15 @@ def test_g5c_the_gauge_never_counts_a_margin_it_did_not_measure(tmp_path):
     assert _deck_absent(rollup["margin_locked"]), rollup
     assert rollup["margin_locked"]["reason"] == "1 of 2 positions report no margin", rollup
     assert rollup["margin_unmeasured"] == 1
+    # A measured ceiling, so this case is only ever about the margin total: the rung's second
+    # argument is the ceiling, and handing it one keeps "NOT MEASURED" here the answer to the
+    # absent *utilization* rather than to an absent ceiling the gauge no longer borrows.
+    measured_ceiling = _g4_helper("_deck_reading", DASHBOARD)(70.0)
     gauge = _g4_helper("_deck_margin_gauge", DASHBOARD)(
         rollup["margin_locked"], _g4_helper("_deck_account_balance", DASHBOARD)(10000.0),
-        _g4_helper("_deck_reading", DASHBOARD)(70.0))
+        measured_ceiling)
     assert _deck_absent(gauge["utilization"]), gauge
-    rung = _g4_helper("_deck_margin_rung", DASHBOARD)(gauge["utilization"])
+    rung = _g4_helper("_deck_margin_rung", DASHBOARD)(gauge["utilization"], measured_ceiling)
     assert rung == {"color": "#94a3b8", "status": "NOT MEASURED"}, rung
     assert rung["color"] != "#00ff66", "an absent total may not read as the all-clear"
 
@@ -8227,23 +8232,77 @@ def test_g5c_ceiling_a_recorded_limit_still_drives_the_ratio_and_the_bar():
             assert gauge["buffer"]["value"] == pytest.approx(8000.0), (stored, gauge)
 
 
-def test_g5c_ceiling_an_absent_limit_greys_the_gauge_instead_of_earning_a_green_bar():
-    """The gauge that depends on the ceiling renders the absence: no ratio, no bar, no verdict, and
-    never the green all-clear for a wall nobody recorded."""
+def test_g5c_ceiling_an_absent_limit_withholds_the_bar_and_not_the_ratios():
+    """The ceiling is the bar's denominator and nothing else's: utilization is margin over the
+    balance and the buffer is the balance minus the margin, so an unrecorded wall leaves both of
+    them measurements. The bar is the only absence, its reason names the margin limit, and the rung
+    keeps its colour but stops claiming a relationship to a ceiling the same panel calls absent."""
     for path in (DASHBOARD, LEGACY_DASHBOARD):
-        gauge = _g4_helper("_deck_margin_gauge", path)(
-            _g4_helper("_deck_reading", path)(2000.0),
-            _g4_helper("_deck_account_balance", path)(10000.0),
-            _g4_helper("_deck_margin_limit", path)(""))
-        for key in ("utilization", "bar_width", "buffer"):
-            assert _deck_absent(gauge[key]), (key, gauge)
-            assert "margin limit" in gauge[key]["reason"], (key, gauge[key])
-        rung = _g4_helper("_deck_margin_rung", path)(gauge["utilization"])
-        assert rung["color"] == "#94a3b8" and rung["status"] == "NOT MEASURED", rung
+        limit = _g4_helper("_deck_margin_limit", path)("")
+        margin = _g4_helper("_deck_reading", path)(2000.0)
+        balance = _g4_helper("_deck_account_balance", path)(10000.0)
+        gauge = _g4_helper("_deck_margin_gauge", path)(margin, balance, limit)
+        # The two figures that never divided by the ceiling are measurements now.
+        assert gauge["utilization"]["measured"] is True, gauge
+        assert gauge["utilization"]["value"] == pytest.approx(20.0), gauge
+        assert gauge["buffer"]["measured"] is True, gauge
+        assert gauge["buffer"]["value"] == pytest.approx(8000.0), gauge
+        # Only the bar is withheld, and it says which input it is missing.
+        assert _deck_absent(gauge["bar_width"]), gauge
+        assert "margin limit" in gauge["bar_width"]["reason"], gauge["bar_width"]
         assert _g4_helper("_deck_value_or", path)(gauge["bar_width"]) == 0.0, (
             "a gauge with no ceiling must draw nothing, not a full bar")
-        assert _g4_helper("_deck_margin_rung_label", path)(gauge["utilization"]) == "", (
+        assert _g4_helper("_deck_value_or", path)(gauge["utilization"]) == pytest.approx(20.0), (
+            "the utilization the ceiling never gated may not be zeroed on its way to screen")
+        # And the rung: same green, different claim. "SAFE BUFFER" is a sentence about a wall.
+        rung = _g4_helper("_deck_margin_rung", path)(gauge["utilization"], limit)
+        assert rung["color"] == "#00ff66", rung
+        assert rung["status"] == "LOW UTILIZATION", (
+            f"a measured 20% may not print an all-clear about a ceiling it just called absent: "
+            f"{rung}")
+        assert "SAFE BUFFER" not in rung["status"] and "CEILING" not in rung["status"], rung
+        assert _g4_helper("_deck_margin_rung_label", path)(gauge["utilization"]) != "", (
+            "a measured utilization still names the rungs its colour came from")
+        # The half of the old bundled gate that this finding does not touch: with no balance the
+        # ratios themselves are absences, grey carries no verdict, and an unread utilization has no
+        # rung to name.
+        no_balance = _g4_helper("_deck_margin_gauge", path)(
+            margin, _g4_helper("_deck_account_balance", path)(None), limit)
+        for key in ("utilization", "bar_width", "buffer"):
+            assert _deck_absent(no_balance[key]), (key, no_balance)
+            assert "account balance" in no_balance[key]["reason"], (key, no_balance[key])
+        grey = _g4_helper("_deck_margin_rung", path)(no_balance["utilization"], limit)
+        assert grey == {"color": "#94a3b8", "status": "NOT MEASURED"}, grey
+        assert _g4_helper("_deck_margin_rung_label", path)(no_balance["utilization"]) == "", (
             "an unread utilization has no rung to name")
+
+
+@pytest.mark.parametrize("util,ceiling_words,bare_words,colour",
+                         [(20.0, "SAFE BUFFER", "LOW UTILIZATION", "#00ff66"),
+                          (55.0, "ELEVATED EXPOSURE", "ELEVATED EXPOSURE", "#ff9900"),
+                          (70.0, "CRITICAL / NEARING CEILING", "CRITICAL UTILIZATION", "#ff003c")],
+                         ids=["safe rung", "elevated rung", "critical rung"])
+def test_g5c_ceiling_the_rung_words_adapt_to_an_absent_ceiling_at_the_same_colour(
+        util, ceiling_words, bare_words, colour):
+    """The wording pair, isolated: one utilization, a recorded ceiling and an unrecorded one, twice
+    through each shipped file. The colour must be identical in both arms — otherwise the honesty is
+    bought by dimming the reading instead of dropping the claim — and the two wordings differ only
+    where the first of them describes a distance to a wall. "ELEVATED EXPOSURE" names no wall, so
+    it is the row that proves the second argument is not a blanket mute."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        read = _g4_helper("_deck_reading", path)(util)
+        with_ceiling = _g4_helper("_deck_margin_rung", path)(
+            read, _g4_helper("_deck_margin_limit", path)("70.0"))
+        without_ceiling = _g4_helper("_deck_margin_rung", path)(
+            read, _g4_helper("_deck_margin_limit", path)(""))
+        assert with_ceiling == {"color": colour, "status": ceiling_words}, (path.name, util,
+                                                                            with_ceiling)
+        assert without_ceiling["color"] == with_ceiling["color"], (
+            f"the fix may not buy honesty by dimming the colour instead of the claim: "
+            f"{without_ceiling}")
+        assert without_ceiling == {"color": colour, "status": bare_words}, (path.name, util,
+                                                                          without_ceiling)
+        assert "CEILING" not in bare_words and "SAFE BUFFER" not in bare_words, bare_words
 
 
 @pytest.mark.parametrize("util,colour,status",
@@ -8263,7 +8322,9 @@ def test_g5c_ceiling_the_rung_that_coloured_the_bar_is_named_where_it_is_read(ut
                                 LEGACY_DASHBOARD) == elevated, "the twin's rungs drifted"
     for path in (DASHBOARD, LEGACY_DASHBOARD):
         read = _g4_helper("_deck_reading", path)(util)
-        assert _g4_helper("_deck_margin_rung", path)(read) == {"color": colour, "status": status}
+        recorded_ceiling = _g4_helper("_deck_margin_limit", path)("70.0")
+        assert _g4_helper("_deck_margin_rung", path)(read, recorded_ceiling) == {
+            "color": colour, "status": status}
         label = _g4_helper("_deck_margin_rung_label", path)(read)
         assert f"{safe:.0f}%" in label and f"{elevated:.0f}%" in label, label
         assert "(panel's own)" in label, label
