@@ -4109,6 +4109,8 @@ def _g5_system_state_row(tmp_path, payload=_G5_LIVE_PAYLOAD, key="basis_trader_t
 
     G-5b added `key` and `updated_at`: the Markov deck's whole B-1 claim is about the row's own
     publish instant, so the fixture has to be able to set it rather than inherit the basis stamp.
+    Re-seeding replaces the row instead of failing, because a G-5b test proves both halves of one
+    claim (absent then measured) against the same tmp database.
     """
     import json as _json
     import sqlite3
@@ -4116,10 +4118,10 @@ def _g5_system_state_row(tmp_path, payload=_G5_LIVE_PAYLOAD, key="basis_trader_t
     db = tmp_path / "telemetry_fixture.db"
     conn = sqlite3.connect(str(db))
     try:
-        conn.execute("CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT, "
+        conn.execute("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT, "
                      "updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         raw = _json.dumps(payload)
-        conn.execute("INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+        conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
                      (key, raw, updated_at))
         conn.commit()
         stored = conn.execute("SELECT value FROM system_state WHERE key = ?",
@@ -5706,7 +5708,7 @@ def test_g5b_a_payload_without_is_tradable_prints_no_all_clear(tmp_path):
     assert "(no is_tradable in markov regime telemetry)" in html, html[:2000]
 
 
-def test_g5b_a_measured_untradable_gate_still_prints_the_red_verdict():
+def test_g5b_a_measured_untradable_gate_still_prints_the_red_verdict(tmp_path):
     """The fix may not be "always grey": a published false is a measurement and keeps its colour."""
     html = _g5b_render_deck(tmp_path, payload={**_G5B_LIVE_PAYLOAD, "is_tradable": False,
                                                "tradability_reason":
@@ -5799,14 +5801,14 @@ def test_g5b_an_unpublished_row_wears_no_measured_colour_at_all(tmp_path):
 
 def test_g5b_the_transition_matrix_is_plotted_only_when_the_engine_published_one(tmp_path):
     """B-4's rendering half: `raw_P = m_tel.get("transition_matrix", default_P.tolist())` put a
-    hardcoded prior into a heatmap titled as the estimated matrix."""
+    hardcoded prior into a heatmap titled as the matrix the engine estimated from the bars."""
     _html, absent_fake, _ns = _g5b_render_deck(tmp_path, raw="", updated_at="")
     assert not [one for one in absent_fake.charts
-                if any("Heatmap" in str(trace.type) for trace in one.data)], (
+                if any(str(trace.type) == "heatmap" for trace in one.data)], (
         "an absent row still renders a transition-matrix heatmap")
     _html2, live_fake, _ns2 = _g5b_render_deck(tmp_path)
     heatmaps = [one for one in live_fake.charts
-                if any("Heatmap" in str(trace.type) for trace in one.data)]
+                if any(str(trace.type) == "heatmap" for trace in one.data)]
     assert len(heatmaps) == 1, len(live_fake.charts)
     z = [list(row) for row in heatmaps[0].data[0].z]
     assert z == _G5B_LIVE_PAYLOAD["transition_matrix"], "the plotted matrix is not the published one"
@@ -5818,14 +5820,14 @@ def test_g5b_a_bar_series_is_skipped_rather_than_plotted_at_zero(tmp_path):
     absence as a measured zero, so the series is left out and the skip is named."""
     _html, fake, _ns = _g5b_render_deck(
         tmp_path, payload=_g5b_payload_without("stationary_distribution"))
-    bars = [one for one in fake.charts if any("Bar" in str(trace.type) for trace in one.data)]
+    bars = [one for one in fake.charts if any(str(trace.type) == "bar" for trace in one.data)]
     assert len(bars) == 1, len(fake.charts)
     names = [trace.name for trace in bars[0].data]
     assert "Equilibrium π*" not in names, names
     assert "Current π_t" in names and "Forecast π_{t+4}" in names, names
     _html2, absent_fake, _ns2 = _g5b_render_deck(tmp_path, raw="", updated_at="")
     assert not [one for one in absent_fake.charts
-                if any("Bar" in str(trace.type) for trace in one.data)]
+                if any(str(trace.type) == "bar" for trace in one.data)]
 
 
 def test_g5b_the_deck_publishes_the_live_readings_it_claims(tmp_path):

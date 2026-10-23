@@ -5015,155 +5015,216 @@ with tab_risk:
     st.markdown("<div style='margin-bottom: 16px;'></div>", unsafe_allow_html=True)
 
     # ── Bayesian Markov Chain & Regime Transition Telemetry Deck ──────────────
-    st.markdown("#### 🎲 Bayesian Markov Regime Engine & Transition Matrix (Live Forward Filter)")
-    
-    # Safe retrieval & default extraction
-    markov_raw = query_system_state("markov_regime_telemetry", "{}")
-    m_tel = {}
-    try:
-        if markov_raw and markov_raw != "{}":
-            m_tel = json.loads(markov_raw)
-    except Exception:
-        m_tel = {}
+    # Age first, because it is the finding: the row's own `updated_at` is the publish instant and
+    # `config.REGIME_MAX_AGE_SEC` is the bound the fleet's own consumers enforce. Absent and stale
+    # are DIFFERENT states -- the consumers refuse a stale row and have nothing at all to refuse
+    # when no row was ever written -- and neither may wear a measured colour. No model is run to
+    # fill a gap: the deck used to instantiate an untrained engine whose constructor is pure
+    # (uniform prior, hardcoded transition matrix, no dataset), so what it printed was the model's
+    # assumption about the world, not a measurement of this one.
+    markov_raw, markov_published_at = query_system_state_row("markov_regime_telemetry")
+    m_r = _markov_regime_readings(markov_raw, markov_published_at)
+    m_dom_st = m_r["dominant_regime"]
+    m_conf_st = m_r["confidence"]
+    m_domdur_st = m_r["dominant_duration"]
+    m_gate_st = m_r["is_tradable"]
+    m_rsn_st = m_r["tradability_reason"]
+    m_sizing_st = m_r["sizing_multiplier"]
+    m_bd_st = m_r["breakdown_risk"]
+    m_stat_st = m_r["equilibrium"]
+    m_matrix_st = m_r["transition_matrix"]
 
-    states_list = ["CHOP", "BULL_EXPANSION", "BEAR_CASCADE"]
-    default_P = np.array([
-        [0.70, 0.15, 0.15],
-        [0.20, 0.70, 0.10],
-        [0.20, 0.10, 0.70]
-    ], dtype=np.float64)
+    # The heading is the claim, so it is the first thing the age has to agree with. A row past the
+    # bound the fleet refuses is not a live forward filter, and a row that measured nothing -- or
+    # carries a stamp that cannot be read -- is not one either.
+    if m_r["heading_is_live"]:
+        m_heading = "Live Forward Filter"
+    elif m_r["stale"]:
+        m_heading = "STALE Forward Filter — row past the fleet age bound"
+    elif not m_r["age_known"]:
+        m_heading = "Forward Filter NOT MEASURED — no usable publish stamp"
+    else:
+        m_heading = "Forward Filter NOT MEASURED — row carries no regime telemetry"
+    st.markdown(f"#### 🎲 Bayesian Markov Regime Engine & Transition Matrix ({m_heading})")
 
-    # If telemetry is absent or incomplete, compute fallback
-    if not m_tel or "state_probabilities" not in m_tel:
-        try:
-            from markov_regime import MarkovRegimeEngine
-            m_eng = MarkovRegimeEngine()
-            dur_fb = m_eng.get_expected_regime_durations()
-            stat_fb = m_eng.get_stationary_distribution()
-            fc_fb = m_eng.forecast_k_steps(k=4)
-            m_tel = {
-                "dominant_regime": "CHOP",
-                "state_probabilities": {"CHOP": 0.60, "BULL_EXPANSION": 0.25, "BEAR_CASCADE": 0.15},
-                "expected_durations_bars": dur_fb,
-                "breakdown_risk_4step": fc_fb.get("breakdown_risk", 0.35),
-                "transition_matrix": default_P.tolist(),
-                "forecast_probabilities": fc_fb.get("forecast_probabilities", {"CHOP": 0.50, "BULL_EXPANSION": 0.30, "BEAR_CASCADE": 0.20}),
-                "stationary_distribution": {"CHOP": num(stat_fb[0]), "BULL_EXPANSION": num(stat_fb[1]), "BEAR_CASCADE": num(stat_fb[2])}
-            }
-        except Exception:
-            m_tel = {
-                "dominant_regime": "CHOP",
-                "state_probabilities": {"CHOP": 0.60, "BULL_EXPANSION": 0.25, "BEAR_CASCADE": 0.15},
-                "expected_durations_bars": {"CHOP": 3.33, "BULL_EXPANSION": 3.33, "BEAR_CASCADE": 3.33},
-                "breakdown_risk_4step": 0.35,
-                "transition_matrix": default_P.tolist(),
-                "forecast_probabilities": {"CHOP": 0.50, "BULL_EXPANSION": 0.30, "BEAR_CASCADE": 0.20},
-                "stationary_distribution": {"CHOP": 0.333, "BULL_EXPANSION": 0.333, "BEAR_CASCADE": 0.333}
-            }
+    # The age line, in the house shape: the stamp, the age, and the bound it blew through by name.
+    if m_r["published_at"]["measured"]:
+        m_stamp_text = utc_to_sast(m_r["published_at"]["text"])
+        if m_r["age_sec"] is None:
+            m_time_text = f"published {m_stamp_text} · age not measurable from that stamp"
+        elif m_r["stale"]:
+            m_time_text = (f"{m_stamp_text} · {m_r['age_sec']:.0f}s old · ⚠️ STALE TELEMETRY — the "
+                           f"fleet's consumers refuse this row past {m_r['max_age_sec']:.0f}s")
+        else:
+            m_time_text = (f"{m_stamp_text} · {m_r['age_sec']:.0f}s old · within the "
+                           f"{m_r['max_age_sec']:.0f}s bound")
+        m_time_color = "#ffcc00" if m_r["stale"] else "#64748b"
+    else:
+        m_time_text = ("row publish stamp: not measured"
+                       + _absence_note(m_r["published_at"]["reason"]))
+        m_time_color = "#94a3b8"
 
-    dom_regime = m_tel.get("dominant_regime", "CHOP")
-    probs = m_tel.get("state_probabilities", {})
-    durations = m_tel.get("expected_durations_bars", {})
-    bd_risk = float(m_tel.get("breakdown_risk_4step", 0.0) or 0.0)
-    fc_probs = m_tel.get("forecast_probabilities", {})
-    stat_dist = m_tel.get("stationary_distribution", {})
+    # ── Published figures, one text variable per card, so no `{x['value']}` can format a None.
+    # Each one keys on its OWN reading: an absent field says which key the engine never wrote, and
+    # a recorded zero stays a reading (`BEAR_CASCADE: 0.0002` is published today).
+    m_dom_text = m_dom_st["text"] if m_dom_st["measured"] else "not measured"
+    m_dom_note = "" if m_dom_st["measured"] else _absence_note(m_dom_st["reason"])
+    m_conf_text = f"{m_conf_st['value'] * 100:.1f}%" if m_conf_st["measured"] else "not measured"
+    m_conf_note = "" if m_conf_st["measured"] else _absence_note(m_conf_st["reason"])
+    m_domdur_text = f"{m_domdur_st['value']:.1f} Bars" if m_domdur_st["measured"] else "not measured"
+    m_domdur_note = "" if m_domdur_st["measured"] else _absence_note(m_domdur_st["reason"])
+    m_sizing_text = f"{m_sizing_st['value']:.2f}x" if m_sizing_st["measured"] else "not measured"
+    m_sizing_note = "" if m_sizing_st["measured"] else _absence_note(m_sizing_st["reason"])
+    m_bd_text = f"{m_bd_st['value'] * 100:.1f}%" if m_bd_st["measured"] else "not measured"
+    m_bd_note = "" if m_bd_st["measured"] else _absence_note(m_bd_st["reason"])
+    m_stat_text = ("/".join(f"{one * 100:.0f}%" for one in m_stat_st["rows"])
+                   if m_stat_st["measured"] else "not measured")
+    m_stat_note = "" if m_stat_st["measured"] else _absence_note(m_stat_st["reason"])
+    m_matrix_note = "" if m_matrix_st["measured"] else _absence_note(m_matrix_st["reason"])
 
-    p_chop = float(probs.get("CHOP", 0.0) or 0.0)
-    p_bull = float(probs.get("BULL_EXPANSION", 0.0) or 0.0)
-    p_bear = float(probs.get("BEAR_CASCADE", 0.0) or 0.0)
+    # Which horizon readings the engine did not publish, named one by one. The bars below are drawn
+    # per series, so the operator can see exactly which of the twelve probabilities is missing
+    # rather than being shown a bar that stands at nothing.
+    m_horizon_absent = tuple(
+        m_r[one]["reason"] for one in m_r["field_names"]
+        if one.startswith(("prob_", "dur_", "fc_", "stat_")) and not m_r[one]["measured"])
+    m_horizon_note = ("<br><span style='color: #94a3b8; font-size: 0.70rem;'>horizon readings the "
+                      "engine did not publish: " + html.escape("; ".join(m_horizon_absent))
+                      + "</span>") if m_horizon_absent else ""
 
-    d_chop = float(durations.get("CHOP", 0.0) or 0.0)
-    d_bull = float(durations.get("BULL_EXPANSION", 0.0) or 0.0)
-    d_bear = float(durations.get("BEAR_CASCADE", 0.0) or 0.0)
+    # ── Derived colours. An absence wears the deck's grey and never a measured colour; a measured
+    # reading keeps the colour it earned. `_MARKOV_*` rungs are the PANEL's own verdict thresholds
+    # (the engine publishes a probability, not a label), so each one is printed beside its label.
+    if m_dom_st["measured"]:
+        m_dom_color = _stance_color(m_dom_st["text"], True, ("BULL_EXPANSION",), ("BEAR_CASCADE",))
+    else:
+        m_dom_color = "#94a3b8"
+    if m_conf_st["measured"]:
+        m_conf_color = "#f59e0b"
+    else:
+        m_conf_color = "#94a3b8"
+    if m_domdur_st["measured"]:
+        m_domdur_color = "#00e5ff"
+    else:
+        m_domdur_color = "#94a3b8"
+    if m_sizing_st["measured"]:
+        m_sizing_color = "#38bdf8"
+    else:
+        m_sizing_color = "#94a3b8"
+    if m_stat_st["measured"]:
+        m_stat_color = "#a855f7"
+    else:
+        m_stat_color = "#94a3b8"
+    if m_matrix_st["measured"]:
+        m_matrix_color = "#38bdf8"
+    else:
+        m_matrix_color = "#94a3b8"
+    if m_bd_st["measured"]:
+        m_bd_color = ("#ff003c" if m_bd_st["value"] >= _MARKOV_BD_ALARM_PCT
+                      else ("#f59e0b" if m_bd_st["value"] >= _MARKOV_BD_WARN_PCT else "#00ff66"))
+        m_bd_label = ("HIGH" if m_bd_st["value"] >= _MARKOV_BD_HIGH_PCT
+                      else ("ELEV" if m_bd_st["value"] >= _MARKOV_BD_ELEV_PCT else "STABLE"))
+    else:
+        m_bd_color = "#94a3b8"
+        m_bd_label = "NOT MEASURED"
+    # The tradability gate is the one verdict in the deck that may bundle: it is a verdict, not a
+    # published value, and it keys on its OWN field. An unmeasured gate reads as unmeasured -- the
+    # fleet goes defensive when this key is missing (`super_bot.py:733` logs a key-missing warning
+    # and skips), and the HUD used to go green.
+    if m_gate_st["measured"]:
+        m_tradable_color = "#00ff66" if m_gate_st["value"] else "#ff003c"
+        m_tradable_badge = "TRADABLE" if m_gate_st["value"] else "UNTRADEABLE CHURN"
+    else:
+        m_tradable_color = "#94a3b8"
+        m_tradable_badge = "GATE NOT MEASURED"
+    m_gate_note = "" if m_gate_st["measured"] else _absence_note(m_gate_st["reason"])
 
-    # Normalize stationary distribution (dict or list)
-    st_chop, st_bull, st_bear = 0.333, 0.333, 0.333
-    raw_stat = m_tel.get("stationary_distribution")
-    if isinstance(raw_stat, dict):
-        st_chop = float(raw_stat.get("CHOP", 0.333) or 0.333)
-        st_bull = float(raw_stat.get("BULL_EXPANSION", 0.333) or 0.333)
-        st_bear = float(raw_stat.get("BEAR_CASCADE", 0.333) or 0.333)
-    elif isinstance(raw_stat, (list, tuple, np.ndarray)) and len(raw_stat) >= 3:
-        st_chop = num(raw_stat[0])
-        st_bull = num(raw_stat[1])
-        st_bear = num(raw_stat[2])
+    # The reason is the engine's own words, published when it said any and missed when it did not.
+    if m_rsn_st["measured"]:
+        m_reason_line = ("Engine-reported reason: <b style='color: #e2e8f0;'>"
+                         f"{html.escape(m_rsn_st['text'])}</b>")
+    else:
+        m_reason_line = ("Engine-reported reason: not measured"
+                         + _absence_note(m_rsn_st["reason"]))
 
-    # Normalize 4-step forecast probabilities (dict or list, check forecast_4step or forecast_probabilities)
-    fc_chop, fc_bull, fc_bear = p_chop, p_bull, p_bear
-    raw_fc = m_tel.get("forecast_probabilities") or m_tel.get("forecast_4step")
-    if isinstance(raw_fc, dict):
-        fc_chop = float(raw_fc.get("CHOP", p_chop) or 0.0)
-        fc_bull = float(raw_fc.get("BULL_EXPANSION", p_bull) or 0.0)
-        fc_bear = float(raw_fc.get("BEAR_CASCADE", p_bear) or 0.0)
-    elif isinstance(raw_fc, (list, tuple, np.ndarray)) and len(raw_fc) >= 3:
-        fc_chop = num(raw_fc[0])
-        fc_bull = num(raw_fc[1])
-        fc_bear = num(raw_fc[2])
+    # One honest headline, counted from the reader's own roster rather than a tuple kept by hand.
+    m_unmeasured_count = m_r["coverage"]["unmeasured"]
+    m_field_count = m_r["coverage"]["total"]
+    if m_unmeasured_count:
+        m_coverage_line = (f"<span style='color: #94a3b8; font-size: 0.72rem;'>⚠️ "
+                           f"{m_unmeasured_count} of {m_field_count} published fields in this deck "
+                           f"were never measured by the regime engine — they are shown as not "
+                           f"measured, not as readings.</span>")
+    else:
+        m_coverage_line = ""
 
-    # Extract new Deep Research Playbook metrics
-    is_tradable = bool(m_tel.get("is_tradable", True))
-    tradable_rsn = str(m_tel.get("tradability_reason", "Tradable"))
-    sizing_mult = float(m_tel.get("sizing_multiplier", 1.0) or 1.0)
-
-    tradable_color = "#00ff66" if is_tradable else "#ff003c"
-    tradable_badge = "TRADABLE" if is_tradable else "UNTRADEABLE CHURN"
+    st.markdown(f"""
+    <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {m_time_color}; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: #cbd5e1; font-size: 0.78rem;">{m_reason_line}</span>
+            <span style="color: {m_time_color}; font-size: 0.75rem; white-space: nowrap;">{m_time_text}</span>
+        </div>
+        <div style="margin-top: 6px;">{m_coverage_line}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Top 6 Markov & Playbook KPI Cards
     mk1, mk2, mk3, mk4, mk5, mk6 = st.columns(6)
     with mk1:
-        dom_color = "#00ff66" if dom_regime == "BULL_EXPANSION" else ("#ff003c" if dom_regime == "BEAR_CASCADE" else "#f59e0b")
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {dom_color}; border-radius: 6px; padding: 12px 14px;">
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {m_dom_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Active State (π_t)</div>
-            <div style="font-size: 1.10rem; font-weight: 800; color: {dom_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{dom_regime}</div>
-            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Conf: <b style="color: {dom_color};">{max(p_chop, p_bull, p_bear)*100:.1f}%</b></div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: {m_dom_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{m_dom_text}</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Conf: <b style="color: {m_conf_color};">{m_conf_text}</b>{m_conf_note}</div>
         </div>
         """, unsafe_allow_html=True)
 
     with mk2:
-        exp_d = durations.get(dom_regime, 3.3)
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #00e5ff; border-radius: 6px; padding: 12px 14px;">
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {m_domdur_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Expected Duration</div>
-            <div style="font-size: 1.10rem; font-weight: 800; color: #00e5ff; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{exp_d:.1f} Bars</div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: {m_domdur_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{m_domdur_text}{m_domdur_note}</div>
             <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">E[D] = 1 / (1 - P_ii)</div>
         </div>
         """, unsafe_allow_html=True)
 
     with mk3:
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {tradable_color}; border-radius: 6px; padding: 12px 14px;">
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {m_tradable_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Tradability Gate</div>
-            <div style="font-size: 1.05rem; font-weight: 800; color: {tradable_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">[{tradable_badge}]</div>
-            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;" title="{tradable_rsn}">E[D] ≥ 3.5b Fee Shield</div>
+            <div style="font-size: 1.05rem; font-weight: 800; color: {m_tradable_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">[{m_tradable_badge}]{m_gate_note}</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">E[D] ≥ {_MARKOV_FEE_SHIELD_BARS}b fee shield (panel label — the engine's own reason is above)</div>
         </div>
         """, unsafe_allow_html=True)
 
     with mk4:
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #38bdf8; border-radius: 6px; padding: 12px 14px;">
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {m_sizing_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Risk Multiplier</div>
-            <div style="font-size: 1.10rem; font-weight: 800; color: #38bdf8; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{sizing_mult:.2f}x</div>
-            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Continuous π-Scaling</div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: {m_sizing_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{m_sizing_text}{m_sizing_note}</div>
+            <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Continuous π-Scaling, bounded [0.20, 1.0] by the engine</div>
         </div>
         """, unsafe_allow_html=True)
 
     with mk5:
-        bd_col = "#ff003c" if bd_risk >= 0.50 else ("#f59e0b" if bd_risk >= 0.30 else "#00ff66")
-        bd_lbl = "HIGH" if bd_risk >= 0.60 else ("ELEV" if bd_risk >= 0.35 else "STABLE")
+        m_bd_rungs = (f" · panel rungs: ≥{_MARKOV_BD_HIGH_PCT:.2f} HIGH, "
+                      f"≥{_MARKOV_BD_ELEV_PCT:.2f} ELEV, below STABLE"
+                      if m_bd_st["measured"] else "")
+        m_bd_alarm = (f" · panel alarm at {_MARKOV_BD_ALARM_PCT:.2f}, warn at "
+                      f"{_MARKOV_BD_WARN_PCT:.2f}" if m_bd_st["measured"] else "")
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {bd_col}; border-radius: 6px; padding: 12px 14px;">
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {m_bd_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">4-Step Cascade Risk</div>
-            <div style="font-size: 1.10rem; font-weight: 800; color: {bd_col}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{bd_risk*100:.1f}%</div>
-            <div style="color: {bd_col}; font-size: 0.70rem; margin-top: 2px; font-weight: bold;">[{bd_lbl}] P(Cascade)</div>
+            <div style="font-size: 1.10rem; font-weight: 800; color: {m_bd_color}; font-family: 'JetBrains Mono', monospace; margin-top: 2px;">{m_bd_text}{m_bd_note}</div>
+            <div style="color: {m_bd_color}; font-size: 0.70rem; margin-top: 2px; font-weight: bold;">[{m_bd_label}] P(Cascade){m_bd_rungs}{m_bd_alarm}</div>
         </div>
         """, unsafe_allow_html=True)
 
     with mk6:
         st.markdown(f"""
-        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #a855f7; border-radius: 6px; padding: 12px 14px;">
+        <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {m_stat_color}; border-radius: 6px; padding: 12px 14px;">
             <div style="color: #94a3b8; font-size: 0.72rem; font-weight: bold; text-transform: uppercase;">Equilibrium (π*)</div>
-            <div style="font-size: 0.95rem; font-weight: 800; color: #a855f7; font-family: 'JetBrains Mono', monospace; margin-top: 4px;">{st_chop*100:.0f}%/{st_bull*100:.0f}%/{st_bear*100:.0f}%</div>
+            <div style="font-size: 0.95rem; font-weight: 800; color: {m_stat_color}; font-family: 'JetBrains Mono', monospace; margin-top: 4px;">{m_stat_text}{m_stat_note}</div>
             <div style="color: #64748b; font-size: 0.70rem; margin-top: 2px;">Chop/Bull/Bear</div>
         </div>
         """, unsafe_allow_html=True)
@@ -5173,107 +5234,118 @@ with tab_risk:
     # 2-Column Plotly Visualizations: Transition Matrix Heatmap & Multi-Horizon Probabilities
     col_hm, col_bars = st.columns([1, 1])
 
-    # Parse or format transition matrix P
-    raw_P = m_tel.get("transition_matrix", default_P.tolist())
-    try:
-        mat_P = np.array(raw_P, dtype=np.float64)
-        if mat_P.shape != (3, 3):
-            mat_P = default_P
-    except Exception:
-        mat_P = default_P
+    # A horizon series is drawn only when every probability in it was published. A bar at 0.0 would
+    # publish an absence as a measured zero, so the series is left out and the skip is named.
+    m_series_specs = (("Current π_t", "prob"), ("Forecast π_{t+4}", "fc"),
+                      ("Equilibrium π*", "stat"))
+    m_series_states = tuple(
+        {"label": one_label,
+         "values": [one[one_key]["value"] for one in m_r["by_state"]],
+         "measured": all(one[one_key]["measured"] for one in m_r["by_state"])}
+        for one_label, one_key in m_series_specs)
+    m_drawn_series = tuple(one for one in m_series_states if one["measured"])
+    m_series_colors = {"Current π_t": "#00e5ff", "Forecast π_{t+4}": "#a855f7",
+                       "Equilibrium π*": "#64748b"}
+
+    if m_matrix_st["measured"]:
+        m_matrix_html = (f"<div style=\"color: {m_matrix_color}; font-size: 0.72rem;\">Transition "
+                         f"matrix the engine published (estimated from labelled bars)</div>")
+    else:
+        m_matrix_html = ("<div style=\"color: #94a3b8; font-size: 0.72rem;\">Transition matrix not "
+                         f"measured{m_matrix_note}</div>")
+    if any(one["measured"] for one in m_series_states):
+        m_bars_html = (f"<div style=\"color: #94a3b8; font-size: 0.72rem;\">Drawing "
+                       f"{len(m_drawn_series)} of {len(m_series_states)} horizon series</div>")
+    else:
+        m_bars_html = ("<div style=\"color: #94a3b8; font-size: 0.72rem;\">Horizon bars not "
+                       "measured</div>" + _absence_note(
+                           "no complete horizon series was published to plot"))
 
     with col_hm:
-        # Hover annotations and text labels with E[D] on diagonal
-        text_matrix = []
-        for i, s_from in enumerate(states_list):
-            row_text = []
-            for j, s_to in enumerate(states_list):
-                val = mat_P[i, j]
-                if i == j:
-                    e_d = durations.get(s_from, 1.0 / max(1e-3, 1.0 - val))
-                    row_text.append(f"{val:.2f}<br><span style='font-size:9px; color:#38bdf8;'>E[D]={e_d:.1f}b</span>")
-                else:
-                    row_text.append(f"{val:.2f}")
-            text_matrix.append(row_text)
+        st.markdown(m_matrix_html, unsafe_allow_html=True)
+        # The heatmap is the published matrix or nothing: there is no stand-in P left in this file,
+        # and a prior plotted under an "estimated" title is the defect this deck was rebuilt to end.
+        if m_matrix_st["measured"]:
+            mat_P = np.array(m_matrix_st["rows"], dtype=np.float64)
+            text_matrix = []
+            for i, one_from in enumerate(m_r["by_state"]):
+                row_text = []
+                for j, one_to in enumerate(m_r["by_state"]):
+                    val = mat_P[i, j]
+                    if i == j:
+                        e_d_text = (f"<span style='font-size:9px; color:#38bdf8;'>E[D]="
+                                    f"{one_to['dur']['value']:.1f}b</span>"
+                                    if one_to["dur"]["measured"] else
+                                    "<span style='font-size:9px; color:#94a3b8;'>E[D] not "
+                                    "measured</span>")
+                        row_text.append(f"{val:.2f}<br>{e_d_text}")
+                    else:
+                        row_text.append(f"{val:.2f}")
+                text_matrix.append(row_text)
 
-        fig_hm = go.Figure(data=go.Heatmap(
-            z=mat_P,
-            x=["To CHOP", "To BULL", "To BEAR"],
-            y=["From CHOP", "From BULL", "From BEAR"],
-            text=text_matrix,
-            texttemplate="%{text}",
-            textfont={"size": 12, "family": "JetBrains Mono"},
-            colorscale=[
-                [0.0, "#0d121f"],
-                [0.25, "#1e293b"],
-                [0.5, "#0284c7"],
-                [0.75, "#00e5ff"],
-                [1.0, "#00ff66"]
-            ],
-            zmin=0.0,
-            zmax=1.0,
-            showscale=False
-        ))
-        fig_hm.update_layout(
-            title={"text": "<b>3×3 Bayesian Transition Matrix P(S_j | S_i)</b>", "font": {"size": 13, "color": "#cbd5e1"}},
-            template="plotly_dark",
-            paper_bgcolor="#0d121f",
-            plot_bgcolor="#0d121f",
-            height=280,
-            margin=dict(l=40, r=20, t=40, b=30),
-            yaxis=dict(autorange="reversed")
-        )
-        st.plotly_chart(fig_hm, width="stretch", config={"displayModeBar": False})
+            fig_hm = go.Figure(data=go.Heatmap(
+                z=mat_P.tolist(),
+                x=["To CHOP", "To BULL", "To BEAR"],
+                y=["From CHOP", "From BULL", "From BEAR"],
+                text=text_matrix,
+                texttemplate="%{text}",
+                textfont={"size": 12, "family": "JetBrains Mono"},
+                colorscale=[
+                    [0.0, "#0d121f"],
+                    [0.25, "#1e293b"],
+                    [0.5, "#0284c7"],
+                    [0.75, "#00e5ff"],
+                    [1.0, "#00ff66"]
+                ],
+                zmin=0.0,
+                zmax=1.0,
+                showscale=False
+            ))
+            fig_hm.update_layout(
+                title={"text": "<b>3×3 Bayesian Transition Matrix P(S_j | S_i)</b>", "font": {"size": 13, "color": "#cbd5e1"}},
+                template="plotly_dark",
+                paper_bgcolor="#0d121f",
+                plot_bgcolor="#0d121f",
+                height=280,
+                margin=dict(l=40, r=20, t=40, b=30),
+                yaxis=dict(autorange="reversed")
+            )
+            st.plotly_chart(fig_hm, width="stretch", config={"displayModeBar": False})
 
     with col_bars:
-        # Comparison: Current Belief π_t vs. 4-step Forecast π_{t+4} vs. Stationary π*
-        labels_x = ["CHOP", "BULL_EXP", "BEAR_CAS"]
-        pi_curr_vals = [p_chop, p_bull, p_bear]
-        pi_fc_vals = [fc_chop, fc_bull, fc_bear]
-        pi_stat_vals = [st_chop, st_bull, st_bear]
+        st.markdown(m_bars_html + m_horizon_note, unsafe_allow_html=True)
+        if m_drawn_series:
+            fig_bars = go.Figure()
+            for one_series in m_drawn_series:
+                fig_bars.add_trace(go.Bar(
+                    name=one_series["label"],
+                    x=list(m_r["states"]),
+                    y=one_series["values"],
+                    marker_color=m_series_colors[one_series["label"]]
+                ))
 
-        fig_bars = go.Figure()
-        fig_bars.add_trace(go.Bar(
-            name="Current π_t",
-            x=labels_x,
-            y=pi_curr_vals,
-            marker_color="#00e5ff"
-        ))
-        fig_bars.add_trace(go.Bar(
-            name="Forecast π_{t+4}",
-            x=labels_x,
-            y=pi_fc_vals,
-            marker_color="#a855f7"
-        ))
-        fig_bars.add_trace(go.Bar(
-            name="Equilibrium π*",
-            x=labels_x,
-            y=pi_stat_vals,
-            marker_color="#64748b"
-        ))
+            # Add the entry hysteresis threshold line the panel draws every horizon against.
+            fig_bars.add_hline(
+                y=_MARKOV_HYSTERESIS_GATE,
+                line_dash="dot",
+                line_color="#ff9900",
+                annotation_text=f"{_MARKOV_HYSTERESIS_GATE:.2f} Hysteresis Gate (panel's own)",
+                annotation_position="top right",
+                annotation_font={"size": 10, "color": "#ff9900"}
+            )
 
-        # Add 0.65 entry hysteresis threshold line
-        fig_bars.add_hline(
-            y=0.65,
-            line_dash="dot",
-            line_color="#ff9900",
-            annotation_text="0.65 Hysteresis Gate",
-            annotation_position="top right",
-            annotation_font={"size": 10, "color": "#ff9900"}
-        )
-
-        fig_bars.update_layout(
-            title={"text": "<b>Markov Horizon: Posterior vs Forecast vs Equilibrium</b>", "font": {"size": 13, "color": "#cbd5e1"}},
-            template="plotly_dark",
-            paper_bgcolor="#0d121f",
-            plot_bgcolor="#0d121f",
-            barmode="group",
-            height=280,
-            margin=dict(l=30, r=20, t=40, b=30),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
-            yaxis=dict(range=[0, 1.0], gridcolor="#1e293b")
-        )
-        st.plotly_chart(fig_bars, width="stretch", config={"displayModeBar": False})
+            fig_bars.update_layout(
+                title={"text": "<b>Markov Horizon: Posterior vs Forecast vs Equilibrium</b>", "font": {"size": 13, "color": "#cbd5e1"}},
+                template="plotly_dark",
+                paper_bgcolor="#0d121f",
+                plot_bgcolor="#0d121f",
+                barmode="group",
+                height=280,
+                margin=dict(l=30, r=20, t=40, b=30),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+                yaxis=dict(range=[0, 1.0], gridcolor="#1e293b")
+            )
+            st.plotly_chart(fig_bars, width="stretch", config={"displayModeBar": False})
 
     st.markdown("<div style='margin-bottom: 16px;'></div>", unsafe_allow_html=True)
 
