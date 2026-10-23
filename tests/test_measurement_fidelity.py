@@ -7827,11 +7827,12 @@ def test_g5c_the_strip_and_the_hero_card_render_the_rollup_not_a_sum():
 
 
 def test_g5c_the_chart_draws_no_series_off_a_mark_it_does_not_have():
-    """A mark the deck never read reaches the chart as 0.0, and 0.0 means DRAW NOTHING. The builder
-    gates its Live Mark annotation on `curr_p > 0`, so an absent mark puts no mark line on the
-    figure and no green-or-red PnL colour derived from one. The last candle close is a real print,
-    but it is not the mark: it keeps its own name and the deck's absence grey, so it can never be
-    read as the thing the header of that same tab says was `not measured`."""
+    """A mark the deck never read reaches the chart as 0.0, and 0.0 draws no "Live Mark" line: the
+    builder gates its Live Mark annotation on `curr_p > 0`, so an absent mark puts no mark line on
+    the figure and no green-or-red PnL colour derived from that mark. It does still draw the last
+    candle close — a real print, but not the mark: it keeps its own name and the deck's absence
+    grey, so it can never be read as the thing the header of that same tab says was
+    `not measured`."""
     block = _g5c_block("chart", DASHBOARD)
     assert block.count('curr_p=_deck_chart_level(p["curr"])') == 2
     assert 'curr_p=p["curr"],' not in block
