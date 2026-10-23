@@ -508,6 +508,9 @@ def calculate_liq_distance_pct(curr_p: float, liq_p: float, side: str) -> float:
 # publishes an absence instead of a number.
 _DECK_ABSENT_TEXT = "not measured"
 _DECK_ABSENT_COLOR = "#94a3b8"
+# The maintenance margin the deck's liquidation model assumes. No producer publishes an MMR and no
+# column stores one, so every figure built on it is labelled as the panel's own model where it shows.
+_PANEL_LIQ_MODEL_MMR = 0.005
 
 
 def _deck_absence(reason: str) -> dict:
@@ -539,9 +542,63 @@ def _deck_note(read) -> str:
     return "" if not _deck_is_absent(read) else _absence_note(read.get("reason", ""))
 
 
+def _deck_color(read, measured_color: str) -> str:
+    """A measured figure keeps its colour; an absence is grey — never an all-clear, never an alarm."""
+    return _DECK_ABSENT_COLOR if _deck_is_absent(read) else measured_color
+
+
 def _deck_chart_level(read) -> float:
     """A measured level for the candle chart, or 0.0 — its own 'draw nothing' encoding."""
-    return 0.0 if _deck_is_absent(read) else float(read["value"])
+    return _deck_value_or(read, 0.0)
+
+
+def _deck_value_or(read, fallback: float = 0.0) -> float:
+    """The measured number a layout needs, or the fallback that shows nothing."""
+    return fallback if _deck_is_absent(read) else float(read["value"])
+
+
+def _deck_account_balance(live_bal_val) -> dict:
+    """The equity the utilization gauge divides by.
+
+    `live_bal_val` is None until the balance syncs; the pre-fix gauge substituted 0.0 and printed a
+    0.0% utilization in the all-clear green for an account it cannot see.
+    """
+    value = _optional_float(live_bal_val)
+    if value is None or value <= 0.0:
+        return _deck_absence("no account balance synced")
+    return _deck_reading(value)
+
+
+def _deck_margin_gauge(margin_locked: dict, balance: dict, limit: dict) -> dict:
+    """Utilization, bar width and free buffer as readings: absent if any input is absent.
+
+    A ratio whose numerator came from an assumed leverage is not a utilization, and a buffer
+    subtracted from a balance that was never read is not a buffer.
+    """
+    for read, name in ((margin_locked, "margin total"), (balance, "account balance"),
+                       (limit, "margin limit")):
+        if _deck_is_absent(read):
+            return {"utilization": _deck_absence(f"no utilization without a measured {name}"),
+                    "bar_width": _deck_absence(f"no gauge without a measured {name}"),
+                    "buffer": _deck_absence(f"no buffer without a measured {name}")}
+    util = margin_locked["value"] / balance["value"] * 100.0
+    return {
+        "utilization": _deck_reading(util),
+        "bar_width": _deck_reading(min(100.0, (util / limit["value"]) * 100.0)),
+        "buffer": _deck_reading(max(0.0, balance["value"] - margin_locked["value"])),
+    }
+
+
+def _deck_margin_rung(util: dict) -> dict:
+    """Colour and status words for one utilization figure — grey and no verdict for an absence."""
+    if _deck_is_absent(util):
+        return {"color": _DECK_ABSENT_COLOR, "status": "NOT MEASURED"}
+    value = util["value"]
+    if value < 45.0:
+        return {"color": "#00ff66", "status": "SAFE BUFFER"}
+    if value < 65.0:
+        return {"color": "#ff9900", "status": "ELEVATED EXPOSURE"}
+    return {"color": "#ff003c", "status": "CRITICAL / NEARING CEILING"}
 
 
 def _position_hard_sl(row) -> dict:
@@ -564,6 +621,189 @@ def _position_hard_sl(row) -> dict:
     return _deck_reading(value)
 
 
+def _position_leverage(row) -> dict:
+    """The leverage the row records, or an absence — never the 10x/5x the panel assumed.
+
+    `leverage` is a real measured column: `reconciliation_engine.py:830` writes the exchange's own
+    value, `super_bot.py:1282-1289` writes `self.grid_leverage` (config.GRID_LEVERAGE) and
+    `swing_trader.py:2116-2118` writes `pos_record["leverage"]`. The deck's default
+    (`10.0 if "BTC" else 5.0`) applied wherever the column was NULL or missing, which is a live
+    path — no INSERT exists anywhere for `berserker_open_positions`, `marl_live_open_positions` or
+    `mean_reversion_open_positions` — and 10x is double the highest leverage the repo's own config
+    defaults at (`config.py:142` 5, `config.py:269-274` 5; `.env` may raise either), so it halved
+    the margin it printed.
+
+    A 0 or negative leverage is an absence too: it is not a leverage the exchange can open a
+    position at, and dividing margin by it is undefined. The `or` this replaces treated a measured
+    0.0 exactly like a missing value and printed the assumed 10x for it.
+    """
+    value = _optional_float(row.get("leverage") if hasattr(row, "get") else None)
+    if value is None:
+        return _deck_absence("no leverage recorded for this position")
+    if value <= 0.0:
+        return _deck_absence("recorded leverage is not a margin denominator")
+    return _deck_reading(value)
+
+
+def _position_margin(qty: dict, entry_p: dict, lev: dict) -> dict:
+    """Notional divided by the recorded leverage. Absent if any input is absent (C-2).
+
+    The pre-fix `if lev > 0 else (qty * entry_p)` published the full notional as the margin for a
+    row with no leverage — an implied 1x nobody measured.
+    """
+    for read, name in ((qty, "size"), (entry_p, "entry price"), (lev, "leverage")):
+        if _deck_is_absent(read):
+            return _deck_absence(f"no margin without a measured {name}")
+    return _deck_reading((qty["value"] * entry_p["value"]) / lev["value"])
+
+
+def _position_liquidation(entry_p: dict, lev: dict, side: str) -> dict:
+    """The panel's OWN liquidation estimate, and an absence unless both inputs were read.
+
+    `calculate_estimated_liquidation`'s `mmr` is a hardcoded 0.5% maintenance margin: nothing in
+    `system_state`, no column and no producer supplies one (the only MMR ever written anywhere was
+    0.004 at archive/experimental_traders/basis_trader.py:279, in dead code). So even a liquidation
+    price built from a measured leverage is a model figure, not a reading, and is labelled as the
+    panel's own everywhere it appears. With an absent leverage the deck prints nothing at all: a
+    liquidation price derived from an assumed leverage is not a risk number an operator can act on.
+    """
+    if _deck_is_absent(entry_p):
+        return _deck_absence("no liquidation estimate without a measured entry price")
+    if _deck_is_absent(lev):
+        return _deck_absence("no liquidation estimate without a measured leverage")
+    price = calculate_estimated_liquidation(entry_p["value"], lev["value"], side,
+                                            mmr=_PANEL_LIQ_MODEL_MMR)
+    if price <= 0.0:
+        return _deck_absence("the panel's liquidation model produced no price")
+    return _deck_reading(price)
+
+
+def _position_roi(pnl: dict, base: dict) -> dict:
+    """Return on the locked margin. An absent input used to print a measured-looking 0.00%.
+
+    The pre-fix `(pnl / margin * 100.0) if margin > 0 else 0.0` fell into its 0.0 branch for
+    exactly the rows whose margin was invented, so the deck reported a flat return on a position
+    it could not size. C-2 supplies the absent `base`; C-3 supplies the absent `pnl`.
+    """
+    for read, name in ((pnl, "PnL"), (base, "locked margin")):
+        if _deck_is_absent(read):
+            return _deck_absence(f"no return on an unmeasured {name}")
+    if base["value"] <= 0.0:
+        return _deck_absence("no return on a margin that is not a denominator")
+    return _deck_reading(pnl["value"] / base["value"] * 100.0)
+
+
+def _position_liq_buffer(curr_p: dict, est_liq: dict, side: str) -> dict:
+    """Distance to the panel's liquidation model, or an absence saying which input is missing.
+
+    `calculate_liq_distance_pct` returns 0.0 for an unmeasured price, which the deck printed as
+    "+0.0% safety" beside a liquidation price it had invented off an assumed leverage.
+    """
+    for read, name in ((curr_p, "live price"), (est_liq, "liquidation estimate")):
+        if _deck_is_absent(read):
+            return _deck_absence(f"no safety buffer without a measured {name}")
+    distance = calculate_liq_distance_pct(curr_p["value"], est_liq["value"], side)
+    if distance <= 0.0:
+        return _deck_absence("the panel's liquidation model gives no safety distance")
+    return _deck_reading(distance)
+
+
+def _position_mark(live_prices, symbol: str, clean_symbol: str = "") -> dict:
+    """The feed's own quote for this position, or an absence — never the entry price wearing it.
+
+    `fetch_live_market_prices` swallows both of its failures, so a symbol can be absent from the
+    dict entirely (a missing key is information, contract item 8). The deck filled that gap with
+    the entry price, which made every unmeasured position print a flat mark under "Mark" and
+    under the column "Live Price" — authority labels for a source the panel did not read.
+    """
+    table = live_prices if isinstance(live_prices, dict) else {}
+    raw = str(symbol)
+    base = raw.split(":")[0]
+    keys = []
+    for candidate in (clean_symbol, base.upper().replace("/", "").replace("-", ""), raw, base):
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    for key in keys:
+        if key in table:
+            value = _optional_float(table.get(key))
+            if value is None:
+                return _deck_absence(f"the price feed's quote for {key} is not a number")
+            if value <= 0.0:
+                return _deck_absence(f"the price feed's quote for {key} is not a price")
+            return _deck_reading(value)
+    return _deck_absence("no live price for this symbol in the current fetch")
+
+
+def _position_unrealized_pnl(curr_p: dict, entry_p: dict, qty: dict, side: str) -> dict:
+    """Mark-to-market PnL: publishable only when the mark, the entry and the size were all read.
+
+    The pre-fix arithmetic produced exactly 0.0 whenever the feed had no quote, because the
+    stand-in mark WAS the entry price — and the deck then coloured that flat number green.
+    """
+    for read, name in ((curr_p, "live price"), (entry_p, "entry price"), (qty, "size")):
+        if _deck_is_absent(read):
+            return _deck_absence(f"no unrealized PnL without a measured {name}")
+    delta = (curr_p["value"] - entry_p["value"] if side == "long"
+             else entry_p["value"] - curr_p["value"])
+    return _deck_reading(delta * qty["value"])
+
+
+def _deck_pnl_color(read) -> str:
+    """Green or red only for a measured PnL; grey for an absence, which is never an all-clear."""
+    if _deck_is_absent(read):
+        return _DECK_ABSENT_COLOR
+    return "#00ff66" if read["value"] >= 0 else "#ff003c"
+
+
+def _deck_signed_money(read, digits: int = 4) -> str:
+    """`+$1.2345` for a measured figure and the house absence for one that was never taken."""
+    if _deck_is_absent(read):
+        return _DECK_ABSENT_TEXT
+    value = read["value"]
+    return f"{'+' if value >= 0 else '-'}${abs(value):,.{digits}f}"
+
+
+def _position_level_distance(curr_p: dict, level: dict, side: str, kind: str) -> dict:
+    """Percent from the live price to a TP/SL level, absent when either input is.
+
+    These read 0.00% for a position with no quote, because the price they divided by was the
+    entry price the panel had substituted.
+    """
+    for read, name in ((curr_p, "live price"), (level, f"{kind} level")):
+        if _deck_is_absent(read):
+            return _deck_absence(f"no distance to {kind} without a measured {name}")
+    if curr_p["value"] <= 0.0:
+        return _deck_absence("no distance on a live price that is not a denominator")
+    price = curr_p["value"]
+    target = level["value"]
+    if kind == "tp":
+        gap = target - price if side == "long" else price - target
+    else:
+        gap = price - target if side == "long" else target - price
+    return _deck_reading(gap / price * 100.0)
+
+
+def _position_target_label(dist: dict, side: str, kind: str) -> str:
+    """The card's target wording, or an absence naming its own field."""
+    if _deck_is_absent(dist):
+        return f"{_DECK_ABSENT_TEXT} ({kind})"
+    value = dist["value"]
+    if kind == "tp":
+        return f"{value:+.2f}% to TP" if side == "long" else f"-{value:.2f}% to TP"
+    return f"{value:.2f}% above SL" if side == "long" else f"{value:.2f}% below SL"
+
+
+def _deck_sum(*reads: dict) -> dict:
+    """A published sum is a measurement only when every addend is one, and says which is not."""
+    values = []
+    for read in reads:
+        if _deck_is_absent(read):
+            reason = read.get("reason", "") if isinstance(read, dict) else ""
+            return _deck_absence(f"no total — {reason}" if reason else "no measured addend to total")
+        values.append(float(read["value"]))
+    return _deck_reading(sum(values)) if values else _deck_absence("nothing to total")
+
+
 def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
     """Every figure the deck publishes for one open position row, measured or absent.
 
@@ -572,12 +812,77 @@ def _position_deck_readings(row, live_prices=None, funding_map=None) -> dict:
     """
     symbol = str(row["symbol"]) if hasattr(row, "__getitem__") else str(row.get("symbol", ""))
     clean_symbol = symbol.upper().replace("/", "").replace("-", "")
+    side = str(row.get("side") or "long").lower()
+
+    def _column(key: str) -> dict:
+        value = _optional_float(row.get(key) if hasattr(row, "get") else None)
+        return _deck_absence(f"no {key} recorded for this position") if value is None \
+            else _deck_reading(value)
+
+    qty = _column("qty")
+    entry_p = _column("entry_price")
+    lev = _position_leverage(row)
+    margin = _position_margin(qty, entry_p, lev)
+    hard_sl = _position_hard_sl(row)
+    est_liq = _position_liquidation(entry_p, lev, side)
+    mark = _position_mark(live_prices, symbol, clean_symbol)
+    tp = _column("take_profit")
+    sl = _column("stop_loss")
+    unr_pnl = _position_unrealized_pnl(mark, entry_p, qty, side)
     return {
         "symbol": symbol,
         "clean_symbol": clean_symbol,
-        "side": str(row.get("side") or "long").lower(),
-        "hard_sl": _position_hard_sl(row),
+        "side": side,
+        "qty": qty,
+        "entry_price": entry_p,
+        "stop_loss": sl,
+        "take_profit": tp,
+        "leverage": lev,
+        "margin": margin,
+        "hard_sl": hard_sl,
+        "est_liq": est_liq,
+        "mark": mark,
+        "unr_pnl": unr_pnl,
+        "unr_roi": _position_roi(unr_pnl, margin),
+        "dist_liq": _position_liq_buffer(mark, est_liq, side),
+        "dist_tp": _position_level_distance(mark, tp, side, "tp"),
+        "dist_sl": _position_level_distance(mark, sl, side, "sl"),
     }
+
+
+def _fleet_position_rollup(positions) -> dict:
+    """The deck's portfolio totals, each one a measurement only when every addend was one.
+
+    `total_margin_locked` fed the utilization gauge, and an absent leverage made the addend a
+    guess — at 10x, half of the margin the gauge then reported. `total_unrealized_pnl` fed the
+    strip and the green-at-zero rule, and its addends were marks the deck had substituted from the
+    entry price. Summing only the measured rows would fix neither: a partial sum published as a
+    total is the same claim with a smaller number behind it, so each total says what is missing
+    and how many rows are missing it.
+    """
+    counts = len(positions)
+    rollup = {"count": counts}
+    for key, total_key, noun in (("margin", "margin_locked", "margin"),
+                                 ("unr_pnl", "unrealized_pnl", "mark PnL")):
+        missing = [p for p in positions if _deck_is_absent(p.get(key))]
+        if not positions:
+            rollup[total_key] = _deck_absence(f"no open positions to total {noun}")
+            rollup[f"{key}_unmeasured"] = 0
+        elif missing:
+            rollup[total_key] = _deck_absence(
+                f"{len(missing)} of {counts} positions report no {noun}")
+            rollup[f"{key}_unmeasured"] = len(missing)
+        else:
+            rollup[total_key] = _deck_reading(
+                sum(p[key]["value"] for p in positions))
+            rollup[f"{key}_unmeasured"] = 0
+    return rollup
+
+
+def _deck_label(read, name: str, fmt: str = "{:,.4f}") -> str:
+    """`5x`, or `leverage not measured`: an absence names its own field so the card stays readable."""
+    return _deck_text(read, fmt) if not _deck_is_absent(read) else f"{name} {_DECK_ABSENT_TEXT}"
+
 
 def get_local_ip() -> str:
     """Detects local LAN IP for Wi-Fi mobile browsing."""
@@ -907,50 +1212,37 @@ else:
 
 # Clean distinct active coins
 active_coins_set = set()
-total_margin_locked = 0.0
-total_unrealized_pnl = 0.0
 live_prices = fetch_live_market_prices()
 
+_deck_positions = [_position_deck_readings(row, live_prices) for _, row in df_open.iterrows()]
+_deck_totals = _fleet_position_rollup(_deck_positions)
+total_margin_locked = _deck_totals["margin_locked"]
+total_unrealized_pnl = _deck_totals["unrealized_pnl"]
+
 if not df_open.empty:
-    for _, row in df_open.iterrows():
-        s = str(row['symbol']).upper().replace("/", "").replace("-", "")
-        active_coins_set.add(s)
-        qty = float(row.get('qty') or 0.0)
-        ep = float(row.get('entry_price') or 0.0)
-        lev = float(row.get('leverage') or (10.0 if "BTC" in s else 5.0))
-        curr_p = float(live_prices.get(s, ep) or ep)
-        side = str(row.get('side') or 'long').lower()
-        
-        pos_margin = (qty * ep) / lev if lev > 0 else (qty * ep)
-        total_margin_locked += pos_margin
-        pos_unr = (curr_p - ep) * qty if side == 'long' else (ep - curr_p) * qty
-        total_unrealized_pnl += pos_unr
+    for p in _deck_positions:
+        active_coins_set.add(p["clean_symbol"])
 
 max_coin_slots = int(query_system_state("GLOBAL_MAX_POSITIONS", "5"))
 margin_limit_pct = float(query_system_state("GLOBAL_MARGIN_LIMIT", "70.0"))
 bal_for_calc = live_bal_val if live_bal_val is not None else 0.0
-free_cash_buffer = max(0.0, bal_for_calc - total_margin_locked)
-
-# Margin utilization calculation
-margin_util_pct = (total_margin_locked / bal_for_calc * 100.0) if bal_for_calc > 0 else 0.0
-margin_bar_width = min(100.0, (margin_util_pct / margin_limit_pct) * 100.0)
 # The buffer and the utilisation are ratios against the account balance. With no balance there is
-# no denominator, so they are absences rather than zeroes.
-margin_measured = live_bal_val is not None and live_bal_val > 0
-if not margin_measured:
-    margin_color = "#64748b"
-    margin_status = "UNKNOWN (no account balance)"
-elif margin_util_pct < 45.0:
-    margin_color = "#00ff66"
-    margin_status = "SAFE BUFFER"
-elif margin_util_pct < 65.0:
-    margin_color = "#ff9900"
-    margin_status = "ELEVATED EXPOSURE"
-else:
-    margin_color = "#ff003c"
-    margin_status = "CRITICAL / NEARING CEILING"
-margin_util_display = f"{margin_util_pct:.1f}%" if margin_measured else "n/a (no account balance)"
-free_cash_display = f"${free_cash_buffer:.2f} USDT" if margin_measured else "n/a (no account balance)"
+# no denominator, so they are absences rather than zeroes — and with no measured margin total
+# either, which is what an assumed leverage used to leave behind.
+_deck_balance = _deck_account_balance(live_bal_val)
+margin_measured = not _deck_is_absent(_deck_balance)
+_margin_gauge = _deck_margin_gauge(total_margin_locked,
+                                  _deck_balance,
+                                  _deck_reading(margin_limit_pct))
+margin_util_pct = _margin_gauge["utilization"]
+margin_bar_width = _margin_gauge["bar_width"]
+free_cash_buffer = _margin_gauge["buffer"]
+_margin_rung = _deck_margin_rung(margin_util_pct)
+margin_color = _margin_rung["color"]
+margin_status = _margin_rung["status"]
+margin_util_display = _deck_text(margin_util_pct, "{:.1f}%")
+margin_locked_display = _deck_text(total_margin_locked, "${:,.2f}")
+free_cash_display = _deck_text(free_cash_buffer, "${:,.2f} USDT")
 
 # ── Hero KPI Cards Grid ──────────────────────────────────────────────────────
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -984,9 +1276,12 @@ with kpi3:
 with kpi4:
     st.metric(
         label="⚡ Live Unrealized PnL",
-        value=f"{'+$' if total_unrealized_pnl>=0 else '-$'}{abs(total_unrealized_pnl):.2f} USDT",
-        delta=(f"${free_cash_buffer:.2f} Free Liquid Cash" if margin_measured
-               else "Free Liquid Cash not measured (no account balance)")
+        value=f"{_deck_signed_money(total_unrealized_pnl, 2)} USDT",
+        # An absent buffer is still an absence with a balance present: a margin total the deck
+        # could not measure leaves nothing to subtract.
+        delta=(f"{_deck_text(free_cash_buffer, '${:,.2f}')} Free Liquid Cash"
+               if not _deck_is_absent(free_cash_buffer) else
+               f"Free Liquid Cash {_DECK_ABSENT_TEXT} ({free_cash_buffer.get('reason', '')})")
     )
 
 # P0: Global Margin Utilization Visual Progress Bar
@@ -994,14 +1289,14 @@ st.markdown(f"""
 <div style="background: #0d121f; border: 1px solid #1e293b; border-radius: 6px; padding: 12px 18px; margin-top: 10px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
     <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; margin-bottom: 8px; flex-wrap: wrap; gap: 6px;">
         <span style="font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em;">
-            🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_display}</b> of {margin_limit_pct:.0f}% Hard Ceiling ({margin_status})
+            🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_display}</b>{_deck_note(margin_util_pct)} of {margin_limit_pct:.0f}% Hard Ceiling ({margin_status})
         </span>
         <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #e2e8f0;">
-            Margin Locked: <b style="color: {margin_color};">${total_margin_locked:.2f}</b> | Liquid Buffer: <b style="color: #00e5ff;">{free_cash_display}</b>
+            Margin Locked: <b style="color: {margin_color};">{margin_locked_display}</b>{_deck_note(total_margin_locked)} | Liquid Buffer: <b style="color: {_deck_color(free_cash_buffer, "#00e5ff")};">{free_cash_display}</b>{_deck_note(free_cash_buffer)}
         </span>
     </div>
     <div style="width: 100%; background: #1e293b; height: 10px; border-radius: 5px; overflow: hidden; position: relative;">
-        <div style="width: {margin_bar_width:.1f}%; background: {margin_color}; height: 100%; border-radius: 5px; transition: width 0.4s ease-in-out;"></div>
+        <div style="width: {_deck_value_or(margin_bar_width):.1f}%; background: {margin_color}; height: 100%; border-radius: 5px; transition: width 0.4s ease-in-out;"></div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1027,46 +1322,43 @@ with tab_live:
         display_pos = []
         
         for idx, row in df_open.iterrows():
-            sym = str(row['symbol'])
-            sym_clean = sym.upper().replace("/", "").replace("-", "")
-            side = str(row.get('side') or 'long').lower()
+            p_read = _position_deck_readings(row, live_prices)
+            sym = p_read["symbol"]
+            sym_clean = p_read["clean_symbol"]
+            side = p_read["side"]
             qty = float(row.get('qty') or 0.0)
             entry_p = float(row.get('entry_price') or 0.0)
             sl = float(row.get('stop_loss') or 0.0)
             tp = float(row.get('take_profit') or 0.0)
-            hard_sl = _position_hard_sl(row)
-            lev = float(row.get('leverage') or (10.0 if "BTC" in sym_clean else 5.0))
-            margin = (qty * entry_p) / lev if lev > 0 else (qty * entry_p)
-            curr_p = float(live_prices.get(sym_clean, entry_p) or entry_p)
+            hard_sl = p_read["hard_sl"]
+            lev = p_read["leverage"]
+            margin = p_read["margin"]
+            curr_p = p_read["mark"]
             entry_time_raw = row.get('entry_time')
             pos_age = compute_position_age(entry_time_raw)
             sl_breach_raw = row.get('sl_breach_time')
             has_flash_breach = bool(sl_breach_raw and str(sl_breach_raw).strip() not in ("", "None", "0", "N/A"))
 
-            # Liquidation estimation
-            est_liq = calculate_estimated_liquidation(entry_p, lev, side)
-            dist_liq_pct = calculate_liq_distance_pct(curr_p, est_liq, side)
+            # Liquidation estimation (panel's own model; see _position_liquidation)
+            est_liq = p_read["est_liq"]
+            dist_liq_pct = p_read["dist_liq"]
 
             # Unrealized PnL & ROI
-            unr_pnl = (curr_p - entry_p) * qty if side == 'long' else (entry_p - curr_p) * qty
-            unr_roi = (unr_pnl / margin * 100.0) if margin > 0 else 0.0
+            unr_pnl = p_read["unr_pnl"]
+            unr_roi = p_read["unr_roi"]
             
             # Target Distances
             if side == "long":
-                dist_tp_pct = ((tp - curr_p) / curr_p * 100.0) if tp > 0 else 0.0
-                dist_sl_pct = ((curr_p - sl) / curr_p * 100.0) if sl > 0 else 0.0
-                tp_str = f"+{dist_tp_pct:.2f}% to TP" if tp > 0 else "Active Trail"
-                sl_str = f"{dist_sl_pct:.2f}% above SL" if sl > 0 else "Active Trail"
                 is_risk_free = (sl >= entry_p)
             else:
-                dist_tp_pct = ((curr_p - tp) / curr_p * 100.0) if tp > 0 else 0.0
-                dist_sl_pct = ((sl - curr_p) / curr_p * 100.0) if sl > 0 else 0.0
-                tp_str = f"-{dist_tp_pct:.2f}% to TP" if tp > 0 else "Active Trail"
-                sl_str = f"{dist_sl_pct:.2f}% below SL" if sl > 0 else "Active Trail"
                 is_risk_free = (sl <= entry_p and sl > 0)
+            tp_str = (_position_target_label(p_read["dist_tp"], side, "tp")
+                      if tp > 0 else "Active Trail")
+            sl_str = (_position_target_label(p_read["dist_sl"], side, "sl")
+                      if sl > 0 else "Active Trail")
 
             with pos_cols[idx % len(pos_cols)]:
-                pnl_color = "#00ff66" if unr_pnl >= 0 else "#ff003c"
+                pnl_color = _deck_pnl_color(unr_pnl)
                 risk_free_badge = "<span style='background: rgba(0,255,102,0.15); color: #00ff66; border: 1px solid #00ff66; font-size: 0.68rem; padding: 1px 5px; border-radius: 3px; font-weight: bold;'>🛡️ RISK-FREE</span>" if is_risk_free else ""
                 flash_timer_badge = "<div style='margin-top: 4px; background: rgba(255,0,60,0.2); border: 1px solid #ff003c; border-radius: 4px; padding: 2px 6px; font-size: 0.72rem; color: #ff003c; font-weight: bold;'>⚠️ FLASH CRASH TIMER RUNNING</div>" if has_flash_breach else ""
 
@@ -1074,18 +1366,18 @@ with tab_live:
                     f'<div class="pos-card" style="border-left: 3px solid {pnl_color};">'
                     f'<div style="display: flex; justify-content: space-between; align-items: center;">'
                     f'<div><b style="font-size: 1.1rem; color: #ffffff;">{sym}</b> {risk_free_badge}</div>'
-                    f'<span class="{"badge-green" if side=="long" else "badge-red"}">{side.upper()} {lev:.0f}x</span>'
+                    f'<span class="{"badge-green" if side=="long" else "badge-red"}">{side.upper()} {_deck_label(lev, "leverage", "{:.0f}x")}</span>'
                     f'</div>'
                     f'<div style="margin: 8px 0; font-family: monospace; font-size: 1.25rem; font-weight: bold; color: {pnl_color};">'
-                    f'{"+$" if unr_pnl>=0 else "-$"}{abs(unr_pnl):.4f} ({unr_roi:+.2f}%)'
+                    f'{_deck_signed_money(unr_pnl)} ({_deck_text(unr_roi, "{:+.2f}%")}{_deck_note(unr_roi)})'
                     f'</div>'
                     f'<div style="font-size: 0.78rem; color: #94a3b8; line-height: 1.45;">'
-                    f'Entry: <b>${entry_p:,.4f}</b> | Mark: <b style="color: #00e5ff;">${curr_p:,.4f}</b><br>'
-                    f'⏱️ Age: <b style="color: #e2e8f0;">{pos_age}</b> | Locked: <b style="color: #e2e8f0;">${margin:.2f}</b><br>'
+                    f'Entry: <b>${entry_p:,.4f}</b> | Mark: <b style="color: {_deck_color(curr_p, "#00e5ff")};">{_deck_text(curr_p, "${:,.4f}")}</b>{_deck_note(curr_p)}<br>'
+                    f'⏱️ Age: <b style="color: #e2e8f0;">{pos_age}</b> | Locked: <b style="color: {_deck_color(margin, "#e2e8f0")};">{_deck_text(margin, "${:,.2f}")}</b>{_deck_note(margin)}<br>'
                     f'🎯 Target: <b style="color: #00ff66;">{tp_str} (${tp:,.4f})</b><br>'
                     f'🛡️ Soft SL: <b style="color: #ff9900;">${sl:,.4f} ({sl_str})</b><br>'
                     f'🧱 Hard SL: <b style="color: #94a3b8;">{_deck_text(hard_sl, "${:,.4f}")}</b>{_deck_note(hard_sl)}<br>'
-                    f'☠️ Est. Liq: <b style="color: #ff003c;">${est_liq:,.4f} (+{dist_liq_pct:.1f}% safety)</b>'
+                    f'☠️ Est. Liq (panel model, {_PANEL_LIQ_MODEL_MMR*100:.1f}% assumed MMR): <b style="color: {_deck_color(est_liq, "#ff003c")};">{_deck_text(est_liq, "${:,.4f}")}</b>{_deck_note(est_liq)} | Safety buffer: <b style="color: {_deck_color(dist_liq_pct, "#ff003c")};">{_deck_text(dist_liq_pct, "+{:.1f}%")}</b>{_deck_note(dist_liq_pct)}'
                     f'{flash_timer_badge}'
                     f'</div>'
                     f'</div>'
@@ -1095,18 +1387,18 @@ with tab_live:
             display_pos.append({
                 "Asset": sym,
                 "Side": side.upper(),
-                "Leverage": f"{lev:.0f}x",
+                "Leverage": _deck_label(lev, "leverage", "{:.0f}x"),
                 "Size": f"{qty:.4f}",
                 "Entry Price": f"${entry_p:,.4f}",
-                "Live Price": f"${curr_p:,.4f}",
-                "Unrealized PnL": f"{'+$' if unr_pnl>=0 else '-$'}{abs(unr_pnl):.4f}",
-                "ROI (%)": f"{unr_roi:+.2f}%",
+                "Live Price": _deck_text(curr_p, "${:,.4f}"),
+                "Unrealized PnL": _deck_signed_money(unr_pnl),
+                "ROI (%)": _deck_text(unr_roi, "{:+.2f}%"),
                 "Soft SL": f"${sl:,.4f}",
                 "Hard SL (recorded)": _deck_text(hard_sl, "${:,.4f}"),
-                "Est. Liq Price": f"${est_liq:,.4f}",
-                "Liq Safety Buffer": f"+{dist_liq_pct:.1f}%",
+                "Est. Liq Price (panel model)": _deck_text(est_liq, "${:,.4f}"),
+                "Liq Safety Buffer (panel model)": _deck_text(dist_liq_pct, "+{:.1f}%"),
                 "Age": pos_age,
-                "Margin Locked": f"${margin:.2f}",
+                "Margin Locked": _deck_text(margin, "${:,.2f}"),
                 "Status": "🟢 RISK-FREE" if is_risk_free else "🟢 LIVE EXECUTED"
             })
             

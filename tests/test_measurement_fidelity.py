@@ -1928,10 +1928,17 @@ def test_the_legacy_margin_block_publishes_no_ratio_without_a_balance():
     """Margin utilisation and the liquid buffer are ratios against the balance: no balance, no
     ratio."""
     src = LEGACY_DASHBOARD.read_text(encoding="utf-8")
-    assert "margin_measured = live_bal_val is not None and live_bal_val > 0" in src
-    assert 'margin_util_display = f"{margin_util_pct:.1f}%" if margin_measured else ' \
-           '"n/a (no account balance)"' in src
-    assert "n/a (no account balance)" in src
+    # G-5c moved this gate into the twin helper `_deck_account_balance` (an unreadable or zero
+    # balance is an absence) and routed the ratio itself through `_deck_margin_gauge`, so a margin
+    # total built on an assumed leverage is now a second way for the gauge to say nothing. The
+    # requirement is unchanged -- no ratio without a balance -- and `margin_measured` survives as
+    # the balance half of it.
+    assert "_deck_balance = _deck_account_balance(live_bal_val)" in src
+    assert "margin_measured = not _deck_is_absent(_deck_balance)" in src
+    assert "_deck_margin_gauge(total_margin_locked" in src
+    assert 'margin_util_display = _deck_text(margin_util_pct, "{:.1f}%")' in src
+    assert '"n/a (no account balance)"' not in src, (
+        "the gauge went back to its own absence sentence instead of the house one")
 
 
 def test_the_legacy_holding_time_cards_publish_no_demo_durations():
@@ -3189,6 +3196,14 @@ _G4_BLOCKS = {
                        (r'\n[ \t]*st\.markdown\(".*Detailed Active Position',)),
     "position_chart": (r"^[ \t]*# Build dynamic tabs: one tab for each coin currently open",
                        (r"\n[ \t]*# .*1\.3 Continuous AI In-Flight",)),
+    # G-5c C-2/C-3: the hero KPI grid and the funding banner sit OUTSIDE those three loops and
+    # publish the deck's own roll-ups, so a scan limited to the loops cannot reach them. Additive:
+    # the three entries above keep naming exactly the regions they named before.
+    "position_hero": (r"^# Clean distinct active coins",
+                      (r"\n# P0: Global Margin Utilization Visual Progress Bar",)),
+    # The legacy twin has no funding banner at all, so this one resolves for dashboard.py only.
+    "position_strip": (r"^[ \t]*# Fleet Accrued Funding Summary Banner",
+                       (r"\n[ \t]*# Render visual metric cards",)),
 }
 
 _G4_DASHBOARD_BLOCKS = ("macro", "ofi", "micro", "radar", "fleet")
@@ -7227,7 +7242,7 @@ def test_g5c_the_hard_sl_the_card_prints_is_the_reading_and_nothing_else():
     assert '_deck_text(hard_sl, "${:,.4f}")' in cards
     assert "_deck_note(hard_sl)" in cards
     legacy_cards = _g5c_block("cards", LEGACY_DASHBOARD)
-    assert "hard_sl = _position_hard_sl(row)" in legacy_cards
+    assert "hard_sl = p_read[\"hard_sl\"]" in legacy_cards
     assert '_deck_text(hard_sl, "${:,.4f}")' in legacy_cards
 
 
@@ -7256,3 +7271,457 @@ def test_g5c_the_twin_helpers_are_byte_identical_and_read_the_same_row():
     legacy_read = _g4_helper("_position_hard_sl", LEGACY_DASHBOARD)(row)
     assert dashboard_read == legacy_read == {
         "value": None, "measured": False, "reason": "no hard SL recorded for this position"}
+
+
+# ── C-2: an assumed 10x/5x leverage became margin, liquidation, "% safety", ROI and the gauge ──
+
+# Banned text plus one line that genuinely contains it, so the prose-immunity half below is a
+# second proof rather than a restatement of the first.
+_G5C_LEVERAGE_STAND_IN_CASES = (
+    ('10.0 if "BTC"', 'lev = num(row.get("leverage"), 10.0 if "BTC" in s else 5.0)'),
+    ('or (10.0 if "BTC"', 'lev = float(row.get("leverage") or (10.0 if "BTC" in s else 5.0))'),
+    ('if lev > 0 else', 'margin = (qty * entry_p) / lev if lev > 0 else (qty * entry_p)'),
+    ('margin > 0 else 0.0', 'unr_roi = (unr_pnl / margin * 100.0) if margin > 0 else 0.0'),
+)
+
+_G5C_C2_HELPERS = ("_position_leverage", "_position_margin", "_position_liquidation",
+                   "_position_roi", "_position_liq_buffer", "_position_deck_readings",
+                   "_fleet_position_rollup", "_deck_label", "_deck_value_or",
+                   "_deck_account_balance", "_deck_margin_gauge", "_deck_margin_rung")
+
+# ── C-3: an absent live price rendered flat-and-green with the entry price under "Mark" ────────
+
+_G5C_MARK_STAND_IN_CASES = (
+    ('live_prices.get(s, ep)', 'curr_p = num(live_prices.get(s, ep), ep)'),
+    ('or entry_p)', 'curr_p = num(live_prices.get(sym_clean, entry_p) or entry_p)'),
+    ('or s_entry)', 's_curr = num(live_prices.get(s_clean, s_entry) or s_entry)'),
+    ('float(live_prices.get(', 'curr_p = float(live_prices.get(sym_clean, entry_p) or entry_p)'),
+    ('"#00ff66" if unr_pnl >= 0', 'pnl_color = "#00ff66" if unr_pnl >= 0 else "#ff003c"'),
+    ('"#00ff66" if p["unr_pnl"] >= 0', 'pnl_color = "#00ff66" if p["unr_pnl"] >= 0 else "#ff003c"'),
+    ("'#00ff66' if total_unrealized_pnl>=0", "colors = {'#00ff66' if total_unrealized_pnl>=0 else '#ff003c'}"),
+    ('"#00ff66" if true_portfolio_net >= 0',
+     'true_port_color = "#00ff66" if true_portfolio_net >= 0 else "#ff003c"'),
+)
+
+_G5C_C3_HELPERS = ("_position_mark", "_position_unrealized_pnl", "_deck_pnl_color",
+                   "_deck_signed_money", "_position_level_distance", "_position_target_label",
+                   "_deck_sum", "_position_roi", "_position_liq_buffer",
+                   "_position_deck_readings", "_fleet_position_rollup", "_deck_color",
+                   "_deck_text", "_deck_note")
+
+
+def _g5c_leverage_code(path=DASHBOARD):
+    """Deck blocks plus every helper that decides what a leverage-shaped figure prints (C-2)."""
+    return "\n".join([_g5c_deck_code(path)]
+                     + [_g5c_helper_code(name, path) for name in _G5C_C2_HELPERS])
+
+
+def _g5c_mark_code(path=DASHBOARD):
+    """The C-3 surface: the three loops, the hero KPI, the funding banner and the mark helpers."""
+    parts = [_g5c_deck_code(path), _g5c_block("hero", path)]
+    if path == DASHBOARD:
+        parts.append(_g5c_block("strip", path))
+    parts += [_g5c_helper_code(name, path) for name in _G5C_C3_HELPERS]
+    return "\n".join(parts)
+
+
+def _g5c_seeded_row(tmp_path, table="open_positions", **columns):
+    """One row off the C-6 testbed: the shipped schema, the shipped five SELECTs, the shipped concat."""
+    payload = {"table": table, "symbol": "BTCUSDT", "side": "long",
+               "entry_price": 100000.0, "hard_sl": None}
+    if table == "swing_open_positions":
+        payload["size"] = columns.pop("qty", 0.01)
+        payload.pop("hard_sl")
+    else:
+        payload["qty"] = 0.01
+    payload.update(columns)
+    db = _g5c_seed_position_db(tmp_path, [payload])
+    frame = _g5c_deck_frame(db)
+    assert len(frame) == 1, list(frame.columns)
+    return next(r for _, r in frame.iterrows())
+
+
+@pytest.mark.parametrize("stored", [None, 0.0, -3.0, "syncing...", float("nan")],
+                         ids=["null", "zero", "negative", "placeholder", "nan"])
+def test_g5c_no_absent_leverage_shape_becomes_a_number(tmp_path, stored):
+    """`leverage` IS a measured column for the tables the fleet writes; what the deck added was a
+    default for the NULL/missing shape. Every unreadable shape is now an absence, including the
+    measured 0.0 that the `or` used to overwrite with the assumed 10x."""
+    row = _g5c_seeded_row(tmp_path, leverage=stored)
+    read = _g4_helper("_position_leverage", DASHBOARD)(row)
+    assert read["measured"] is False, f"{stored!r} was published as a leverage: {read}"
+    assert read["value"] is None
+    label = _g4_helper("_deck_label", DASHBOARD)(read, "leverage", "{:.0f}x")
+    assert label == "leverage not measured", label
+    assert "10x" not in label and "5x" not in label, label
+
+
+def test_g5c_a_recorded_leverage_stays_a_reading_unchanged(tmp_path):
+    """The other half of C-2: a row that carries its leverage publishes exactly it, unsigned by any
+    assumption, with no absence note beside it."""
+    row = _g5c_seeded_row(tmp_path, leverage=3)
+    read = _g4_helper("_position_leverage", DASHBOARD)(row)
+    assert read == {"value": 3.0, "measured": True, "reason": ""}, read
+    assert _g4_helper("_deck_label", DASHBOARD)(read, "leverage", "{:.0f}x") == "3x"
+    assert _g4_helper("_deck_note", DASHBOARD)(read) == ""
+
+
+def test_g5c_a_row_with_no_leverage_column_at_all_is_an_absence():
+    """A table the deck reads but no writer fills can reach the frame without the key at all
+    (concat of differing column sets). That is the same absence, not a 5x."""
+    read = _g4_helper("_position_leverage", DASHBOARD)(
+        pd.Series({"symbol": "ETHUSDT", "side": "long", "entry_price": 4000.0}))
+    assert read == {"value": None, "measured": False,
+                    "reason": "no leverage recorded for this position"}, read
+
+
+def test_g5c_everything_that_divides_by_an_assumed_leverage_is_withheld(tmp_path):
+    """Per field, not bundled: margin, Est. Liq, the safety buffer and ROI each say which input
+    they could not read. The recorded prices stay readings."""
+    row = _g5c_seeded_row(tmp_path, leverage=None, stop_loss=97000.0, take_profit=110000.0)
+    reads = _g4_helper("_position_deck_readings", DASHBOARD)(row, {"BTCUSDT": 105000.0}, {})
+    # per field, each absence naming the input it could not read; the chain back to the leverage
+    # runs margin -> "no margin without a measured leverage" and est_liq -> the same.
+    for key, named in (("margin", "leverage"), ("est_liq", "leverage"),
+                       ("unr_roi", "locked margin"), ("dist_liq", "liquidation estimate")):
+        assert reads[key]["measured"] is False, (key, reads[key])
+        assert named in reads[key]["reason"], (key, reads[key]["reason"])
+    assert _g4_helper("_deck_text", DASHBOARD)(reads["margin"], "${:,.2f}") == "not measured"
+    assert _g4_helper("_deck_text", DASHBOARD)(reads["unr_roi"], "{:+.2f}%") == "not measured"
+    for key in ("entry_price", "qty", "mark", "unr_pnl", "stop_loss", "take_profit"):
+        assert reads[key]["measured"] is True, (key, reads[key])
+
+
+def _g5c_module_constant(name, path=DASHBOARD):
+    """One module-level constant's own value, read off the shipped file rather than retyped."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{path.name} has no module-level constant {name}")
+
+
+def test_g5c_a_measured_leverage_still_computes_the_whole_risk_line(tmp_path):
+    """C-2 must not over-withhold: with a recorded leverage the same row publishes the margin, the
+    panel's own liquidation model and the ROI built from it."""
+    row = _g5c_seeded_row(tmp_path, leverage=5)
+    reads = _g4_helper("_position_deck_readings", DASHBOARD)(row, {"BTCUSDT": 105000.0}, {})
+    assert reads["margin"]["value"] == pytest.approx(200.0), reads["margin"]
+    shipped_liq = _g4_helper("calculate_estimated_liquidation", DASHBOARD)(
+        100000.0, 5.0, "long",
+        mmr=_g5c_module_constant("_PANEL_LIQ_MODEL_MMR"))
+    assert reads["est_liq"]["value"] == pytest.approx(shipped_liq), reads["est_liq"]
+    assert reads["unr_pnl"]["value"] == pytest.approx(50.0), reads["unr_pnl"]
+    assert reads["unr_roi"]["value"] == pytest.approx(25.0), reads["unr_roi"]
+    buffer_ = _g4_helper("_position_liq_buffer", DASHBOARD)(
+        reads["mark"], reads["est_liq"], "long")
+    assert buffer_ == reads["dist_liq"], (buffer_, reads["dist_liq"])
+
+
+def test_g5c_the_gauge_never_counts_a_margin_it_did_not_measure(tmp_path):
+    """`total_margin_locked` feeds the utilization gauge, so one invented margin invalidates the
+    whole total — and the gauge says how many rows are missing rather than summing the rest."""
+    measured = _g4_helper("_position_deck_readings", DASHBOARD)(
+        _g5c_seeded_row(tmp_path, leverage=5), {"BTCUSDT": 105000.0}, {})
+    invented = _g4_helper("_position_deck_readings", DASHBOARD)(
+        pd.Series({"symbol": "ETHUSDT", "side": "long", "entry_price": 4000.0, "qty": 2.0}),
+        {}, {})
+    readings = [measured, invented]
+    rollup = _g4_helper("_fleet_position_rollup", DASHBOARD)(readings)
+    assert _deck_absent(rollup["margin_locked"]), rollup
+    assert rollup["margin_locked"]["reason"] == "1 of 2 positions report no margin", rollup
+    assert rollup["margin_unmeasured"] == 1
+    gauge = _g4_helper("_deck_margin_gauge", DASHBOARD)(
+        rollup["margin_locked"], _g4_helper("_deck_account_balance", DASHBOARD)(10000.0),
+        _g4_helper("_deck_reading", DASHBOARD)(70.0))
+    assert _deck_absent(gauge["utilization"]), gauge
+    rung = _g4_helper("_deck_margin_rung", DASHBOARD)(gauge["utilization"])
+    assert rung == {"color": "#94a3b8", "status": "NOT MEASURED"}, rung
+    assert rung["color"] != "#00ff66", "an absent total may not read as the all-clear"
+
+
+def _deck_absent(read):
+    return _g4_helper("_deck_is_absent", DASHBOARD)(read)
+
+
+def test_g5c_a_fully_measured_book_still_totals_its_margin(tmp_path):
+    """The sum survives when nothing is invented — the total is the two rows' own margins."""
+    reads = [_g4_helper("_position_deck_readings", DASHBOARD)(
+        _g5c_seeded_row(tmp_path, leverage=5), {"BTCUSDT": 105000.0}, {})]
+    reads.append(_g4_helper("_position_deck_readings", DASHBOARD)(
+        pd.Series({"symbol": "ETHUSDT", "side": "long", "entry_price": 4000.0, "qty": 2.0,
+                   "leverage": 4.0}), {"ETHUSDT": 4100.0}, {}))
+    rollup = _g4_helper("_fleet_position_rollup", DASHBOARD)(reads)
+    assert rollup["margin_locked"]["measured"] is True, rollup
+    assert rollup["margin_locked"]["value"] == pytest.approx(200.0 + 2000.0), rollup
+    assert rollup["margin_unmeasured"] == 0, rollup
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_LEVERAGE_STAND_IN_CASES)
+def test_g5c_no_assumed_leverage_survives_in_the_deck(banned, code_line):
+    """Neither the 10x/5x default, nor the implied-1x margin it fed, nor the ROI that printed 0.0
+    for an unmeasured margin — in either file, in the panels or in the helpers behind them."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        hits = _g5_banned_hits(_g5c_deck_code(path), [banned])
+        assert hits == [], f"{path.name}'s deck blocks still contain {banned!r}"
+        hits = _g5_banned_hits(_g5c_leverage_code(path), [banned])
+        assert hits == [], f"{path.name}'s leverage helpers still contain {banned!r}"
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_LEVERAGE_STAND_IN_CASES)
+def test_g5c_a_comment_neither_trips_nor_hides_a_leverage_scan(banned, code_line):
+    """Both halves of prose immunity on C-2's own tokens: prose about the deleted default passes —
+    `_position_leverage`'s docstring quotes it — and the same text really in code fails."""
+    prose = f"def f():\n    # the deck used to publish {banned} here\n    return 1\n"
+    assert _g5_banned_hits(prose, [banned]) == []
+    documented = f'def f():\n    """the deck used to publish {banned} here. """\n    return 1\n'
+    assert _g5_banned_hits(documented, [banned]) == []
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [banned]) == [banned], (
+        f"{banned!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [banned]) == [banned]
+
+
+def test_g5c_the_card_names_the_missing_leverage_and_the_panel_model_its_liq():
+    """What the operator sees: the badge and the table column carry the leverage label or its
+    absence, and the liquidation figures are named as the panel's own model with its assumed MMR."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        cards = _g5c_block("cards", path)
+        assert '_deck_label(lev, "leverage", "{:.0f}x")' in cards, path.name
+        assert '"Leverage": _deck_label(lev, "leverage", "{:.0f}x")' in cards, path.name
+        assert "assumed MMR" in cards, path.name
+        assert '"Est. Liq Price (panel model)"' in cards, path.name
+        assert '"Liq Safety Buffer (panel model)"' in cards, path.name
+        assert '"Est. Liq Price": f"${est_liq:,.4f}"' not in cards, path.name
+
+
+def test_g5c_the_chart_gets_no_liquidation_price_the_leverage_cannot_support():
+    """An absent leverage reaches the chart as 0.0 — its own 'draw nothing' encoding — at both
+    call sites, so the invented level never becomes an annotation."""
+    block = _g5c_block("chart", DASHBOARD)
+    assert block.count('est_liq=_deck_chart_level(p["est_liq"])') == 2, block.count(
+        'est_liq=_deck_chart_level(p["est_liq"])')
+
+
+def test_g5c_the_assumed_mmr_the_card_names_is_the_one_the_model_used():
+    """Shape (b) only holds if the number on screen is the number in the arithmetic: the model call
+    passes the same module constant the label prints, and both twins agree on it."""
+    mmr = _g5c_module_constant("_PANEL_LIQ_MODEL_MMR", DASHBOARD)
+    assert mmr == _g5c_module_constant("_PANEL_LIQ_MODEL_MMR", LEGACY_DASHBOARD), mmr
+    assert mmr > 0.0, mmr
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        assert "mmr=_PANEL_LIQ_MODEL_MMR" in _g5c_helper_code("_position_liquidation", path), path
+        assert "_PANEL_LIQ_MODEL_MMR*100:.1f}% assumed MMR" in _g5c_block("cards", path), path
+
+
+# ── C-3: no live price → no mark, no PnL, no ROI, no distances, never the green all-clear ──────
+
+def _g5c_live_price_row(tmp_path):
+    """A BTC row with everything recorded except the live price, which no row can record."""
+    db = _g5c_seed_position_db(tmp_path, [{
+        "table": "open_positions", "symbol": "BTCUSDT", "side": "long",
+        "entry_price": 100000.0, "qty": 0.01, "leverage": 5, "stop_loss": 97000.0,
+        "take_profit": 110000.0}])
+    return next(r for _, r in _g5c_deck_frame(db).iterrows())
+
+
+@pytest.mark.parametrize("feed", [
+    {},                                        # both fetches failed: the key is simply absent
+    {"BTCUSDT": 0.0},                          # a zero is not a price
+    {"BTCUSDT": -5.0},                         # a negative is not a price
+    {"BTCUSDT": None},                         # a null quote
+    {"BTCUSDT": "syncing..."},                 # placeholder text
+    {"BTCUSDT": float("nan")},                 # NaN
+], ids=["missing-key", "zero", "negative", "null", "placeholder", "nan"])
+def test_g5c_an_unreadable_live_price_is_never_the_entry_price_wearing_the_mark(tmp_path, feed):
+    """Contract item 8: a missing key is real information. The deck filled it with the entry price
+    and printed that under "Mark" and under a column literally headed "Live Price"."""
+    row = _g5c_live_price_row(tmp_path)
+    entry_text = _g4_helper("_deck_text", DASHBOARD)(
+        _g4_helper("_position_deck_readings", DASHBOARD)(row, feed, {})["entry_price"],
+        "${:,.4f}")
+    mark = _g4_helper("_position_mark", DASHBOARD)(feed, "BTCUSDT", "BTCUSDT")
+    assert mark["measured"] is False, (feed, mark)
+    rendered = _g4_helper("_deck_text", DASHBOARD)(mark, "${:,.4f}")
+    assert rendered == "not measured", (feed, rendered)
+    assert rendered != entry_text, "the absence still rendered the row's own entry price"
+    assert _g4_helper("_deck_pnl_color", DASHBOARD)(mark) == "#94a3b8", feed
+    assert _g4_helper("_deck_pnl_color", DASHBOARD)(mark) != "#00ff66", feed
+
+
+def test_g5c_a_measured_flat_mark_is_a_reading_and_keeps_its_colour():
+    """House convention: a recorded 0.0 is a measurement. A mark that genuinely equals the entry
+    price prints +$0.0000 in the all-clear green — that is the case the absence rule must NOT eat."""
+    mark = _g4_helper("_position_mark", DASHBOARD)({"BTCUSDT": 100000.0}, "BTCUSDT", "BTCUSDT")
+    assert mark == {"value": 100000.0, "measured": True, "reason": ""}, mark
+    pnl = _g4_helper("_position_unrealized_pnl", DASHBOARD)(
+        mark, _g4_helper("_deck_reading", DASHBOARD)(100000.0),
+        _g4_helper("_deck_reading", DASHBOARD)(0.01), "long")
+    assert pnl == {"value": 0.0, "measured": True, "reason": ""}, pnl
+    assert _g4_helper("_deck_pnl_color", DASHBOARD)(pnl) == "#00ff66"
+    assert _g4_helper("_deck_signed_money", DASHBOARD)(pnl) == "+$0.0000"
+
+
+def test_g5c_no_live_price_means_no_pnl_no_roi_no_distances_for_that_position(tmp_path):
+    """Per field: the recorded columns survive, the price-dependent figures all become absences,
+    and none of them is the 0.0 the pre-fix arithmetic produced from a stand-in mark."""
+    row = _g5c_live_price_row(tmp_path)
+    reads = _g4_helper("_position_deck_readings", DASHBOARD)(row, {}, {})
+    for key in ("mark", "unr_pnl", "unr_roi", "dist_liq", "dist_tp", "dist_sl"):
+        assert reads[key]["measured"] is False, (key, reads[key])
+    assert reads["mark"]["reason"] == "no live price for this symbol in the current fetch"
+    assert reads["unr_pnl"]["reason"] == "no unrealized PnL without a measured live price"
+    for key in ("entry_price", "qty", "leverage", "margin", "stop_loss", "take_profit"):
+        assert reads[key]["measured"] is True, (key, reads[key])
+    assert _g4_helper("_deck_signed_money", DASHBOARD)(reads["unr_pnl"]) == "not measured"
+    assert _g4_helper("_deck_pnl_color", DASHBOARD)(reads["unr_pnl"]) == "#94a3b8"
+    assert _g4_helper("_deck_pnl_color", DASHBOARD)(reads["unr_pnl"]) != "#00ff66"
+    assert _g4_helper("_position_target_label", DASHBOARD)(
+        reads["dist_tp"], "long", "tp") == "not measured (tp)"
+    # the feed's own key spellings are honoured: clean, raw, and the colon-suffixed ticker the
+    # exchange returns ("BTCUSDT:USDT" must still find the deck's cleaned "BTCUSDT")
+    for symbol, clean, feed in (
+            ("BTCUSDT", "BTCUSDT", {"BTCUSDT": 105000.0}),
+            ("BTC/USDT", "BTCUSDT", {"BTC/USDT": 105000.0}),
+            ("BTCUSDT:USDT", "BTCUSDTUSDT", {"BTCUSDT:USDT": 105000.0}),
+            ("BTC/USDT:USDT", "BTCUSDTUSDT", {"BTCUSDT": 105000.0})):
+        assert _g4_helper("_position_mark", DASHBOARD)(feed, symbol, clean)["value"] \
+            == 105000.0, (symbol, feed)
+
+
+def test_g5c_a_short_position_is_marked_from_the_other_side():
+    """The sign convention the three loops used to re-type: a falling mark is a gain on a short."""
+    mark = _g4_helper("_position_mark", DASHBOARD)({"ETHUSDT": 3800.0}, "ETHUSDT", "ETHUSDT")
+    entry = _g4_helper("_deck_reading", DASHBOARD)(4000.0)
+    qty = _g4_helper("_deck_reading", DASHBOARD)(2.0)
+    pnl = _g4_helper("_position_unrealized_pnl", DASHBOARD)(mark, entry, qty, "short")
+    assert pnl["value"] == pytest.approx(400.0), pnl
+    assert _g4_helper("_position_unrealized_pnl", DASHBOARD)(mark, entry, qty, "long")["value"] \
+        == pytest.approx(-400.0)
+
+
+def test_g5c_the_target_distances_match_what_the_deck_printed_before(tmp_path):
+    """A measured mark keeps the wording and the numbers the panel had: +x% to TP on a long,
+    -x% to TP and "% below SL" on a short."""
+    row = _g5c_live_price_row(tmp_path)
+    feeds = {"BTCUSDT": 105000.0}
+    reads = _g4_helper("_position_deck_readings", DASHBOARD)(row, feeds, {})
+    assert _g4_helper("_position_target_label", DASHBOARD)(
+        reads["dist_tp"], "long", "tp") == "+4.76% to TP", reads["dist_tp"]
+    assert _g4_helper("_position_target_label", DASHBOARD)(
+        reads["dist_sl"], "long", "sl") == "7.62% above SL", reads["dist_sl"]
+    short = _g4_helper("_position_deck_readings", DASHBOARD)(
+        pd.Series({"symbol": "ETHUSDT", "side": "short", "entry_price": 4000.0, "qty": 2.0,
+                   "leverage": 4.0, "stop_loss": 4200.0, "take_profit": 3600.0}),
+        {"ETHUSDT": 4000.0}, {})
+    assert _g4_helper("_position_target_label", DASHBOARD)(
+        short["dist_tp"], "short", "tp") == "-10.00% to TP", short["dist_tp"]
+    assert _g4_helper("_position_target_label", DASHBOARD)(
+        short["dist_sl"], "short", "sl") == "5.00% below SL", short["dist_sl"]
+
+
+def test_g5c_the_portfolio_pnl_is_absent_when_any_position_has_no_mark():
+    """The roll-up needs its OWN measured-or-absent state: a sum over partly-invented addends is
+    not a measurement, and the strip coloured exactly 0.0 green."""
+    fed = _g4_helper("_position_deck_readings", DASHBOARD)(
+        pd.Series({"symbol": "BTCUSDT", "side": "long", "entry_price": 100000.0, "qty": 0.01,
+                   "leverage": 5.0}), {"BTCUSDT": 105000.0}, {})
+    blind = _g4_helper("_position_deck_readings", DASHBOARD)(
+        pd.Series({"symbol": "ETHUSDT", "side": "long", "entry_price": 4000.0, "qty": 2.0,
+                   "leverage": 4.0}), {}, {})
+    rollup = _g4_helper("_fleet_position_rollup", DASHBOARD)([fed, blind])
+    assert _deck_absent(rollup["unrealized_pnl"]), rollup
+    assert rollup["unrealized_pnl"]["reason"] == "1 of 2 positions report no mark PnL", rollup
+    assert rollup["unr_pnl_unmeasured"] == 1
+    assert _g4_helper("_deck_pnl_color", DASHBOARD)(rollup["unrealized_pnl"]) == "#94a3b8"
+    net = _g4_helper("_deck_sum", DASHBOARD)(
+        rollup["unrealized_pnl"], _g4_helper("_deck_reading", DASHBOARD)(1.5))
+    assert _deck_absent(net) and "mark PnL" in net["reason"], net
+    both = _g4_helper("_fleet_position_rollup", DASHBOARD)([fed, _g4_helper(
+        "_position_deck_readings", DASHBOARD)(
+        pd.Series({"symbol": "ETHUSDT", "side": "long", "entry_price": 4000.0, "qty": 2.0,
+                   "leverage": 4.0}), {"ETHUSDT": 4100.0}, {})])
+    assert both["unrealized_pnl"]["value"] == pytest.approx(50.0 + 200.0), both
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_MARK_STAND_IN_CASES)
+def test_g5c_no_stand_in_mark_survives_in_the_deck(banned, code_line):
+    """No entry-price stand-in for a quote, and no green-at-zero comparison left inline — the
+    colour decision now lives in `_deck_pnl_color`, which greys absences."""
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        hits = _g5_banned_hits(_g5c_deck_code(path), [banned])
+        assert hits == [], f"{path.name}'s deck blocks still contain {banned!r}"
+        hits = _g5_banned_hits(_g5c_mark_code(path), [banned])
+        assert hits == [], f"{path.name}'s mark helpers still contain {banned!r}"
+
+
+@pytest.mark.parametrize("banned,code_line", _G5C_MARK_STAND_IN_CASES)
+def test_g5c_a_comment_neither_trips_nor_hides_a_mark_scan(banned, code_line):
+    """Both halves on C-3's own tokens."""
+    prose = f"def f():\n    # the deck used to publish {banned} here\n    return 1\n"
+    assert _g5_banned_hits(prose, [banned]) == []
+    documented = f'def f():\n    """the deck used to publish {banned} here. """\n    return 1\n'
+    assert _g5_banned_hits(documented, [banned]) == []
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [banned]) == [banned], (
+        f"{banned!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [banned]) == [banned]
+
+
+def test_g5c_the_mark_the_card_and_the_table_print_is_the_feed_or_nothing():
+    """The render sites consume the reading: "Mark", the "Live Price" column, the PnL line and
+    the PnL colour all come from the helpers, none of them from a substituted float."""
+    cards = _g5c_block("cards", DASHBOARD)
+    assert 'mark = p_read["mark"]' in cards
+    assert '_deck_text(mark, "${:,.4f}")' in cards
+    assert "_deck_note(mark)" in cards
+    assert '"Live Price": _deck_text(mark, "${:,.4f}")' in cards
+    assert '"Unrealized PnL": _deck_signed_money(unr_pnl)' in cards
+    assert "pnl_color = _deck_pnl_color(unr_pnl)" in cards
+    legacy_cards = _g5c_block("cards", LEGACY_DASHBOARD)
+    assert '_deck_text(curr_p, "${:,.4f}")' in legacy_cards
+    assert '"Live Price": _deck_text(curr_p, "${:,.4f}")' in legacy_cards
+    assert "pnl_color = _deck_pnl_color(unr_pnl)" in legacy_cards
+
+
+def test_g5c_the_strip_and_the_hero_card_render_the_rollup_not_a_sum():
+    """The aggregate is published through the same measured-or-absent helpers as a per-position
+    figure, so a partly-invented total cannot come back green."""
+    strip = _g5c_block("strip", DASHBOARD)
+    assert "_deck_pnl_color(total_unrealized_pnl)" in strip
+    assert "_deck_signed_money(true_portfolio_net, 2)" in strip
+    assert "_deck_sum(total_unrealized_pnl" in strip
+    assert "_deck_note(true_portfolio_net)" in strip
+    assert "true_port_color = _deck_pnl_color(true_portfolio_net)" in strip
+    assert "color: {true_port_color};" in strip
+    hero = _g5c_block("hero", DASHBOARD)
+    assert "_deck_signed_money(total_unrealized_pnl, 2)" in hero
+    assert "total_unrealized_pnl += " not in hero
+    assert "_deck_signed_money(total_unrealized_pnl, 2)" in _g5c_block("hero", LEGACY_DASHBOARD)
+
+
+def test_g5c_the_chart_draws_no_series_off_a_mark_it_does_not_have():
+    """The chart's own `curr_p: float = 0.0` default falls back to the last candle close — a real
+    exchange print — instead of the panel's entry-price stand-in, at both call sites."""
+    block = _g5c_block("chart", DASHBOARD)
+    assert block.count('curr_p=_deck_chart_level(p["curr"])') == 2
+    assert 'curr_p=p["curr"],' not in block
+    assert "Mark: `{_deck_text(p['curr'], '${:,.4f}')}`" in block
+
+
+def test_g5c_the_twin_helpers_are_byte_identical_and_read_the_same_price():
+    """The convention the branch carries for `scripts/live_dashboard.py`: same bytes, same answer
+    on the same row, for the C-2 and C-3 helpers as well as the C-1 ones."""
+    for name in _G5C_C2_HELPERS + _G5C_C3_HELPERS:
+        assert _g5c_helper_code(name, DASHBOARD) == _g5c_helper_code(name, LEGACY_DASHBOARD), name
+    row = pd.Series({"symbol": "BTCUSDT", "side": "long", "entry_price": 100000.0, "qty": 0.01,
+                     "leverage": None})
+    for name, args in (("_position_leverage", (row,)),
+                       ("_position_deck_readings", (row, {}, {}))):
+        dashboard_read = _g4_helper(name, DASHBOARD)(*args)
+        legacy_read = _g4_helper(name, LEGACY_DASHBOARD)(*args)
+        assert dashboard_read == legacy_read, (name, dashboard_read, legacy_read)
