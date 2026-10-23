@@ -1417,7 +1417,7 @@ st.markdown(f"""
             🛡️ Portfolio Margin Utilization: <b style="color: {margin_color};">{margin_util_display}</b>{_deck_note(margin_util_pct)} of {margin_ceiling_display}{_deck_note(margin_limit)} ({margin_status}{margin_rung_label})
         </span>
         <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #e2e8f0;">
-            Margin Locked: <b style="color: {margin_color};">{margin_locked_display}</b>{_deck_note(total_margin_locked)} | Liquid Buffer: <b style="color: {_deck_color(free_cash_buffer, "#00e5ff")};">{free_cash_display}</b>{_deck_note(free_cash_buffer)}
+            Margin Locked: <b style="color: {_deck_color(total_margin_locked, "#e2e8f0")};">{margin_locked_display}</b>{_deck_note(total_margin_locked)} | Liquid Buffer: <b style="color: {_deck_color(free_cash_buffer, "#00e5ff")};">{free_cash_display}</b>{_deck_note(free_cash_buffer)}
         </span>
     </div>
     <div style="width: 100%; background: #1e293b; height: 10px; border-radius: 5px; overflow: hidden; position: relative;">

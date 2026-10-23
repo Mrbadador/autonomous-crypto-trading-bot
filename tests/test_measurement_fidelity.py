@@ -7097,6 +7097,19 @@ def _g5c_block(part, path=DASHBOARD):
     return _g4_block(f"position_{part}", path)
 
 
+def _g5c_margin_locked_span(block):
+    """The banner's own "Margin Locked" figure, cut out of the block that renders it.
+
+    The banner prints several figures on one line, so the span is cut on its own text rather
+    than on the whole line: the utilization's verdict colour was earned by the utilization and
+    has to stay on it.
+    """
+    marker = 'Margin Locked: <b style="color: '
+    assert marker in block, "the banner no longer renders a Margin Locked figure"
+    start = block.index(marker)
+    return block[start:block.index("</b>", start)]
+
+
 def _g5c_helper_code(name, path=DASHBOARD):
     return _function_source(path, name)
 
@@ -8141,6 +8154,35 @@ def test_g5c_the_hero_the_bar_and_the_banner_render_the_total_through_the_helper
     assert "total_fund_color = _deck_funding_color(total_live_funding)" in strip
     assert "_deck_sum(total_unrealized_pnl, total_live_funding)" in strip
     assert "_deck_note(true_portfolio_net)" in strip
+
+
+def test_g5c_the_margin_total_wears_its_own_colour_not_the_utilizations_verdict():
+    """A measured margin total is a measurement, so it may not wear the absence grey.
+
+    `margin_color` is the utilization's verdict colour, and the utilization is absent whenever
+    the account balance was never read -- while the margin total itself is a real reading
+    whenever the positions reported their margin. Printing that measurement in `#94a3b8` makes
+    it indistinguishable from a withheld one, so the banner takes its colour from the margin
+    reading itself, exactly as the position card already does for the same figure.
+    """
+    for path in (DASHBOARD, LEGACY_DASHBOARD):
+        bar = _g5c_block("funding_bar", path)
+        span = _g5c_margin_locked_span(bar)
+        assert '_deck_color(total_margin_locked, "#e2e8f0")' in span, (
+            f"{path.name}'s banner does not take the Margin Locked colour from the margin reading")
+        assert "{margin_color}" not in span, (
+            f"{path.name}'s banner still paints the margin total in the utilization's verdict colour")
+        # the utilization keeps the verdict colour it earned, and so does the bar it fills
+        assert 'Portfolio Margin Utilization: <b style="color: {margin_color};">' in bar
+        assert "background: {margin_color};" in bar
+        # the card already prints this same figure in this same colour, and the banner must agree
+        assert '_deck_color(margin, "#e2e8f0")' in _g5c_block("cards", path)
+    # and the two colours the change is about: a measurement keeps its own, an absence is grey
+    color = _g4_helper("_deck_color", DASHBOARD)
+    measured = _g4_helper("_deck_reading", DASHBOARD)(1234.5)
+    absent = _g4_helper("_deck_absence", DASHBOARD)("no margin reported for this position")
+    assert color(measured, "#e2e8f0") == "#e2e8f0"
+    assert color(absent, "#e2e8f0") == "#94a3b8"
 
 
 def test_g5c_the_twin_carries_the_funding_reader_and_none_of_the_funding_panels():
