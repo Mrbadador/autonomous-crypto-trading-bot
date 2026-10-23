@@ -1642,46 +1642,149 @@ async def evaluate_runner_vs_harvest(position_context: dict, timeout_sec: float 
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
+# ---------------------------------------------------------------------------
+# Engine 2 payload-honesty helpers (G-5d dispatch A, finding D-1).
+#
+# A ghost/spoof verdict is publishable only when every input feeding it was measured. These are
+# module-level pure functions on purpose: the shipped decision can then be executed by the test
+# suite without booting the LLM pool, opening a session, or touching a database.
+# ---------------------------------------------------------------------------
+
+# Every field Engine 2 publishes that is a *claim about the order book*. All of them are None on an
+# absence. `phantom_walls`/`genuine_anchors` are claims too: an empty list says "looked, found none",
+# which is a verdict, and an absence may not say that.
+GHOST_VERDICT_FIELDS = (
+    "spoof_detected",
+    "spoof_side",
+    "phantom_walls",
+    "genuine_anchors",
+    "execution_advisory",
+    "manipulation_risk_pct",
+    "headline",
+)
+
+# The fast-path inputs the published verdict is computed from. `hawkes_rho` is deliberately NOT one
+# of them: P0-3 froze it at 0.30314 and removed it from the veto condition, so it feeds no field of
+# this payload and gating on it would claim a dependency that does not exist.
+GHOST_FASTPATH_INPUTS = (
+    "hawkes_veto",
+    "hawkes_spoof_index",
+    "mean_residence_time_ms",
+    "normalized_ofi",
+)
+
+
+def _ghost_read_metric(depth_packet: dict, key: str):
+    """One numeric fast-path input, or None when it was not measured.
+
+    A recorded 0.0 is a measurement and stays 0.0. The stand-in this replaces was
+    `float(packet.get(key, 0.0) or 0.0)` / `... or 250.0`, and `or` is falsy on a measured zero, so
+    that one expression both invented a number for an absent key AND overwrote a measured reading of
+    0 — the second half of the same trap.
+    """
+    if not isinstance(depth_packet, dict) or depth_packet.get(key) is None:
+        return None
+    try:
+        value = float(depth_packet[key])
+    except (TypeError, ValueError):
+        return None
+    if value != value:  # NaN is not a reading either
+        return None
+    return value
+
+
+def _ghost_read_flag(depth_packet: dict, key: str):
+    """One boolean fast-path input, or None when it was not measured. A recorded False is a reading."""
+    if not isinstance(depth_packet, dict) or depth_packet.get(key) is None:
+        return None
+    return bool(depth_packet[key])
+
+
+def _ghost_absence_payload(reason: str) -> dict:
+    """What Engine 2 publishes when it did not measure a verdict.
+
+    Every verdict field is None — not False, not `[]`, not a risk percentage — so no reader can print
+    an absence as a clean book, and no reader has to guess which absent shape it got. `measured` is
+    the single marker a consumer keys on; `reason` is the short machine-readable name of the stage
+    that failed. `updated_at` is kept because the attempt really did happen now: the row says "an
+    attempt was made at this time and it did not measure anything", which is why the persister is
+    told to keep writing it (suppressing the write would make "engine down" and "never ran"
+    indistinguishable).
+    """
+    payload = {field: None for field in GHOST_VERDICT_FIELDS}
+    payload["measured"] = False
+    payload["reason"] = str(reason)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return payload
+
+
+def _ghost_deterministic_verdict(depth_packet: dict) -> dict:
+    """Engine 2's quantitative fast path: a measured verdict in, an absence out.
+
+    The arithmetic is exactly what this branch shipped (`is_spoof = hawkes_veto or (spoof >= 0.70 and
+    residence < 300.0)`, `risk_pct = max(5.0, round(hawkes_spoof * 50.0, 1))`). What changed is that
+    the inputs are read as readings instead of defaulted: an input that was never measured stops the
+    verdict, because the 250.0 residence stand-in *passed* the `< 300.0` half and so made a detection
+    more likely than the measurement supported. Note the floor the brief asks to be preserved: a
+    clean book therefore reports 5.0%, not 0% — `max(5.0, ...)` is a computed reading, not a default.
+    """
+    hawkes_veto = _ghost_read_flag(depth_packet, "hawkes_veto")
+    hawkes_spoof = _ghost_read_metric(depth_packet, "hawkes_spoof_index")
+    mean_res = _ghost_read_metric(depth_packet, "mean_residence_time_ms")
+    norm_ofi = _ghost_read_metric(depth_packet, "normalized_ofi")
+
+    if any(value is None for value in (hawkes_veto, hawkes_spoof, mean_res, norm_ofi)):
+        return _ghost_absence_payload("deterministic_input_absent")
+
+    # Quantitative spoofing condition: Hawkes veto or spoof index >= 0.70 with sub-300ms residence
+    # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314); removed rho comparison from entry veto path
+    is_spoof = hawkes_veto or (hawkes_spoof >= 0.70 and mean_res < 300.0)
+    spoof_side = "NONE"
+    if is_spoof:
+        spoof_side = "BID" if norm_ofi > 0 else "ASK"
+        advisory = "VETO_BUY_SPOOF" if spoof_side == "BID" else "VETO_SELL_SPOOF"
+        risk_pct = min(95.0, round(hawkes_spoof * 100.0, 1))
+        headline = f"Quantitative Fast-Path: Phantom spoofing detected on {spoof_side} (Hawkes spoof={hawkes_spoof:.2f}, residence={mean_res:.0f}ms)."
+    else:
+        advisory = "ALLOW"
+        risk_pct = max(5.0, round(hawkes_spoof * 50.0, 1))
+        headline = f"Quantitative Fast-Path: Order book depth stable (Hawkes spoof={hawkes_spoof:.2f}, residence={mean_res:.0f}ms)."
+
+    return {
+        "spoof_detected": is_spoof,
+        "spoof_side": spoof_side,
+        "phantom_walls": [],
+        "genuine_anchors": [],
+        "execution_advisory": advisory,
+        "manipulation_risk_pct": risk_pct,
+        "headline": headline,
+        "measured": True,
+        "deterministic": True,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+
 async def detect_spoof_and_ghost_walls(depth_packet: dict, timeout_sec: float = 8.0) -> dict:
     """
     Engine 2: Order Book Ghost Wall & Spoofing Detector.
     Dispatched via deterministic quantitative fast-path if enabled, or Groq Cloud 3-key pool (<300ms).
+
+    Publishes `measured: True` only when a verdict was actually computed (fast path) or returned by
+    the model pool. Every other outcome — no client, no response, an unparseable response, fast-path
+    inputs that were never read — is `_ghost_absence_payload(reason)`. The fallback that used to live
+    here fabricated a whole verdict (`spoof_detected: False`, `execution_advisory: "ALLOW"`,
+    `manipulation_risk_pct: 10.0`, a prose headline) with a fresh `updated_at`, which downstream read
+    exactly like a clean book.
     """
     if getattr(config, "USE_DETERMINISTIC_MICROSTRUCTURE", True):
-        hawkes_rho = float(depth_packet.get("hawkes_rho", 0.0) or 0.0)
-        hawkes_spoof = float(depth_packet.get("hawkes_spoof_index", 0.0) or 0.0)
-        hawkes_veto = bool(depth_packet.get("hawkes_veto", False))
-        mean_res = float(depth_packet.get("mean_residence_time_ms", 250.0) or 250.0)
-        norm_ofi = float(depth_packet.get("normalized_ofi", 0.0) or 0.0)
+        return _ghost_deterministic_verdict(depth_packet)
 
-        # Quantitative spoofing condition: Hawkes veto or spoof index >= 0.70 with sub-300ms residence
-        # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314); removed rho comparison from entry veto path
-        is_spoof = hawkes_veto or (hawkes_spoof >= 0.70 and mean_res < 300.0)
-        spoof_side = "NONE"
-        if is_spoof:
-            spoof_side = "BID" if norm_ofi > 0 else "ASK"
-            advisory = "VETO_BUY_SPOOF" if spoof_side == "BID" else "VETO_SELL_SPOOF"
-            risk_pct = min(95.0, round(hawkes_spoof * 100.0, 1))
-            headline = f"Quantitative Fast-Path: Phantom spoofing detected on {spoof_side} (Hawkes spoof={hawkes_spoof:.2f}, residence={mean_res:.0f}ms)."
-        else:
-            advisory = "ALLOW"
-            risk_pct = max(5.0, round(hawkes_spoof * 50.0, 1))
-            headline = f"Quantitative Fast-Path: Order book depth stable (Hawkes spoof={hawkes_spoof:.2f}, residence={mean_res:.0f}ms)."
-
-        return {
-            "spoof_detected": is_spoof,
-            "spoof_side": spoof_side,
-            "phantom_walls": [],
-            "genuine_anchors": [],
-            "execution_advisory": advisory,
-            "manipulation_risk_pct": risk_pct,
-            "headline": headline,
-            "deterministic": True,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }
-
-    client = get_llm("ghost_wall_detector")
-    client.session = _ensure_active_session(client)
+    try:
+        client = get_llm("ghost_wall_detector")
+        client.session = _ensure_active_session(client)
+    except Exception as client_error:
+        log.warning(f"[GHOST-WALL] No LLM client available: {client_error}")
+        return _ghost_absence_payload("no_llm_client")
 
     system_prompt = (
         "You are a Quantitative High-Frequency Microstructure & Spoofing Detection Specialist. "
@@ -1716,26 +1819,24 @@ async def detect_spoof_and_ghost_walls(depth_packet: dict, timeout_sec: float = 
     }
 
     data = await _query_groq_cloud_with_rotation(client.session, payload, timeout_sec=timeout_sec)
-    if data:
-        try:
-            raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            res = robust_json_decode(raw)
-            if res and isinstance(res, dict):
-                res["updated_at"] = datetime.now(timezone.utc).isoformat()
-                return res
-        except Exception:
-            pass
+    if not data:
+        log.warning("[GHOST-WALL] LLM pool returned no response; publishing an absence, not a verdict.")
+        return _ghost_absence_payload("no_llm_response")
 
-    return {
-        "spoof_detected": False,
-        "spoof_side": "NONE",
-        "phantom_walls": [],
-        "genuine_anchors": [],
-        "execution_advisory": "ALLOW",
-        "manipulation_risk_pct": 10.0,
-        "headline": "Order book displaying standard queue dynamics with low spoofing probability.",
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    }
+    try:
+        raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        res = robust_json_decode(raw)
+    except Exception as decode_error:
+        log.warning(f"[GHOST-WALL] LLM answer could not be decoded ({decode_error}); publishing an absence.")
+        return _ghost_absence_payload("llm_json_decode_failed")
+
+    if not res or not isinstance(res, dict):
+        log.warning("[GHOST-WALL] LLM answer was not a JSON object; publishing an absence.")
+        return _ghost_absence_payload("llm_json_unusable")
+
+    res["measured"] = True
+    res["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return res
 
 async def evaluate_mtf_confluence(batch_mtf_context: dict, timeout_sec: float = 20.0) -> dict:
     """

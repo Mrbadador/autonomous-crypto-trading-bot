@@ -8551,3 +8551,502 @@ def test_g5c_ceiling_the_twin_carries_the_shared_ceiling_readers_and_no_briefing
     for name in _G5C_CEILING_DASHBOARD_HELPERS:
         assert f"def {name}(" not in legacy_src, (
             f"{name} was added to the twin, which has no panel that calls it")
+
+
+# ---------------------------------------------------------------------------
+# G-5d dispatch A — Engine 2's ghost/spoof producer (D-1) and its persister (D-2)
+# ---------------------------------------------------------------------------
+# Neither file may be booted by a test. `ai_engine.py` builds an LLM session pool, and
+# `ofi_daemon.py:11` imports `dns_fix`, which monkeypatches ccxt's `Exchange.open` process-wide,
+# before it connects to a live Bitget WebSocket. So every behavioural claim below is made by
+# EXECUTING a shipped pure helper lifted out of the file's own syntax tree (`_dashboard_helper`
+# compiles one function plus the module-level names it loads, and takes a path, which is what makes
+# it usable on these two files), by walking that tree for the guards that live inside a coroutine,
+# or by driving the producer's own failure routes with the network stubbed to "no answer" — never
+# with a fabricated Groq response standing in for a measurement.
+#
+# `ai_engine` is imported for the async routes only, and even there `get_llm` is replaced with a
+# stub: the real `LLMClient.__init__` calls `os.makedirs("cache")` and loads a cache file, a side
+# effect a fidelity test has no business causing. `ofi_daemon.py` is never imported at all — see
+# `_g5d_daemon_helper`, which compiles the gate's own node in an empty namespace.
+
+AI_ENGINE = REPO_ROOT / "ai_engine.py"
+OFI_DAEMON = REPO_ROOT / "ofi_daemon.py"
+
+# Every reason the producer may publish. Each one names the stage that failed, in words a reader can
+# branch on, and none of them is a verdict.
+_G5D_ABSENCE_REASONS = (
+    "deterministic_input_absent",
+    "no_llm_client",
+    "no_llm_response",
+    "llm_json_decode_failed",
+    "llm_json_unusable",
+)
+
+# `banned` is the token that must not survive in the producer's code; `code_line` is the same token
+# in real code, used to prove the scan still bites when it is moved out of prose.
+_G5D_STAND_IN_CASES = (
+    ('"spoof_detected": False', 'return {"spoof_detected": False}'),
+    ('"manipulation_risk_pct": 10.0', 'return {"manipulation_risk_pct": 10.0}'),
+    ('"headline": "Order book',
+     'return {"headline": "Order book displaying standard queue dynamics."}'),
+    ("standard queue dynamics",
+     'headline = "Order book displaying standard queue dynamics with low spoofing probability."'),
+    ("or 250.0", 'mean_res = float(packet.get("mean_residence_time_ms", 250.0) or 250.0)'),
+    ("or 0.0", 'norm_ofi = float(packet.get("normalized_ofi", 0.0) or 0.0)'),
+)
+
+
+def _g5d_engine_helper(name):
+    """One pure Engine 2 helper, executed out of `ai_engine.py`'s own source."""
+    return _dashboard_helper(name, AI_ENGINE)
+
+
+def _g5d_daemon_helper(name):
+    """One pure ghost gate, executed out of `ofi_daemon.py`'s source WITHOUT its module imports.
+
+    `_dashboard_helper` execs the file's top-level imports before the helper's node, and
+    `ofi_daemon.py`'s include `dns_fix` (a process-wide ccxt patch) and `websockets`. These gates are
+    builtins-only, so the needed nodes — the target plus any module-level function it calls — are
+    compiled in an empty namespace: the shipped bodies still run for real, and the suite does not
+    acquire a patch it never asked for.
+    """
+    import ast
+
+    src = OFI_DAEMON.read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=str(OFI_DAEMON))
+    by_name = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert name in by_name, f"ofi_daemon.py has no module-level function named {name}"
+
+    wanted, pending = {name}, [by_name[name]]
+    while pending:
+        node = pending.pop()
+        fresh = {n.id for n in ast.walk(node)
+                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - wanted
+        if not fresh:
+            continue
+        wanted |= fresh
+        pending.extend(by_name[f] for f in fresh if f in by_name)
+
+    ns = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(OFI_DAEMON), "exec"), ns)
+    return ns[name]
+
+
+def _g5d_function_source(path, name):
+    """The source of one module-level function or coroutine, read out of the file's own tree.
+
+    `_function_source` matches `FunctionDef` only; the ghost producer and the whisperer loop are both
+    `async def`, so the guards this dispatch pins live in nodes the sync extractor cannot reach.
+    """
+    import ast
+
+    src = path.read_text(encoding="utf-8")
+    for node in ast.parse(src, filename=str(path)).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            segment = ast.get_source_segment(src, node)
+            assert segment, f"{path.name}:{name} extracted no source"
+            return segment
+    raise AssertionError(f"{path.name} has no module-level function named {name}")
+
+
+def _g5d_const(name, path=AI_ENGINE):
+    """One module-level tuple constant, read out of its own file's tree.
+
+    `_dashboard_helper` extracts functions only, so a constant the tests have to enumerate comes out
+    of the syntax tree by itself; otherwise a test would check a transcription of the roster against
+    the roster.
+    """
+    import ast
+
+    src = path.read_text(encoding="utf-8")
+    for node in ast.parse(src, filename=str(path)).body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == name:
+            return tuple(el.value for el in node.value.elts)
+    raise AssertionError(f"{path.name} no longer declares {name}")
+
+
+def _g5d_roster():
+    return _g5d_const("GHOST_VERDICT_FIELDS")
+
+
+def _g5d_absence_like(payload, roster):
+    """Every verdict field is the absence marker — not False, not `[]`, not a number, not a sentence."""
+    return all(payload.get(field) is None for field in roster)
+
+
+def _g5d_producer_with(monkeypatch, answer):
+    """The shipped coroutine with its three collaborators stubbed to "no network".
+
+    `get_llm` is stubbed because the real `LLMClient.__init__` does `os.makedirs("cache")` and loads a
+    cache file — a side effect, not the thing under test. `answer` is what the stubbed pool hands
+    back, and every answer used here is a FAILURE: `None` (the pool said nothing) or a malformed
+    envelope (the pool said something unusable). No test in this file fabricates a Groq answer that
+    looks measured; the measured route is pinned structurally instead.
+    """
+    import types
+
+    import ai_engine
+
+    monkeypatch.setattr(ai_engine.config, "USE_DETERMINISTIC_MICROSTRUCTURE", False, raising=False)
+    monkeypatch.setattr(ai_engine, "get_llm", lambda *a, **k: types.SimpleNamespace(session=None))
+    monkeypatch.setattr(ai_engine, "_ensure_active_session", lambda target: None)
+
+    async def _pool(session, payload, timeout_sec=8.0):
+        return answer
+
+    monkeypatch.setattr(ai_engine, "_query_groq_cloud_with_rotation", _pool)
+    return ai_engine
+
+
+# ---------------------------------------------------------------------------
+# D-1 — the producer
+# ---------------------------------------------------------------------------
+
+def test_g5d_the_absence_payload_is_an_absence_in_every_verdict_field():
+    """D-1's shape, executed from the shipped helper.
+
+    `updated_at` is kept on the absence deliberately: the attempt really did happen at that time, and
+    the row is still written so that "engine down" and "no row ever" stay distinguishable. `measured`
+    is the field a reader keys on; `reason` names the stage that failed.
+    """
+    roster = _g5d_roster()
+    absence = _g5d_engine_helper("_ghost_absence_payload")("no_llm_response")
+    assert absence["measured"] is False, absence
+    assert absence["reason"] == "no_llm_response", absence
+    assert _g5d_absence_like(absence, roster), absence
+    assert isinstance(absence["updated_at"], str) and "T" in absence["updated_at"], absence
+    assert re.fullmatch(r"[a-z0-9_]+", str(absence["reason"])), absence["reason"]
+    # The stand-ins this dispatch exists to remove, each of which reads downstream as a finding:
+    # False = "measured, no spoofing", [] = "looked, found no walls", a number = a reading.
+    assert not isinstance(absence["spoof_detected"], bool), absence
+    assert not isinstance(absence["manipulation_risk_pct"], (int, float)), absence
+    assert not isinstance(absence["phantom_walls"], list), absence
+    assert absence["headline"] is None, absence
+
+
+def test_g5d_the_verdict_roster_is_the_fields_the_measured_path_publishes():
+    """A verdict field dropped from the roster would still be published on a reading and be silently
+    missing on an absence — the same hole in different clothes, so the roster is pinned against the
+    shipped measured payload rather than against a transcription of it."""
+    roster = _g5d_roster()
+    measured = _g5d_engine_helper("_ghost_deterministic_verdict")({
+        "hawkes_veto": False, "hawkes_spoof_index": 0.0,
+        "mean_residence_time_ms": 400.0, "normalized_ofi": 0.0})
+    assert set(roster) <= set(measured), (roster, sorted(measured))
+    assert {"spoof_detected", "manipulation_risk_pct", "headline"} <= set(roster), roster
+    for field in roster:
+        assert field in _g5d_engine_helper("_ghost_absence_payload")("x"), field
+    assert not ({"measured", "reason", "updated_at"} & set(roster)), roster
+
+
+def test_g5d_no_llm_client_available_returns_absence_not_a_verdict(monkeypatch):
+    """Case 1, the "no client" route, driven through the shipped coroutine with no network."""
+    import asyncio
+
+    def _no_client(*a, **k):
+        raise RuntimeError("no Groq key configured")
+
+    engine = _g5d_producer_with(monkeypatch, answer=None)
+    monkeypatch.setattr(engine, "get_llm", _no_client)
+    payload = asyncio.run(engine.detect_spoof_and_ghost_walls({
+        "hawkes_veto": False, "hawkes_spoof_index": 0.95,
+        "mean_residence_time_ms": 120.0, "normalized_ofi": 0.4}))
+    assert payload["measured"] is False, payload
+    assert payload["reason"] == "no_llm_client", payload
+    assert _g5d_absence_like(payload, _g5d_roster()), payload
+
+
+def test_g5d_an_llm_that_answers_nothing_returns_absence_not_an_all_clear(monkeypatch):
+    """Case 1, the "no data" route.
+
+    The brief's correction is right about the shape and wrong about the lines: the fabricated return
+    sat at the function's own indent, after `if data:` — so it was reached both when the pool said
+    nothing AND when it said something unparseable. This is the first of those two.
+    """
+    import asyncio
+
+    engine = _g5d_producer_with(monkeypatch, answer=None)
+    payload = asyncio.run(engine.detect_spoof_and_ghost_walls(
+        {"timestamp": "2026-10-22T00:00:00+00:00"}))
+    assert payload["measured"] is False, payload
+    assert payload["reason"] == "no_llm_response", payload
+    assert payload["spoof_detected"] is None, payload
+    assert _g5d_absence_like(payload, _g5d_roster()), payload
+
+
+@pytest.mark.parametrize("content,reason", (
+    ({"spoof": 1}, "llm_json_decode_failed"),
+    ("book looks calm, nothing to report", "llm_json_unusable"),
+    ("", "llm_json_unusable"),
+))
+def test_g5d_an_unparseable_llm_answer_returns_absence(monkeypatch, content, reason):
+    """Case 1, the JSON route, driven through the real `robust_json_decode`.
+
+    A non-string answer makes the repair ladder raise (AttributeError on `.find`), which is the
+    `llm_json_decode_failed` route the old code swallowed with `except Exception: pass`; text with no
+    JSON object in it decodes to `{}`, which is `llm_json_unusable`. Both used to land on the same
+    invented verdict with a fresh timestamp.
+    """
+    import asyncio
+
+    engine = _g5d_producer_with(
+        monkeypatch, answer={"choices": [{"message": {"content": content}}]})
+    payload = asyncio.run(engine.detect_spoof_and_ghost_walls(
+        {"timestamp": "2026-10-22T00:00:00+00:00"}))
+    assert payload["measured"] is False, (content, payload)
+    assert payload["reason"] == reason, (content, payload)
+    assert _g5d_absence_like(payload, _g5d_roster()), payload
+
+
+def _g5d_measured_mark_guard(src, tree):
+    """The statement that refuses an unusable answer, if one stands between the producer and its mark.
+
+    Returns `(assign_source, guard_source)`. `guard_source` is None when nothing rejects a bad answer
+    before the mark is set — which is what makes this a check and not a description: the shipped code
+    marks measured with an early return in front of it, and a fragment that drops that return has to
+    come back None.
+    """
+    import ast
+
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    marks = [sub for sub in ast.walk(tree)
+             if isinstance(sub, ast.Assign)
+             and any(isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                     and t.slice.value == "measured" for t in sub.targets)
+             and getattr(sub.value, "value", None) is True]
+    assert len(marks) <= 1, [ast.get_source_segment(src, m) for m in marks]
+    if not marks:
+        return None, None
+    mark = marks[0]
+    body = parents.get(id(mark))
+    assert body is not None
+    siblings = list(ast.iter_child_nodes(body))
+    index = siblings.index(mark)
+    for sibling in reversed(siblings[:index]):
+        if (isinstance(sibling, ast.If)
+                and "isinstance" in (ast.get_source_segment(src, sibling.test) or "")
+                and "res" in (ast.get_source_segment(src, sibling.test) or "")
+                and any(isinstance(r, ast.Return) and "absence" in (ast.get_source_segment(src, r) or "")
+                        for r in ast.walk(sibling))):
+            return ast.get_source_segment(src, mark), ast.get_source_segment(src, sibling)
+    return ast.get_source_segment(src, mark), None
+
+
+def test_g5d_only_a_parsed_llm_answer_may_be_marked_measured():
+    """The `measured: True` marker sits on the success route and nowhere else — pinned structurally.
+
+    Faking a Groq answer to prove this would test the stub, so the shipped tree is walked: at most one
+    assignment marks Engine 2 measured, and an `If` that refuses an answer which is not a parsed dict
+    — and returns the absence — has to stand between the parse and the mark.
+    """
+    import ast
+
+    src = _g5d_function_source(AI_ENGINE, "detect_spoof_and_ghost_walls")
+    mark, guard = _g5d_measured_mark_guard(src, ast.parse(src))
+    assert mark == 'res["measured"] = True', mark
+    assert guard is not None, "measured is marked with no guard in front of it"
+    assert "isinstance(res, dict)" in guard or "not isinstance(res, dict)" in guard, guard
+    assert "_ghost_absence_payload" in guard, guard
+
+    # Both halves: the same walk over a fragment that marks measured with no refusal in front of it
+    # must find nothing, or this assertion would be true by construction.
+    unguarded = (
+        "async def producer(res):\n"
+        '    res["measured"] = True\n'
+        "    return res\n"
+    )
+    _mark, _guard = _g5d_measured_mark_guard(unguarded, ast.parse(unguarded))
+    assert _mark == 'res["measured"] = True' and _guard is None, (_mark, _guard)
+
+
+def _g5d_built_payloads(src):
+    """Every dict literal `src` returns."""
+    import ast
+
+    return [n.value for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)]
+
+
+def _g5d_markerless_returns(src):
+    """The source of every dict literal this code RETURNS without declaring `measured`.
+
+    A payload with no marker is a payload a reader cannot tell measured from invented, so the marker
+    is not optional on any built shape — including a fallback someone adds later.
+    """
+    import ast
+
+    offenders = []
+    for literal in _g5d_built_payloads(src):
+        keys = {k.value for k in literal.keys if isinstance(k, ast.Constant)}
+        if "measured" not in keys:
+            offenders.append(ast.get_source_segment(src, literal) or "")
+    return offenders
+
+
+def _g5d_return_count(src):
+    """Every `Return` in `src`, so a scan that found no payload at all cannot pass by accident."""
+    import ast
+
+    return [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Return)]
+
+
+def test_g5d_every_payload_the_producer_builds_declares_whether_it_measured():
+    """The structural half of D-1, over the whole producer surface.
+
+    This is also why the banned-token list does not carry `"execution_advisory": "ALLOW"`: that string
+    appears legitimately in the JSON schema the model is asked to fill in (`ai_engine.py:1805`), so a
+    text scan of the producer would flag correct code. A returned stand-in cannot hide from this
+    check, and the non-vacuity half below proves the check bites.
+    """
+    names = ("detect_spoof_and_ghost_walls", "_ghost_deterministic_verdict",
+             "_ghost_absence_payload", "_ghost_read_metric", "_ghost_read_flag")
+    src = "\n\n".join(_g5d_function_source(AI_ENGINE, name) for name in names)
+    assert _g5d_return_count(src), "the producer no longer returns anything"
+    assert _g5d_markerless_returns(src) == [], _g5d_markerless_returns(src)
+    assert _g5d_built_payloads(src), "the producer builds no payload literal of its own any more"
+
+    # Non-vacuity: the shipped fabricated fallback, replayed as code, is exactly what this catches.
+    invented = (
+        "async def old_producer():\n"
+        "    return {\n"
+        '        "spoof_detected": False,\n'
+        '        "execution_advisory": "ALLOW",\n'
+        '        "manipulation_risk_pct": 10.0,\n'
+        "    }\n"
+    )
+    offenders = _g5d_markerless_returns(invented)
+    assert len(offenders) == 1 and '"spoof_detected": False' in offenders[0], offenders
+    assert _g5d_markerless_returns(
+        'def ok():\n    return {"spoof_detected": False, "measured": False}\n') == []
+
+
+def test_g5d_every_absence_route_names_a_declared_failed_stage():
+    """The reason set and the call sites are the same set, in both directions.
+
+    A reason the producer can emit but the contract does not declare is a string a reader cannot
+    branch on; a declared reason no route emits is a name this dispatch promises for nothing. Both
+    halves come from the shipped source, so neither is a transcription of the other.
+    """
+    names = ("detect_spoof_and_ghost_walls", "_ghost_deterministic_verdict")
+    src = "\n\n".join(_g5d_function_source(AI_ENGINE, name) for name in names)
+    emitted = set(re.findall(r'_ghost_absence_payload\("([a-z0-9_]+)"\)', src))
+    assert emitted == set(_G5D_ABSENCE_REASONS), (sorted(emitted), sorted(_G5D_ABSENCE_REASONS))
+    assert all(len(r) <= 32 and "_" in r for r in emitted), sorted(emitted)
+
+
+def test_g5d_the_absent_residence_time_never_reaches_is_spoof_through_250ms():
+    """Case 2: the fast path's 250.0 stand-in passed the sub-300ms half of the spoof condition.
+
+    A missing `mean_residence_time_ms`, a present-but-None one, and an unparseable one must all stop
+    the verdict — with a spoof index of 0.95 the old line invented 250ms, `250 < 300` held, and the
+    payload went out as a BID veto under a headline printing `residence=250ms` as if it had been read.
+    """
+    verdict = _g5d_engine_helper("_ghost_deterministic_verdict")
+    roster = _g5d_roster()
+    hot = {"hawkes_veto": False, "hawkes_spoof_index": 0.95, "normalized_ofi": 0.4}
+
+    for label, packet in (("key missing", dict(hot)),
+                          ("explicit None", dict(hot, mean_residence_time_ms=None)),
+                          ("not a number", dict(hot, mean_residence_time_ms="fast")),
+                          ("NaN", dict(hot, mean_residence_time_ms=float("nan")))):
+        out = verdict(packet)
+        assert out["measured"] is False, (label, out)
+        assert out["reason"] == "deterministic_input_absent", (label, out)
+        assert _g5d_absence_like(out, roster), (label, out)
+
+    base = {"hawkes_veto": False, "hawkes_spoof_index": 0.95,
+            "mean_residence_time_ms": 120.0, "normalized_ofi": 0.4}
+    for key in _g5d_const("GHOST_FASTPATH_INPUTS"):
+        packet = dict(base)
+        del packet[key]
+        out = verdict(packet)
+        assert out["measured"] is False and out["reason"] == "deterministic_input_absent", (key, out)
+    assert verdict({})["measured"] is False
+    assert verdict(None)["measured"] is False
+
+
+def test_g5d_a_measured_zero_is_a_reading_and_stays_a_reading():
+    """Case 3, the half that catches an `or`-based "fix".
+
+    `0.0 or 250.0` is 250.0, so the shipped defaults destroyed a measured zero twice over: a 0ms
+    residence became 250ms, and the `or 0.0` reads kept a measured zero only by accident. Every input
+    here was read, so the fast path must compute and publish a verdict, not an absence.
+    """
+    out = _g5d_engine_helper("_ghost_deterministic_verdict")({
+        "hawkes_veto": False, "hawkes_spoof_index": 0.0,
+        "mean_residence_time_ms": 0.0, "normalized_ofi": 0.0})
+    assert out["measured"] is True, out
+    assert out["spoof_detected"] is False, out
+    assert out["spoof_side"] == "NONE", out
+    assert out["execution_advisory"] == "ALLOW", out
+    assert "residence=0ms" in out["headline"], out["headline"]
+    assert "250" not in out["headline"], out["headline"]
+    # The floor the brief says to leave alone: a clean book therefore reports 5.0%, not 0%.
+    assert out["manipulation_risk_pct"] == 5.0, out["manipulation_risk_pct"]
+
+
+@pytest.mark.parametrize("spoof,res,veto,ofi,detected,side,advisory,risk", (
+    (0.95, 120.0, False, 0.4, True, "BID", "VETO_BUY_SPOOF", 95.0),
+    (0.95, 120.0, False, -0.4, True, "ASK", "VETO_SELL_SPOOF", 95.0),
+    (0.69, 120.0, False, 0.4, False, "NONE", "ALLOW", 34.5),
+    (0.95, 400.0, False, 0.4, False, "NONE", "ALLOW", 47.5),
+    (0.10, 120.0, True, 0.4, True, "BID", "VETO_BUY_SPOOF", 10.0),
+    (0.10, 120.0, False, 0.4, False, "NONE", "ALLOW", 5.0),
+    (0.70, 299.9, False, 0.0, True, "ASK", "VETO_SELL_SPOOF", 70.0),
+))
+def test_g5d_the_fast_paths_arithmetic_is_unchanged(spoof, res, veto, ofi, detected, side,
+                                                    advisory, risk):
+    """D-1 is a payload fix, not a signal change: a fully read packet decides exactly as before."""
+    out = _g5d_engine_helper("_ghost_deterministic_verdict")({
+        "hawkes_veto": veto, "hawkes_spoof_index": spoof,
+        "mean_residence_time_ms": res, "normalized_ofi": ofi})
+    assert out["measured"] is True and out["deterministic"] is True, out
+    assert out["spoof_detected"] is detected, out
+    assert out["spoof_side"] == side, out
+    assert out["execution_advisory"] == advisory, out
+    assert out["manipulation_risk_pct"] == risk, out
+    assert f"residence={res:.0f}ms" in out["headline"], out["headline"]
+
+
+# ---------------------------------------------------------------------------
+# Negative scans over the producer and the persister (both halves each)
+# ---------------------------------------------------------------------------
+
+def _g5d_producer_code():
+    """The producer's own code, comments and docstrings removed: the shipped fallback surface."""
+    names = ("detect_spoof_and_ghost_walls", "_ghost_deterministic_verdict",
+             "_ghost_absence_payload", "_ghost_read_metric", "_ghost_read_flag")
+    return _g5_code_only("\n".join(_g5d_function_source(AI_ENGINE, name) for name in names))
+
+
+@pytest.mark.parametrize("banned,code_line", _G5D_STAND_IN_CASES)
+def test_g5d_no_invented_ghost_verdict_survives_in_the_producer(banned, code_line):
+    """The fabricated fallback and every `or`-defaulted input are gone from Engine 2's code."""
+    assert _g5_banned_hits(_g5d_producer_code(), [banned]) == [], (
+        f"ai_engine's ghost producer still contains {banned!r}")
+
+
+@pytest.mark.parametrize("banned,code_line", _G5D_STAND_IN_CASES)
+def test_g5d_a_comment_neither_trips_nor_hides_that_producer_scan(banned, code_line):
+    """Both halves on this dispatch's own tokens: prose passes, code fails.
+
+    The producer's docstrings really do name the stand-ins they replaced, so the first half is not
+    hypothetical here — a scan that only stripped `#` comments would fail on the shipped file.
+    """
+    prose = f"def f():\n    # the producer used to publish {banned} here\n    return 1\n"
+    assert _g5_banned_hits(prose, [banned]) == []
+    documented = f'def f():\n    """the producer used to publish {banned} here. """\n    return 1\n'
+    assert _g5_banned_hits(documented, [banned]) == []
+    real = f"def f():\n    {code_line}\n    return 1\n"
+    assert _g5_banned_hits(real, [banned]) == [banned], (
+        f"{banned!r} is in the code and the stripped scan no longer sees it")
+    hidden = f"def f():\n    {code_line}  # {banned}\n    return 1\n"
+    assert _g5_banned_hits(hidden, [banned]) == [banned]
+
+
