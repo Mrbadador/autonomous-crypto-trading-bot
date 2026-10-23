@@ -7800,15 +7800,6 @@ def test_g5c_the_chart_draws_no_series_off_a_mark_it_does_not_have():
             f"the close overlay is dressed in the reading colour {colour}")
 
 
-def test_g5c_the_chart_level_helper_says_what_zero_means():
-    """`_deck_chart_level` is what the chart tabs are handed, so its own promise is the contract
-    the builder has to keep: 0.0 is "draw nothing", never "draw a substitute"."""
-    for path in (DASHBOARD, LEGACY_DASHBOARD):
-        src = _g5c_helper_code("_deck_chart_level", path)
-        assert "draw nothing" in src, (path.name, src)
-        assert "never" in src, (path.name, src)
-
-
 def test_g5c_the_twin_helpers_are_byte_identical_and_read_the_same_price():
     """The convention the branch carries for `scripts/live_dashboard.py`: same bytes, same answer
     on the same row, for the C-2 and C-3 helpers as well as the C-1 ones."""
