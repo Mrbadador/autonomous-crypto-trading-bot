@@ -109,9 +109,14 @@ SUPER_BOT_ENABLED             = os.getenv("SUPER_BOT_ENABLED", "true").lower() i
 REGIME_MAX_AGE_SEC            = float(os.getenv("REGIME_MAX_AGE_SEC", "900"))
 GRID_LEVERAGE                 = int(os.getenv("GRID_LEVERAGE", "3"))
 GRID_ALLOCATION_USDT          = float(os.getenv("GRID_ALLOCATION_USDT", "85.0"))  # Proportional Sizing: $85 margin per trade
-GRID_TP_PCT                   = float(os.getenv("GRID_TP_PCT", "0.0135"))         # +1.35% limit target (1.17 R:R vs 1.15% SL)
-GRID_SL_PCT                   = float(os.getenv("GRID_SL_PCT", "0.0115"))         # -1.15% tight stop
-GRID_RSI_THRESHOLD            = float(os.getenv("GRID_RSI_THRESHOLD", "34.0"))  # Relaxed to 34.0 to catch standard 5m pullbacks
+GRID_TP_PCT                   = float(os.getenv("GRID_TP_PCT", "0.0150"))         # +1.50% limit target (1.11 R:R vs 1.35% SL)
+GRID_SL_PCT                   = float(os.getenv("GRID_SL_PCT", "0.0135"))         # -1.35% stop (clears 5m liquidation wicks)
+GRID_RSI_THRESHOLD            = float(os.getenv("GRID_RSI_THRESHOLD", "26.0"))    # High-conviction deep oversold threshold
+GRID_RSI_SHORT_THRESHOLD      = float(os.getenv("GRID_RSI_SHORT_THRESHOLD", "74.0")) # High-conviction deep overbought threshold
+GRID_BB_STD                   = float(os.getenv("GRID_BB_STD", "2.5"))            # 2.5 sigma extreme band
+GRID_VWAP_WINDOW              = int(os.getenv("GRID_VWAP_WINDOW", "96"))          # 96 5m bars = 8-hour VWAP lookback
+GRID_PARTIAL_TP_ENABLED       = os.getenv("GRID_PARTIAL_TP_ENABLED", "false").lower() in ("true", "1") # Disabled: Let winners ride to Limit TP
+GRID_BREAKEVEN_TRIGGER_PCT    = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0120")) # Only breakeven at +1.20% (80% of TP)
 
 # ---------------------------------------------------------------------------
 # Quick Scalp Short Engine (Fast Turnover Protocol - Disabled: Restored Long Swing + Maker Grid Core)

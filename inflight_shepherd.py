@@ -658,7 +658,7 @@ class InflightPositionShepherd:
                                     try:
                                         with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
                                             l_row = l_conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
-                                            if not l_row or str(l_row[0]) != "swing_architect":
+                                            if not l_row or str(l_row[0]) not in ("swing_architect", "super_bot_grid", "super_bot_scalp_short"):
                                                 return False
                                             hb_str = str(l_row[1] or "")
                                             clean_hb = hb_str.replace("Z", "+00:00")
