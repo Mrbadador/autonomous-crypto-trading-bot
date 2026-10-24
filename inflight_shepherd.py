@@ -658,8 +658,13 @@ class InflightPositionShepherd:
                                     try:
                                         with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
                                             l_row = l_conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
-                                            if not l_row or str(l_row[0]) not in ("swing_architect", "super_bot_grid", "super_bot_scalp_short"):
-                                                return False
+                                            # Fail-closed: if unrecorded or owned by an active fleet engine, treat as locked.
+                                            # Only return False (allow external shepherd ratchet) if explicitly unlocked or owned by 'external_shepherd'.
+                                            if not l_row:
+                                                return True
+                                            holder = str(l_row[0] or "")
+                                            if holder in ("swing_architect", "super_bot_grid", "super_bot_scalp_short"):
+                                                return True
                                             hb_str = str(l_row[1] or "")
                                             clean_hb = hb_str.replace("Z", "+00:00")
                                             if "+" not in clean_hb:
@@ -667,8 +672,10 @@ class InflightPositionShepherd:
                                             hb_dt = datetime.fromisoformat(clean_hb)
                                             # Fresh lock only if heartbeat within last 900 seconds (15 mins)
                                             return (datetime.now(timezone.utc) - hb_dt).total_seconds() <= 900.0
-                                    except Exception:
-                                        return False
+                                    except Exception as db_e:
+                                        # Fail-closed on DB contention/lock: do not allow shepherd to modify stops blindly
+                                        log.warning(f"[SHEPHERD-FAIL-CLOSED] Error reading asset_locks for {std_sym}: {db_e}. Assuming locked.")
+                                        return True
 
                                 swing_is_owner = await asyncio.to_thread(_is_swing_locked)
                                 if swing_is_owner:

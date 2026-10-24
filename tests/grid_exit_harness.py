@@ -15,6 +15,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import config
 import tests.conftest  # noqa: F401 — enforce D-11 quarantine
 
 _orig_sqlite_connect = sqlite3.connect
@@ -103,3 +104,10 @@ class SwingExitHarnessCase(unittest.TestCase):
                                  side_effect=lambda *a, **kw: _orig_sqlite_connect(self.db_path))
         self.db_conn_ctx.start()
         self.addCleanup(self.db_conn_ctx.stop)
+        # Ensure test harness exercises partial harvest & 0.75% trigger logic regardless of prod defaults
+        self.patch_tp = patch.object(config, "GRID_PARTIAL_TP_ENABLED", True)
+        self.patch_be = patch.object(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0075)
+        self.patch_tp.start()
+        self.patch_be.start()
+        self.addCleanup(self.patch_tp.stop)
+        self.addCleanup(self.patch_be.stop)

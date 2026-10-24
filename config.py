@@ -185,14 +185,11 @@ HAWKES_CASCADE_RHO_THRESHOLD      = float(os.getenv("HAWKES_CASCADE_RHO_THRESHOL
 MICROSTRUCTURE_VPIN_VETO_THRESHOLD = float(os.getenv("MICROSTRUCTURE_VPIN_VETO_THRESHOLD", "0.70")) # Hard pre-trade informed flow toxicity cutoff
 TRADFI_FAIL_CLOSED                = os.getenv("TRADFI_FAIL_CLOSED", "true").lower() in ("true", "1")
 
-# Chop Grid Hyperparameters (V36.5 Quantitative Calibration)
-
-GRID_MAX_5M_ADX                 = float(os.getenv("GRID_MAX_5M_ADX", "36.0"))           # Raised from 32.0 to 36.0 to allow moderate volatility dips
-GRID_BREAKEVEN_TRIGGER_PCT      = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0075")) # +0.75% profit triggers the partial take-profit
-GRID_BREAKEVEN_FEE_BUFFER_PCT   = float(os.getenv("GRID_BREAKEVEN_FEE_BUFFER_PCT", "0.0035")) # fallback lock when the position is too small to halve
-GRID_PARTIAL_TP_ENABLED         = os.getenv("GRID_PARTIAL_TP_ENABLED", "true").lower() in ("true", "1")
-GRID_PARTIAL_TP_FRACTION        = float(os.getenv("GRID_PARTIAL_TP_FRACTION", "0.50"))  # close half at the trigger, let the rest ride to the maker TP
-GRID_PARTIAL_TP_MIN_REMAINING   = float(os.getenv("GRID_PARTIAL_TP_MIN_REMAINING", "5.0"))  # min notional (USD) to keep running after the harvest
+# Chop Grid Auxiliary Parameters (V36.5 Quantitative Calibration)
+GRID_MAX_5M_ADX                 = float(os.getenv("GRID_MAX_5M_ADX", "25.0"))           # 5m ADX ceiling to avoid chasing waterfalls
+GRID_BREAKEVEN_FEE_BUFFER_PCT   = float(os.getenv("GRID_BREAKEVEN_FEE_BUFFER_PCT", "0.0035")) # fallback lock buffer
+GRID_PARTIAL_TP_FRACTION        = float(os.getenv("GRID_PARTIAL_TP_FRACTION", "0.50"))  # close fraction if partial TP enabled
+GRID_PARTIAL_TP_MIN_REMAINING   = float(os.getenv("GRID_PARTIAL_TP_MIN_REMAINING", "5.0"))  # min notional (USD)
 
 # Native exit priority (swing_trader.manage_active_positions)
 # The on-exchange mark-price plans own the TP/SL fills; the software close is a verified fallback.
@@ -391,7 +388,6 @@ MIN_AI_CONVICTION_SCORE   = 50.0
 MIN_NN_CONFIDENCE         = float(os.getenv("MIN_NN_CONFIDENCE", "0.34"))
 MAX_TRADES_PER_24H        = 3
 MAX_CONCURRENT_TRADES     = int(os.getenv("MAX_CONCURRENT_TRADES", "8"))
-RISK_PER_TRADE_PCT        = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))  # Single source of truth (0.5% equity risk per trade)
 # P3-PATCH: Raised from 5.0 → 55.0. At 5.0 the gate was functionally dead (any
 # conviction > 5/100 passed). 55.0 creates a meaningful second-tier filter:
 # Boardroom must score ≥50 to signal (MIN_AI_CONVICTION_SCORE), then Berserker
