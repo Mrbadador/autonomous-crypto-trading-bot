@@ -81,6 +81,83 @@ def _ensure_shepherd_tables():
 _ensure_shepherd_tables()
 
 
+def _default_lock_reader(std_sym):
+    """Production reader: the (locked_by, heartbeat) asset_locks row for std_sym, or None.
+
+    Kept byte-for-byte equivalent to the original inline query so behaviour is
+    unchanged when no reader is injected; raises on DB failure so the caller can
+    fail closed.
+    """
+    with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
+        return l_conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
+
+
+def _is_swing_locked(std_sym, lock_reader=None) -> tuple:
+    """Decide whether the external shepherd may ratchet stops for std_sym.
+
+    Returns (locked: bool, reason: str). locked=True means DO NOT ratchet
+    (fail-closed); locked=False means the ratchet is approved. The reason names
+    the measured cause so the advisory log and persisted diagnosis state only
+    what the lock read actually supports — 'locked' is not the same claim as
+    'managed by swing_architect'.
+    """
+    reader = lock_reader or _default_lock_reader
+    try:
+        l_row = reader(std_sym)
+        # Fail-closed: if unrecorded or owned by an active fleet engine, treat as locked.
+        # Only return False (allow external shepherd ratchet) on a stale heartbeat
+        # from a non-fleet holder.
+        if not l_row:
+            return (True, f"no asset_locks row for {std_sym}")
+        holder = str(l_row[0] or "")
+        if holder in ("swing_architect", "super_bot_grid", "super_bot_scalp_short"):
+            return (True, f"held by {holder}")
+        hb_str = str(l_row[1] or "")
+        clean_hb = hb_str.replace("Z", "+00:00")
+        if "+" not in clean_hb:
+            clean_hb += "+00:00"
+        hb_dt = datetime.fromisoformat(clean_hb)
+        # Fresh lock only if heartbeat within last 900 seconds (15 mins)
+        age = (datetime.now(timezone.utc) - hb_dt).total_seconds()
+        if age <= 900.0:
+            return (True, f"fresh heartbeat from {holder} ({int(age)}s old)")
+        return (False, f"stale heartbeat from {holder}")
+    except Exception as db_e:
+        # Fail-closed on DB contention/lock: do not allow shepherd to modify stops blindly
+        log.warning(f"[SHEPHERD-FAIL-CLOSED] Error reading asset_locks for {std_sym}: {db_e}. Assuming locked.")
+        return (True, f"lock state unreadable ({db_e}) — failing closed")
+
+
+def _verdict_word(decision) -> str:
+    """The verdict the AI measured, or the absence token when its payload carried none.
+
+    A response with no "verdict" key — or a blank one — measured nothing, so defaulting it to
+    "HOLDING_NORMAL" used to publish an all-clear the AI never gave.
+    `inflight_shepherd_logs.verdict` is TEXT NOT NULL, so the absence travels as this non-null token
+    — never None — and every consumer renders it as an absence.
+    """
+    payload = decision if isinstance(decision, dict) else {}
+    raw = payload.get("verdict")
+    if raw is None or not str(raw).strip():
+        return config.VERDICT_ABSENT
+    return str(raw).strip().upper()
+
+
+def _tape_word(decision, tape_data):
+    """The L2 tape word the position was measured against, or None when nothing carried one.
+
+    The published default used to be the word "BALANCED" — a tape reading the shepherd had not taken.
+    `tape_condition` is a nullable column, so an unmeasured tape publishes None and the consumers say
+    "not measured" instead of colouring an invented word.
+    """
+    src = decision if isinstance(decision, dict) else {}
+    packet = tape_data if isinstance(tape_data, dict) else {}
+    for candidate in (src.get("tape_condition"), packet.get("tape_condition")):
+        if candidate is not None and str(candidate).strip() != "":
+            return str(candidate)
+    return None
+
+
 class InflightPositionShepherd:
     """
     Continuous 15-Minute AI In-Flight Position Shepherd.
@@ -248,15 +325,20 @@ class InflightPositionShepherd:
             except Exception as pe:
                 log.warning(f"Shepherd JSON parse error: {pe}")
 
+        # No verdict was measured: publish the absence, not a plausible all-clear. The verdict is the
+        # absence TOKEN (a non-null string) because inflight_shepherd_logs.verdict is TEXT NOT NULL;
+        # tape_condition and confidence are nullable, so they publish None. runner_mode / tighten_sl /
+        # suggested_sl stay inert (no action on an unmeasured verdict) and target_r 2.5 is POLICY, not
+        # a measurement, so it is untouched.
         return {
-            "verdict": "HOLDING_NORMAL",
+            "verdict": config.VERDICT_ABSENT,
             "runner_mode": False,
             "tighten_sl": False,
             "suggested_sl": None,
             "target_r": 2.5,
-            "tape_condition": "BALANCED",
-            "diagnosis": "Standard algorithmic trailing baseline maintained.",
-            "confidence": 0.50
+            "tape_condition": None,
+            "diagnosis": "AI shepherd unreachable: no verdict measured. The static algorithmic trailing baseline (policy) is holding.",
+            "confidence": None
         }
 
     async def evaluate_active_positions(self, force: bool = False) -> list:
@@ -413,14 +495,20 @@ class InflightPositionShepherd:
                     decision = await self._query_ai_shepherd(pos_context, timeout_sec=10.0)
                     self.last_check_ts[clean_sym] = now_ts
 
-                    verdict = str(decision.get("verdict", "HOLDING_NORMAL")).upper()
+                    verdict = _verdict_word(decision)
                     runner_mode = bool(decision.get("runner_mode", False))
                     tighten_sl = bool(decision.get("tighten_sl", False))
                     suggested_sl = decision.get("suggested_sl")
                     diagnosis = str(decision.get("diagnosis", "Monitored."))
-                    conf = float(decision.get("confidence", 0.8))
+                    # A partial AI response that omits "confidence" measured no confidence; defaulting it to
+                    # 0.80 published a reading the model never gave. The column is nullable, so a missing key
+                    # publishes None (absence) exactly like tape and verdict — only a real value is floated.
+                    raw_conf = decision.get("confidence")
+                    # A published absence is None (the fallback measured no confidence); the column is
+                    # nullable, so it travels as None rather than being floated into a number.
+                    conf = float(raw_conf) if raw_conf is not None else None
                     target_r = float(decision.get("target_r", 3.0))
-                    tape_cond = str(decision.get("tape_condition", tape_data.get("tape_condition", "BALANCED")))
+                    tape_cond = _tape_word(decision, tape_data)
 
                     # Feature 3: Climax Exhaustion & Peak Harvest Sentinel
                     # Monitors profitable trades (>= +1.0R or >= +8% ROE or HARVEST_PROFIT verdict)
@@ -654,33 +742,17 @@ class InflightPositionShepherd:
                                 log.info(f"[BREATHING-ROOM] Rule #173/175 Active: Muting micro-tightening for {std_sym} (Hold: {holding_mins:.1f}m < 60m & advance < 1.0 ATR). Allowing room to expand.")
                             else:
                                 # Coordinate with swing_architect to prevent racing modification on the same position
-                                def _is_swing_locked():
-                                    try:
-                                        with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
-                                            l_row = l_conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
-                                            # Fail-closed: if unrecorded or owned by an active fleet engine, treat as locked.
-                                            # Only return False (allow external shepherd ratchet) if explicitly unlocked or owned by 'external_shepherd'.
-                                            if not l_row:
-                                                return True
-                                            holder = str(l_row[0] or "")
-                                            if holder in ("swing_architect", "super_bot_grid", "super_bot_scalp_short"):
-                                                return True
-                                            hb_str = str(l_row[1] or "")
-                                            clean_hb = hb_str.replace("Z", "+00:00")
-                                            if "+" not in clean_hb:
-                                                clean_hb += "+00:00"
-                                            hb_dt = datetime.fromisoformat(clean_hb)
-                                            # Fresh lock only if heartbeat within last 900 seconds (15 mins)
-                                            return (datetime.now(timezone.utc) - hb_dt).total_seconds() <= 900.0
-                                    except Exception as db_e:
-                                        # Fail-closed on DB contention/lock: do not allow shepherd to modify stops blindly
-                                        log.warning(f"[SHEPHERD-FAIL-CLOSED] Error reading asset_locks for {std_sym}: {db_e}. Assuming locked.")
-                                        return True
-
-                                swing_is_owner = await asyncio.to_thread(_is_swing_locked)
-                                if swing_is_owner:
-                                    log.info(f"[SHEPHERD-COORDINATION] {std_sym} is actively managed by swing_architect. Inflight Shepherd acting in advisory mode.")
-                                    diagnosis = f"Advisory Shepherding: {verdict}"
+                                swing_is_locked, lock_reason = await asyncio.to_thread(_is_swing_locked, std_sym)
+                                if swing_is_locked:
+                                    log.info(f"[SHEPHERD-COORDINATION] {std_sym} not ratcheting ({lock_reason}); acting in advisory mode.")
+                                    # An unmeasured verdict arrives as the truthy VERDICT_ABSENT token (never
+                                    # None after F6), so `if verdict else` would leak the raw token into the
+                                    # persisted diagnosis — which the dashboard then prints. Render the token as
+                                    # the absence word, consistent with every other consumer.
+                                    verdict_text = ("no AI verdict measured"
+                                                    if verdict == config.VERDICT_ABSENT
+                                                    else (verdict or "not measured"))
+                                    diagnosis = f"Advisory Shepherding ({lock_reason}): {verdict_text}"
                                 else:
                                     log.info(f"[SHEPHERD-RATCHET] {std_sym} SL Ratchet Approved! Moving SL from ${current_sl:,.4f} -> ${suggested_sl:,.4f} ({verdict})")
                                     try:

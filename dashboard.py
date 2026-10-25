@@ -2484,6 +2484,44 @@ def _markov_regime_readings(raw_value, published_at, now=None, max_age_sec=None)
     return readings
 
 
+# ── In-flight sentinel verdict: a measured word, or an absence ─────────────────────────────
+# The shepherd publishes `config.VERDICT_ABSENT` when the AI measured no verdict, and `None`
+# for a tape it never read. Both sentinel renders below (the position-card badge and the full
+# "AI In-Flight Position Shepherd" card) used to default an absent verdict to "HOLDING_NORMAL"
+# painted green — a positive all-clear for a position nothing had actually assessed.
+_SHEP_VERDICT_ABSENT_TEXT = "no AI verdict measured"
+
+
+def _shepherd_verdict_display(s_data) -> dict:
+    """The sentinel's verdict word, colour, icon, tape word and diagnosis — measured or absent.
+
+    Pure and module-level so the shipped body is testable without booting the app. A verdict the
+    producer never measured (the absence token, `None`, an empty string, or no key at all) renders
+    as grey words that say so; the raw token, "HOLDING_NORMAL", "BALANCED" and a literal `None`
+    are never printed. A measured verdict keeps the word, colour and icon it always had.
+    """
+    payload = s_data if isinstance(s_data, dict) else {}
+    raw = payload.get("verdict")
+    absent = (raw is None or str(raw).strip() == ""
+              or str(raw).strip().upper() == config.VERDICT_ABSENT)
+    if absent:
+        return {"text": _SHEP_VERDICT_ABSENT_TEXT, "color": _DECK_ABSENT_COLOR,
+                "icon": "", "tape_text": _DECK_ABSENT_TEXT,
+                "diag": str(payload.get("diagnosis") or _SHEP_VERDICT_ABSENT_TEXT),
+                "absent": True}
+
+    verdict = str(raw)
+    is_run = bool(payload.get("runner_mode", False))
+    color = ("#00e5ff" if is_run else
+             ("#00ff66" if verdict == "HOLDING_NORMAL" else
+              ("#ff9900" if "STALL" in verdict else "#ff003c")))
+    icon = "🏃" if is_run else ("🛡️" if verdict == "HOLDING_NORMAL" else "⚠️")
+    tape = payload.get("tape_condition")
+    tape_text = _DECK_ABSENT_TEXT if (tape is None or str(tape).strip() == "") else str(tape)
+    return {"text": verdict, "color": color, "icon": icon, "tape_text": tape_text,
+            "diag": str(payload.get("diagnosis", "Position monitored.")), "absent": False}
+
+
 # ── Dark Financial Terminal Aesthetic ────────────────────────────────────────
 st.markdown("""
 <style>
@@ -3666,14 +3704,18 @@ with tab_live:
                 # Query AI Shepherd Verdict & In-Flight Reversal/Carry Sentinel
                 shep_raw = query_system_state(f"ai_shepherd_{sym_clean}", "")
                 shep_badge = ""
-                shep_verdict_str = "MONITORED"
+                # No sentinel row at all is an absence too — "MONITORED" used to claim a watch nobody ran.
+                shep_verdict_str = _SHEP_VERDICT_ABSENT_TEXT
                 if shep_raw:
                     try:
                         s_obj = json.loads(shep_raw)
-                        s_verd = s_obj.get("verdict", "HOLDING_NORMAL")
+                        shep_disp = _shepherd_verdict_display(s_obj)
+                        s_verd = shep_disp["text"]
                         s_diag = s_obj.get("diagnosis", "")
                         s_rat = bool(s_obj.get("sl_ratcheted", False))
-                        s_col = "#00e5ff" if "RUNNER" in s_verd else ("#00ff66" if s_rat or "BREAKEVEN" in s_diag.upper() else "#94a3b8")
+                        s_col = (_DECK_ABSENT_COLOR if shep_disp["absent"]
+                                 else ("#00e5ff" if "RUNNER" in s_verd
+                                       else ("#00ff66" if s_rat or "BREAKEVEN" in s_diag.upper() else "#94a3b8")))
                         shep_verdict_str = s_verd
                         shep_badge = f"<div style='margin-top: 5px; background: rgba(0, 229, 255, 0.06); border-left: 2px solid {s_col}; padding: 3px 6px; border-radius: 3px; font-size: 0.72rem; color: #cbd5e1;'>🦅 <b>In-Flight Sentinel:</b> <span style='color: {s_col}; font-weight: bold;'>{s_verd}</span> {('⚡ SL RATCHETED' if s_rat else '')} — <span style='color: #94a3b8;'>{s_diag[:65]}...</span></div>"
                     except Exception:
@@ -3882,14 +3924,14 @@ with tab_live:
             for idx, (sym_name, s_data) in enumerate(shepherd_cards):
                 c_col = cols[idx % len(cols)]
                 with c_col:
-                    v_val = s_data.get("verdict", "HOLDING_NORMAL")
-                    is_run = s_data.get("runner_mode", False)
-                    v_color = "#00e5ff" if is_run else ("#00ff66" if v_val == "HOLDING_NORMAL" else ("#ff9900" if "STALL" in v_val else "#ff003c"))
-                    v_icon = "🏃" if is_run else ("🛡️" if v_val == "HOLDING_NORMAL" else "⚠️")
+                    shep_disp = _shepherd_verdict_display(s_data)
+                    v_val = shep_disp["text"]
+                    v_color = shep_disp["color"]
+                    v_icon = shep_disp["icon"]
                     r_mult = num(s_data.get("r_multiple"), 0.0)
                     tgt_r = num(s_data.get("target_r"), 2.5)
-                    tape = s_data.get("tape_condition", "BALANCED")
-                    diag = s_data.get("diagnosis", "Position monitored.")
+                    tape = shep_disp["tape_text"]
+                    diag = shep_disp["diag"]
                     sl_sugg = s_data.get("suggested_sl")
                     sl_text = f"${float(sl_sugg):,.4f}" if sl_sugg else "Hold Existing"
                     ratchet_badge = " <span style='color: #00ff66; font-size: 0.75rem; font-weight: bold;'>[RATCHETED]</span>" if s_data.get("sl_ratcheted") else ""
