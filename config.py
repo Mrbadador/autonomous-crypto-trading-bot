@@ -24,6 +24,17 @@ REPLAY_START_DATE = os.getenv("REPLAY_START_DATE", "2023-04-01")
 REPLAY_END_DATE   = os.getenv("REPLAY_END_DATE", "2023-07-31")
 
 # ---------------------------------------------------------------------------
+# AI Verdict Contract
+# ---------------------------------------------------------------------------
+# The token the in-flight shepherd publishes when the AI measured NO verdict for a
+# position (provider unreachable, parse failure, or a payload with no verdict key).
+# It is a word, not None, because inflight_shepherd_logs.verdict is a TEXT NOT NULL
+# column: a None would fail the INSERT and every ledger row for an unmeasured verdict
+# would be silently lost. Consumers (dashboard, hourly_briefing, executive_briefing)
+# must render it as an absence — grey, "no AI verdict measured" — never as an all-clear.
+VERDICT_ABSENT = "NO_AI_VERDICT"
+
+# ---------------------------------------------------------------------------
 # Exchange / Symbol
 # ---------------------------------------------------------------------------
 SANDBOX          = os.getenv("SANDBOX", "true").lower() in ("true", "1")
