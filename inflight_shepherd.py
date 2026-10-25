@@ -500,7 +500,10 @@ class InflightPositionShepherd:
                     tighten_sl = bool(decision.get("tighten_sl", False))
                     suggested_sl = decision.get("suggested_sl")
                     diagnosis = str(decision.get("diagnosis", "Monitored."))
-                    raw_conf = decision.get("confidence", 0.8)
+                    # A partial AI response that omits "confidence" measured no confidence; defaulting it to
+                    # 0.80 published a reading the model never gave. The column is nullable, so a missing key
+                    # publishes None (absence) exactly like tape and verdict — only a real value is floated.
+                    raw_conf = decision.get("confidence")
                     # A published absence is None (the fallback measured no confidence); the column is
                     # nullable, so it travels as None rather than being floated into a number.
                     conf = float(raw_conf) if raw_conf is not None else None
@@ -742,8 +745,13 @@ class InflightPositionShepherd:
                                 swing_is_locked, lock_reason = await asyncio.to_thread(_is_swing_locked, std_sym)
                                 if swing_is_locked:
                                     log.info(f"[SHEPHERD-COORDINATION] {std_sym} not ratcheting ({lock_reason}); acting in advisory mode.")
-                                    # verdict may be absent (F6); an absence must render as an absence word, never "None".
-                                    verdict_text = verdict if verdict else "not measured"
+                                    # An unmeasured verdict arrives as the truthy VERDICT_ABSENT token (never
+                                    # None after F6), so `if verdict else` would leak the raw token into the
+                                    # persisted diagnosis — which the dashboard then prints. Render the token as
+                                    # the absence word, consistent with every other consumer.
+                                    verdict_text = ("no AI verdict measured"
+                                                    if verdict == config.VERDICT_ABSENT
+                                                    else (verdict or "not measured"))
                                     diagnosis = f"Advisory Shepherding ({lock_reason}): {verdict_text}"
                                 else:
                                     log.info(f"[SHEPHERD-RATCHET] {std_sym} SL Ratchet Approved! Moving SL from ${current_sl:,.4f} -> ${suggested_sl:,.4f} ({verdict})")

@@ -152,8 +152,13 @@ def test_advisory_label_names_the_cause_not_an_assumption(shepherd):
 
 def test_absent_verdict_never_prints_none(shepherd):
     src = inspect.getsource(shepherd)
-    # House convention: an absence renders as an absence word, never the literal "None".
-    assert 'verdict if verdict else "not measured"' in src
+    # House convention: an absence renders as an absence WORD — never the literal "None", and (after
+    # F6) never the raw VERDICT_ABSENT token either. The old bare `verdict if verdict else` guard let
+    # the truthy token through into the persisted diagnosis, which the dashboard then printed.
+    assert "verdict if verdict else" not in src, "the leak-the-token guard is back"
+    assert "verdict == config.VERDICT_ABSENT" in src, "the advisory path must detect the absence token"
+    assert '"no AI verdict measured"' in src, "and render it in words"
+    assert '"not measured"' in src, "a truly empty verdict still renders as an absence word, not None"
 
 
 def test_default_reader_runs_the_same_production_query(shepherd):

@@ -150,6 +150,29 @@ def test_absence_confidence_does_not_reach_a_float_call(monkeypatch, tmp_path):
     assert "if raw_conf is not None else None" in loop
 
 
+def test_missing_confidence_key_publishes_none_not_a_default_reading():
+    """A PARTIAL AI response that omits `confidence` measured none — defaulting it to `0.8` published
+    a confidence the model never gave (the same present-key-omitted class F6 removed for verdict/tape).
+    The nullable column must carry None in that case, so the read must have NO numeric default."""
+    src = SHEPHERD_SRC.read_text(encoding="utf-8")
+    loop = src[src.index("decision = await self._query_ai_shepherd"):]
+    loop = loop[:loop.index("tape_cond =")]
+    assert 'get("confidence", 0.8)' not in loop, "a default confidence is back"
+    assert 'decision.get("confidence")' in loop, "the confidence read must carry no stand-in value"
+
+
+def test_advisory_diagnosis_translates_the_absent_verdict_to_words():
+    """The advisory branch persists `diagnosis` to system_state and the ledger, and the dashboard prints
+    it. After F6 `verdict` is the truthy VERDICT_ABSENT token, so the old bare `if verdict else` guard
+    leaked the raw token into that text — F6's own 'never print the raw token' guarantee. The token must
+    be rendered in words here."""
+    src = SHEPHERD_SRC.read_text(encoding="utf-8")
+    seg = src[src.index("not ratcheting"): src.index("SL Ratchet Approved")]
+    assert "verdict == config.VERDICT_ABSENT" in seg, "advisory path must detect the absence token"
+    assert '"no AI verdict measured"' in seg, "and render it as the absence word"
+    assert "verdict if verdict else" not in seg, "the bare-truthy guard that leaked the token is gone"
+
+
 # ── the derived (measured) verdicts still win ──────────────────────────────────────────────────
 
 def test_derived_verdicts_still_overwrite_the_published_default():
@@ -180,30 +203,46 @@ def test_derived_verdicts_still_overwrite_the_published_default():
 def test_every_verdict_comparison_answers_identically_for_the_token(monkeypatch, tmp_path):
     """Swapping the default for the token may not move one branch.
 
-    Every `Compare` node in `evaluate_active_positions` that touches `verdict` is compiled out of
-    the shipped source and evaluated twice — once with the absence token, once with the word it
-    replaced — and both answers must match. This is the proof, not a restatement of it.
+    Each `Compare` node in `evaluate_active_positions` that touches `verdict` falls into one of two
+    kinds, proved separately:
+      * TRADING GUARD — gates the ratchet/exit. Compiled from the shipped source and evaluated twice
+        (token, then the word it replaced); BOTH answers must match, so no branch moves.
+      * RENDER CHECK — references `config` to detect the token so the advisory text can say
+        "no AI verdict measured". This kind is SUPPOSED to differ: True for the token, False for a
+        measured word. That is the fix, not a regression, so it is excluded from the "identical" claim
+        and pinned to its correct asymmetry instead.
     """
     _load_shepherd(monkeypatch, tmp_path)  # keeps this file's import rule in one place
     fn = _shepherd_function()
 
-    comparisons = []
+    guard_comparisons = []
+    render_comparisons = []
     for node in ast.walk(fn):
-        if isinstance(node, ast.Compare):
-            if any(isinstance(n, ast.Name) and n.id == "verdict" for n in ast.walk(node)):
-                comparisons.append(node)
+        if isinstance(node, ast.Compare) and any(
+                isinstance(n, ast.Name) and n.id == "verdict" for n in ast.walk(node)):
+            refs_config = any(isinstance(n, ast.Name) and n.id == "config" for n in ast.walk(node))
+            (render_comparisons if refs_config else guard_comparisons).append(node)
 
-    assert len(comparisons) >= 4, f"expected the guard chain, found {len(comparisons)}"
+    assert len(guard_comparisons) >= 4, f"expected the guard chain, found {len(guard_comparisons)}"
 
     env = {"r_multiple": 1.5, "roe_pct": 9.0, "tighten_sl": True, "suggested_sl": 100.0}
-    for node in comparisons:
+    for node in guard_comparisons:
         code = compile(ast.Expression(body=node), "<verdict-comparison>", "eval")
         answers = []
         for verdict in (config.VERDICT_ABSENT, "HOLDING_NORMAL"):
             scope = dict(env)
             scope["verdict"] = verdict
-            answers.append(eval(code, {"__builtins__": {}}, scope))  # the repo's own AST node
+            answers.append(eval(code, {"__builtins__": {}, "config": config}, scope))  # the repo's own AST node
         assert answers[0] == answers[1], f"control flow moved: {ast.unparse(node)}"
+
+    # The render check must be present and must behave asymmetrically on purpose.
+    assert render_comparisons, "expected the advisory-render token check"
+    for node in render_comparisons:
+        code = compile(ast.Expression(body=node), "<verdict-render>", "eval")
+        globals_ = {"__builtins__": {}, "config": config}
+        token_ans = eval(code, globals_, {"verdict": config.VERDICT_ABSENT})
+        word_ans = eval(code, globals_, {"verdict": "HOLDING_NORMAL"})
+        assert token_ans is True and word_ans is False, f"render check misbehaves: {ast.unparse(node)}"
 
     # And the word the token replaced is never a comparison operand anywhere in the module.
     whole = ast.parse(SHEPHERD_SRC.read_text(encoding="utf-8"), filename=str(SHEPHERD_SRC))
