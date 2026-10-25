@@ -112,9 +112,9 @@ GRID_ALLOCATION_USDT          = float(os.getenv("GRID_ALLOCATION_USDT", "85.0"))
 GRID_TP_PCT                   = float(os.getenv("GRID_TP_PCT", "0.0150"))         # +1.50% limit target (1.11 R:R vs 1.35% SL)
 GRID_SL_PCT                   = float(os.getenv("GRID_SL_PCT", "0.0135"))         # -1.35% stop (clears 5m liquidation wicks)
 GRID_RSI_THRESHOLD            = float(os.getenv("GRID_RSI_THRESHOLD", "26.0"))    # High-conviction deep oversold threshold
-GRID_RSI_SHORT_THRESHOLD      = float(os.getenv("GRID_RSI_SHORT_THRESHOLD", "74.0")) # High-conviction deep overbought threshold
-GRID_BB_STD                   = float(os.getenv("GRID_BB_STD", "2.5"))            # 2.5 sigma extreme band
-GRID_VWAP_WINDOW              = int(os.getenv("GRID_VWAP_WINDOW", "96"))          # 96 5m bars = 8-hour VWAP lookback
+GRID_RSI_SHORT_THRESHOLD      = float(os.getenv("GRID_RSI_SHORT_THRESHOLD", "74.0")) # NOT CONSUMED by any engine — the live overbought read is SCALP_SHORT_RSI_OVERBOUGHT (read in strategy_base / super_bot); setting this has no effect.
+GRID_BB_STD                   = float(os.getenv("GRID_BB_STD", "2.5"))            # NOT CONSUMED by any engine — the live band is 2.0 sigma over 24 bars (see super_bot.compute_grid_5m_indicators); setting this has no effect.
+GRID_VWAP_WINDOW              = int(os.getenv("GRID_VWAP_WINDOW", "96"))          # NOT CONSUMED by any engine — the live VWAP window is 24 bars (see super_bot.compute_grid_5m_indicators); setting this has no effect.
 GRID_PARTIAL_TP_ENABLED       = os.getenv("GRID_PARTIAL_TP_ENABLED", "false").lower() in ("true", "1") # Disabled: Let winners ride to Limit TP
 GRID_BREAKEVEN_TRIGGER_PCT    = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0120")) # Only breakeven at +1.20% (80% of TP)
 

@@ -372,7 +372,13 @@ class SwingKumoStrategy(BaseStrategy):
 class ChopGridMakerStrategy(BaseStrategy):
     """
     5m Mean-Reversion Maker Dip-Buy Strategy (CHOP Regime).
-    Enters on RSI < 30 & Close <= 24-period VWAP Lower Band (-2.0 std) with ADX < 24.
+
+    should_long enters only when the 5m ADX is below config.GRID_MAX_5M_ADX
+    (chop-only; expansion blocks the entry), RSI is at or below
+    config.GRID_RSI_THRESHOLD, price is at or below the lower VWAP deviation
+    band, and a rebound hook confirms the dip is turning rather than still
+    falling (bullish close with a meaningful lower wick, a hammer, or a
+    rising RSI). See should_long in this class for the rebound-hook logic.
     """
     name: str = "GRID_MAKER"
     timeframe: str = "5m"
