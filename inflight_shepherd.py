@@ -81,6 +81,53 @@ def _ensure_shepherd_tables():
 _ensure_shepherd_tables()
 
 
+def _default_lock_reader(std_sym):
+    """Production reader: the (locked_by, heartbeat) asset_locks row for std_sym, or None.
+
+    Kept byte-for-byte equivalent to the original inline query so behaviour is
+    unchanged when no reader is injected; raises on DB failure so the caller can
+    fail closed.
+    """
+    with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
+        return l_conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
+
+
+def _is_swing_locked(std_sym, lock_reader=None) -> tuple:
+    """Decide whether the external shepherd may ratchet stops for std_sym.
+
+    Returns (locked: bool, reason: str). locked=True means DO NOT ratchet
+    (fail-closed); locked=False means the ratchet is approved. The reason names
+    the measured cause so the advisory log and persisted diagnosis state only
+    what the lock read actually supports — 'locked' is not the same claim as
+    'managed by swing_architect'.
+    """
+    reader = lock_reader or _default_lock_reader
+    try:
+        l_row = reader(std_sym)
+        # Fail-closed: if unrecorded or owned by an active fleet engine, treat as locked.
+        # Only return False (allow external shepherd ratchet) on a stale heartbeat
+        # from a non-fleet holder.
+        if not l_row:
+            return (True, f"no asset_locks row for {std_sym}")
+        holder = str(l_row[0] or "")
+        if holder in ("swing_architect", "super_bot_grid", "super_bot_scalp_short"):
+            return (True, f"held by {holder}")
+        hb_str = str(l_row[1] or "")
+        clean_hb = hb_str.replace("Z", "+00:00")
+        if "+" not in clean_hb:
+            clean_hb += "+00:00"
+        hb_dt = datetime.fromisoformat(clean_hb)
+        # Fresh lock only if heartbeat within last 900 seconds (15 mins)
+        age = (datetime.now(timezone.utc) - hb_dt).total_seconds()
+        if age <= 900.0:
+            return (True, f"fresh heartbeat from {holder} ({int(age)}s old)")
+        return (False, f"stale heartbeat from {holder}")
+    except Exception as db_e:
+        # Fail-closed on DB contention/lock: do not allow shepherd to modify stops blindly
+        log.warning(f"[SHEPHERD-FAIL-CLOSED] Error reading asset_locks for {std_sym}: {db_e}. Assuming locked.")
+        return (True, f"lock state unreadable ({db_e}) — failing closed")
+
+
 class InflightPositionShepherd:
     """
     Continuous 15-Minute AI In-Flight Position Shepherd.
@@ -654,33 +701,12 @@ class InflightPositionShepherd:
                                 log.info(f"[BREATHING-ROOM] Rule #173/175 Active: Muting micro-tightening for {std_sym} (Hold: {holding_mins:.1f}m < 60m & advance < 1.0 ATR). Allowing room to expand.")
                             else:
                                 # Coordinate with swing_architect to prevent racing modification on the same position
-                                def _is_swing_locked():
-                                    try:
-                                        with sqlite3.connect("trading_data.db", timeout=5.0) as l_conn:
-                                            l_row = l_conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (std_sym,)).fetchone()
-                                            # Fail-closed: if unrecorded or owned by an active fleet engine, treat as locked.
-                                            # Only return False (allow external shepherd ratchet) if explicitly unlocked or owned by 'external_shepherd'.
-                                            if not l_row:
-                                                return True
-                                            holder = str(l_row[0] or "")
-                                            if holder in ("swing_architect", "super_bot_grid", "super_bot_scalp_short"):
-                                                return True
-                                            hb_str = str(l_row[1] or "")
-                                            clean_hb = hb_str.replace("Z", "+00:00")
-                                            if "+" not in clean_hb:
-                                                clean_hb += "+00:00"
-                                            hb_dt = datetime.fromisoformat(clean_hb)
-                                            # Fresh lock only if heartbeat within last 900 seconds (15 mins)
-                                            return (datetime.now(timezone.utc) - hb_dt).total_seconds() <= 900.0
-                                    except Exception as db_e:
-                                        # Fail-closed on DB contention/lock: do not allow shepherd to modify stops blindly
-                                        log.warning(f"[SHEPHERD-FAIL-CLOSED] Error reading asset_locks for {std_sym}: {db_e}. Assuming locked.")
-                                        return True
-
-                                swing_is_owner = await asyncio.to_thread(_is_swing_locked)
-                                if swing_is_owner:
-                                    log.info(f"[SHEPHERD-COORDINATION] {std_sym} is actively managed by swing_architect. Inflight Shepherd acting in advisory mode.")
-                                    diagnosis = f"Advisory Shepherding: {verdict}"
+                                swing_is_locked, lock_reason = await asyncio.to_thread(_is_swing_locked, std_sym)
+                                if swing_is_locked:
+                                    log.info(f"[SHEPHERD-COORDINATION] {std_sym} not ratcheting ({lock_reason}); acting in advisory mode.")
+                                    # verdict may be absent (F6); an absence must render as an absence word, never "None".
+                                    verdict_text = verdict if verdict else "not measured"
+                                    diagnosis = f"Advisory Shepherding ({lock_reason}): {verdict_text}"
                                 else:
                                     log.info(f"[SHEPHERD-RATCHET] {std_sym} SL Ratchet Approved! Moving SL from ${current_sl:,.4f} -> ${suggested_sl:,.4f} ({verdict})")
                                     try:
