@@ -81,6 +81,36 @@ def _ensure_shepherd_tables():
 _ensure_shepherd_tables()
 
 
+def _verdict_word(decision) -> str:
+    """The verdict the AI measured, or the absence token when its payload carried none.
+
+    A response with no "verdict" key — or a blank one — measured nothing, so defaulting it to
+    "HOLDING_NORMAL" used to publish an all-clear the AI never gave.
+    `inflight_shepherd_logs.verdict` is TEXT NOT NULL, so the absence travels as this non-null token
+    — never None — and every consumer renders it as an absence.
+    """
+    payload = decision if isinstance(decision, dict) else {}
+    raw = payload.get("verdict")
+    if raw is None or not str(raw).strip():
+        return config.VERDICT_ABSENT
+    return str(raw).strip().upper()
+
+
+def _tape_word(decision, tape_data):
+    """The L2 tape word the position was measured against, or None when nothing carried one.
+
+    The published default used to be the word "BALANCED" — a tape reading the shepherd had not taken.
+    `tape_condition` is a nullable column, so an unmeasured tape publishes None and the consumers say
+    "not measured" instead of colouring an invented word.
+    """
+    src = decision if isinstance(decision, dict) else {}
+    packet = tape_data if isinstance(tape_data, dict) else {}
+    for candidate in (src.get("tape_condition"), packet.get("tape_condition")):
+        if candidate is not None and str(candidate).strip() != "":
+            return str(candidate)
+    return None
+
+
 class InflightPositionShepherd:
     """
     Continuous 15-Minute AI In-Flight Position Shepherd.
@@ -248,15 +278,20 @@ class InflightPositionShepherd:
             except Exception as pe:
                 log.warning(f"Shepherd JSON parse error: {pe}")
 
+        # No verdict was measured: publish the absence, not a plausible all-clear. The verdict is the
+        # absence TOKEN (a non-null string) because inflight_shepherd_logs.verdict is TEXT NOT NULL;
+        # tape_condition and confidence are nullable, so they publish None. runner_mode / tighten_sl /
+        # suggested_sl stay inert (no action on an unmeasured verdict) and target_r 2.5 is POLICY, not
+        # a measurement, so it is untouched.
         return {
-            "verdict": "HOLDING_NORMAL",
+            "verdict": config.VERDICT_ABSENT,
             "runner_mode": False,
             "tighten_sl": False,
             "suggested_sl": None,
             "target_r": 2.5,
-            "tape_condition": "BALANCED",
-            "diagnosis": "Standard algorithmic trailing baseline maintained.",
-            "confidence": 0.50
+            "tape_condition": None,
+            "diagnosis": "AI shepherd unreachable: no verdict measured. The static algorithmic trailing baseline (policy) is holding.",
+            "confidence": None
         }
 
     async def evaluate_active_positions(self, force: bool = False) -> list:
@@ -413,14 +448,17 @@ class InflightPositionShepherd:
                     decision = await self._query_ai_shepherd(pos_context, timeout_sec=10.0)
                     self.last_check_ts[clean_sym] = now_ts
 
-                    verdict = str(decision.get("verdict", "HOLDING_NORMAL")).upper()
+                    verdict = _verdict_word(decision)
                     runner_mode = bool(decision.get("runner_mode", False))
                     tighten_sl = bool(decision.get("tighten_sl", False))
                     suggested_sl = decision.get("suggested_sl")
                     diagnosis = str(decision.get("diagnosis", "Monitored."))
-                    conf = float(decision.get("confidence", 0.8))
+                    raw_conf = decision.get("confidence", 0.8)
+                    # A published absence is None (the fallback measured no confidence); the column is
+                    # nullable, so it travels as None rather than being floated into a number.
+                    conf = float(raw_conf) if raw_conf is not None else None
                     target_r = float(decision.get("target_r", 3.0))
-                    tape_cond = str(decision.get("tape_condition", tape_data.get("tape_condition", "BALANCED")))
+                    tape_cond = _tape_word(decision, tape_data)
 
                     # Feature 3: Climax Exhaustion & Peak Harvest Sentinel
                     # Monitors profitable trades (>= +1.0R or >= +8% ROE or HARVEST_PROFIT verdict)
