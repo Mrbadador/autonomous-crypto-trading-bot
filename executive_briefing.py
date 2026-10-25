@@ -15,6 +15,8 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
+import config
+
 # Ensure UTF-8 output encoding
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -107,6 +109,30 @@ async def fetch_live_bitget_balance() -> Dict[str, float]:
     # Fallback to system_state cached balance
     cached_bal = float(query_system_state("balance", "152.10"))
     return {"usdt_equity": cached_bal, "usdt_free": cached_bal * 0.80, "source": "cached_db"}
+
+
+def _shepherd_badge_and_tape(s_data) -> Dict[str, str]:
+    """The 5-minute briefing's sentinel line — a measured verdict word, or an honest absence.
+
+    Pure so the briefing's rendering is testable without running the briefing loop. A verdict the
+    shepherd never measured (the absence token, None, an empty string, or no key at all) prints the
+    words "no AI verdict measured" with no shield — a shield implied a health check that did not
+    happen — and the tape prints "not measured". Neither the raw token, nor "HOLDING_NORMAL", nor
+    "BALANCED", nor a literal None is ever printed.
+    """
+    payload = s_data if isinstance(s_data, dict) else {}
+    raw = payload.get("verdict")
+    absent = (raw is None or str(raw).strip() == ""
+              or str(raw).strip().upper() == getattr(config, "VERDICT_ABSENT", "NO_AI_VERDICT"))
+    if absent:
+        badge = "**no AI verdict measured**"
+    elif payload.get("runner_mode"):
+        badge = "🏃 **RUNNER EXPANSION**"
+    else:
+        badge = f"🛡️ **{raw}**"
+    tape = payload.get("tape_condition")
+    tape_text = "not measured" if (tape is None or str(tape).strip() == "") else str(tape)
+    return {"badge": badge, "tape": tape_text}
 
 
 async def build_briefing_async(cycle_num: int = 1) -> Dict[str, Any]:
@@ -385,10 +411,11 @@ async def build_briefing_async(cycle_num: int = 1) -> Dict[str, Any]:
             if shepherd_raw:
                 try:
                     s_data = json.loads(shepherd_raw)
-                    v_badge = "🏃 **RUNNER EXPANSION**" if s_data.get("runner_mode") else f"🛡️ **{s_data.get('verdict', 'HOLDING_NORMAL')}**"
+                    _shep_disp = _shepherd_badge_and_tape(s_data)
+                    v_badge = _shep_disp["badge"]
                     diag = s_data.get("diagnosis", "")
                     target_r = s_data.get("target_r", 2.5)
-                    tape = s_data.get("tape_condition", "BALANCED")
+                    tape = _shep_disp["tape"]
                     sl_sugg = s_data.get("suggested_sl")
                     sl_str = f" | Ratchet SL: `${sl_sugg:,.4f}`" if sl_sugg else ""
                     md.append(f"* **`{sym}`:** {v_badge} | Target: `{target_r}R` | Tape: `{tape}`{sl_str}  \n  *{diag}*")

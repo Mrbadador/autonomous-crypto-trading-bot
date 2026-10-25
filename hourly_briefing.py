@@ -77,6 +77,20 @@ def query_system_state(key: str, default: str = "") -> str:
     return default
 
 
+def _shep_verdict_display(raw_verdict) -> Dict[str, str]:
+    """A shepherd verdict that was never measured renders as an absence, never as an all-clear word.
+
+    Pure: it maps the published verdict value (or its absence) to the briefing's on-screen text and
+    colour, so the briefing cannot print "HOLDING_NORMAL"/"MONITORED" — let alone the raw absence
+    token — for a position the AI never assessed.
+    """
+    absent = (raw_verdict is None or str(raw_verdict).strip() == ""
+              or str(raw_verdict).strip().upper() == getattr(config, "VERDICT_ABSENT", "NO_AI_VERDICT"))
+    if absent:
+        return {"text": "no AI verdict measured", "color": "#94a3b8"}
+    return {"text": str(raw_verdict), "color": "#38bdf8"}
+
+
 def generate_hourly_briefing_data() -> Dict[str, Any]:
     """Gathers and synthesizes the last 60 minutes of 5-minute briefings and fleet telemetry."""
     now_utc = datetime.now(timezone.utc)
@@ -275,14 +289,15 @@ def generate_hourly_briefing_data() -> Dict[str, Any]:
 
         # Query Shepherd verdict
         shep_raw = query_system_state(f"ai_shepherd_{sym_clean}", "")
-        shep_verdict = "MONITORED"
+        # A missing sentinel row / a missing verdict key is an absence, not "MONITORED".
+        shep_verdict = None
         shep_diag = ""
         shep_ratchet = False
         shep_target_r = 2.5
         if shep_raw:
             try:
                 s_obj = json.loads(shep_raw)
-                shep_verdict = s_obj.get("verdict", "HOLDING_NORMAL")
+                shep_verdict = s_obj.get("verdict")
                 shep_diag = s_obj.get("diagnosis", "")
                 shep_ratchet = bool(s_obj.get("sl_ratcheted", False))
                 shep_target_r = float(s_obj.get("target_r", 2.5))
@@ -400,6 +415,7 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
             
             raw_diag = str(p.get("shep_diag", ""))
             disp_diag = html.escape(raw_diag[:55] + "..." if len(raw_diag) > 55 else raw_diag)
+            shep_disp = _shep_verdict_display(p.get("shep_verdict"))
             
             positions_html += f"""
             <tr style="border-bottom: 1px solid #1e293b;">
@@ -423,7 +439,7 @@ def build_hourly_briefing_html(data: Dict[str, Any]) -> str:
                     TP: <b style="color: #22c55e;">${p['tp']:,.4f}</b> (Target: {p['shep_target_r']:.1f}R)
                 </td>
                 <td style="padding: 10px 8px; font-size: 11px; color: #cbd5e1;">
-                    <b style="color: #38bdf8;">{html.escape(str(p['shep_verdict']))}</b><br>
+                    <b style="color: {shep_disp['color']};">{html.escape(shep_disp['text'])}</b><br>
                     <span style="color: #94a3b8;">{disp_diag}</span>
                 </td>
             </tr>
