@@ -26,13 +26,98 @@ from backtests.backtest_grid_replay import run_grid_replay, run_fleet_grid_repla
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
+# F3 absence convention (shared with quant_validation.py and backtests/backtest_ablation_harness.py):
+# a figure this run did not measure is published as None in data and as these words on screen —
+# never as a plausible zero, a stand-in number, or an asserted verdict.
+ABSENT_METRIC_TEXT = "not measured"
 
-def bootstrap_ci(values: List[float], n_bootstrap: int = 1000, ci_level: float = 0.90) -> tuple[float, float, float]:
+# The marketing claim row (a) of Section 1 audits. It is a target under test, never a result,
+# and it must not be repeated inside the verdict cell (the verdict is derived from the measurement).
+CLAIMED_CHOP_WIN_RATE_PCT = 68.5
+
+
+def _fnum(value: Optional[float], fmt: str) -> str:
+    """None-aware number renderer: formats the measurement, or names the absence."""
+    return ABSENT_METRIC_TEXT if value is None else format(value, fmt)
+
+
+def _fpct(value: Optional[float], fmt: str = ".1f") -> str:
+    """None-aware percentage renderer."""
+    return ABSENT_METRIC_TEXT if value is None else f"{format(value, fmt)}%"
+
+
+def _usd(value: Optional[float], fmt: str = "+.3f") -> str:
+    """None-aware dollar renderer."""
+    return ABSENT_METRIC_TEXT if value is None else f"${value:{fmt}}"
+
+
+def _ev_ci_str(m: Dict[str, Any], fmt: str = "+.3f") -> str:
+    """The 'Net EV / trade [$X] [lo, hi]' cell, built only from what the arm actually measured."""
+    ev = m.get("ev_mean")
+    ci = m.get("ev_ci_90")
+    if ev is None:
+        return f"{ABSENT_METRIC_TEXT} (no trades in this arm)"
+    if ci is None:
+        return f"${ev:{fmt}} (CI {ABSENT_METRIC_TEXT})"
+    return f"${ev:{fmt}} [${ci[0]:{fmt}}, ${ci[1]:{fmt}}]"
+
+
+def _ev_pct_of_notional(m: Dict[str, Any], notional: float) -> Optional[float]:
+    """EV as a percent of notional, or None when no EV was measured."""
+    ev = m.get("ev_mean")
+    return None if ev is None else ev / notional * 100.0
+
+
+def _ev_pair_str(m: Dict[str, Any], notional: float, fmt: str = "+.3f") -> str:
+    """'$EV (EV% of notional)' — or the absence — for the Section 7 prose."""
+    ev = m.get("ev_mean")
+    if ev is None:
+        return ABSENT_METRIC_TEXT
+    return f"${ev:{fmt}} ({ev / notional * 100.0:{fmt}}%)"
+
+
+def _spread_pct(a: Dict[str, Any], b: Dict[str, Any], notional: float) -> Optional[float]:
+    """EV spread (a minus b) as a percent of notional, or None when either arm measured no EV."""
+    ea, eb = a.get("ev_mean"), b.get("ev_mean")
+    return None if ea is None or eb is None else (ea - eb) / notional * 100.0
+
+
+def _win_rate_verdict(win_rate: Optional[float]) -> str:
+    """Row (a): the verdict is derived from the win rate printed in the same row — no number of
+    its own may appear in the verdict cell."""
+    if win_rate is None:
+        return "**NOT MEASURED** (this arm closed no trades, so no win rate was measured)"
+    if win_rate >= CLAIMED_CHOP_WIN_RATE_PCT:
+        return "**SUPPORTED** (the measured win rate reaches the claimed target this row tests)"
+    return "**REFUTED** (the measured win rate falls below the claimed target this row tests)"
+
+
+def _ev_verdict(m: Dict[str, Any]) -> str:
+    """Row (b): the verdict is derived from the measured EV and its own CI — no hard-coded EV
+    figure may appear in the verdict cell."""
+    ev = m.get("ev_mean")
+    ci = m.get("ev_ci_90")
+    if ev is None:
+        return "**NOT MEASURED** (this arm closed no trades, so no expectancy was measured)"
+    if ci is None:
+        return f"**INCONCLUSIVE** (no confidence interval could be estimated for this sample)"
+    lo, hi = ci[0], ci[1]
+    if lo == hi:
+        return f"**INCONCLUSIVE** (zero-width interval — a variance-free sample cannot support a verdict)"
+    if lo <= 0.0 <= hi:
+        return "**MARGINAL / NOT DEMONSTRATED** (CI straddles $0 — this run cannot separate the arm from flat)"
+    if lo > 0.0:
+        return "**SUPPORTED** (EV is positive and the interval excludes zero)"
+    return "**NEGATIVE** (the interval excludes zero on the loss side)"
+
+
+def bootstrap_ci(values: List[float], n_bootstrap: int = 1000, ci_level: float = 0.90) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """
     Computes empirical mean and bootstrap confidence interval.
+    An empty sample has no mean and no interval: it publishes the absence, not a silent zero.
     """
     if not values:
-        return 0.0, 0.0, 0.0
+        return None, None, None
     arr = np.array(values)
     mean_val = float(np.mean(arr))
     if len(arr) < 2:
@@ -53,12 +138,15 @@ def compute_metrics(trades: List[Dict[str, Any]], signal_to_fill_pct: float = 0.
     'signal_to_fill_pct' measures order fill rate (filled limit orders / placed limit orders).
     """
     if not trades:
+        # n_trades: 0 IS the measurement. Everything else below was never measured and is
+        # published as None so a flat arm cannot read as "we measured zero".
         return {
             "n_trades": 0,
-            "win_rate": 0.0,
-            "profit_factor": 0.0,
-            "ev_mean": 0.0,
-            "ev_ci_90": (0.0, 0.0),
+            "win_rate": None,
+            "profit_factor": None,
+            "ev_mean": None,
+            "ev_ci_90": None,
+            "absence_reason": "no trades closed: win rate, profit factor, and EV were never measured",
             "signal_to_fill_pct": signal_to_fill_pct,
             "tp_exit_share": 0.0,
             "avg_hold_mins": 0.0,
@@ -79,7 +167,8 @@ def compute_metrics(trades: List[Dict[str, Any]], signal_to_fill_pct: float = 0.
 
     gross_profit = float(np.sum(wins)) if len(wins) > 0 else 0.0
     gross_loss = float(np.abs(np.sum(losses))) if len(losses) > 0 else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+    # No denominator means no ratio: publish the absence, never a stand-in like the old 99.0.
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
 
     ev_mean, ev_low, ev_high = bootstrap_ci(list(net_pnls))
 
@@ -324,9 +413,9 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
         f.write("## 1. Audit of Core Engine Claims (Evaluated on Fleet-Capped Grid Longs)\n\n")
         f.write("| Marketing Claim | Claimed Target | Measured Empirical Result (Fleet Cap = 2) | Empirical Verdict |\n")
         f.write("| :--- | :--- | :--- | :--- |\n")
-        f.write(f"| (a) 68.5% Win Rate in Chop | 68.5% WR | **{fleet_deep_m['win_rate']:.1f}% WR** (Deep Chop ADX<20: N={fleet_deep_m['n_trades']}) | **REFUTED** (Peak WR ~46.2% under live fleet cap) |\n")
-        f.write(f"| (b) Positive Expectancy from Maker Fees | EV > $0.00 | **Deep Chop EV = ${fleet_deep_m['ev_mean']:+.3f} [{fleet_deep_m['ev_ci_90'][0]:+.3f}, {fleet_deep_m['ev_ci_90'][1]:+.3f}]** | **MARGINAL / NEGATIVE** (Net EV ~ -0.064% of notional) |\n")
-        f.write(f"| (c) Regime Confined to Low-ADX Chop | Strict Low ADX | Market ADX < 28 shield active; Waterfall 5m ADX < 24 preserved | **CONFIRMED SHIELD** (Suppresses high-volatility trends) |\n\n")
+        f.write(f"| (a) 68.5% Win Rate in Chop | 68.5% WR | **{_fpct(fleet_deep_m['win_rate'])} WR** (Deep Chop ADX<20: N={fleet_deep_m['n_trades']}) | {_win_rate_verdict(fleet_deep_m['win_rate'])} |\n")
+        f.write(f"| (b) Positive Expectancy from Maker Fees | EV > $0.00 | **Deep Chop EV = {_ev_ci_str(fleet_deep_m)}** | {_ev_verdict(fleet_deep_m)} |\n")
+        f.write(f"| (c) Regime Confined to Low-ADX Chop | Strict Low ADX | Market ADX < 28 shield active; Waterfall 5m ADX < 24 preserved (configured for this run; the run's outcome figures are in rows (a)/(b)) | **NOT MEASURED IN THIS RUN** (this script does not measure the ADX shield's effect on outcomes) |\n\n")
         f.write("---\n\n")
 
         # Section 2: Fleet-Capped Headline Performance
@@ -335,8 +424,8 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
         f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
 
         for lbl, m in [("Chop Grid (Fleet-Capped Longs Only)", fleet_long_m), ("Quick Scalp (Short Scalps Only)", fleet_short_m), ("Combined Fleet Stack", fleet_comb_m)]:
-            ci_str = f"${m['ev_mean']:+.3f} [${m['ev_ci_90'][0]:+.3f}, ${m['ev_ci_90'][1]:+.3f}]"
-            f.write(f"| **{lbl}** | {m['n_trades']} | {m['win_rate']:.1f}% | {m['profit_factor']:.2f} | {m['signal_to_fill_pct']:.1f}% | {m['tp_exit_share']:.1f}% | {m['avg_hold_mins']:.1f}m | {ci_str} | ${m['total_net_pnl']:+.2f} |\n")
+            ci_str = _ev_ci_str(m)
+            f.write(f"| **{lbl}** | {m['n_trades']} | {_fpct(m['win_rate'])} | {_fnum(m['profit_factor'], '.2f')} | {m['signal_to_fill_pct']:.1f}% | {m['tp_exit_share']:.1f}% | {m['avg_hold_mins']:.1f}m | {ci_str} | ${m['total_net_pnl']:+.2f} |\n")
         f.write("\n---\n\n")
 
         # Section 3: Fleet Cap vs Uncapped Ablation
@@ -346,12 +435,16 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
 
         f.write("| Configuration | Long Trades (N) | Win Rate (%) | Signal-to-Fill (%) | Max DD ($) | Net EV / Trade ($) [90% CI] | Total Long PnL ($) |\n")
         f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n")
-        ci_cap2 = f"${fleet_long_m['ev_mean']:+.3f} [${fleet_long_m['ev_ci_90'][0]:+.3f}, ${fleet_long_m['ev_ci_90'][1]:+.3f}]"
-        ci_uncap = f"${uncapped_m['ev_mean']:+.3f} [${uncapped_m['ev_ci_90'][0]:+.3f}, ${uncapped_m['ev_ci_90'][1]:+.3f}]"
-        f.write(f"| **Live Fleet Cap (Max 2 Longs)** | {fleet_long_m['n_trades']} | {fleet_long_m['win_rate']:.1f}% | {fleet_long_m['signal_to_fill_pct']:.1f}% | ${fleet_long_m['max_drawdown_usd']:.2f} | {ci_cap2} | ${fleet_long_m['total_net_pnl']:+.2f} |\n")
-        f.write(f"| **Uncapped Fleet Ablation (Cap = 99)** | {uncapped_m['n_trades']} | {uncapped_m['win_rate']:.1f}% | {uncapped_m['signal_to_fill_pct']:.1f}% | ${uncapped_m['max_drawdown_usd']:.2f} | {ci_uncap} | ${uncapped_m['total_net_pnl']:+.2f} |\n\n")
+        ci_cap2 = _ev_ci_str(fleet_long_m)
+        ci_uncap = _ev_ci_str(uncapped_m)
+        f.write(f"| **Live Fleet Cap (Max 2 Longs)** | {fleet_long_m['n_trades']} | {_fpct(fleet_long_m['win_rate'])} | {fleet_long_m['signal_to_fill_pct']:.1f}% | ${fleet_long_m['max_drawdown_usd']:.2f} | {ci_cap2} | ${fleet_long_m['total_net_pnl']:+.2f} |\n")
+        f.write(f"| **Uncapped Fleet Ablation (Cap = 99)** | {uncapped_m['n_trades']} | {_fpct(uncapped_m['win_rate'])} | {uncapped_m['signal_to_fill_pct']:.1f}% | ${uncapped_m['max_drawdown_usd']:.2f} | {ci_uncap} | ${uncapped_m['total_net_pnl']:+.2f} |\n\n")
         f.write("> [!NOTE]\n")
-        f.write(f"> The live fleet cap (max 2) prunes 258 late-cascade entries ({uncapped_m['n_trades']} -> {fleet_long_m['n_trades']} trades) and cuts maximum drawdown from **${uncapped_m['max_drawdown_usd']:.2f} down to ${fleet_long_m['max_drawdown_usd']:.2f}** (a {(1.0 - fleet_long_m['max_drawdown_usd']/uncapped_m['max_drawdown_usd'])*100:.1f}% reduction in peak capital drawdown).\n\n")
+        dd_live = fleet_long_m['max_drawdown_usd']
+        dd_uncap = uncapped_m['max_drawdown_usd']
+        dd_note = (f"(a {(1.0 - dd_live / dd_uncap) * 100:.1f}% reduction in peak capital drawdown)"
+                   if dd_uncap > 0 else "(no nonzero uncapped drawdown to compare against)")
+        f.write(f"> The live fleet cap (max 2) prunes {max(uncapped_m['n_trades'] - fleet_long_m['n_trades'], 0)} late-cascade entries ({uncapped_m['n_trades']} -> {fleet_long_m['n_trades']} trades) and moves maximum drawdown from **${dd_uncap:.2f} to ${dd_live:.2f}** {dd_note}.\n\n")
         f.write("---\n\n")
 
         # Section 4: Pre-Registered Arm (Market ADX < 20 Only)
@@ -361,11 +454,11 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
 
         f.write("| Strategy Arm | Trades (N) | Win Rate (%) | Signal-to-Fill (%) | Max DD ($) | Net EV / Trade ($) [90% CI] | EV % of Notional | Net PnL ($) |\n")
         f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
-        ci_c20 = f"${ceil20_m['ev_mean']:+.3f} [${ceil20_m['ev_ci_90'][0]:+.3f}, ${ceil20_m['ev_ci_90'][1]:+.3f}]"
-        ev_pct_live = (fleet_long_m['ev_mean'] / notional * 100.0)
-        ev_pct_c20 = (ceil20_m['ev_mean'] / notional * 100.0)
-        f.write(f"| **Live Shield (ADX < 28/25)** | {fleet_long_m['n_trades']} | {fleet_long_m['win_rate']:.1f}% | {fleet_long_m['signal_to_fill_pct']:.1f}% | ${fleet_long_m['max_drawdown_usd']:.2f} | {ci_cap2} | {ev_pct_live:+.3f}% | ${fleet_long_m['total_net_pnl']:+.2f} |\n")
-        f.write(f"| **Pre-Registered Arm (ADX < 20 Only)** | {ceil20_m['n_trades']} | {ceil20_m['win_rate']:.1f}% | {ceil20_m['signal_to_fill_pct']:.1f}% | ${ceil20_m['max_drawdown_usd']:.2f} | {ci_c20} | {ev_pct_c20:+.3f}% | ${ceil20_m['total_net_pnl']:+.2f} |\n\n")
+        ci_c20 = _ev_ci_str(ceil20_m)
+        ev_pct_live = _ev_pct_of_notional(fleet_long_m, notional)
+        ev_pct_c20 = _ev_pct_of_notional(ceil20_m, notional)
+        f.write(f"| **Live Shield (ADX < 28/25)** | {fleet_long_m['n_trades']} | {_fpct(fleet_long_m['win_rate'])} | {fleet_long_m['signal_to_fill_pct']:.1f}% | ${fleet_long_m['max_drawdown_usd']:.2f} | {ci_cap2} | {_fpct(ev_pct_live, '+.3f')} | ${fleet_long_m['total_net_pnl']:+.2f} |\n")
+        f.write(f"| **Pre-Registered Arm (ADX < 20 Only)** | {ceil20_m['n_trades']} | {_fpct(ceil20_m['win_rate'])} | {ceil20_m['signal_to_fill_pct']:.1f}% | ${ceil20_m['max_drawdown_usd']:.2f} | {ci_c20} | {_fpct(ev_pct_c20, '+.3f')} | ${ceil20_m['total_net_pnl']:+.2f} |\n\n")
 
         # Section 5: Per-Asset Standalone Ablation Matrix
         f.write("## 5. Quantitative Ablation Matrix per Asset (Engine-Split)\n\n")
@@ -385,8 +478,8 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
                 ("Funding Regime Gate (ON)", d["funding_gate"]["grid_long"]),
             ]
             for label, m in rows:
-                ci_str = f"${m['ev_mean']:+.3f} [${m['ev_ci_90'][0]:+.3f}, ${m['ev_ci_90'][1]:+.3f}]"
-                f.write(f"| {label} | Grid Long | {m['n_trades']} | {m['win_rate']:.1f}% | {m['profit_factor']:.2f} | {m['signal_to_fill_pct']:.1f}% | {m['tp_exit_share']:.1f}% | {m['avg_hold_mins']:.1f}m | ${m['max_drawdown_usd']:.2f} | {ci_str} |\n")
+                ci_str = _ev_ci_str(m)
+                f.write(f"| {label} | Grid Long | {m['n_trades']} | {_fpct(m['win_rate'])} | {_fnum(m['profit_factor'], '.2f')} | {m['signal_to_fill_pct']:.1f}% | {m['tp_exit_share']:.1f}% | {m['avg_hold_mins']:.1f}m | ${m['max_drawdown_usd']:.2f} | {ci_str} |\n")
             f.write(f"\n*Funding Drag Note:* Total funding paid by standalone {sym} longs was **${d['conservative']['grid_long']['total_funding_usd']:+.2f}** across {d['conservative']['grid_long']['n_trades']} trades.\n\n")
 
         f.write("---\n\n")
@@ -400,9 +493,9 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
             strat = d["stratified_long"]
             for s_k, s_lbl in [("deep_chop_lt20", "Deep Chop (Market ADX < 20)"), ("mid_chop_20_25", "Moderate Trend (20 <= ADX < 25)"), ("upper_chop_25_28", "Transition Zone (25 <= ADX < 28)")]:
                 m = strat[s_k]
-                ci_str = f"${m['ev_mean']:+.3f} [${m['ev_ci_90'][0]:+.3f}, ${m['ev_ci_90'][1]:+.3f}]"
-                ev_pct = (m['ev_mean'] / notional * 100.0) if m['n_trades'] > 0 else 0.0
-                f.write(f"| {sym} | {s_lbl} | {m['n_trades']} | {m['win_rate']:.1f}% | {m['profit_factor']:.2f} | {ci_str} | {ev_pct:+.3f}% | ${m['total_net_pnl']:+.2f} |\n")
+                ci_str = _ev_ci_str(m)
+                ev_pct = _ev_pct_of_notional(m, notional)
+                f.write(f"| {sym} | {s_lbl} | {m['n_trades']} | {_fpct(m['win_rate'])} | {_fnum(m['profit_factor'], '.2f')} | {ci_str} | {_fpct(ev_pct, '+.3f')} | ${m['total_net_pnl']:+.2f} |\n")
 
         f.write("\n---\n\n")
 
@@ -414,28 +507,29 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
         sol_deep = per_sym["SOLUSDT"]["stratified_long"]["deep_chop_lt20"]
         sol_mid = per_sym["SOLUSDT"]["stratified_long"]["mid_chop_20_25"]
 
-        spread_btc_pct = (btc_deep["ev_mean"] - btc_mid["ev_mean"]) / notional * 100.0
-        spread_eth_pct = (eth_deep["ev_mean"] - eth_mid["ev_mean"]) / notional * 100.0
-        spread_sol_pct = (sol_deep["ev_mean"] - sol_mid["ev_mean"]) / notional * 100.0
+        spread_btc_pct = _spread_pct(btc_deep, btc_mid, notional)
+        spread_eth_pct = _spread_pct(eth_deep, eth_mid, notional)
+        spread_sol_pct = _spread_pct(sol_deep, sol_mid, notional)
 
         f.write("## 7. Directional Acceptance Test & External Benchmark Reconciliation\n\n")
         f.write("### 7.1. Directional Acceptance Test (Deep Chop ADX < 20 vs 20–25 Strata)\n")
         f.write(
-            f"The empirical replay confirms that the deep-market-chop block ($ADX < 20$) consistently outperforms intermediate trend regimes:\n\n"
-            f"- **BTCUSDT Grid Longs:** Market ADX < 20 EV = ${btc_deep['ev_mean']:+.3f} ({btc_deep['ev_mean']/notional*100:+.3f}%) vs 20–25 EV = ${btc_mid['ev_mean']:+.3f} ({btc_mid['ev_mean']/notional*100:+.3f}%). "
-            f"**Spread: {spread_btc_pct:+.3f}% per trade in favor of deep chop.**\n"
-            f"- **ETHUSDT Grid Longs:** Market ADX < 20 EV = ${eth_deep['ev_mean']:+.3f} ({eth_deep['ev_mean']/notional*100:+.3f}%) vs 20–25 EV = ${eth_mid['ev_mean']:+.3f} ({eth_mid['ev_mean']/notional*100:+.3f}%). "
-            f"**Spread: {spread_eth_pct:+.3f}% per trade in favor of deep chop.**\n"
-            f"- **SOLUSDT Grid Longs:** Market ADX < 20 EV = ${sol_deep['ev_mean']:+.3f} ({sol_deep['ev_mean']/notional*100:+.3f}%) vs 20–25 EV = ${sol_mid['ev_mean']:+.3f} ({sol_mid['ev_mean']/notional*100:+.3f}%). "
-            f"**Spread: {spread_sol_pct:+.3f}% per trade in favor of deep chop.**\n\n"
+            "The empirical replay reports the deep-market-chop (ADX < 20) versus 20-25 EV spread for each asset below; "
+            "no direction is asserted — each line is the measured spread, or the absence where a strata arm closed no trades:\n\n"
+            f"- **BTCUSDT Grid Longs:** Market ADX < 20 EV = {_ev_pair_str(btc_deep, notional)} vs 20–25 EV = {_ev_pair_str(btc_mid, notional)}. "
+            f"**Spread: {_fpct(spread_btc_pct, '+.3f')} per trade (deep chop minus 20–25).**\n"
+            f"- **ETHUSDT Grid Longs:** Market ADX < 20 EV = {_ev_pair_str(eth_deep, notional)} vs 20–25 EV = {_ev_pair_str(eth_mid, notional)}. "
+            f"**Spread: {_fpct(spread_eth_pct, '+.3f')} per trade (deep chop minus 20–25).**\n"
+            f"- **SOLUSDT Grid Longs:** Market ADX < 20 EV = {_ev_pair_str(sol_deep, notional)} vs 20–25 EV = {_ev_pair_str(sol_mid, notional)}. "
+            f"**Spread: {_fpct(spread_sol_pct, '+.3f')} per trade (deep chop minus 20–25).**\n\n"
         )
 
         f.write("### 7.2. External Benchmark Reconciliation\n")
         f.write(
             f"The external benchmark reported pooled conservative chop EV +0.198% per trade (BTC +0.454%, ETH +0.200%, SOL +0.064%) with a 56.3% win rate.\n"
             f"Under our live-faithful replay harness (Fleet Cap = 2, Bitget maker fee 0.02%, taker 0.06%, synthetic 8h funding):\n"
-            f"- **Pooled Deep Chop Longs (ADX < 20):** N = {fleet_deep_m['n_trades']}, WR = {fleet_deep_m['win_rate']:.1f}%, Net EV = ${fleet_deep_m['ev_mean']:+.4f} [{fleet_deep_m['ev_ci_90'][0]:+.4f}, {fleet_deep_m['ev_ci_90'][1]:+.4f}] ({fleet_deep_m['ev_mean']/notional*100:+.3f}% of notional).\n"
-            f"- **Pre-Registered ADX < 20 Ceiling Arm:** N = {ceil20_m['n_trades']}, WR = {ceil20_m['win_rate']:.1f}%, Net EV = ${ceil20_m['ev_mean']:+.4f} [{ceil20_m['ev_ci_90'][0]:+.4f}, {ceil20_m['ev_ci_90'][1]:+.4f}] ({ceil20_m['ev_mean']/notional*100:+.3f}% of notional), Max DD = ${ceil20_m['max_drawdown_usd']:.2f}.\n"
+            f"- **Pooled Deep Chop Longs (ADX < 20):** N = {fleet_deep_m['n_trades']}, WR = {_fpct(fleet_deep_m['win_rate'])}, Net EV = {_ev_ci_str(fleet_deep_m, '+.4f')} ({_fpct(_ev_pct_of_notional(fleet_deep_m, notional), '+.3f')} of notional).\n"
+            f"- **Pre-Registered ADX < 20 Ceiling Arm:** N = {ceil20_m['n_trades']}, WR = {_fpct(ceil20_m['win_rate'])}, Net EV = {_ev_ci_str(ceil20_m, '+.4f')} ({_fpct(_ev_pct_of_notional(ceil20_m, notional), '+.3f')} of notional), Max DD = ${ceil20_m['max_drawdown_usd']:.2f}.\n"
             f"- **Residual Decomposition:** The remaining difference is driven by:\n"
             f"  1. **Strict Conservative Limit Fill Model:** In our model, price must strictly penetrate the limit by 1 tick (`curr_low <= limit - tick_size`). In a touch-fill model, EV shifts positive by ~+0.12% per trade.\n"
             f"  2. **Fee Asymmetry:** When take-profit limit orders fill, maker fee is 0.02%; however, stop-losses and time expiries pay 0.06% taker fees. The 1.4:1 payoff ratio is insufficient when win rates hover around 46–49%.\n"
@@ -444,7 +538,7 @@ def generate_report(results: Dict[str, Any], date_str: str) -> str:
 
         f.write("### 7.3. Quantitative Recommendation\n")
         f.write(
-            f"- **Confine Grid Longs to Deep Chop:** Tightening the regime ceiling from ADX 28 down to ADX 20 improves overall Long EV from ${fleet_long_m['ev_mean']:+.3f} to ${ceil20_m['ev_mean']:+.3f} and slashes drawdown from ${fleet_long_m['max_drawdown_usd']:.2f} to ${ceil20_m['max_drawdown_usd']:.2f}.\n"
+            f"- **Confine Grid Longs to Deep Chop:** The ADX-28/25 shield arm and the tightened ADX-20 arm recorded Long EV of {_usd(fleet_long_m['ev_mean'])} and {_usd(ceil20_m['ev_mean'])} with drawdown of ${fleet_long_m['max_drawdown_usd']:.2f} and ${ceil20_m['max_drawdown_usd']:.2f} respectively; read the direction from those measured figures rather than from this sentence.\n"
             f"- **Capital Allocation:** Due to marginal expectancy after taker exit fees, maintain the Grid engine as a secondary defensive yield harvester capped at existing capital allocations.\n"
         )
 
