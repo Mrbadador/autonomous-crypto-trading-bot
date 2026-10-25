@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sqlite3
 from bitget_uta_client import BitgetUTAClient
 

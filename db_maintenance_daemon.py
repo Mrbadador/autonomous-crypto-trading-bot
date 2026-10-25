@@ -333,6 +333,8 @@ def main():
     log.info(f"     Prune Retention: {RETENTION_DAYS} Days | Interval: {CHECKPOINT_INTERVAL_SECS}s")
     log.info("=" * 60)
 
+    last_disk_alert_email_ts = 0.0
+
     while True:
         try:
             log.info("Starting scheduled database maintenance pass...")
@@ -362,14 +364,17 @@ def main():
                 if free_pct < 15.0 or free_gb < 3.0:
                     disk_alert = f"CRITICAL: Low root disk space! Only {free_gb:.2f} GB ({free_pct:.1f}%) free."
                     log.error(f"[DISK-SPACE-ALERT] {disk_alert}")
-                    try:
-                        from email_dispatcher import send_email_alert
-                        send_email_alert(
-                            subject="🚨 CRITICAL: Trading Bot Host Low Disk Space",
-                            body=f"Host root disk is near exhaustion:\nFree: {free_gb:.2f} GB ({free_pct:.1f}%)\nTotal: {total_b/(1024**3):.2f} GB\nImmediate cleanup required to prevent SQLite write lockups."
-                        )
-                    except Exception as email_e:
-                        log.warning(f"[DISK-SPACE-ALERT] Failed to dispatch email alert: {email_e}")
+                    now_sec = time.time()
+                    if now_sec - last_disk_alert_email_ts >= 3600.0:  # Debounce: at most 1 email per hour
+                        try:
+                            from email_dispatcher import send_email_alert
+                            send_email_alert(
+                                subject="🚨 CRITICAL: Trading Bot Host Low Disk Space",
+                                body=f"Host root disk is near exhaustion:\nFree: {free_gb:.2f} GB ({free_pct:.1f}%)\nTotal: {total_b/(1024**3):.2f} GB\nImmediate cleanup required to prevent SQLite write lockups."
+                            )
+                            last_disk_alert_email_ts = now_sec
+                        except Exception as email_e:
+                            log.warning(f"[DISK-SPACE-ALERT] Failed to dispatch email alert: {email_e}")
                 elif free_pct < 25.0:
                     log.warning(f"[DISK-SPACE-ALERT] Disk space warning: {free_gb:.2f} GB ({free_pct:.1f}%) free.")
             except Exception as disk_e:

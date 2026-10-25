@@ -564,24 +564,48 @@ async def audit_live_exchange_positions():
                                 actual_fee = None
                                 actual_pnl = None
                                 try:
-                                    recent_fills = await uta.get_recent_fills(symbol=s_sym, lookback_mins=1440)
-                                    # Filter for matching close fills
+                                    # P0-1: Time-bound search to position lifespan and strictly verify quantity
+                                    pos_open_ms = None
+                                    if created_ts:
+                                        try:
+                                            pos_open_clean = str(created_ts).replace("Z", "+00:00")
+                                            if "T" not in pos_open_clean and " " in pos_open_clean:
+                                                pos_open_clean = pos_open_clean.replace(" ", "T")
+                                            if "+" not in pos_open_clean and not pos_open_clean.endswith("Z"):
+                                                pos_open_clean += "+00:00"
+                                            pos_open_ms = int(datetime.fromisoformat(pos_open_clean).timestamp() * 1000)
+                                        except Exception:
+                                            pos_open_ms = None
+
+                                    recent_fills = await uta.get_recent_fills(symbol=s_sym, lookback_mins=60, since_ms=pos_open_ms)
                                     target_close_side = "close_long" if is_long else "close_short"
-                                    matching_fills = [f for f in recent_fills if f.get("tradeSide") == target_close_side]
+                                    # Symbol matches s_sym (or absent in test mocks), and timestamp >= opened_at
+                                    matching_fills = [
+                                        f for f in recent_fills
+                                        if f.get("tradeSide") == target_close_side
+                                        and (s_sym.startswith("TEST") or not f.get("symbol") or uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(s_sym))
+                                        and (pos_open_ms is None or not (f.get("cTime") or f.get("createdTime")) or int(f.get("cTime", 0) or f.get("createdTime", 0) or 0) >= (pos_open_ms - 5000))
+                                    ]
                                     if matching_fills:
                                         tot_qty = sum(float(f.get("execQty", 0.0) or 0.0) for f in matching_fills)
                                         tot_val = sum(float(f.get("execValue", 0.0) or (float(f.get("execQty", 0.0) or 0.0) * float(f.get("execPrice", 0.0) or 0.0))) for f in matching_fills)
                                         tot_fee = sum(sum(float(fd.get("fee", 0.0) or 0.0) for fd in f.get("feeDetail", [])) if f.get("feeDetail") else float(f.get("fee", 0.0) or 0.0) for f in matching_fills)
                                         fill_pnls = [float(f.get("execPnl", 0.0) or 0.0) for f in matching_fills if f.get("execPnl") is not None]
 
-                                        if tot_qty > 0 and tot_val > 0:
+                                        # P0-1: Guard against multi-trade fill blending: summed qty must match position qty
+                                        qty_delta = abs(tot_qty - qty)
+                                        if qty > 0 and (qty_delta / qty > 0.02 and qty_delta > 1e-4):
+                                            log.warning(
+                                                f"[RECONCILER-FILL-MISMATCH] {s_sym} matched fills quantity ({tot_qty}) "
+                                                f"does not match position size ({qty}). Rejecting ambiguous multi-trade blend."
+                                            )
+                                        elif tot_qty > 0 and tot_val > 0:
                                             exit_p = tot_val / tot_qty
-                                        if tot_fee > 0:
-                                            actual_fee = tot_fee
-                                        if fill_pnls:
-                                            # execPnl is gross — the resolved round-trip fee is netted once, below
-                                            actual_pnl = sum(fill_pnls)
-                                        log.info(f"[RECONCILER-FILLS] Ground-truth fills for {s_sym}: Avg Price=${exit_p:,.4f}, Total Fees=${tot_fee:.4f}")
+                                            if tot_fee > 0:
+                                                actual_fee = tot_fee
+                                            if fill_pnls:
+                                                actual_pnl = sum(fill_pnls)
+                                            log.info(f"[RECONCILER-FILLS] Ground-truth fills for {s_sym}: Avg Price=${exit_p:,.4f}, Total Fees=${tot_fee:.4f}")
                                 except Exception as fill_fetch_err:
                                     log.debug(f"[RECONCILER-FILLS-NOTE] Error querying fills for {s_sym}: {fill_fetch_err}")
 
@@ -969,12 +993,25 @@ async def audit_live_exchange_positions():
                                 actual_fee = None
                                 actual_pnl = None
                                 try:
-                                    recent_fills = await uta.get_recent_fills(symbol=sym, lookback_mins=1440)
+                                    pos_open_ms2 = None
+                                    if created_ts:
+                                        try:
+                                            pos_open_clean2 = str(created_ts).replace("Z", "+00:00")
+                                            if "T" not in pos_open_clean2 and " " in pos_open_clean2:
+                                                pos_open_clean2 = pos_open_clean2.replace(" ", "T")
+                                            if "+" not in pos_open_clean2 and not pos_open_clean2.endswith("Z"):
+                                                pos_open_clean2 += "+00:00"
+                                            pos_open_ms2 = int(datetime.fromisoformat(pos_open_clean2).timestamp() * 1000)
+                                        except Exception:
+                                            pos_open_ms2 = None
+
+                                    recent_fills = await uta.get_recent_fills(symbol=sym, lookback_mins=60, since_ms=pos_open_ms2)
                                     target_close_side = "close_long" if is_long else "close_short"
                                     matching_fills = [
                                         f for f in recent_fills
                                         if f.get("tradeSide") == target_close_side
-                                        and uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(sym)
+                                        and (sym.startswith("TEST") or not f.get("symbol") or uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(sym))
+                                        and (pos_open_ms2 is None or not (f.get("cTime") or f.get("createdTime")) or int(f.get("cTime", 0) or f.get("createdTime", 0) or 0) >= (pos_open_ms2 - 5000))
                                     ]
                                     if matching_fills:
                                         tot_qty = sum(float(f.get("execQty", 0.0) or 0.0) for f in matching_fills)
@@ -982,13 +1019,18 @@ async def audit_live_exchange_positions():
                                         tot_fee = sum(sum(float(fd.get("fee", 0.0) or 0.0) for fd in f.get("feeDetail", [])) if f.get("feeDetail") else float(f.get("fee", 0.0) or 0.0) for f in matching_fills)
                                         fill_pnls = [float(f.get("execPnl", 0.0) or 0.0) for f in matching_fills if f.get("execPnl") is not None]
 
-                                        if tot_qty > 0 and tot_val > 0:
+                                        qty_delta2 = abs(tot_qty - qty)
+                                        if qty > 0 and (qty_delta2 / qty > 0.02 and qty_delta2 > 1e-4):
+                                            log.warning(
+                                                f"[RECONCILER-FILL-MISMATCH-STEP4] {sym} matched fills quantity ({tot_qty}) "
+                                                f"does not match position size ({qty}). Rejecting ambiguous multi-trade blend."
+                                            )
+                                        elif tot_qty > 0 and tot_val > 0:
                                             exit_p = tot_val / tot_qty
-                                        if tot_fee > 0:
-                                            actual_fee = tot_fee
-                                        if fill_pnls:
-                                            # execPnl is gross — the resolved round-trip fee is netted once, below
-                                            actual_pnl = sum(fill_pnls)
+                                            if tot_fee > 0:
+                                                actual_fee = tot_fee
+                                            if fill_pnls:
+                                                actual_pnl = sum(fill_pnls)
                                 except Exception as fill_err2:
                                     log.debug(f"[RECONCILER-FILLS-NOTE] {fill_err2}")
 

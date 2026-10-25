@@ -639,15 +639,17 @@ def run_bootstrap_entry_significance(
 def compute_finrl_rolling_sharpe_selector(bootstrap_res: Dict[str, Any]) -> Dict[str, Any]:
     """
     FinRL DRLEnsembleAgent Rolling Validation Sharpe Strategy Selector:
-    Ranks the declarative strategies by out-of-sample validation Sharpe ratio and assigns
-    dynamic capital allocation weights (1.20x Overweight Leader, 1.00x Standard, 0.75x Defensive Throttle).
+    Ranks the declarative strategies by out-of-sample validation Sharpe ratio and assigns a
+    dynamic capital allocation weight per posture tier. The tiers and their multipliers are the
+    branches below, in order; this docstring deliberately does not restate them, because restating
+    a number that lives in code is how a report comes to claim something the code no longer does.
 
     An arm whose rolling Sharpe was NOT measured is ranked BELOW every measured arm, is sized at
-    the most conservative multiplier (0.75x — the floor the live engine clamps to anyway) and
-    carries a posture that names the absence. It is never ranked or sized as though it had
-    measured 0.0. The `.get(key, default)` trap is the reason this needs care: a key that is
-    PRESENT with the value None returns None, not the default, so every read here inspects the
-    value itself instead of trusting a default.
+    the most conservative tier — the floor the live engine clamps to anyway — and carries a posture
+    that names the absence. It is never ranked or sized as though it had measured 0.0. The
+    `.get(key, default)` trap is the reason this needs care: a key that is PRESENT with the value
+    None returns None, not the default, so every read here inspects the value itself instead of
+    trusting a default.
     """
     def _sort_key(item):
         """Measured arms rank above unmeasured arms; unmeasured arms order by z_score."""
@@ -885,13 +887,8 @@ def generate_full_validation_report(force_refresh: bool = False) -> Dict[str, An
     return report
 
 
-def print_validation_report(rep: Dict[str, Any]) -> None:
-    """Render an already-built validation report to stdout.
-
-    Split from ``main()`` because the report's absences must be printable without regenerating
-    the report: ``main()`` calls ``generate_full_validation_report(force_refresh=True)``, which
-    rewrites the cache the live engines read.
-    """
+def main() -> None:
+    rep = generate_full_validation_report(force_refresh=True)
     print(f"=== QUANT VALIDATION SUITE COMPLETED IN {rep['compute_seconds']}s ===")
     for k, v in rep["bootstrap_significance"].items():
         # The rolling Sharpe can be absent (the window refused to divide by a dispersion below
@@ -925,10 +922,6 @@ def print_validation_report(rep: Dict[str, Any]) -> None:
             f"Median DD={mc['median_max_dd_pct']:.2f}% | MaxDD_95={mc['max_dd_95_pct']:.2f}% | "
             f"MaxDD_99={mc['max_dd_99_pct']:.2f}% | Median Terminal Equity=${mc['terminal_equity_p50']:,.2f}"
         )
-
-
-def main() -> None:
-    print_validation_report(generate_full_validation_report(force_refresh=True))
 
 
 if __name__ == "__main__":

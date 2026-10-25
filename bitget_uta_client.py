@@ -807,14 +807,15 @@ class BitgetUTAClient:
             log.warning(f"[BITGET-UTA] get_order_fills note for {clean_sym} ({order_id}): {e}")
             return []
 
-    async def get_recent_fills(self, symbol: str, lookback_mins: int = 30) -> list[dict]:
+    async def get_recent_fills(self, symbol: str, lookback_mins: int = 30, since_ms: int = None) -> list[dict]:
         """
-        Fetches all recent execution fills for a symbol within lookback window.
+        Fetches all recent execution fills for a symbol within lookback window or since explicit timestamp.
         """
         await self.ensure_time_sync()
         clean_sym = self._normalize_symbol(symbol)
         try:
-            since_ms = int((time.time() - (lookback_mins * 60)) * 1000)
+            if since_ms is None:
+                since_ms = int((time.time() - (lookback_mins * 60)) * 1000)
             params = {"category": "USDT-FUTURES", "symbol": clean_sym, "startTime": str(since_ms), "limit": "50"}
             res = await self.exchange.private_uta_get_v3_trade_fills(params)
             data = res.get("data", {})
