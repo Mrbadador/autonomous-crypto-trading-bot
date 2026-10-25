@@ -2635,10 +2635,9 @@ class SwingArchitectTrader:
                                         "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
                                         (f"ai_health_{s_name}", json.dumps(h_res), datetime.now(UTC).isoformat())
                                     )
-                                    s_conn.execute(
-                                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-                                        (f"ai_shepherd_{s_name}", json.dumps(h_res), datetime.now(UTC).isoformat())
-                                    )
+                                    # WHY: this probe writes ONLY ai_health_{sym}. The ai_shepherd_{sym} key is owned by
+                                    # inflight_shepherd._persist_shepherd_report; a health-schema payload written there
+                                    # would clobber the sentinel's own report row and feed its consumers the wrong verdict.
                                     s_conn.commit()
                             except Exception:
                                 pass
