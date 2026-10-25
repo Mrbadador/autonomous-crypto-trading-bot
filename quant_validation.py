@@ -30,6 +30,16 @@ if hasattr(sys.stdout, "reconfigure"):
 
 REPORT_CACHE_PATH = os.path.join("cache", "quant_validation_report.json")
 
+# The smallest window an arm needs before its signals can be replayed. The guard below and the
+# reason string it publishes read this one constant, so the number a reader is told can never
+# drift from the number the code enforces.
+MIN_ARM_BARS = 120
+
+# The smallest dispersion a rolling Sharpe may divide by. Below it the ratio is a number the
+# floor produced, not a measurement, so the window publishes an absence instead. It is a refusal
+# threshold, never a divisor.
+ROLLING_SHARPE_MIN_DISPERSION = 0.10
+
 
 class InsufficientValidationData(RuntimeError):
     """Raised when a validation statistic cannot be computed from real recorded trades."""
@@ -371,6 +381,82 @@ def _extract_strategy_signals(df: pd.DataFrame, strategy: BaseStrategy, symbol: 
     return signals
 
 
+def _optional_float(value):
+    """Return the value as a float, or None when it is absent, null or unparseable.
+
+    A missing reading and a measured zero are different things, and only None tells them
+    apart. `float(value or 0.0)` cannot: it invents a zero for a missing key.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return number
+
+
+def _rolling_window_sharpes(sig_arr) -> Dict[str, Any]:
+    """Measure the rolling validation window's Sharpe and Sortino, or publish an absence.
+
+    The window is the most recent slice of the arm's sampled signal returns. The old code
+    divided the window mean by ``max(std, 0.10)`` and by ``max(downside_rms, 0.10)`` (or by an
+    invented ``0.15`` when the window held no losing trade at all). Those floors are silent
+    default denominators: below them the published ratio is a number the floor produced, not a
+    measurement, and the live engine turns that number into an allocation multiplier it sizes
+    real capital with.
+
+    So the floor is now a REFUSAL threshold and never a divisor. Below it the window publishes
+    an absence (None) and every consumer renders that absence in words. The arithmetic on the
+    measured path is untouched: the same ``sqrt(len(window)) * (mean / std)``, the same rounding.
+
+    Returns a dict with the window size, the window mean, and the two ratios (each either a
+    float or None).
+    """
+    arr = np.asarray(sig_arr, dtype=float)
+    val_window = min(30, max(10, len(arr) // 3))
+    recent_slice = arr[-val_window:]
+    rec_mean = float(np.mean(recent_slice))
+    rec_std = float(np.std(recent_slice))
+    downside_slice = recent_slice[recent_slice < 0]
+    if len(downside_slice) > 0:
+        downside_std = float(np.sqrt(np.mean(downside_slice ** 2)))
+    else:
+        downside_std = None
+
+    # A window whose dispersion is at or below the threshold has no denominator to divide by.
+    rolling_sharpe = None
+    if rec_std > ROLLING_SHARPE_MIN_DISPERSION:
+        rolling_sharpe = round(float(np.sqrt(len(recent_slice)) * (rec_mean / rec_std)), 2)
+
+    # The Sortino needs a losing trade to measure downside dispersion at all, and that
+    # dispersion needs to clear the same threshold before it can serve as a denominator.
+    rolling_sortino = None
+    if downside_std is not None and downside_std > ROLLING_SHARPE_MIN_DISPERSION:
+        rolling_sortino = round(float(np.sqrt(len(recent_slice)) * (rec_mean / downside_std)), 2)
+
+    return {
+        "rolling_validation_window": int(len(recent_slice)),
+        "rolling_recent_roe_pct": round(rec_mean, 3),
+        "rolling_sharpe": rolling_sharpe,
+        "rolling_sortino": rolling_sortino,
+    }
+
+
+def format_rolling_sharpe(rolling_sharpe) -> str:
+    """Render the rolling Sharpe, printing absence where the window refused to measure one.
+
+    Same shape as `backtests.backtest_ablation_harness.format_sharpe`: a measured number is
+    printed, an unmeasured one is printed as words that name the cause, never as 0.00.
+    """
+    if rolling_sharpe is not None:
+        return f"{rolling_sharpe:+.2f}"
+    return (f"n/a (window dispersion at or below {ROLLING_SHARPE_MIN_DISPERSION}, "
+            "Sharpe has no denominator)")
+
+
 def run_bootstrap_entry_significance(
     b_iterations: int = 2000,
     noise_sigma: float = 0.15,
@@ -433,12 +519,12 @@ def run_bootstrap_entry_significance(
                 else:
                     df_raw = pd.read_csv(fpath).tail(2500)
                 df = _prepare_indicator_dataframe(df_raw)
-                if len(df) < 120:
+                if len(df) < MIN_ARM_BARS:
                     # Present but unusable: a reader who only learns "missing_datasets: []" would
                     # conclude this arm got everything, which is false. Record the reason too.
                     arm_missing_datasets.append(
                         f"{fname} (unusable: {len(df)} bars after indicator preparation, "
-                        f"below the 120-bar minimum this arm needs)"
+                        f"below the {MIN_ARM_BARS}-bar minimum this arm needs)"
                     )
                     continue
 
@@ -521,16 +607,10 @@ def run_bootstrap_entry_significance(
         pert_mean = float(np.mean(all_perturbed_rets)) if all_perturbed_rets else obs_mean
 
         # FinRL DRLEnsembleAgent Rolling Validation Window (Most recent out-of-sample trades)
-        val_window = min(30, max(10, k_signals // 3))
-        recent_slice = sig_arr[-val_window:]
-        rec_mean = float(np.mean(recent_slice))
-        rec_std = max(float(np.std(recent_slice)), 0.10)
-        downside_slice = recent_slice[recent_slice < 0]
-        downside_std = max(float(np.sqrt(np.mean(downside_slice ** 2))) if len(downside_slice) > 0 else 0.15, 0.10)
-
-        # Window-scaled Sharpe & Sortino (sqrt(N_window) exactly per FinRL's validation Sharpe formula)
-        rolling_sharpe = round(float(np.sqrt(len(recent_slice)) * (rec_mean / rec_std)), 2)
-        rolling_sortino = round(float(np.sqrt(len(recent_slice)) * (rec_mean / downside_std)), 2)
+        window = _rolling_window_sharpes(sig_arr)
+        rec_mean = window["rolling_recent_roe_pct"]
+        rolling_sharpe = window["rolling_sharpe"]
+        rolling_sortino = window["rolling_sortino"]
 
         results[strat.name] = {
             "strategy_name": strat.name,
@@ -546,8 +626,8 @@ def run_bootstrap_entry_significance(
             "significant_edge": bool(p_value < 0.05),
             "perturbed_expectancy_roe_pct": round(pert_mean, 3),
             "ratchet_survival_rate_pct": ratchet_survival_pct,
-            "rolling_validation_window": int(len(recent_slice)),
-            "rolling_recent_roe_pct": round(rec_mean, 3),
+            "rolling_validation_window": int(window["rolling_validation_window"]),
+            "rolling_recent_roe_pct": rec_mean,
             "rolling_sharpe": rolling_sharpe,
             "rolling_sortino": rolling_sortino,
             "missing_datasets": list(arm_missing_datasets),
@@ -561,21 +641,41 @@ def compute_finrl_rolling_sharpe_selector(bootstrap_res: Dict[str, Any]) -> Dict
     FinRL DRLEnsembleAgent Rolling Validation Sharpe Strategy Selector:
     Ranks the declarative strategies by out-of-sample validation Sharpe ratio and assigns
     dynamic capital allocation weights (1.20x Overweight Leader, 1.00x Standard, 0.75x Defensive Throttle).
+
+    An arm whose rolling Sharpe was NOT measured is ranked BELOW every measured arm, is sized at
+    the most conservative multiplier (0.75x — the floor the live engine clamps to anyway) and
+    carries a posture that names the absence. It is never ranked or sized as though it had
+    measured 0.0. The `.get(key, default)` trap is the reason this needs care: a key that is
+    PRESENT with the value None returns None, not the default, so every read here inspects the
+    value itself instead of trusting a default.
     """
-    ranked = sorted(
-        bootstrap_res.values(),
-        key=lambda x: (float(x.get("rolling_sharpe", 0.0)), float(x.get("z_score", 0.0))),
-        reverse=True,
-    )
-    winner = ranked[0]["strategy_name"] if ranked else "SWING_4H"
+    def _sort_key(item):
+        """Measured arms rank above unmeasured arms; unmeasured arms order by z_score."""
+        raw_sharpe = item.get("rolling_sharpe")
+        measured = 0 if raw_sharpe is None else 1
+        sharpe = 0.0 if raw_sharpe is None else float(raw_sharpe)
+        z = _optional_float(item.get("z_score"))
+        z = 0.0 if z is None else float(z)
+        return (measured, sharpe, z)
+
+    ranked = sorted(bootstrap_res.values(), key=_sort_key, reverse=True)
+    # No arm at all means no winner was measured. The old default named SWING_4H, which is a
+    # label the report never earned; the consumer renders the absence instead.
+    winner = ranked[0]["strategy_name"] if ranked else None
     weights: Dict[str, Dict[str, Any]] = {}
 
     for idx, item in enumerate(ranked):
         s_name = item["strategy_name"]
-        r_sharpe = float(item.get("rolling_sharpe", 0.0))
+        raw_sharpe = item.get("rolling_sharpe")
+        r_sharpe = None if raw_sharpe is None else float(raw_sharpe)
         sig_edge = bool(item.get("significant_edge", False))
 
-        if idx == 0 and r_sharpe >= 0.75 and sig_edge:
+        if r_sharpe is None:
+            # No Sharpe was measured for this window: the most conservative multiplier and a
+            # posture that says so. Never a 0.0 that the engine would size as a real reading.
+            mult = 0.75
+            posture = "DEFENSIVE_THROTTLE_UNMEASURED"
+        elif idx == 0 and r_sharpe >= 0.75 and sig_edge:
             mult = 1.20
             posture = "OVERWEIGHT_LEADER"
         elif r_sharpe >= 0.40 and sig_edge:
@@ -588,18 +688,25 @@ def compute_finrl_rolling_sharpe_selector(bootstrap_res: Dict[str, Any]) -> Dict
             mult = 0.75
             posture = "DEFENSIVE_THROTTLE"
 
+        raw_sortino = item.get("rolling_sortino")
+        raw_recent = item.get("rolling_recent_roe_pct")
         weights[s_name] = {
             "rank": idx + 1,
             "rolling_sharpe": r_sharpe,
-            "rolling_sortino": float(item.get("rolling_sortino", 0.0)),
-            "rolling_recent_roe_pct": float(item.get("rolling_recent_roe_pct", 0.0)),
-            "allocation_weight_mult": mult,
+            "rolling_sortino": None if raw_sortino is None else float(raw_sortino),
+            "rolling_recent_roe_pct": None if raw_recent is None else float(raw_recent),
+            "allocation_weight_mult": float(mult),
             "posture": posture,
         }
 
+    winner_sharpe = None
+    if ranked:
+        raw_winner_sharpe = ranked[0].get("rolling_sharpe")
+        winner_sharpe = None if raw_winner_sharpe is None else float(raw_winner_sharpe)
+
     return {
         "ensemble_winner": winner,
-        "winner_sharpe": float(ranked[0].get("rolling_sharpe", 0.0)) if ranked else 0.0,
+        "winner_sharpe": winner_sharpe,
         "strategy_weights": weights,
     }
 
@@ -778,14 +885,23 @@ def generate_full_validation_report(force_refresh: bool = False) -> Dict[str, An
     return report
 
 
-def main() -> None:
-    rep = generate_full_validation_report(force_refresh=True)
+def print_validation_report(rep: Dict[str, Any]) -> None:
+    """Render an already-built validation report to stdout.
+
+    Split from ``main()`` because the report's absences must be printable without regenerating
+    the report: ``main()`` calls ``generate_full_validation_report(force_refresh=True)``, which
+    rewrites the cache the live engines read.
+    """
     print(f"=== QUANT VALIDATION SUITE COMPLETED IN {rep['compute_seconds']}s ===")
     for k, v in rep["bootstrap_significance"].items():
+        # The rolling Sharpe can be absent (the window refused to divide by a dispersion below
+        # the threshold), so the format specifier is chosen by the value itself.
+        # `f"{None:+.2f}"` raises TypeError, which is why the value is handed to a renderer
+        # that prints the absence in words instead of a number.
         print(
             f"[{k}] K={v['Sampled Signals (K)']} | Obs ROE={v['observed_expectancy_roe_pct']:+.2f}% vs "
             f"Rand={v['random_baseline_roe_pct']:+.2f}% | Z={v['z_score']:+.2f} | p={v['p_value']:.4f} "
-            f"| Pass={v['significant_edge']} | Rolling Sharpe={v.get('rolling_sharpe', 0.0):+.2f} "
+            f"| Pass={v['significant_edge']} | Rolling Sharpe={format_rolling_sharpe(v.get('rolling_sharpe'))} "
             f"| Ratchet Survival={v['ratchet_survival_rate_pct']:.1f}%"
         )
     for k, v in rep.get("missing_datasets", {}).items():
@@ -793,8 +909,13 @@ def main() -> None:
             # Wording has to cover both kinds of gap the map now carries: files that are absent and
             # files that exist but could not be used. The old sentence asserted the first for both.
             print(f"   [DATA GAP] {k}: requested datasets missing or unusable — {', '.join(v)}")
-    ens = rep.get("finrl_ensemble_selector", {})
-    print(f"[FINRL ENSEMBLE WINNER] {ens.get('ensemble_winner')} (Sharpe={ens.get('winner_sharpe', 0.0):+.2f}) | Weights: {ens.get('strategy_weights')}")
+    ens = rep.get("finrl_ensemble_selector", {}) or {}
+    # Same rule for the winner's Sharpe: it is absent whenever the winning window measured none.
+    print(
+        f"[FINRL ENSEMBLE WINNER] {ens.get('ensemble_winner')} "
+        f"(Sharpe={format_rolling_sharpe(ens.get('winner_sharpe'))}) | "
+        f"Weights: {ens.get('strategy_weights')}"
+    )
     mc = rep["monte_carlo"]
     if mc.get("status") == "unavailable":
         print(f"[MONTE CARLO] UNAVAILABLE — {mc.get('reason')}")
@@ -804,6 +925,10 @@ def main() -> None:
             f"Median DD={mc['median_max_dd_pct']:.2f}% | MaxDD_95={mc['max_dd_95_pct']:.2f}% | "
             f"MaxDD_99={mc['max_dd_99_pct']:.2f}% | Median Terminal Equity=${mc['terminal_equity_p50']:,.2f}"
         )
+
+
+def main() -> None:
+    print_validation_report(generate_full_validation_report(force_refresh=True))
 
 
 if __name__ == "__main__":
