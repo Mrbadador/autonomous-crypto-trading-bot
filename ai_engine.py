@@ -650,6 +650,8 @@ class LLMClient:
 
         # 1. Load Dynamic Learned Rules directly from trading_ledger.db (the true source of truth)
         def _load_learned_rules_from_db():
+            if not getattr(config, "ENABLE_LEARNED_RULES_INJECTION", False):
+                return []
             rules = []
             try:
                 import sqlite3 as _sq
@@ -1038,6 +1040,8 @@ async def red_team_deliberation(
 
     # Load Dynamic Learned Rules distilled from past mistakes
     def _get_top_rules_sync():
+        if not getattr(config, "ENABLE_LEARNED_RULES_INJECTION", False):
+            return []
         rules = []
         try:
             import sqlite3 as _sq

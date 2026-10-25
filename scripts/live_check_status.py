@@ -24,9 +24,15 @@ async def check():
     
     tot_equity = bal + tot_unr
     print(f"Total Portfolio Equity: ${tot_equity:.2f} USDT")
-    net_profit = tot_equity - 137.00
-    roi = (net_profit / 137.00) * 100.0
-    print(f"Net Profit vs $137.00 Deposit: ${net_profit:+.2f} ({roi:+.2f}%)")
+    
+    # Read actual deposit baseline from env if set, avoiding misleading hardcoded baseline
+    baseline_deposit = float(os.getenv("INITIAL_DEPOSIT_USDT", "0.0"))
+    if baseline_deposit > 0:
+        net_profit = tot_equity - baseline_deposit
+        roi = (net_profit / baseline_deposit) * 100.0
+        print(f"Net Profit vs ${baseline_deposit:.2f} Baseline Deposit: ${net_profit:+.2f} ({roi:+.2f}%)")
+    else:
+        print(f"Current Wallet Equity: ${tot_equity:.2f} USDT (Set INITIAL_DEPOSIT_USDT in .env to compute net ROI)")
 
     # Check strategy / stop orders
     for sym in ["NEARUSDT", "SOLUSDT"]:

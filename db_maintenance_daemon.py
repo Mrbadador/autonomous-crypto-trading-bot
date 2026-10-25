@@ -346,12 +346,38 @@ def main():
             # 3. Clean temp files
             cleaned_temp = cleanup_stale_temp_files()
             
-            # 4. Storage sizes
+            # 4. Storage sizes & filesystem disk check
             storage_stats = get_storage_stats()
             
+            # Check host root filesystem free space
+            disk_alert = None
+            try:
+                import shutil
+                total_b, used_b, free_b = shutil.disk_usage(os.path.dirname(os.path.abspath(__file__)))
+                free_gb = free_b / (1024 ** 3)
+                free_pct = (free_b / total_b) * 100.0
+                storage_stats["disk_free_gb"] = f"{free_gb:.2f} GB"
+                storage_stats["disk_free_pct"] = f"{free_pct:.1f}%"
+                
+                if free_pct < 15.0 or free_gb < 3.0:
+                    disk_alert = f"CRITICAL: Low root disk space! Only {free_gb:.2f} GB ({free_pct:.1f}%) free."
+                    log.error(f"[DISK-SPACE-ALERT] {disk_alert}")
+                    try:
+                        from email_dispatcher import send_email_alert
+                        send_email_alert(
+                            subject="🚨 CRITICAL: Trading Bot Host Low Disk Space",
+                            body=f"Host root disk is near exhaustion:\nFree: {free_gb:.2f} GB ({free_pct:.1f}%)\nTotal: {total_b/(1024**3):.2f} GB\nImmediate cleanup required to prevent SQLite write lockups."
+                        )
+                    except Exception as email_e:
+                        log.warning(f"[DISK-SPACE-ALERT] Failed to dispatch email alert: {email_e}")
+                elif free_pct < 25.0:
+                    log.warning(f"[DISK-SPACE-ALERT] Disk space warning: {free_gb:.2f} GB ({free_pct:.1f}%) free.")
+            except Exception as disk_e:
+                log.warning(f"[DISK-SPACE-CHECK] Error checking filesystem disk usage: {disk_e}")
+
             # 5. Emit health metrics (status reflects the worst per-DB verdict, never a
             # hardcoded healthy)
-            if any(s in ("CORRUPT", "ERROR") for s in cp_status.values()):
+            if any(s in ("CORRUPT", "ERROR") for s in cp_status.values()) or (disk_alert and "CRITICAL" in disk_alert):
                 overall_status = "CRITICAL"
             elif any(s in ("BUSY", "DEGRADED") for s in cp_status.values()):
                 overall_status = "DEGRADED"

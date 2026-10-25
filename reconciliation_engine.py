@@ -564,7 +564,7 @@ async def audit_live_exchange_positions():
                                 actual_fee = None
                                 actual_pnl = None
                                 try:
-                                    recent_fills = await uta.get_recent_fills(symbol=s_sym, lookback_mins=30)
+                                    recent_fills = await uta.get_recent_fills(symbol=s_sym, lookback_mins=1440)
                                     # Filter for matching close fills
                                     target_close_side = "close_long" if is_long else "close_short"
                                     matching_fills = [f for f in recent_fills if f.get("tradeSide") == target_close_side]
@@ -969,7 +969,7 @@ async def audit_live_exchange_positions():
                                 actual_fee = None
                                 actual_pnl = None
                                 try:
-                                    recent_fills = await uta.get_recent_fills(symbol=sym, lookback_mins=30)
+                                    recent_fills = await uta.get_recent_fills(symbol=sym, lookback_mins=1440)
                                     target_close_side = "close_long" if is_long else "close_short"
                                     matching_fills = [
                                         f for f in recent_fills

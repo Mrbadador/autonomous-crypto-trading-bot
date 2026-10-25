@@ -385,6 +385,7 @@ CHOP_TP_MULTIPLE       = 1.0
 # Capital Protection & Throttling (V6.2)
 # ---------------------------------------------------------------------------
 MIN_AI_CONVICTION_SCORE   = 50.0
+ENABLE_LEARNED_RULES_INJECTION = os.getenv("ENABLE_LEARNED_RULES_INJECTION", "false").lower() in ("true", "1")  # Default False: Freeze dynamic prompt rule injection to avoid noise fitting
 MIN_NN_CONFIDENCE         = float(os.getenv("MIN_NN_CONFIDENCE", "0.34"))
 MAX_TRADES_PER_24H        = 3
 MAX_CONCURRENT_TRADES     = int(os.getenv("MAX_CONCURRENT_TRADES", "8"))
