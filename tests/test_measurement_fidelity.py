@@ -9199,3 +9199,173 @@ def test_g5d_the_persister_no_longer_prints_ghost_values_it_did_not_measure():
         "the whisperer loop prints ghost values again by itself, outside the measured branch")
     for banned in ("Spoof=None", "Risk=None%"):
         assert banned not in loop_code, banned
+
+
+# ---------------------------------------------------------------------------
+# F2 — the FinRL selector panel publishes the report's multipliers and absences
+# ---------------------------------------------------------------------------
+# F1 made quant_validation.py's rolling Sharpe selector publish `None` for an arm it never
+# measured. These pins run the panel's own module-level renderers (extracted with the AST
+# harness — dashboard.py cannot be imported) against synthetic dicts, and scan the shipped
+# panel blocks for the hard-coded tier F2 had to remove. No test here touches the live
+# cache/quant_validation_report.json, a database, or the network.
+
+_finrl_leader_badge = _dashboard_helper("_finrl_leader_badge")
+_finrl_allocation_line = _dashboard_helper("_finrl_allocation_line")
+_finrl_gap_note = _dashboard_helper("_finrl_gap_note")
+_finrl_signal_edge_card = _dashboard_helper("_finrl_signal_edge_card")
+
+_F2_ABSENT_GREY = "#94a3b8"
+_F2_MEASURED_COLORS = ("#00e5ff", "#10b981", "#f59e0b", "#ef4444", "#38bdf8")
+_F2_OLD_TIER = ("1.20x", "1.05x", "0.90x")
+
+
+def test_f2_leader_badge_with_none_winner_sharpe_publishes_absence_not_2_00():
+    """`num(None, 2.0)` was the fabrication: an unmeasured winner Sharpe printed as +2.00."""
+    badge = _finrl_leader_badge({"ensemble_winner": "SCALP_SHORT", "winner_sharpe": None})
+    assert "not measured" in badge["text"], badge["text"]
+    assert "+2.00" not in badge["text"], badge["text"]
+    assert badge["color"] == _F2_ABSENT_GREY, badge
+    assert not any(c in badge["color"] for c in _F2_MEASURED_COLORS), badge
+
+
+def test_f2_leader_badge_with_none_winner_names_no_default_leader_and_no_literal_none():
+    """The `.get("ensemble_winner", "SWING_4H")` trap: a PRESENT None returned None, str() made
+    the literal text, and the old default invented a leader the selector did not pick."""
+    badge = _finrl_leader_badge({"ensemble_winner": None, "winner_sharpe": -1.3})
+    assert "not measured" in badge["text"], badge["text"]
+    assert "SWING_4H" not in badge["text"], badge["text"]
+    assert "None" not in badge["text"], badge["text"]
+    assert badge["color"] == _F2_ABSENT_GREY, badge
+
+
+def test_f2_leader_badge_with_missing_key_publishes_absence_too():
+    badge = _finrl_leader_badge({})
+    assert badge["text"] == "LEADER: not measured (Sharpe not measured)", badge["text"]
+    assert badge["color"] == _F2_ABSENT_GREY, badge
+
+
+def test_f2_leader_badge_measured_winner_and_zero_sharpe_stay_measurements():
+    """A recorded 0.0 is a reading, not an absence — and a real winner keeps its measured colour."""
+    badge = _finrl_leader_badge({"ensemble_winner": "SCALP_SHORT", "winner_sharpe": 0.0})
+    assert badge["text"] == "LEADER: SCALP_SHORT (Sharpe +0.00)", badge["text"]
+    assert "not measured" not in badge["text"], badge["text"]
+    assert badge["color"] == "#00e5ff", badge
+    live = _finrl_leader_badge({"ensemble_winner": "SCALP_SHORT", "winner_sharpe": -1.3})
+    assert live["text"] == "LEADER: SCALP_SHORT (Sharpe -1.30)", live["text"]
+
+
+def test_f2_allocation_line_publishes_the_reports_multipliers_not_the_hard_coded_tier():
+    """The live cache sizes SCALP_SHORT and GRID_MAKER at 0.75x and carries no SWING_4H entry.
+    The line must say exactly that — no 1.20x, 1.05x or 0.90x may survive."""
+    line = _finrl_allocation_line({
+        "SCALP_SHORT": {"allocation_weight_mult": 0.75, "posture": "DEFENSIVE_THROTTLE"},
+        "GRID_MAKER": {"allocation_weight_mult": 0.75, "posture": "DEFENSIVE_THROTTLE"},
+    })
+    assert "SCALP_SHORT 0.75x" in line, line
+    assert "GRID_MAKER 0.75x" in line, line
+    assert "SWING_4H not measured" in line, line
+    for old in _F2_OLD_TIER:
+        assert old not in line, f"the hard-coded tier {old} is still being printed"
+    swing_seg = next(seg for seg in line.split(" • ") if "SWING_4H" in seg)
+    assert _F2_ABSENT_GREY in swing_seg, swing_seg
+    assert not any(c in swing_seg for c in _F2_MEASURED_COLORS), swing_seg
+
+
+def test_f2_allocation_line_zero_weight_is_a_measurement_and_empty_map_is_all_absences():
+    line = _finrl_allocation_line({"SWING_4H": {"allocation_weight_mult": 0.0}})
+    assert "SWING_4H 0.00x" in line, line
+    assert "SWING_4H not measured" not in line, line
+    empty = _finrl_allocation_line({})
+    assert empty.count("not measured") == 3, empty
+    assert not any(old in empty for old in _F2_OLD_TIER), empty
+
+
+def test_f2_absent_arm_card_publishes_absences_not_zeroes_and_standin_posture():
+    """An arm with no record rendered as `0.00 Sharpe, 1.00x, STANDARD, p=0.500` — a full-looking
+    measurement of nothing."""
+    card = _finrl_signal_edge_card("SWING_4H", {}, {})
+    assert card["sharpe_text"] == "not measured", card
+    assert card["weight_text"] == "not measured", card
+    assert card["badge_text"] == "NOT MEASURED", card
+    assert card["z_text"] == "not measured", card
+    for fabricated in ("0.00", "1.00x", "STANDARD", "0.500", "+0.00"):
+        assert fabricated not in card["weight_text"], fabricated
+        assert fabricated not in card["sharpe_text"], fabricated
+    assert card["sharpe_color"] == _F2_ABSENT_GREY, card
+    assert card["weight_color"] == _F2_ABSENT_GREY, card
+    assert card["badge_fg"] == _F2_ABSENT_GREY, card
+    for key in ("obs_color", "rand_color", "surv_color", "k_color", "z_color"):
+        assert card[key] == _F2_ABSENT_GREY, key
+
+
+def test_f2_f1_none_valued_weight_entry_is_an_absence_not_a_tier():
+    """F1 publishes the key PRESENT with value None — `num(None, 1.0)`/`str(default)` printed
+    1.00x STANDARD for it; the card must render the absence instead."""
+    card = _finrl_signal_edge_card("GRID_MAKER", {}, {
+        "allocation_weight_mult": None, "posture": None, "rolling_sharpe": None})
+    assert card["weight_text"] == "not measured", card
+    assert card["sharpe_text"] == "not measured", card
+    assert "STANDARD" not in card["weight_text"], card
+    assert card["weight_color"] == _F2_ABSENT_GREY, card
+
+
+def test_f2_measured_arm_card_renders_the_reports_own_numbers_including_real_zeroes():
+    """The over-correction guard: a genuine recorded 0.0 is a reading and must stay a number."""
+    card = _finrl_signal_edge_card("SCALP_SHORT", {
+        "p_value": 0.03, "z_score": 0.0,
+        "observed_expectancy_roe_pct": 0.0, "random_baseline_roe_pct": 0.0,
+        "Sampled Signals (K)": 12, "ratchet_survival_rate_pct": 40.0,
+        "rolling_sharpe": 0.0, "significant_edge": False,
+    }, {"allocation_weight_mult": 0.0, "posture": "STANDARD"})
+    assert card["z_text"] == "+0.00", card
+    assert card["obs_text"] == "+0.00%", card
+    assert card["sharpe_text"] == "+0.00", card
+    assert card["weight_text"] == "0.00x (STANDARD)", card
+    assert card["badge_text"] == "REGIME-BOUND (p=0.0300)", card
+    assert card["badge_fg"] == "#f59e0b", card
+    assert card["sharpe_color"] == "#10b981", card
+    assert "not measured" not in " ".join(
+        card[k] for k in ("z_text", "obs_text", "sharpe_text", "weight_text", "badge_text")), card
+    live = _finrl_signal_edge_card("SCALP_SHORT", {}, {
+        "allocation_weight_mult": 0.75, "posture": "DEFENSIVE_THROTTLE", "rolling_sharpe": -1.3})
+    assert live["sharpe_text"] == "-1.30", live
+    assert live["weight_text"] == "0.75x (DEFENSIVE_THROTTLE)", live
+
+
+def test_f2_card_note_uses_the_reports_own_missing_datasets_reason():
+    assert _finrl_gap_note({"SWING_4H": ["SOLUSDT_4h_full.csv"]}, "SWING_4H") == "SOLUSDT_4h_full.csv"
+    assert _finrl_gap_note({"SWING_4H": []}, "SWING_4H") == ""
+    assert _finrl_gap_note("nonsense", "SWING_4H") == ""
+    assert _finrl_gap_note(None, "SWING_4H") == ""
+    card = _finrl_signal_edge_card("SWING_4H", {}, {},
+                                   _finrl_gap_note({"SWING_4H": ["SOLUSDT_4h_full.csv"]}, "SWING_4H"))
+    assert "SOLUSDT_4h_full.csv" in card["note"], card
+    assert _F2_ABSENT_GREY in card["note"], card
+    measured = _finrl_signal_edge_card("SCALP_SHORT", {"p_value": 0.01}, {})
+    assert measured["note"] == "", "a measured card with nothing absent prints no gap note"
+
+
+_F2_FINRL_BLOCKS = {
+    "leader": (r"^[ \t]*# 0\. FinRL Mahalanobis Cross-Asset Turbulence",
+               (r"\n[ \t]*# 1\. Signal Edge Cards",)),
+    "cards": (r"^[ \t]*# 1\. Signal Edge Cards",
+              (r"\n[ \t]*# 2\. Monte Carlo Sequence Risk",)),
+}
+
+
+def test_f2_panel_blocks_route_every_figure_through_the_helpers_and_keep_no_hard_coded_tier():
+    """Code-only, comment-immune scan of the two shipped panel blocks: the old tier literals and
+    the fabricated stand-ins must be gone from the code, and each figure must come from a helper."""
+    leader = _g5_code_only(_section_block(DASHBOARD, *_F2_FINRL_BLOCKS["leader"]))
+    cards = _g5_code_only(_section_block(DASHBOARD, *_F2_FINRL_BLOCKS["cards"]))
+    for banned in ("1.20x", "1.05x", "0.90x", "STANDARD", "SWING_4H 1."):
+        assert banned not in leader, f"the leader block still hard-codes {banned!r}"
+        assert banned not in cards, f"the card block still hard-codes {banned!r}"
+    assert "_finrl_leader_badge(ens_map)" in leader, leader[:400]
+    assert "_finrl_allocation_line(ens_weights)" in leader, leader[:400]
+    assert 'num(ens_map.get("winner_sharpe")' not in leader, leader[:400]
+    assert "_finrl_signal_edge_card(" in cards, cards[:400]
+    assert "_finrl_gap_note(" in cards, cards[:400]
+    for banned_default in ('num(w_info.get("allocation_weight_mult")', 'str(w_info.get("posture"'):
+        assert banned_default not in cards, banned_default

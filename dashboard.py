@@ -1917,6 +1917,155 @@ def _absence_note(reason: str) -> str:
     return f" <span style='color: #94a3b8; font-size: 0.8rem;'>({html.escape(str(reason))})</span>"
 
 
+# ── FinRL selector panel: published readings only, never a stand-in tier ────────────────
+# F1 made quant_validation.py's rolling Sharpe selector publish `None` for an arm it never
+# measured — `ensemble_winner`, `winner_sharpe`, and each arm's `allocation_weight_mult` /
+# `rolling_sharpe` can all be absent. The panel consumed those absences through `num(x, default)`
+# and `.get(key, default)`, so an unmeasured winner Sharpe printed as "+2.00", an arm with no
+# weight printed as "1.00x STANDARD", and the allocation line was hard-coded to a tier the report
+# never produced. Every figure below is read from the report itself and rendered through the
+# house absence convention: a missing reading says "not measured" in grey, a recorded 0.0 stays
+# a number. Pure and module-level so the tests can extract and run them without importing this
+# file.
+_FINRL_SELECTOR_ARMS = (
+    ("SWING_4H", "#00e5ff"),
+    ("SCALP_SHORT", "#f59e0b"),
+    ("GRID_MAKER", "#c084fc"),
+)
+
+
+def _finrl_leader_badge(ens_map) -> dict:
+    """The selector's LEADER badge text, colour and background from the report's own winner.
+
+    `ensemble_winner` present but None is the F1 absence — the `.get(key, "SWING_4H")` trap that
+    made `str(None)` print the literal "None" for an unmeasured leader. An absent name or an
+    absent Sharpe renders in words, in grey; the badge never claims the cyan measured colour for
+    a figure that was not measured.
+    """
+    ens_map = ens_map if isinstance(ens_map, dict) else {}
+    raw_winner = ens_map.get("ensemble_winner")
+    winner_text = str(raw_winner).strip() if raw_winner is not None else ""
+    winner_measured = bool(winner_text) and winner_text.lower() not in ("none", "null", "nan")
+    if not winner_measured:
+        winner_text = _DECK_ABSENT_TEXT
+    sharpe_read = _published_number(
+        ens_map.get("winner_sharpe"), "the rolling Sharpe selector measured no winner")
+    sharpe_text = _deck_text(sharpe_read, "{:+.2f}")
+    measured = winner_measured and bool(sharpe_read["measured"])
+    return {
+        "text": f"LEADER: {winner_text} (Sharpe {sharpe_text})",
+        "color": "#00e5ff" if measured else _DECK_ABSENT_COLOR,
+        "bg": "rgba(0,229,255,0.15)" if measured else "rgba(148,163,184,0.15)",
+    }
+
+
+def _finrl_allocation_line(ens_weights) -> str:
+    """One segment per selector arm, sized by the report's own `allocation_weight_mult`.
+
+    An arm with no weight entry publishes the absence in grey — the report deciding which arms
+    get sized, not the panel keeping a fabricated tier of arm colours and multipliers.
+    """
+    ens_weights = ens_weights if isinstance(ens_weights, dict) else {}
+    parts = []
+    for arm, measured_color in _FINRL_SELECTOR_ARMS:
+        w_info = ens_weights.get(arm)
+        w_info = w_info if isinstance(w_info, dict) else {}
+        read = _published_number(
+            w_info.get("allocation_weight_mult"), f"{arm} carries no allocation weight in the report")
+        parts.append(
+            f'<b style="color:{_deck_color(read, measured_color)};">'
+            f'{arm} {_deck_text(read, "{:.2f}x")}</b>')
+    return " • ".join(parts)
+
+
+def _finrl_gap_note(missing_datasets, arm: str) -> str:
+    """The report's own dataset-gap sentence for one arm; empty when the report carried none."""
+    if not isinstance(missing_datasets, dict):
+        return ""
+    gaps = missing_datasets.get(arm)
+    if isinstance(gaps, (list, tuple)):
+        return "; ".join(str(g) for g in gaps if g)
+    return str(gaps).strip() if gaps is not None else ""
+
+
+def _finrl_signal_edge_card(arm: str, s_info, w_info, gap_note: str = "") -> dict:
+    """The card's measured-or-absent readings for one selector arm.
+
+    Every figure is read out of the report's own `bootstrap_significance` / `strategy_weights`
+    entries. An arm with no record renders every figure as the absence — not the old stand-ins
+    `p=0.500`, `0.00` Sharpe, `1.00x`, `STANDARD` — and says why when the report's
+    `missing_datasets` names the arm. A recorded 0.0 is a measurement and stays a number.
+    """
+    s_info = s_info if isinstance(s_info, dict) else {}
+    w_info = w_info if isinstance(w_info, dict) else {}
+
+    p_read = _published_number(s_info.get("p_value"), f"{arm} has no recorded p-value")
+    z_read = _published_number(s_info.get("z_score"), f"{arm} has no recorded z-score")
+    obs_read = _published_number(
+        s_info.get("observed_expectancy_roe_pct"), f"{arm} has no recorded observed ROE")
+    rand_read = _published_number(
+        s_info.get("random_baseline_roe_pct"), f"{arm} has no recorded random baseline ROE")
+    k_read = _published_number(
+        s_info.get("Sampled Signals (K)"), f"{arm} has no recorded sampled signal count")
+    surv_read = _published_number(
+        s_info.get("ratchet_survival_rate_pct"), f"{arm} has no recorded ratchet survival rate")
+
+    # The rolling Sharpe rides in the bootstrap section and the selector's weight entry; the
+    # first one that carries a reading wins, and None in both (F1) is the absence.
+    sharpe_read = _published_number(s_info.get("rolling_sharpe"), "")
+    if not sharpe_read["measured"]:
+        sharpe_read = _published_number(
+            w_info.get("rolling_sharpe"), f"{arm} has no measured rolling Sharpe in the report")
+
+    mult_read = _published_number(
+        w_info.get("allocation_weight_mult"), f"{arm} carries no allocation weight in the report")
+    raw_posture = w_info.get("posture")
+    posture_text = str(raw_posture).strip() if raw_posture is not None else ""
+    posture_measured = bool(posture_text) and posture_text.lower() not in ("none", "null", "nan")
+
+    sig_read = _published_boolean(
+        s_info.get("significant_edge"), f"{arm} has no recorded significance verdict")
+    if not sig_read["measured"] and p_read["measured"]:
+        sig_read = {"value": p_read["value"] < 0.05, "measured": True, "reason": ""}
+    p_disp = _deck_text(p_read, "{:.4f}")
+    if not sig_read["measured"]:
+        badge_text = _DECK_ABSENT_TEXT.upper()
+        badge_bg, badge_fg = "rgba(148,163,184,0.15)", _DECK_ABSENT_COLOR
+    elif sig_read["value"]:
+        badge_bg, badge_fg = "rgba(16,185,129,0.18)", "#10b981"
+        badge_text = f"PASS (p={p_disp} < 0.05)" if p_read["measured"] else f"PASS (p {_DECK_ABSENT_TEXT})"
+    else:
+        badge_bg, badge_fg = "rgba(245,158,11,0.18)", "#f59e0b"
+        badge_text = f"REGIME-BOUND (p={p_disp})" if p_read["measured"] else f"REGIME-BOUND (p {_DECK_ABSENT_TEXT})"
+
+    if not mult_read["measured"]:
+        weight_text, weight_color = _DECK_ABSENT_TEXT, _DECK_ABSENT_COLOR
+    elif not posture_measured:
+        weight_text = f"{mult_read['value']:.2f}x (posture {_DECK_ABSENT_TEXT})"
+        weight_color = _DECK_ABSENT_COLOR
+    else:
+        weight_text = f"{mult_read['value']:.2f}x ({posture_text})"
+        weight_color = "#f8fafc"
+
+    any_absent = not all(
+        r["measured"] if isinstance(r, dict) else False
+        for r in (p_read, z_read, obs_read, rand_read, k_read, surv_read, sharpe_read, mult_read)
+    )
+    note = _absence_note(gap_note) if (gap_note and any_absent) else ""
+
+    return {
+        "badge_text": badge_text, "badge_bg": badge_bg, "badge_fg": badge_fg,
+        "obs_text": _deck_text(obs_read, "{:+.2f}%"), "obs_color": _deck_color(obs_read, "#f8fafc"),
+        "rand_text": _deck_text(rand_read, "{:+.2f}%"), "rand_color": _deck_color(rand_read, "#94a3b8"),
+        "z_text": _deck_text(z_read, "{:+.2f}"), "z_color": _deck_color(z_read, "#f8fafc"),
+        "sharpe_text": _deck_text(sharpe_read, "{:+.2f}"), "sharpe_color": _deck_color(sharpe_read, "#10b981"),
+        "weight_text": weight_text, "weight_color": weight_color,
+        "surv_text": _deck_text(surv_read, "{:.1f}%"), "surv_color": _deck_color(surv_read, "#38bdf8"),
+        "k_text": _deck_text(k_read, "{:.0f}"), "k_color": _deck_color(k_read, "#f8fafc"),
+        "note": note,
+    }
+
+
 # ── BTC cash-and-carry basis engine: published readings only, never a stand-in book ──────
 # The panel used to default every economics field to a plausible figure — a 1000-dollar
 # allocation, an 8 percent hurdle, a 100 percent liquidation buffer, a "crossed" margin mode — and
@@ -6363,8 +6512,8 @@ with tab_risk:
         t_state = str(turb_data.get("turbulence_state", "CALM_NORMAL"))
         t_pct = num(turb_data.get("percentile_rank"), 20.0)
         t_color = "#10b981" if t_state == "CALM_NORMAL" else ("#f59e0b" if t_state == "ELEVATED_STRESS" else "#ef4444")
-        ens_winner = str(ens_map.get("ensemble_winner", "SWING_4H"))
-        ens_w_sharpe = num(ens_map.get("winner_sharpe"), 2.0)
+        ens_badge = _finrl_leader_badge(ens_map)
+        ens_alloc_line = _finrl_allocation_line(ens_weights)
 
         ft_c1, ft_c2 = st.columns(2)
         with ft_c1:
@@ -6389,13 +6538,10 @@ with tab_risk:
                 <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid #00e5ff; border-radius: 6px; padding: 12px 15px; margin-bottom: 10px;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                         <b style="color:#f8fafc; font-size:0.88rem;">🏆 FinRL Rolling Validation Sharpe Selector</b>
-                        <span style="background:rgba(0,229,255,0.15); color:#00e5ff; font-size:0.72rem; padding:2px 8px; border-radius:4px; font-weight:700;">LEADER: {ens_winner} (Sharpe {ens_w_sharpe:+.2f})</span>
+                        <span style="background:{ens_badge['bg']}; color:{ens_badge['color']}; font-size:0.72rem; padding:2px 8px; border-radius:4px; font-weight:700;">{ens_badge['text']}</span>
                     </div>
                     <div style="color:#94a3b8; font-size:0.80rem; margin-top:6px;">
-                        Dynamic Allocation Multipliers:
-                        <b style="color:#00e5ff;">SWING_4H 1.20x</b> •
-                        <b style="color:#f59e0b;">SCALP_SHORT 1.05x</b> •
-                        <b style="color:#c084fc;">GRID_MAKER 0.90x</b>
+                        Dynamic Allocation Multipliers: {ens_alloc_line}
                     </div>
                 </div>
                 """,
@@ -6411,21 +6557,9 @@ with tab_risk:
             ("SCALP_SHORT", "5m Quick Scalp Short", "#f59e0b"),
         ]
         for idx_s, (s_key, s_label, s_color) in enumerate(strat_meta):
-            s_info = boot_map.get(s_key, {})
-            w_info = ens_weights.get(s_key, {})
-            p_val = num(s_info.get("p_value"), 0.5)
-            z_val = num(s_info.get("z_score"), 0.0)
-            obs_roe = num(s_info.get("observed_expectancy_roe_pct"), 0.0)
-            rand_roe = num(s_info.get("random_baseline_roe_pct"), 0.0)
-            k_cnt = int(num(s_info.get("Sampled Signals (K)"), 0.0))
-            surv_pct = num(s_info.get("ratchet_survival_rate_pct"), 0.0)
-            r_sharpe = num(s_info.get("rolling_sharpe"), w_info.get("rolling_sharpe", 0.0))
-            w_mult = num(w_info.get("allocation_weight_mult"), 1.0)
-            w_posture = str(w_info.get("posture", "STANDARD"))
-            is_sig = bool(s_info.get("significant_edge", p_val < 0.05))
-            badge_bg = "rgba(16,185,129,0.18)" if is_sig else "rgba(245,158,11,0.18)"
-            badge_fg = "#10b981" if is_sig else "#f59e0b"
-            badge_txt = f"PASS (p={p_val:.4f} < 0.05)" if is_sig else f"REGIME-BOUND (p={p_val:.3f})"
+            card = _finrl_signal_edge_card(
+                s_key, boot_map.get(s_key, {}), ens_weights.get(s_key, {}),
+                _finrl_gap_note(jv_report.get("missing_datasets"), s_key))
 
             with bs_cols[idx_s]:
                 st.markdown(
@@ -6433,12 +6567,12 @@ with tab_risk:
                     <div style="background: #0d121f; border: 1px solid #1e293b; border-left: 3px solid {s_color}; border-radius: 6px; padding: 14px 16px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                             <b style="color: {s_color}; font-size: 0.92rem;">{s_label}</b>
-                            <span style="background: {badge_bg}; color: {badge_fg}; font-size: 0.72rem; padding: 2px 7px; border-radius: 4px; font-weight: 700;">{badge_txt}</span>
+                            <span style="background: {card['badge_bg']}; color: {card['badge_fg']}; font-size: 0.72rem; padding: 2px 7px; border-radius: 4px; font-weight: 700;">{card['badge_text']}</span>
                         </div>
                         <div style="color: #cbd5e1; font-size: 0.81rem; line-height: 1.55;">
-                            • <b>Observed vs. Random ROE:</b> <span style="color:#f8fafc;">{obs_roe:+.2f}%</span> vs. <span style="color:#94a3b8;">{rand_roe:+.2f}%</span> (Z = {z_val:+.2f})<br>
-                            • <b>FinRL Rolling Sharpe & Weight:</b> <span style="color:#10b981; font-weight:600;">{r_sharpe:+.2f}</span> → <span style="color:#f8fafc; font-weight:600;">{w_mult:.2f}x ({w_posture})</span><br>
-                            • <b>Ratchet Survival (±0.15 ATR):</b> <span style="color:#38bdf8; font-weight:600;">{surv_pct:.1f}%</span> (K = {k_cnt})
+                            • <b>Observed vs. Random ROE:</b> <span style="color:{card['obs_color']};">{card['obs_text']}</span> vs. <span style="color:{card['rand_color']};">{card['rand_text']}</span> (Z = <span style="color:{card['z_color']};">{card['z_text']}</span>)<br>
+                            • <b>FinRL Rolling Sharpe & Weight:</b> <span style="color:{card['sharpe_color']}; font-weight:600;">{card['sharpe_text']}</span> → <span style="color:{card['weight_color']}; font-weight:600;">{card['weight_text']}</span><br>
+                            • <b>Ratchet Survival (±0.15 ATR):</b> <span style="color:{card['surv_color']}; font-weight:600;">{card['surv_text']}</span> (K = <span style="color:{card['k_color']};">{card['k_text']}</span>){card['note']}
                         </div>
                     </div>
                     """,
