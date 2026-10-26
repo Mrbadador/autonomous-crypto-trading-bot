@@ -77,7 +77,7 @@ class _FakeUTA:
 def _close_fill(exit_p, qty, pnl):
     notional = exit_p * qty
     return {
-        "symbol": "NEARUSDT",
+        "symbol": "TESTBUSDT",
         "tradeSide": "close_long",
         "execQty": str(qty),
         "execPrice": str(exit_p),

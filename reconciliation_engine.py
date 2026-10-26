@@ -583,7 +583,7 @@ async def audit_live_exchange_positions():
                                     matching_fills = [
                                         f for f in recent_fills
                                         if f.get("tradeSide") == target_close_side
-                                        and (s_sym.startswith("TEST") or not f.get("symbol") or uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(s_sym))
+                                        and (not f.get("symbol") or uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(s_sym))
                                         and (pos_open_ms is None or not (f.get("cTime") or f.get("createdTime")) or int(f.get("cTime", 0) or f.get("createdTime", 0) or 0) >= (pos_open_ms - 5000))
                                     ]
                                     if matching_fills:
@@ -1010,7 +1010,7 @@ async def audit_live_exchange_positions():
                                     matching_fills = [
                                         f for f in recent_fills
                                         if f.get("tradeSide") == target_close_side
-                                        and (sym.startswith("TEST") or not f.get("symbol") or uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(sym))
+                                        and (not f.get("symbol") or uta._normalize_symbol(str(f.get("symbol", ""))) == uta._normalize_symbol(sym))
                                         and (pos_open_ms2 is None or not (f.get("cTime") or f.get("createdTime")) or int(f.get("cTime", 0) or f.get("createdTime", 0) or 0) >= (pos_open_ms2 - 5000))
                                     ]
                                     if matching_fills:

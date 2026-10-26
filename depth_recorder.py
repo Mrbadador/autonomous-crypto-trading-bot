@@ -251,6 +251,18 @@ class DepthRecorder:
         self.bootstrap_all()
         cleanup_expired_partitions()
 
+        async def _retention_loop():
+            # The startup purge alone never fires on a long-lived process, so depth
+            # partitions grew unbounded until the disk filled. Re-run it hourly.
+            while True:
+                await asyncio.sleep(3600)
+                try:
+                    await asyncio.to_thread(cleanup_expired_partitions)
+                except Exception as e:
+                    print(f"[DEPTH-RETENTION] Periodic purge failed: {e}")
+
+        self._retention_task = asyncio.create_task(_retention_loop())
+
         sub_args = [{"instType": "USDT-FUTURES", "channel": "books15", "instId": s} for s in self.symbols]
         sub_payload = {"op": "subscribe", "args": sub_args}
 
