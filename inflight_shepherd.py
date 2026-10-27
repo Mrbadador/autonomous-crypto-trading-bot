@@ -466,7 +466,10 @@ class InflightPositionShepherd:
                     has_1_atr_expansion = (price_advance >= atr_val)
 
                     # Rule #173 & #175 Invariant: Breathing Room check
-                    breathing_room_active = (holding_mins < 60.0) and (not has_1_atr_expansion)
+                    # Breathing Room Policy: Minimum 240 mins (4 hours) hold protection for 4H swing trades
+                    # Prevents premature LLM paper-handing before trend develops unless 1.5 ATR expansion occurs
+                    breathing_room_mins = float(getattr(config, 'SWING_BREATHING_ROOM_MINS', 240.0))
+                    breathing_room_active = (holding_mins < breathing_room_mins) and (not has_1_atr_expansion)
 
                     pos_context = {
                         "symbol": std_sym,
