@@ -27,12 +27,16 @@ import requests
 import websockets
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+
+# Load project .env so sub-process inherits DEPTH_RETENTION_DAYS directly
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 WS_URL = "wss://ws.bitget.com/v2/ws/public"
 REST_DEPTH_URL = "https://api.bitget.com/api/v2/mix/market/merge-depth"
 DEPTH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "depth")
-RETENTION_DAYS = int(os.getenv("DEPTH_RETENTION_DAYS", "2"))
+RETENTION_DAYS = int(os.getenv("DEPTH_RETENTION_DAYS", "1"))
 BATCH_FLUSH_INTERVAL_SEC = 2.0
 MAX_BATCH_ROWS = 5000
 
