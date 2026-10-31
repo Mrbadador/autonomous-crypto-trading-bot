@@ -798,13 +798,24 @@ class SwingArchitectTrader:
             return {"direction": None, "long_failed": ["no_4h_indicators"],
                     "short_failed": ["no_4h_indicators"], "near_miss": False}
         close_4h = float(ind_4h["close"])
+        relax_1d = getattr(config, "SWING_RELAX_1D_ALIGNMENT", True)
+
+        # In relaxed mode, 1D trend doesn't need to already be fully aligned;
+        # it just must NOT be in an adverse opposing trend.
+        if relax_1d:
+            long_1d_fail = bool(ind_1d.get("bearish_alignment", False))
+            short_1d_fail = bool(ind_1d.get("bullish_alignment", False))
+        else:
+            long_1d_fail = not bool(ind_1d.get("bullish_alignment", False))
+            short_1d_fail = not bool(ind_1d.get("bearish_alignment", False))
+
         long_checks = [
             ("no_bullish_kumo", not bool(ind_4h.get("bullish_kumo", False))),
             ("no_bullish_candle", not bool(ind_4h.get("bullish_candle_4h", False))),
             ("live_bar_dumping", bool(live_4h_c < live_4h_o * 0.9985)),
             ("live_break_below_closed", bool(live_4h_c < close_4h * 0.9970)),
             (f"adx_below_{min_adx:g}", bool(adx < min_adx)),
-            ("no_1d_bullish_alignment", not bool(ind_1d.get("bullish_alignment", False))),
+            ("no_1d_bullish_alignment", long_1d_fail),
             ("rsi_overbought", bool(rsi > 70.0)),
         ]
         short_checks = [
@@ -813,7 +824,7 @@ class SwingArchitectTrader:
             ("live_bar_pumping", bool(live_4h_c > live_4h_o * 1.0015)),
             ("live_break_above_closed", bool(live_4h_c > close_4h * 1.0030)),
             (f"adx_below_{min_adx:g}", bool(adx < min_adx)),
-            ("no_1d_bearish_alignment", not bool(ind_1d.get("bearish_alignment", False))),
+            ("no_1d_bearish_alignment", short_1d_fail),
             ("rsi_oversold", bool(rsi < 35.0)),
         ]
         long_pattern = bool(ind_4h.get("bullish_kumo", False)) and bool(ind_4h.get("bullish_candle_4h", False))
@@ -914,8 +925,8 @@ class SwingArchitectTrader:
 
         if dir_upper == "LONG" and (macro_bias.upper() in ("BEARISH", "DEFENSIVE_BEAR") or market_regime in ("BEAR_TREND", "BEARISH")):
             return False, f"Macro/Regime is {macro_bias}/{market_regime}. Halting long swing entries (anti-dead-cat-bounce)."
-        if dir_upper == "SHORT" and (macro_bias.upper() not in ("BEARISH", "DEFENSIVE_BEAR", "BEAR_TREND") and market_regime not in ("BEAR_TREND", "BEARISH")):
-            return False, f"Macro Bias is {macro_bias} and Regime is {market_regime}. Halting short swing entries (requires confirmed bear regime to avoid short squeezes)."
+        if dir_upper == "SHORT" and (macro_bias.upper() in ("BULLISH", "PRO_CRYPTO_EXPANSION") or market_regime in ("BULL_TREND", "BULLISH")):
+            return False, f"Macro Bias is {macro_bias} and Regime is {market_regime}. Halting short swing entries (cannot short into macro bull trend)."
 
         # Bayesian Markov Chain Gate
         def _read_markov():
@@ -3272,6 +3283,14 @@ class SwingArchitectTrader:
                     log.warning(f"[NEWS-VETO] {symbol} candidate blocked: {news_rsn}")
                     await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"News: {news_rsn}", candle_key=candle_key)
                     continue
+
+                # Initialize optional gate status defaults to ensure safe gates_snapshot assembly
+                runway_ok, runway_rsn = True, "Gate disabled in config"
+                align15_ok, align15_rsn = True, "Gate disabled in config"
+                div_ok, div_rsn = True, "Gate disabled in config"
+                vp_ok, vp_rsn = True, "Gate disabled in config"
+                td_ok, td_rsn = True, "Gate disabled in config"
+                trap_score, trap_rsn = 0.0, "Gate disabled in config"
 
                 # 4. HTF Resistance/Support Runway Gate (Optional)
                 if getattr(config, "SWING_HTF_RUNWAY_GATE_ENABLED", False):

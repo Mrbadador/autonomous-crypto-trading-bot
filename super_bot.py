@@ -1637,15 +1637,6 @@ class SuperBotTrader:
                     # UNKNOWN or non-finite. Position management already ran above this loop,
                     # so trailing stops, breakeven ratchets and exits are unaffected.
                     log.debug(f"[REGIME-GATE] Entry scans skipped this cycle: {self.regime_stale_reason}")
-                elif is_bear:
-                    # Bear Mode: BEAR_SHIELD Active (Zero Longs, 100% Cash Preservation)
-                    if now_ts - last_4h_scan >= self.check_interval_4h:
-                        log.info(f"[REGIME: BEAR_SHIELD] 🛡️ (ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) -> Bear Shield Active (Zero Longs).")
-                        last_4h_scan = now_ts
-                    # Strict Regime Gate: Only permit short scans in confirmed BEAR_TREND
-                    if self.scalp_short_enabled and regime == "BEAR_TREND":
-                        await self.scan_quick_scalp_short_opportunities(mode="BEAR")
-
                 else:
                     # 3a. Engine 1: 4H Swing Trend Engine (both LONG and SHORT)
                     # Scans every check_interval_4h across the fleet
@@ -1657,11 +1648,7 @@ class SuperBotTrader:
                             )
                         else:
                             # Dynamic directional bias: if market is distinctly bull, bias LONG; if bear, bias SHORT; otherwise allow both directions
-                            target_direction = None
-                            if is_bull:
-                                target_direction = "LONG"
-                            elif is_bear:
-                                target_direction = "SHORT"
+                            target_direction = "SHORT" if is_bear else ("LONG" if is_bull else None)
                             
                             log.info(
                                 f"[ENGINE-1: 4H SWING] (Regime: {regime}, ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) "
@@ -1671,8 +1658,8 @@ class SuperBotTrader:
                         last_4h_scan = now_ts
 
                     # 3b. Engine 2: 15m/5m Clean Chop Maker Grid Dip-Buy Scan
-                    # Active during chop or neutral consolidation when directional ADX < 25
-                    if is_chop and not is_bull:
+                    # Active during chop or neutral consolidation when directional ADX < 25 (Zero dip-buys in active bear or strong bull trends)
+                    if is_chop and not is_bull and not is_bear:
                         if self._chop_grid_adx_active and adx >= 25.5:
                             self._chop_grid_adx_active = False
                         elif not self._chop_grid_adx_active and adx <= 24.5:
@@ -1682,7 +1669,10 @@ class SuperBotTrader:
                             log.info(f"[CHOP-GRID-VETO] Market ADX={adx:.1f} >= 25.0 (hysteresis ceiling 25.5) indicates directional expansion. Chop Grid dip-buying suppressed.")
                         else:
                             await self.scan_chop_grid_opportunities()
+                    elif is_bear:
+                        log.debug(f"[REGIME-GATE] 🛡️ Bear regime active ({regime}): Suppressing Chop Grid dip-buys to avoid catching falling knives.")
                     elif is_bull:
+                        log.debug(f"[REGIME-GATE] 🚀 Confirmed BULL_TREND active ({regime}): Suppressing Chop Grid mean-reversion dip-buys to prioritize 4H trend-following runners.")
                         log.debug(f"[REGIME-GATE] 🚀 Confirmed BULL_TREND active ({regime}): Suppressing Chop Grid mean-reversion dip-buys to prioritize 4H trend-following runners.")
 
                 # 4. Telemetry Logging (every 60s)
