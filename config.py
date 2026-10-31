@@ -179,16 +179,23 @@ SWING_ABORT_COOLDOWN_HOURS    = float(os.getenv("SWING_ABORT_COOLDOWN_HOURS", "0
 # ---------------------------------------------------------------------------
 # Quantitative Alpha Gates (Zero AI Cost — Active Pre-Boardroom Filters)
 # ---------------------------------------------------------------------------
-SWING_DIVERGENCE_GATE_ENABLED     = os.getenv("SWING_DIVERGENCE_GATE_ENABLED", "true").lower() in ("true", "1")
+SWING_DIVERGENCE_GATE_ENABLED     = os.getenv("SWING_DIVERGENCE_GATE_ENABLED", "false").lower() in ("true", "1")
 SWING_DIVERGENCE_LOOKBACK_BARS    = int(os.getenv("SWING_DIVERGENCE_LOOKBACK_BARS", "14"))
 
-SWING_VOLUME_PROFILE_GATE_ENABLED = os.getenv("SWING_VOLUME_PROFILE_GATE_ENABLED", "true").lower() in ("true", "1")
+SWING_VOLUME_PROFILE_GATE_ENABLED = os.getenv("SWING_VOLUME_PROFILE_GATE_ENABLED", "false").lower() in ("true", "1")
 SWING_VOLUME_PROFILE_LOOKBACK     = int(os.getenv("SWING_VOLUME_PROFILE_LOOKBACK", "48"))
 SWING_VOLUME_PROFILE_VA_PCT       = float(os.getenv("SWING_VOLUME_PROFILE_VA_PCT", "0.50"))  # Focuses on core 50% Value Area
 SWING_VOLUME_PROFILE_VAH_TOLERANCE = float(os.getenv("SWING_VOLUME_PROFILE_VAH_TOLERANCE", "0.985")) # Permits breakout builds within 1.5% of VAH
 
-SWING_TD_SEQUENTIAL_GATE_ENABLED  = os.getenv("SWING_TD_SEQUENTIAL_GATE_ENABLED", "true").lower() in ("true", "1")
+SWING_TD_SEQUENTIAL_GATE_ENABLED  = os.getenv("SWING_TD_SEQUENTIAL_GATE_ENABLED", "false").lower() in ("true", "1")
 SWING_TD_EXHAUSTION_COUNT         = int(os.getenv("SWING_TD_EXHAUSTION_COUNT", "9"))
+
+# Two-Engine Decoupling Controls
+SWING_INTRADAY_15M_GATE_ENABLED   = os.getenv("SWING_INTRADAY_15M_GATE_ENABLED", "false").lower() in ("true", "1")
+SWING_HTF_RUNWAY_GATE_ENABLED     = os.getenv("SWING_HTF_RUNWAY_GATE_ENABLED", "false").lower() in ("true", "1")
+SWING_BREAKOUT_TRAP_GATE_ENABLED  = os.getenv("SWING_BREAKOUT_TRAP_GATE_ENABLED", "false").lower() in ("true", "1")
+SWING_BOARDROOM_GATE_ENABLED      = os.getenv("SWING_BOARDROOM_GATE_ENABLED", "false").lower() in ("true", "1")
+SWING_RELAX_1D_ALIGNMENT          = os.getenv("SWING_RELAX_1D_ALIGNMENT", "true").lower() in ("true", "1")
 
 # Microstructure Anti-Spoofing & Cascade Veto Thresholds
 HAWKES_SPOOF_VETO_THRESHOLD       = float(os.getenv("HAWKES_SPOOF_VETO_THRESHOLD", "0.78"))  # Veto only severe flash spoofing (>0.78)

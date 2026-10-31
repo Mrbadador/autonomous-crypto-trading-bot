@@ -3273,40 +3273,45 @@ class SwingArchitectTrader:
                     await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"News: {news_rsn}", candle_key=candle_key)
                     continue
 
-                # 4. HTF Resistance/Support Runway Gate
-                runway_ok, runway_rsn = await self._check_htf_runway(symbol, ind_4h["close"], direction=cand_direction)
-                if not runway_ok:
-                    log.warning(f"[RUNWAY-VETO] {symbol} candidate blocked: {runway_rsn}")
-                    await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"Runway: {runway_rsn}", candle_key=candle_key)
-                    continue
+                # 4. HTF Resistance/Support Runway Gate (Optional)
+                if getattr(config, "SWING_HTF_RUNWAY_GATE_ENABLED", False):
+                    runway_ok, runway_rsn = await self._check_htf_runway(symbol, ind_4h["close"], direction=cand_direction)
+                    if not runway_ok:
+                        log.warning(f"[RUNWAY-VETO] {symbol} candidate blocked: {runway_rsn}")
+                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"Runway: {runway_rsn}", candle_key=candle_key)
+                        continue
 
-                # 4.4 15m Intraday Trend & EMA20 Alignment Gate (Zero AI Cost)
-                align15_ok, align15_rsn = await self._check_intraday_15m_alignment(symbol, direction=cand_direction)
-                if not align15_ok:
-                    log.warning(f"[15M-ALIGNMENT-VETO] {symbol} {cand_direction} candidate blocked: {align15_rsn}")
-                    await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"15mAlign: {align15_rsn}", candle_key=candle_key)
-                    continue
+                # 4.4 15m Intraday Trend & EMA20 Alignment Gate (Optional)
+                if getattr(config, "SWING_INTRADAY_15M_GATE_ENABLED", False):
+                    align15_ok, align15_rsn = await self._check_intraday_15m_alignment(symbol, direction=cand_direction)
+                    if not align15_ok:
+                        log.warning(f"[15M-ALIGNMENT-VETO] {symbol} {cand_direction} candidate blocked: {align15_rsn}")
+                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"15mAlign: {align15_rsn}", candle_key=candle_key)
+                        continue
 
-                # 4.6 Momentum Divergence Gate (Go-Stock Quantitative Upgrade — Zero AI Cost)
-                div_ok, div_rsn = self._check_divergence_gate(symbol, df_4h_eval, direction=cand_direction)
-                if not div_ok:
-                    log.warning(f"[DIVERGENCE-VETO] {symbol} {cand_direction} candidate blocked: {div_rsn}")
-                    await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"Divergence: {div_rsn}", candle_key=candle_key)
-                    continue
+                # 4.6 Momentum Divergence Gate (Optional)
+                if getattr(config, "SWING_DIVERGENCE_GATE_ENABLED", False):
+                    div_ok, div_rsn = self._check_divergence_gate(symbol, df_4h_eval, direction=cand_direction)
+                    if not div_ok:
+                        log.warning(f"[DIVERGENCE-VETO] {symbol} {cand_direction} candidate blocked: {div_rsn}")
+                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"Divergence: {div_rsn}", candle_key=candle_key)
+                        continue
 
-                # 4.7 Volume Profile & Value Area Gate (Go-Stock Quantitative Upgrade — Zero AI Cost)
-                vp_ok, vp_rsn = self._check_volume_profile_gate(symbol, df_4h_eval, ind_4h["close"], direction=cand_direction)
-                if not vp_ok:
-                    log.warning(f"[VOLUME-PROFILE-VETO] {symbol} {cand_direction} candidate blocked: {vp_rsn}")
-                    await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"VolumeProfile: {vp_rsn}", candle_key=candle_key)
-                    continue
+                # 4.7 Volume Profile & Value Area Gate (Optional)
+                if getattr(config, "SWING_VOLUME_PROFILE_GATE_ENABLED", False):
+                    vp_ok, vp_rsn = self._check_volume_profile_gate(symbol, df_4h_eval, ind_4h["close"], direction=cand_direction)
+                    if not vp_ok:
+                        log.warning(f"[VOLUME-PROFILE-VETO] {symbol} {cand_direction} candidate blocked: {vp_rsn}")
+                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"VolumeProfile: {vp_rsn}", candle_key=candle_key)
+                        continue
 
-                # 4.8 TD Sequential Exhaustion Gate (Go-Stock Quantitative Upgrade — Zero AI Cost)
-                td_ok, td_rsn = self._check_td_sequential_gate(symbol, df_4h_eval, direction=cand_direction)
-                if not td_ok:
-                    log.warning(f"[TD-SEQUENTIAL-VETO] {symbol} {cand_direction} candidate blocked: {td_rsn}")
-                    await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"TD9: {td_rsn}", candle_key=candle_key)
-                    continue
+                # 4.8 TD Sequential Exhaustion Gate (Optional)
+                if getattr(config, "SWING_TD_SEQUENTIAL_GATE_ENABLED", False):
+                    td_ok, td_rsn = self._check_td_sequential_gate(symbol, df_4h_eval, direction=cand_direction)
+                    if not td_ok:
+                        log.warning(f"[TD-SEQUENTIAL-VETO] {symbol} {cand_direction} candidate blocked: {td_rsn}")
+                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, ind_4h["close"], veto_reason=f"TD9: {td_rsn}", candle_key=candle_key)
+                        continue
 
                 # Per-Candle Boardroom & Trap Gate Cache (cuts 4H scan AI calls by ~95%)
                 # Cache per (symbol, direction, 4h_candle_timestamp) for up to 60m unless price moves > 0.5%
@@ -3326,52 +3331,55 @@ class SwingArchitectTrader:
                         continue
 
                 # 4.5 AI Breakout vs. Bull-Trap Gate (Zero-Lag Fakeout Shield — with Per-Candle Pass Cache)
-                cached_trap = self._trap_pass_cache.get(cache_key)
-                trap_cached_ok = False
-                if isinstance(cached_trap, dict):
-                    same_candle = (candle_4h_ts > 0 and cached_trap.get("candle_ts") == candle_4h_ts)
-                    ref_price = float(cached_trap.get("price", curr_p) or curr_p)
-                    price_moved_pct = abs(curr_p - ref_price) / ref_price if ref_price > 0 else 1.0
-                    if same_candle and price_moved_pct <= 0.005:
-                        trap_cached_ok = True
-                        log.info(f"[TRAP-CANDLE-CACHE] Reusing 4H Trap Gate pass for {symbol} {cand_direction} (Δprice={price_moved_pct*100:.2f}%)")
+                if getattr(config, "SWING_BREAKOUT_TRAP_GATE_ENABLED", False):
+                    cached_trap = self._trap_pass_cache.get(cache_key)
+                    trap_cached_ok = False
+                    if isinstance(cached_trap, dict):
+                        same_candle = (candle_4h_ts > 0 and cached_trap.get("candle_ts") == candle_4h_ts)
+                        ref_price = float(cached_trap.get("price", curr_p) or curr_p)
+                        price_moved_pct = abs(curr_p - ref_price) / ref_price if ref_price > 0 else 1.0
+                        if same_candle and price_moved_pct <= 0.005:
+                            trap_cached_ok = True
+                            log.info(f"[TRAP-CANDLE-CACHE] Reusing 4H Trap Gate pass for {symbol} {cand_direction} (Δprice={price_moved_pct*100:.2f}%)")
 
-                if not trap_cached_ok:
-                    trap_ok, trap_score, trap_rsn = await self._check_breakout_trap_gate(symbol, ind_4h, curr_p, direction=cand_direction)
-                    if not trap_ok:
+                    if not trap_cached_ok:
+                        trap_ok, trap_score, trap_rsn = await self._check_breakout_trap_gate(symbol, ind_4h, curr_p, direction=cand_direction)
+                        if not trap_ok:
+                            self._ai_veto_cache[cache_key] = {
+                                "ts": time.time(),
+                                "candle_ts": candle_4h_ts,
+                                "price": curr_p,
+                                "reason": f"TrapGate: {trap_rsn}"
+                            }
+                            log.warning(f"[BREAKOUT-TRAP-VETO] {symbol} {cand_direction} blocked: {trap_rsn}")
+                            await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, curr_p, veto_reason=f"TrapGate: {trap_rsn}", candle_key=candle_key)
+                            continue
+                        self._trap_pass_cache[cache_key] = {
+                            "ts": time.time(),
+                            "candle_ts": candle_4h_ts,
+                            "price": curr_p,
+                            "score": trap_score,
+                            "reason": trap_rsn
+                        }
+
+                # 5. Multi-Agent Conviction Boardroom
+                score = 0.85
+                rationale = "Direct 4H Trend Breakout Execution"
+                if getattr(config, "SWING_BOARDROOM_GATE_ENABLED", False):
+                    log.info(f"[BOARDROOM] Convening Boardroom deliberation for {symbol} 4H Swing {cand_direction}...")
+                    execute, score, rationale = await self._deliberate_boardroom(symbol, ind_4h, ind_1d, direction=cand_direction)
+                    if not execute or score < 0.65:
                         self._ai_veto_cache[cache_key] = {
                             "ts": time.time(),
                             "candle_ts": candle_4h_ts,
                             "price": curr_p,
-                            "reason": f"TrapGate: {trap_rsn}"
+                            "reason": f"Boardroom ({score:.2f}): {rationale}"
                         }
-                        log.warning(f"[BREAKOUT-TRAP-VETO] {symbol} {cand_direction} blocked: {trap_rsn}")
-                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, curr_p, veto_reason=f"TrapGate: {trap_rsn}", candle_key=candle_key)
+                        log.warning(f"[BOARDROOM-VETO] {symbol} rejected (Score: {score:.2f}): {rationale}")
+                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, curr_p, veto_reason=f"Boardroom: {rationale}", candle_key=candle_key)
                         continue
-                    self._trap_pass_cache[cache_key] = {
-                        "ts": time.time(),
-                        "candle_ts": candle_4h_ts,
-                        "price": curr_p,
-                        "score": trap_score,
-                        "reason": trap_rsn
-                    }
 
-                # 5. Multi-Agent Conviction Boardroom (Unified 1-Call Deliberation)
-                log.info(f"[BOARDROOM] Convening Boardroom deliberation for {symbol} 4H Swing {cand_direction}...")
-
-                execute, score, rationale = await self._deliberate_boardroom(symbol, ind_4h, ind_1d, direction=cand_direction)
-                if not execute or score < 0.65:
-                    self._ai_veto_cache[cache_key] = {
-                        "ts": time.time(),
-                        "candle_ts": candle_4h_ts,
-                        "price": curr_p,
-                        "reason": f"Boardroom ({score:.2f}): {rationale}"
-                    }
-                    log.warning(f"[BOARDROOM-VETO] {symbol} rejected (Score: {score:.2f}): {rationale}")
-                    await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, curr_p, veto_reason=f"Boardroom: {rationale}", candle_key=candle_key)
-                    continue
-
-                log.info(f"[BOARDROOM-APPROVED] {symbol} passed deliberation for {cand_direction} (Score: {score:.2f})!")
+                    log.info(f"[BOARDROOM-APPROVED] {symbol} passed deliberation for {cand_direction} (Score: {score:.2f})!")
 
                 # Assemble Gate Snapshot for Truthful Quantitative Logging
                 gates_snapshot = {

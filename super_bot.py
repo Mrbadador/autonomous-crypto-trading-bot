@@ -1647,28 +1647,32 @@ class SuperBotTrader:
                         await self.scan_quick_scalp_short_opportunities(mode="BEAR")
 
                 else:
-                    # 3a. 4H Swing Architect + AI Boardroom Scan (every 5m when not in Bear Shield and DI spread >= -2.0)
-                    # Unchains decoupled momentum leaders (NEAR, LINK, AVAX, SUI, APT) in Bull Trend or neutral chop
+                    # 3a. Engine 1: 4H Swing Trend Engine (both LONG and SHORT)
+                    # Scans every check_interval_4h across the fleet
                     if now_ts - last_4h_scan >= self.check_interval_4h:
                         if self.turbulence_state == "EXTREME_SHOCK":
                             log.warning(
                                 f"[FINRL-TURBULENCE-SHIELD] 🚨 Cross-asset turbulence breach active "
-                                f"(d_t={self.turbulence_index:.2f} > {self.turbulence_threshold:.2f}). 4H Swing LONG scan muted."
+                                f"(d_t={self.turbulence_index:.2f} > {self.turbulence_threshold:.2f}). 4H Swing scan muted."
                             )
-                        elif is_bull or self.market_regime_di_spread >= -2.0:
+                        else:
+                            # Dynamic directional bias: if market is distinctly bull, bias LONG; if bear, bias SHORT; otherwise allow both directions
+                            target_direction = None
+                            if is_bull:
+                                target_direction = "LONG"
+                            elif is_bear:
+                                target_direction = "SHORT"
+                            
                             log.info(
-                                f"[REGIME: {regime}] (ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}, "
-                                f"Hurst: {hurst:.2f}, Turbulence: {self.turbulence_index:.1f}/{self.turbulence_threshold:.1f} [{self.turbulence_state}]) "
-                                f"-> Running 4H Swing Architect + AI Boardroom fleet scan (LONG)..."
+                                f"[ENGINE-1: 4H SWING] (Regime: {regime}, ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) "
+                                f"-> Running 4H Swing Breakout scan (direction: {target_direction or 'BOTH'})..."
                             )
-                            await self.swing_engine.scan_fleet(allowed_direction="LONG")
+                            await self.swing_engine.scan_fleet(allowed_direction=target_direction)
                         last_4h_scan = now_ts
 
-                    # 3b. Clean Chop Maker Grid Dip-Buy Scan
-                    # Strict Regime Gate: NEVER run mean-reversion chop dip-buys in a confirmed BULL_TREND (divert 100% margin to 4H trend-following)
+                    # 3b. Engine 2: 15m/5m Clean Chop Maker Grid Dip-Buy Scan
+                    # Active during chop or neutral consolidation when directional ADX < 25
                     if is_chop and not is_bull:
-                        # Q-2 FIX: Market ADX dead-band hysteresis to prevent toggle noise around 25.0
-                        # Deactivates at ADX >= 25.5 (expansion); reactivates once ADX cools down <= 24.5.
                         if self._chop_grid_adx_active and adx >= 25.5:
                             self._chop_grid_adx_active = False
                         elif not self._chop_grid_adx_active and adx <= 24.5:
