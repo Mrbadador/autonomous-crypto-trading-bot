@@ -657,11 +657,35 @@ class SwingArchitectTrader:
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
         
-        tr_sum = tr.rolling(window=14).sum()
-        plus_di = 100.0 * (pd.Series(plus_dm, index=df.index).rolling(window=14).sum() / tr_sum)
-        minus_di = 100.0 * (pd.Series(minus_dm, index=df.index).rolling(window=14).sum() / tr_sum)
-        dx = 100.0 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
-        adx_14 = dx.rolling(window=14).mean()
+        # Wilder's exponential smoothing (alpha = 1/14) to match regime_classifier and markov_regime
+        n_bars = len(df)
+        length = 14
+        def _wilder_smooth(vals):
+            out = np.full(n_bars, np.nan)
+            if n_bars <= length:
+                return out
+            out[length] = vals[1:length + 1].sum()
+            for i in range(length + 1, n_bars):
+                out[i] = out[i - 1] - (out[i - 1] / length) + vals[i]
+            return out
+
+        tr_smooth = _wilder_smooth(tr.to_numpy())
+        plus_dm_smooth = _wilder_smooth(plus_dm)
+        minus_dm_smooth = _wilder_smooth(minus_dm)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            active_m = tr_smooth > 0
+            p_di = np.where(active_m, 100.0 * plus_dm_smooth / tr_smooth, 0.0)
+            m_di = np.where(active_m, 100.0 * minus_dm_smooth / tr_smooth, 0.0)
+            di_s = p_di + m_di
+            raw_dx = np.where(di_s > 0, 100.0 * np.abs(p_di - m_di) / di_s, 0.0)
+        
+        adx_series = np.full(n_bars, np.nan)
+        seed_i = 2 * length - 1
+        if n_bars > seed_i:
+            adx_series[seed_i] = raw_dx[length:seed_i + 1].mean()
+            for i in range(seed_i + 1, n_bars):
+                adx_series[i] = (adx_series[i - 1] * (length - 1) + raw_dx[i]) / length
+        adx_14 = pd.Series(adx_series, index=df.index)
 
         # RSI(14) for Overbought/Oversold exhaustion filters
         delta = close.diff()
@@ -2429,10 +2453,13 @@ class SwingArchitectTrader:
                         if new_sl >= curr_price:
                             log.warning(f"[RATCHET-SKIP] {symbol} (LONG) breakeven stop ${new_sl:,.4f} would sit at/above the last price ${curr_price:,.4f} — a long stop above spot fires instantly, refusing the move.")
                         else:
-                            pos["stop_loss"] = round(new_sl, 4)
-                            pos["trailing_stop"] = round(new_sl, 4)
-                            log.info(f"[RATCHET-BE] {symbol} (LONG) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (+${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"ratchet_be_long_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = round(new_sl, 4)
+                                pos["trailing_stop"] = round(new_sl, 4)
+                                log.info(f"[RATCHET-BE] {symbol} (LONG) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (+${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
+                            else:
+                                log.warning(f"[RATCHET-FAIL] {symbol} (LONG) modify_strategy_order failed on exchange. Preserving current SL (${pos['stop_loss']:.4f}).")
 
                     # Ratchet 1.5: High-Water Mark Dynamic Profit Protection (Rule #154, #155, #156)
                     # Prevents winning runners from round-tripping peak paper gains back into breakeven
@@ -2445,17 +2472,23 @@ class SwingArchitectTrader:
                     if peak_roe >= t2_roe:
                         floor_sl = entry_p + ((peak_p - entry_p) * t2_ratio)
                         if floor_sl > pos["stop_loss"] and curr_price > floor_sl:
-                            pos["stop_loss"] = round(floor_sl, 4)
-                            pos["trailing_stop"] = round(floor_sl, 4)
-                            log.info(f"[PROFIT-LOCK-70%] {symbol} (LONG) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 70% profit floor: ${floor_sl:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit")), f"profit_lock_70_long_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = round(floor_sl, 4)
+                                pos["trailing_stop"] = round(floor_sl, 4)
+                                log.info(f"[PROFIT-LOCK-70%] {symbol} (LONG) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 70% profit floor: ${floor_sl:,.4f}")
+                            else:
+                                log.warning(f"[PROFIT-LOCK-FAIL] {symbol} (LONG) modify_strategy_order failed for 70% floor. Retaining SL.")
                     elif peak_roe >= t1_roe:
                         floor_sl = entry_p + ((peak_p - entry_p) * t1_ratio)
                         if floor_sl > pos["stop_loss"] and curr_price > floor_sl:
-                            pos["stop_loss"] = round(floor_sl, 4)
-                            pos["trailing_stop"] = round(floor_sl, 4)
-                            log.info(f"[PROFIT-LOCK-50%] {symbol} (LONG) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 50% profit floor: ${floor_sl:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit")), f"profit_lock_50_long_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = round(floor_sl, 4)
+                                pos["trailing_stop"] = round(floor_sl, 4)
+                                log.info(f"[PROFIT-LOCK-50%] {symbol} (LONG) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 50% profit floor: ${floor_sl:,.4f}")
+                            else:
+                                log.warning(f"[PROFIT-LOCK-FAIL] {symbol} (LONG) modify_strategy_order failed for 50% floor. Retaining SL.")
 
                     # Ratchet 2: Dynamic 4H Trailing Stop (LONG - SWING_4H only) - only move UP
                     if is_swing_4h:
@@ -2463,30 +2496,33 @@ class SwingArchitectTrader:
                         new_sl_val = round(trail_anchor, 4) if trail_anchor else None
                         if new_sl_val and new_sl_val > pos["stop_loss"] and curr_price > new_sl_val:
                             old_sl_val = pos["stop_loss"]
-                            pos["stop_loss"] = new_sl_val
-                            pos["trailing_stop"] = new_sl_val
-                            anchor_name = "4H Tenkan" if (r_multiple >= 3.0 and tenkan) else "4H Kijun"
-                            log.info(f"[TRAIL-RATCHET] {symbol} (LONG) Trailing stop advanced to {anchor_name}: ${new_sl_val:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl_val, tp=pos.get("take_profit")), f"trail_ratchet_long_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=new_sl_val, tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = new_sl_val
+                                pos["trailing_stop"] = new_sl_val
+                                anchor_name = "4H Tenkan" if (r_multiple >= 3.0 and tenkan) else "4H Kijun"
+                                log.info(f"[TRAIL-RATCHET] {symbol} (LONG) Trailing stop advanced to {anchor_name}: ${new_sl_val:,.4f}")
 
-                            # Alert via email when stop moves meaningfully (> 0.5% advance)
-                            if ((new_sl_val - old_sl_val) / max(0.001, old_sl_val) >= 0.005) or (old_sl_val < entry_p <= new_sl_val):
-                                try:
-                                    from email_dispatcher import send_trailing_ratchet_alert_async
-                                    locked_profit = max(0.0, (new_sl_val - entry_p) * float(pos.get("size", 1.0) or 1.0))
-                                    self._track_task(send_trailing_ratchet_alert_async(
-                                        symbol=symbol,
-                                        side="LONG",
-                                        old_sl=old_sl_val,
-                                        new_sl=new_sl_val,
-                                        current_price=curr_price,
-                                        peak_price=peak_p,
-                                        r_multiple=r_multiple,
-                                        locked_profit_usd=locked_profit,
-                                        anchor_name=anchor_name
-                                    ), f"trail_alert_long_{symbol}")
-                                except Exception as trail_mail_err:
-                                    log.debug(f"[TRAIL-ALERT-NOTE] {trail_mail_err}")
+                                # Alert via email when stop moves meaningfully (> 0.5% advance)
+                                if ((new_sl_val - old_sl_val) / max(0.001, old_sl_val) >= 0.005) or (old_sl_val < entry_p <= new_sl_val):
+                                    try:
+                                        from email_dispatcher import send_trailing_ratchet_alert_async
+                                        locked_profit = max(0.0, (new_sl_val - entry_p) * float(pos.get("size", 1.0) or 1.0))
+                                        self._track_task(send_trailing_ratchet_alert_async(
+                                            symbol=symbol,
+                                            side="LONG",
+                                            old_sl=old_sl_val,
+                                            new_sl=new_sl_val,
+                                            current_price=curr_price,
+                                            peak_price=peak_p,
+                                            r_multiple=r_multiple,
+                                            locked_profit_usd=locked_profit,
+                                            anchor_name=anchor_name
+                                        ), f"trail_alert_long_{symbol}")
+                                    except Exception as trail_mail_err:
+                                        log.debug(f"[TRAIL-ALERT-NOTE] {trail_mail_err}")
+                            else:
+                                log.warning(f"[TRAIL-RATCHET-FAIL] {symbol} (LONG) trailing stop update rejected by exchange. Retaining SL.")
                 else:
                     # Ratchet 0A: Fast Micro-Breakeven Ratchet for Quick Scalp Short (deliberate fast-harvest design)
                     peak_profit_pct = (entry_p - peak_p) / entry_p
@@ -2513,10 +2549,13 @@ class SwingArchitectTrader:
                         if new_sl <= curr_price:
                             log.warning(f"[RATCHET-SKIP] {symbol} (SHORT) breakeven stop ${new_sl:,.4f} would sit at/below the last price ${curr_price:,.4f} — a short stop below spot fires instantly, refusing the move.")
                         else:
-                            pos["stop_loss"] = round(new_sl, 4)
-                            pos["trailing_stop"] = round(new_sl, 4)
-                            log.info(f"[RATCHET-BE] {symbol} (SHORT) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (-${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"ratchet_be_short_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = round(new_sl, 4)
+                                pos["trailing_stop"] = round(new_sl, 4)
+                                log.info(f"[RATCHET-BE] {symbol} (SHORT) at +{r_multiple:.2f}R! Stop-loss ratcheted to Breakeven (-${fee_buffer:.4f} fee buffer): ${new_sl:,.4f}")
+                            else:
+                                log.warning(f"[RATCHET-FAIL] {symbol} (SHORT) modify_strategy_order failed on exchange. Preserving current SL (${pos['stop_loss']:.4f}).")
 
                     # Ratchet 1.5: High-Water Mark Dynamic Profit Protection (Rule #154, #155, #156)
                     peak_roe = ((entry_p - peak_p) / entry_p) * pos.get("leverage", self.leverage) * 100.0
@@ -2528,17 +2567,23 @@ class SwingArchitectTrader:
                     if peak_roe >= t2_roe:
                         floor_sl = entry_p - ((entry_p - peak_p) * t2_ratio)
                         if floor_sl < pos["stop_loss"] and curr_price < floor_sl:
-                            pos["stop_loss"] = round(floor_sl, 4)
-                            pos["trailing_stop"] = round(floor_sl, 4)
-                            log.info(f"[PROFIT-LOCK-70%] {symbol} (SHORT) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 70% profit floor: ${floor_sl:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit")), f"profit_lock_70_short_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = round(floor_sl, 4)
+                                pos["trailing_stop"] = round(floor_sl, 4)
+                                log.info(f"[PROFIT-LOCK-70%] {symbol} (SHORT) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 70% profit floor: ${floor_sl:,.4f}")
+                            else:
+                                log.warning(f"[PROFIT-LOCK-FAIL] {symbol} (SHORT) modify_strategy_order failed for 70% floor. Retaining SL.")
                     elif peak_roe >= t1_roe:
                         floor_sl = entry_p - ((entry_p - peak_p) * t1_ratio)
                         if floor_sl < pos["stop_loss"] and curr_price < floor_sl:
-                            pos["stop_loss"] = round(floor_sl, 4)
-                            pos["trailing_stop"] = round(floor_sl, 4)
-                            log.info(f"[PROFIT-LOCK-50%] {symbol} (SHORT) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 50% profit floor: ${floor_sl:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit")), f"profit_lock_50_short_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=round(floor_sl, 4), tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = round(floor_sl, 4)
+                                pos["trailing_stop"] = round(floor_sl, 4)
+                                log.info(f"[PROFIT-LOCK-50%] {symbol} (SHORT) Peak at ${peak_p:.4f} (+{peak_roe:.1f}% ROE)! Ratcheting stop to 50% profit floor: ${floor_sl:,.4f}")
+                            else:
+                                log.warning(f"[PROFIT-LOCK-FAIL] {symbol} (SHORT) modify_strategy_order failed for 50% floor. Retaining SL.")
 
                     # Ratchet 2: Dynamic 4H Trailing Stop (SHORT - SWING_4H only) - only move DOWN
                     if is_swing_4h:
@@ -2546,30 +2591,33 @@ class SwingArchitectTrader:
                         new_sl_val = round(trail_anchor, 4) if trail_anchor else None
                         if new_sl_val and new_sl_val < pos["stop_loss"] and curr_price < new_sl_val:
                             old_sl_val = pos["stop_loss"]
-                            pos["stop_loss"] = new_sl_val
-                            pos["trailing_stop"] = new_sl_val
-                            anchor_name = "4H Tenkan" if (r_multiple >= 3.0 and tenkan) else "4H Kijun"
-                            log.info(f"[TRAIL-RATCHET] {symbol} (SHORT) Trailing stop dropped to {anchor_name}: ${new_sl_val:,.4f}")
-                            self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl_val, tp=pos.get("take_profit")), f"trail_ratchet_short_{symbol}")
+                            ok = await self.uta_client.modify_strategy_order(symbol, sl=new_sl_val, tp=pos.get("take_profit"))
+                            if ok:
+                                pos["stop_loss"] = new_sl_val
+                                pos["trailing_stop"] = new_sl_val
+                                anchor_name = "4H Tenkan" if (r_multiple >= 3.0 and tenkan) else "4H Kijun"
+                                log.info(f"[TRAIL-RATCHET] {symbol} (SHORT) Trailing stop dropped to {anchor_name}: ${new_sl_val:,.4f}")
 
-                            # Alert via email when stop moves meaningfully (> 0.5% advance)
-                            if ((old_sl_val - new_sl_val) / max(0.001, old_sl_val) >= 0.005) or (old_sl_val > entry_p >= new_sl_val):
-                                try:
-                                    from email_dispatcher import send_trailing_ratchet_alert_async
-                                    locked_profit = max(0.0, (entry_p - new_sl_val) * float(pos.get("size", 1.0) or 1.0))
-                                    self._track_task(send_trailing_ratchet_alert_async(
-                                        symbol=symbol,
-                                        side="SHORT",
-                                        old_sl=old_sl_val,
-                                        new_sl=new_sl_val,
-                                        current_price=curr_price,
-                                        peak_price=peak_p,
-                                        r_multiple=r_multiple,
-                                        locked_profit_usd=locked_profit,
-                                        anchor_name=anchor_name
-                                    ), f"trail_alert_short_{symbol}")
-                                except Exception as trail_mail_err:
-                                    log.debug(f"[TRAIL-ALERT-NOTE] {trail_mail_err}")
+                                # Alert via email when stop moves meaningfully (> 0.5% advance)
+                                if ((old_sl_val - new_sl_val) / max(0.001, old_sl_val) >= 0.005) or (old_sl_val > entry_p >= new_sl_val):
+                                    try:
+                                        from email_dispatcher import send_trailing_ratchet_alert_async
+                                        locked_profit = max(0.0, (entry_p - new_sl_val) * float(pos.get("size", 1.0) or 1.0))
+                                        self._track_task(send_trailing_ratchet_alert_async(
+                                            symbol=symbol,
+                                            side="SHORT",
+                                            old_sl=old_sl_val,
+                                            new_sl=new_sl_val,
+                                            current_price=curr_price,
+                                            peak_price=peak_p,
+                                            r_multiple=r_multiple,
+                                            locked_profit_usd=locked_profit,
+                                            anchor_name=anchor_name
+                                        ), f"trail_alert_short_{symbol}")
+                                    except Exception as trail_mail_err:
+                                        log.debug(f"[TRAIL-ALERT-NOTE] {trail_mail_err}")
+                            else:
+                                log.warning(f"[TRAIL-RATCHET-FAIL] {symbol} (SHORT) trailing stop update rejected by exchange. Retaining SL.")
 
                 # Ratchet 3: AI Continuous Active Shepherding & Runner vs. Harvest Architect
                 # Evaluates active position health every 1200s (20 minutes)
@@ -3382,7 +3430,7 @@ class SwingArchitectTrader:
                         }
 
                 # 5. Multi-Agent Conviction Boardroom
-                score = 0.85
+                score = 0.75  # Default to standard conviction (3x leverage) when boardroom is disabled
                 rationale = "Direct 4H Trend Breakout Execution"
                 if getattr(config, "SWING_BOARDROOM_GATE_ENABLED", False):
                     log.info(f"[BOARDROOM] Convening Boardroom deliberation for {symbol} 4H Swing {cand_direction}...")
@@ -3399,6 +3447,27 @@ class SwingArchitectTrader:
                         continue
 
                     log.info(f"[BOARDROOM-APPROVED] {symbol} passed deliberation for {cand_direction} (Score: {score:.2f})!")
+                else:
+                    # Enforce deterministic pre-filters even when LLM Boardroom is disabled
+                    try:
+                        pre_check = await self.boardroom._check_deterministic_prefilters(
+                            symbol, cand_direction, {"strategy": "SWING_4H", "timeframe": "4h", "rsi": rsi, "adx": adx}
+                        )
+                        if pre_check.get("veto"):
+                            veto_info = pre_check["veto"]
+                            veto_stage = veto_info.get("stage", "prefilter")
+                            veto_rsn = veto_info.get("final_rationale", "Deterministic prefilter veto")
+                            self._ai_veto_cache[cache_key] = {
+                                "ts": time.time(),
+                                "candle_ts": candle_4h_ts,
+                                "price": curr_p,
+                                "reason": f"Prefilter-{veto_stage}: {veto_rsn}"
+                            }
+                            log.warning(f"[PREFILTER-VETO] {symbol} 4H Swing {cand_direction} blocked by {veto_stage}: {veto_rsn}")
+                            await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, curr_p, veto_reason=f"Prefilter: {veto_rsn}", candle_key=candle_key)
+                            continue
+                    except Exception as pre_err:
+                        log.warning(f"[PREFILTER-CHECK-NOTE] {symbol}: {pre_err}")
 
                 # Assemble Gate Snapshot for Truthful Quantitative Logging
                 gates_snapshot = {

@@ -1654,7 +1654,8 @@ class SuperBotTrader:
                                 f"[ENGINE-1: 4H SWING] (Regime: {regime}, ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) "
                                 f"-> Running 4H Swing Breakout scan (direction: {target_direction or 'BOTH'})..."
                             )
-                            await self.swing_engine.scan_fleet(allowed_direction=target_direction)
+                            # Run 4H scan decoupled as a tracked task so maker sniper waits don't freeze the 15s loop
+                            self._track_task(self.swing_engine.scan_fleet(allowed_direction=target_direction), "swing_scan_fleet")
                         last_4h_scan = now_ts
 
                     # 3b. Engine 2: 15m/5m Clean Chop Maker Grid Dip-Buy Scan

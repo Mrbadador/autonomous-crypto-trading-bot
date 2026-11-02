@@ -105,8 +105,10 @@ class SymbolOFIState:
         self.latest_mlofi = 0.0
         self.latest_micro_price = 0.0
         self.latest_micro_bps = 0.0
-        self.vpin_calc = VPINCalculator(bucket_volume=2000.0, num_buckets=30)
-        self.vpin_calc_real = VPINCalculator(bucket_volume=2000.0, num_buckets=30)
+        sym_u = symbol.upper()
+        bucket_vol_usd = 50000.0 if any(m in sym_u for m in ["BTC", "ETH", "SOL"]) else 15000.0
+        self.vpin_calc = VPINCalculator(bucket_volume=bucket_vol_usd, num_buckets=30)
+        self.vpin_calc_real = VPINCalculator(bucket_volume=bucket_vol_usd, num_buckets=30)
         self.hawkes_guard = HawkesSpoofGuard()
         self.latest_hawkes_spoof = 0.0
         self.latest_hawkes_rho = 0.0
@@ -163,7 +165,7 @@ class SymbolOFIState:
             return
         self.real_trade_count += 1
         self.last_real_trade_ts = time.time()
-        self.vpin_calc_real.update_trade(price=price, size=size, side=side)
+        self.vpin_calc_real.update_trade(price=price, size=price * size, side=side)
 
     def process_depth(self, bids: list, asks: list):
         """
@@ -348,8 +350,8 @@ class SymbolOFIState:
 
         # Streaming VPIN update
         mid_p = (self.curr_bid_p[0] + self.curr_ask_p[0]) / 2.0
-        top_vol = (self.curr_bid_q[0] + self.curr_ask_q[0]) / 2.0
-        self.vpin_calc.update_trade(price=mid_p, size=top_vol)
+        top_vol_notional = ((self.curr_bid_q[0] + self.curr_ask_q[0]) / 2.0) * mid_p
+        self.vpin_calc.update_trade(price=mid_p, size=top_vol_notional)
 
         self.prev_bid_p[:] = self.curr_bid_p
         self.prev_bid_q[:] = self.curr_bid_q

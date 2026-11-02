@@ -109,6 +109,8 @@ class RiskManager:
                 conn = sqlite3.connect(db_path, timeout=30.0)
                 # HIGH-03: Cross-fleet win rate across Sniper, Berserker, and MARL
                 query = """
+                    SELECT pnl FROM swing_trades WHERE pnl IS NOT NULL
+                    UNION ALL
                     SELECT pnl FROM trades WHERE status IN ('closed', 'CLOSED')
                     UNION ALL
                     SELECT pnl FROM berserker_trades WHERE status IN ('closed', 'CLOSED')
@@ -167,20 +169,23 @@ class RiskManager:
         try:
             with sqlite3.connect(db_path, timeout=5.0) as conn:
                 st_rows = conn.execute("""
-                    SELECT pnl, size, entry_price 
+                    SELECT pnl, size, entry_price, roe_pct 
                     FROM swing_trades 
                     WHERE pnl IS NOT NULL
-                    ORDER BY id DESC LIMIT 50
+                    ORDER BY id DESC LIMIT 100
                 """).fetchall()
                 for r in st_rows:
                     pnl = float(r[0] or 0.0)
                     sz = float(r[1] or 0.0)
                     ep = float(r[2] or 0.0)
-                    if sz > 0 and ep > 0:
-                        margin_est = (sz * ep) / 5.0  # Normalized to 5x margin base
+                    roe = float(r[3] or 0.0) if r[3] is not None else None
+                    if roe is not None and abs(roe) < 500.0:
+                        returns.append(roe / 100.0)
+                    elif sz > 0 and ep > 0:
+                        margin_est = (sz * ep) / 3.0
                         returns.append(pnl / margin_est if margin_est > 0 else 0.0)
                     elif pnl != 0.0:
-                        returns.append(pnl / 2.0)  # Normalized fallback risk unit
+                        returns.append(pnl / 50.0)
 
                 t_rows = conn.execute("""
                     SELECT pnl, qty, entry_price FROM trades 
@@ -255,21 +260,21 @@ class RiskManager:
             # Fetch 24h of 15m data (96 candles)
             limit = 96
             
-            async def get_close_prices(sym):
+            async def get_returns(sym):
                 ohlcv = await exchange.fetch_ohlcv(sym, timeframe='15m', limit=limit)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                return df['close'].astype(float)
+                closes = df['close'].astype(float)
+                return np.log(closes / closes.shift(1)).dropna()
             
-            new_sym_closes = await get_close_prices(symbol)
+            new_sym_rets = await get_returns(symbol)
             correlations = []
             
             for pos_sym in current_positions:
-                pos_closes = await get_close_prices(pos_sym)
-                # Align series to minimum length
-                min_len = min(len(new_sym_closes), len(pos_closes))
+                pos_rets = await get_returns(pos_sym)
+                min_len = min(len(new_sym_rets), len(pos_rets))
                 if min_len < 10:
                     continue
-                corr = new_sym_closes.iloc[-min_len:].corr(pos_closes.iloc[-min_len:])
+                corr = new_sym_rets.iloc[-min_len:].corr(pos_rets.iloc[-min_len:])
                 if not np.isnan(corr):
                     correlations.append(corr)
             
