@@ -181,16 +181,40 @@ def precompute_4h_indicators_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     res["atr"] = tr.rolling(window=14).mean().fillna(0.0)
 
-    # Wilder ADX(14)
+    # Wilder ADX(14) — matches Wilder's exponential smoothing in swing_trader.py
     up_move = h - h.shift(1)
     down_move = l.shift(1) - l
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr_sum = tr.rolling(window=14).sum()
-    plus_di = 100.0 * (pd.Series(plus_dm, index=df.index).rolling(window=14).sum() / (tr_sum + 1e-9))
-    minus_di = 100.0 * (pd.Series(minus_dm, index=df.index).rolling(window=14).sum() / (tr_sum + 1e-9))
-    dx = 100.0 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
-    res["adx"] = dx.rolling(window=14).mean().fillna(0.0)
+
+    n_bars = len(df)
+    length = 14
+    def _wilder_smooth(vals):
+        out = np.full(n_bars, np.nan)
+        if n_bars <= length:
+            return out
+        out[length] = vals[1:length + 1].sum()
+        for i in range(length + 1, n_bars):
+            out[i] = out[i - 1] - (out[i - 1] / length) + vals[i]
+        return out
+
+    tr_smooth = _wilder_smooth(tr.to_numpy())
+    plus_dm_smooth = _wilder_smooth(plus_dm)
+    minus_dm_smooth = _wilder_smooth(minus_dm)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        active_m = tr_smooth > 0
+        p_di = np.where(active_m, 100.0 * plus_dm_smooth / tr_smooth, 0.0)
+        m_di = np.where(active_m, 100.0 * minus_dm_smooth / tr_smooth, 0.0)
+        di_s = p_di + m_di
+        raw_dx = np.where(di_s > 0, 100.0 * np.abs(p_di - m_di) / di_s, 0.0)
+
+    adx_series = np.full(n_bars, np.nan)
+    seed_i = 2 * length - 1
+    if n_bars > seed_i:
+        adx_series[seed_i] = raw_dx[length:seed_i + 1].mean()
+        for i in range(seed_i + 1, n_bars):
+            adx_series[i] = (adx_series[i - 1] * (length - 1) + raw_dx[i]) / length
+    res["adx"] = pd.Series(adx_series, index=df.index).fillna(0.0)
 
     # RSI(14)
     delta = c.diff()

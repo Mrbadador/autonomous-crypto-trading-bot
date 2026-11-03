@@ -166,7 +166,7 @@ def test_r4_reconciler_locks_scoped_and_preserves_other_engines():
                     queries[node.lineno] = arg.value
 
     # Scoped closure delete query in reconciliation_engine.py
-    sql_closure = queries.get(687) or queries.get(1094) or queries.get(547) or queries.get(892)
+    sql_closure = queries.get(687) or queries.get(730) or queries.get(1094) or queries.get(1174) or queries.get(547) or queries.get(892)
     assert sql_closure is not None, "Could not find AST-extracted closure delete query in reconciliation_engine.py"
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:

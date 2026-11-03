@@ -2526,7 +2526,7 @@ class SwingArchitectTrader:
                 else:
                     # Ratchet 0A: Fast Micro-Breakeven Ratchet for Quick Scalp Short (deliberate fast-harvest design)
                     peak_profit_pct = (entry_p - peak_p) / entry_p
-                    short_be_trigger = max(float(getattr(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0050)), 0.0050)
+                    short_be_trigger = float(getattr(config, "SCALP_SHORT_BREAKEVEN_TRIGGER_PCT", 0.0075))
                     short_fee_buffer = max(float(getattr(config, "SCALP_SHORT_BE_FEE_BUFFER_PCT", 0.0035)), 0.0035)
 
                     if is_scalp_short and peak_profit_pct >= short_be_trigger and sl > (entry_p * (1.0 - short_fee_buffer)):

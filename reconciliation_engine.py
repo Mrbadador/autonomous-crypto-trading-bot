@@ -663,10 +663,29 @@ async def audit_live_exchange_positions():
                                     notes_str = f"On-exchange {close_type.upper()} on Bitget UTA (Net: {pnl_str}, Fee: {fee_str})"
                                 
                                 # Check if engine already closed & recorded this trade in closed_tbl recently (last 15 minutes)
-                                recent_close = conn.execute(
-                                    f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') ORDER BY rowid DESC LIMIT 1",
-                                    (s_sym, s_sym.replace('/', ''), entry_p, entry_p)
-                                ).fetchone()
+                                # Must match symbol, side, entry price within 0.2%, AND size within 5% to prevent deleting unrecorded distinct trades
+                                if closed_tbl == "swing_trades":
+                                    recent_close = conn.execute(
+                                        f"""SELECT timestamp FROM {closed_tbl} 
+                                            WHERE (symbol = ? OR symbol = ?) 
+                                              AND side = ?
+                                              AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) 
+                                              AND ABS(size - ?) <= MAX(? * 0.05, 0.0001)
+                                              AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') 
+                                            ORDER BY rowid DESC LIMIT 1""",
+                                        (s_sym, s_sym.replace('/', ''), norm_side, entry_p, entry_p, qty, qty)
+                                    ).fetchone()
+                                else:
+                                    recent_close = conn.execute(
+                                        f"""SELECT timestamp FROM {closed_tbl} 
+                                            WHERE (symbol = ? OR symbol = ?) 
+                                              AND side = ?
+                                              AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) 
+                                              AND ABS(qty - ?) <= MAX(? * 0.05, 0.0001)
+                                              AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') 
+                                            ORDER BY rowid DESC LIMIT 1""",
+                                        (s_sym, s_sym.replace('/', ''), norm_side, entry_p, entry_p, qty, qty)
+                                    ).fetchone()
                                 
                                 ledger_write_ok = True
                                 if not recent_close:
@@ -1088,10 +1107,29 @@ async def audit_live_exchange_positions():
                                     notes_str = f"On-exchange {close_type.upper()} on Bitget UTA (Net: {pnl_str}, Fee: {fee_str})"
 
                                 # Check if engine already closed & recorded this trade in closed_tbl recently (last 15 minutes)
-                                recent_close = conn.execute(
-                                    f"SELECT timestamp FROM {closed_tbl} WHERE (symbol = ? OR symbol = ?) AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') ORDER BY rowid DESC LIMIT 1",
-                                    (sym, sym.replace('/', ''), entry_p, entry_p)
-                                ).fetchone()
+                                # Must match symbol, side, entry price within 0.2%, AND size within 5% to prevent deleting unrecorded distinct trades
+                                if closed_tbl == "swing_trades":
+                                    recent_close = conn.execute(
+                                        f"""SELECT timestamp FROM {closed_tbl} 
+                                            WHERE (symbol = ? OR symbol = ?) 
+                                              AND side = ?
+                                              AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) 
+                                              AND ABS(size - ?) <= MAX(? * 0.05, 0.0001)
+                                              AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') 
+                                            ORDER BY rowid DESC LIMIT 1""",
+                                        (sym, sym.replace('/', ''), norm_side, entry_p, entry_p, qty, qty)
+                                    ).fetchone()
+                                else:
+                                    recent_close = conn.execute(
+                                        f"""SELECT timestamp FROM {closed_tbl} 
+                                            WHERE (symbol = ? OR symbol = ?) 
+                                              AND side = ?
+                                              AND ABS(entry_price - ?) <= MAX(? * 0.002, 0.0001) 
+                                              AND ABS(qty - ?) <= MAX(? * 0.05, 0.0001)
+                                              AND replace(substr(timestamp, 1, 19), 'T', ' ') >= datetime('now', '-15 minutes') 
+                                            ORDER BY rowid DESC LIMIT 1""",
+                                        (sym, sym.replace('/', ''), norm_side, entry_p, entry_p, qty, qty)
+                                    ).fetchone()
 
                                 # 1. Log to closed trades table (only if not already recorded)
                                 ledger_write_ok = True
@@ -1298,9 +1336,13 @@ async def reconciliation_main_loop():
             live_audit = await audit_live_exchange_positions()
             
             # 3. Combine telemetry and publish to system_state
+            is_healthy = bool(
+                paper_audit.get("status") in ("OK", "HEALTHY") and
+                (not live_audit or live_audit.get("status") in ("OK", "HEALTHY"))
+            )
             telemetry = {
                 "timestamp": datetime.now(UTC).isoformat(),
-                "status": "HEALTHY",
+                "status": "HEALTHY" if is_healthy else "DEGRADED",
                 "paper_audit": paper_audit,
                 "live_audit": live_audit
             }

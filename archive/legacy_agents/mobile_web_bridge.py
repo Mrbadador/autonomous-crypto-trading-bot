@@ -34,8 +34,12 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Security Configuration
-APP_PASSWORD = os.getenv("APP_PASSWORD", "SovereignSwarm2026!")
+# Security Configuration — P0-8: Enforce explicit password from environment, never ship hardcoded defaults
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+if not APP_PASSWORD:
+    # Disable bridge if no strong password provided
+    APP_PASSWORD = secrets.token_hex(32)
+    log.warning("[SECURITY] No APP_PASSWORD configured in environment. Generated one-time ephemeral secret.")
 SESSION_SECRET = os.getenv("SESSION_SECRET_KEY", secrets.token_hex(32))
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8765"))
 TRADING_DB = os.path.join(BASE_DIR, "trading_data.db")

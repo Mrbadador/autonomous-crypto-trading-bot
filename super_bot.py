@@ -1033,20 +1033,63 @@ class SuperBotTrader:
             else:
                 tp_price = current_price * (1.0 - self.scalp_short_tp_pct)
                 sl_price = current_price * (1.0 + self.scalp_short_sl_pct)
+
+            # P0-2 LOCK ACQUISITION: Acquire symbol lock BEFORE order placement to prevent race conditions with swing engine
+            lock_who = "super_bot_grid" if is_long else "super_bot_scalp_short"
+            lock_why = f"Chop Maker Grid dip-buy ({conv_reason})" if is_long else f"Scalp Short Maker fade ({conv_reason})"
+            now_iso_lock = datetime.now(timezone.utc).isoformat()
             
+            def _acquire_pre_lock():
+                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    # Clean out expired locks (> 900s) first
+                    conn.execute("""
+                        DELETE FROM asset_locks 
+                        WHERE symbol = ? 
+                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
+                    """, (symbol,))
+                    rowcount = conn.execute("""
+                        INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
+                        SELECT ?, ?, ?, ?, ?
+                        WHERE NOT EXISTS (SELECT 1 FROM asset_locks WHERE symbol = ? AND locked_by != ?)
+                    """, (symbol, lock_who, now_iso_lock, lock_why, now_iso_lock, symbol, lock_who)).rowcount
+                    conn.commit()
+                    return rowcount > 0
+
+            lock_ok = await asyncio.to_thread(_acquire_pre_lock)
+            if not lock_ok:
+                log.warning(f"[{engine_tag}-LOCK-RACE-VETO] Could not acquire asset_locks for {symbol} prior to order placement. Aborting.")
+                return
+
+            def _release_pre_lock():
+                try:
+                    with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                        conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = ?", (symbol, lock_who))
+                        conn.commit()
+                except Exception as r_err:
+                    log.warning(f"[{engine_tag}-LOCK-RELEASE-ERR] {r_err}")
+
             log.info(f"[{engine_tag}] [POST-ONLY-{order_verb.upper()}] Placing True Post-Only Maker Limit {order_verb} for {symbol}: {qty:.4f} units @ ${current_price:,.4f}")
             
-            # Place TRUE Maker Post-Only order via UTA client (cannot cross as a taker; booked at the 0.02% maker rate)
-            order = await self.uta_client.create_post_only_order(
-                symbol=symbol,
-                side=pos_side,
-                qty=qty,
-                price=current_price,
-                leverage_val=self.grid_leverage
-            )
+            # Place TRUE Maker Post-Only order with ATOMIC PRESET STOP LOSS (P0-3) via UTA client
+            try:
+                order = await self.uta_client.create_post_only_order(
+                    symbol=symbol,
+                    side=pos_side,
+                    qty=qty,
+                    price=current_price,
+                    sl=sl_price,
+                    tp=tp_price,
+                    leverage_val=self.grid_leverage
+                )
+            except Exception as po_err:
+                log.warning(f"[{engine_tag}] Maker post-only order placement exception on {symbol}: {po_err}")
+                await asyncio.to_thread(_release_pre_lock)
+                return
+
             order_id = order.get("id") or order.get("orderId") if order else None
             if not order_id:
                 log.warning(f"[{engine_tag}] Maker post-only order placement rejected or crossed spread on {symbol}.")
+                await asyncio.to_thread(_release_pre_lock)
                 return
 
             log.info(f"[{engine_tag}] Maker order {order_id} placed for {symbol}. Monitoring fill queue (30s TTL)...")
@@ -1095,6 +1138,7 @@ class SuperBotTrader:
                     log.debug(f"[{engine_tag}-LATE-FILL-NOTE] {le}")
 
                 if not is_filled:
+                    await asyncio.to_thread(_release_pre_lock)
                     return
 
             # Formulate TP & SL accurately based on ACTUAL execution fill price (not pre-fill quote)
@@ -1161,46 +1205,72 @@ class SuperBotTrader:
                     abort_err_str = str(ab_err)
                     log.error(f"[{engine_tag}-SHIELD] Failed to abort position on {symbol}: {ab_err}")
                 
-                # F-07 REMEDIATION: Write emergency state row when BOTH SL and close fail
-                if not close_success:
-                    try:
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        clean_sym = symbol.replace("/", "")
-                        
-                        with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                            conn.execute("""
-                                INSERT INTO system_state (key, value, updated_at)
-                                VALUES (?, ?, ?)
-                                ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
-                            """, (
-                                f"emergency_sl_failure_{clean_sym}",
-                                json.dumps({
-                                    "symbol": clean_sym,
-                                    "side": pos_side,
-                                    "qty": qty,
-                                    "sl_error": str(last_se),
-                                    "close_error": abort_err_str,
-                                    "timestamp": now_iso,
-                                    "status": "UNPROTECTED_NAKED_POSITION",
-                                    "engine": engine_tag
-                                }),
-                                now_iso,
-                                json.dumps({
-                                    "symbol": clean_sym,
-                                    "side": pos_side,
-                                    "qty": qty,
-                                    "sl_error": str(last_se),
-                                    "close_error": abort_err_str,
-                                    "timestamp": now_iso,
-                                    "status": "UNPROTECTED_NAKED_POSITION",
-                                    "engine": engine_tag
-                                }),
-                                now_iso
-                            ))
-                            conn.commit()
-                            log.critical(f"[{engine_tag}-EMERGENCY-STATE] Persisted critical failure record for {clean_sym} — manual intervention required!")
-                    except Exception as state_err:
-                        log.critical(f"[{engine_tag}-EMERGENCY-STATE] Failed to persist emergency state for {symbol}: {state_err}")
+                # P0-4 REMEDIATION: If abort close succeeded, release lock.
+                # If abort close FAILED, write emergency state AND register in swing_open_positions as UNPROTECTED_NAKED_POSITION
+                # so the position is tracked, visible to VaR, visible to reconciler, and never invisible.
+                if close_success:
+                    await asyncio.to_thread(_release_pre_lock)
+                    return
+
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    clean_sym = symbol.replace("/", "")
+                    
+                    with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                        conn.execute("""
+                            INSERT INTO system_state (key, value, updated_at)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+                        """, (
+                            f"emergency_sl_failure_{clean_sym}",
+                            json.dumps({
+                                "symbol": clean_sym,
+                                "side": pos_side,
+                                "qty": qty,
+                                "sl_error": str(last_se),
+                                "close_error": abort_err_str,
+                                "timestamp": now_iso,
+                                "status": "UNPROTECTED_NAKED_POSITION",
+                                "engine": engine_tag
+                            }),
+                            now_iso,
+                            json.dumps({
+                                "symbol": clean_sym,
+                                "side": pos_side,
+                                "qty": qty,
+                                "sl_error": str(last_se),
+                                "close_error": abort_err_str,
+                                "timestamp": now_iso,
+                                "status": "UNPROTECTED_NAKED_POSITION",
+                                "engine": engine_tag
+                            }),
+                            now_iso
+                        ))
+                        # Register in open positions table with critical status
+                        conn.execute("""
+                            INSERT OR REPLACE INTO swing_open_positions 
+                            (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price,
+                             leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes,
+                             intended_entry_price, actual_fill_price, slippage_bps, fee_entry_usd, execution_type, gates_snapshot)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            symbol, pos_side, actual_entry, qty, sl_price, tp_price, sl_price, actual_entry,
+                            self.grid_leverage, now_iso, now_iso, "UNPROTECTED_NAKED_POSITION", 0.0,
+                            round((qty * actual_entry) * sl_pct, 4),
+                            f"CRITICAL: SL & abort close failed ({abort_err_str})",
+                            current_price, actual_entry, 0.0, 0.0, "emergency_orphan", "{}"
+                        ))
+                        conn.commit()
+                        log.critical(f"[{engine_tag}-EMERGENCY-STATE] Persisted critical failure & open position record for {clean_sym} — manual intervention required!")
+                except Exception as state_err:
+                    log.critical(f"[{engine_tag}-EMERGENCY-STATE] Failed to persist emergency state for {symbol}: {state_err}")
+                
+                self.active_positions[symbol] = {
+                    "symbol": symbol, "side": pos_side, "entry_price": actual_entry,
+                    "size": qty, "stop_loss": sl_price, "take_profit": tp_price,
+                    "leverage": self.grid_leverage, "status": "UNPROTECTED_NAKED_POSITION",
+                    "opened_at": now_iso, "notes": "CRITICAL: SL & abort close failed"
+                }
                 return
 
             # Register native strategy Take Profit (pos_profit) on Bitget so TP executes immediately on-exchange
@@ -1289,21 +1359,16 @@ class SuperBotTrader:
                         self.grid_leverage, now_iso, now_iso, "ACTIVE", 0.0, pos_record["initial_risk_usd"], pos_record["notes"],
                         intended_p, actual_fill_p, slippage_bps, fee_entry_usd, "maker", grid_gates_json
                     ))
-                    # Acquire exclusive lock atomically — only if no other engine holds it
-                    lock_acquired = conn.execute("""
+                    # Refresh/confirm exclusive lock atomically
+                    conn.execute("""
                         INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
-                        SELECT ?, ?, ?, ?, ?
-                        WHERE NOT EXISTS (SELECT 1 FROM asset_locks WHERE symbol = ? AND locked_by != ?)
-                    """, (symbol, lock_who, now_iso, lock_why, now_iso, symbol, lock_who)).rowcount > 0
-                    
-                    if not lock_acquired:
-                        existing_owner = conn.execute(
-                            "SELECT locked_by FROM asset_locks WHERE symbol = ?", (symbol,)
-                        ).fetchone()
-                        conn.rollback()
-                        raise RuntimeError(
-                            f"Cannot acquire lock on {symbol}: already held by {existing_owner[0] if existing_owner else 'unknown'}"
-                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET 
+                            locked_by = excluded.locked_by,
+                            heartbeat = excluded.heartbeat,
+                            reason = excluded.reason
+                        WHERE locked_by = excluded.locked_by
+                    """, (symbol, lock_who, now_iso, lock_why, now_iso))
                     
                     conn.commit()
                     

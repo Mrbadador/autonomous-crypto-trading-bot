@@ -261,9 +261,12 @@ async def main():
     print("   LAUNCHING SQUADRON BACKTEST SIMULATOR [MULTI-ASSET]")
     print("============================================================")
     
-    # Purge old logs to avoid ParserErrors
-    for f in ["trade_history.csv", "trades.csv", "trading_data.db"]:
-        if os.path.exists(f): os.remove(f)
+    # Purge old simulation artifacts to avoid ParserErrors
+    # P0-6 FIX: Never remove the production root trading_data.db! Only backtest-scoped artifacts.
+    sim_dir = os.path.dirname(os.path.abspath(__file__))
+    for f in ["trade_history.csv", "trades.csv", os.path.join(sim_dir, "backtest_sim.db")]:
+        if os.path.exists(f): 
+            os.remove(f)
         
     db = DatabaseManager()
     now_iso = datetime.now(UTC).isoformat()

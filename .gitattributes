@@ -1,0 +1,5 @@
+# Exclude non-production / archive trees and secrets from release bundles
+archive/ export-ignore
+tests/ export-ignore
+docs/ export-ignore
+.github/ export-ignore

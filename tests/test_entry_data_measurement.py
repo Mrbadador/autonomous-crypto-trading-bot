@@ -107,8 +107,10 @@ def _ind_4h(**over):
 
 
 def _eval(ind_4h=None, ind_1d=None, live_o=100.0, live_c=100.0, adx=30.0, rsi=50.0, min_adx=22.0):
+    # In relaxed mode, test default ind_1d is neutral ({'bullish_alignment': True, 'bearish_alignment': False}) so neither side is blocked by opposing trend
+    default_1d = {"bullish_alignment": True, "bearish_alignment": False}
     return SwingTrader._evaluate_swing_candidate(
-        ind_4h or _ind_4h(), ind_1d or {"bullish_alignment": True, "bearish_alignment": True},
+        ind_4h or _ind_4h(), ind_1d if ind_1d is not None else default_1d,
         live_o, live_c, adx, rsi, min_adx)
 
 
@@ -137,7 +139,7 @@ class TestEvaluateSwingCandidate(unittest.TestCase):
         for bk, bc, k_br, c_br, lo, lc, adx_v, rsi_v in itertools.product(
                 flags, flags, flags, flags, (100.0, 99.0), (100.2, 99.0), (10.0, 30.0), (20.0, 50.0, 80.0)):
             ind = _ind_4h(bullish_kumo=bk, bullish_candle_4h=bc, bearish_kumo=k_br, bearish_candle_4h=c_br)
-            ind_1d = {"bullish_alignment": True, "bearish_alignment": True}
+            ind_1d = {"bullish_alignment": False, "bearish_alignment": False}
             original = None
             if (bk and bc and lc >= lo * 0.9985 and lc >= 100.0 * 0.9970 and adx_v >= 22.0 and rsi_v <= 70.0):
                 original = "LONG"

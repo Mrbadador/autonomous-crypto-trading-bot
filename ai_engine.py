@@ -455,8 +455,9 @@ def _ensure_active_session(target) -> aiohttp.ClientSession | None:
     return None
 
 def _cache_key(ctx: dict) -> str:
-    """Stable cache key from coarse market signals — now includes ema_stack and patterns."""
+    """Stable cache key from coarse market signals — now includes symbol, ema_stack, and patterns."""
     simplified = {
+        "symbol":    str(ctx.get("symbol", "")).upper().replace("/", ""),
         "regime":    str(ctx.get("regime", "UNKNOWN")),
         "signal":    str(ctx.get("signal", "hold")),
         "phase":     str(ctx.get("phase", "UNKNOWN")),
@@ -2804,10 +2805,10 @@ async def detect_breakout_trap(trap_context: dict, timeout_sec: float = 10.0) ->
             log.warning(f"[BREAKOUT-TRAP] Parse error: {pe}")
 
     return {
-        "verdict": "CONFIRMED_BREAKOUT",
-        "trap_risk_score": 0.35,
-        "confidence": 0.50,
-        "structural_rationale": "Trap gate offline — baseline execution allowed."
+        "verdict": "VETO",
+        "trap_risk_score": 1.0,
+        "confidence": 0.0,
+        "structural_rationale": "Trap gate offline — failing closed to preserve capital."
     }
 
 
