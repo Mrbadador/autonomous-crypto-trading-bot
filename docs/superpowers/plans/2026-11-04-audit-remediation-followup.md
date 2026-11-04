@@ -636,7 +636,7 @@ git commit -m "fix(db): enforce ledger uniqueness in schema code and add a backe
 IMPORT FAILED: NameError name 'log' is not defined
 ```
 
-Verified by executing the module directly. Separately, the secret `SovereignSwarm2026!` is still present in git history and **still present on the EC2 box** — `grep -c 'SovereignSwarm2026' archive/legacy_agents/mobile_web_bridge.py` on the remote returns `1`. `.gitattributes` `export-ignore` only affects future `git archive` bundles; the previously deployed copy was never removed.
+Verified by executing the module directly. Separately, the leaked fallback password is still present in git history and **still present on the EC2 box** — a `grep -c` for the leaked value in `archive/legacy_agents/mobile_web_bridge.py` on the remote returns `1`. `.gitattributes` `export-ignore` only affects future `git archive` bundles; the previously deployed copy was never removed.
 
 - [x] **Step 1: Write the failing test**
 
@@ -667,7 +667,13 @@ class TestMobileBridgeImportable(unittest.TestCase):
     def test_no_hardcoded_password_literal(self):
         with open(self.PATH, "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertNotIn("SovereignSwarm2026", src)
+        self.assertNotIn(LEAKED, src)
+```
+
+The needle is assembled from parts so the leaked value never appears verbatim in this repository:
+
+```python
+LEAKED = "Sovereign" + "Swarm" + "2026" + "!"
 ```
 
 - [x] **Step 2: Run the test to verify it fails**
@@ -1048,11 +1054,11 @@ ssh -i ~/.ssh/aws_trading_key.pem ubuntu@13.53.41.118 \
 
 ### 3. Remove the archive tree and rotate the leaked password
 
-The secret `SovereignSwarm2026!` was published in git history and is still on the box. Removing the file is not enough — the value must be treated as compromised.
+The leaked fallback password was published in git history and is still on the box. Removing the file is not enough — the value must be treated as compromised.
 
 ```bash
 ssh -i ~/.ssh/aws_trading_key.pem ubuntu@13.53.41.118 \
-  "cd ~/llama_trading_bot && rm -rf archive && grep -rc 'SovereignSwarm2026' . 2>/dev/null | grep -v ':0' | head"
+  "cd ~/llama_trading_bot && rm -rf archive && grep -rIl -e 'Sovereign' -e 'Swarm20' . 2>/dev/null | head"
 ```
 
 Then generate a fresh `APP_PASSWORD` for the operator's `.env` on the box — do not reuse the old value.
