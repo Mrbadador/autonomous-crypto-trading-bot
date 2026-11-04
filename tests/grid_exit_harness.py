@@ -85,7 +85,7 @@ class SwingExitHarnessCase(unittest.TestCase):
                 "r_multiple REAL, initial_risk_usd REAL, notes TEXT, engine_type TEXT, "
                 "grid_partial_tp_harvested INTEGER DEFAULT 0)")
             conn.execute("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
-            conn.execute("CREATE TABLE IF NOT EXISTS asset_locks (symbol TEXT PRIMARY KEY, locked_by TEXT, heartbeat TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS asset_locks (symbol TEXT PRIMARY KEY, locked_by TEXT, locked_at TEXT, reason TEXT, heartbeat TEXT)")
             conn.commit()
         finally:
             conn.close()

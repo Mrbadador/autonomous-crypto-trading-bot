@@ -264,11 +264,14 @@ async def main():
     # Purge old simulation artifacts to avoid ParserErrors
     # P0-6 FIX: Never remove the production root trading_data.db! Only backtest-scoped artifacts.
     sim_dir = os.path.dirname(os.path.abspath(__file__))
-    for f in ["trade_history.csv", "trades.csv", os.path.join(sim_dir, "backtest_sim.db")]:
+    sim_db_path = os.path.join(sim_dir, "backtest_sim.db")
+    sim_trade_history = os.path.join(sim_dir, "trade_history.csv")
+    sim_trades_csv = os.path.join(sim_dir, "trades.csv")
+    for f in [sim_trade_history, sim_trades_csv, sim_db_path]:
         if os.path.exists(f): 
             os.remove(f)
         
-    db = DatabaseManager()
+    db = DatabaseManager(db_path=sim_db_path)
     now_iso = datetime.now(UTC).isoformat()
     with db._get_conn() as conn:
         conn.execute("DELETE FROM trades")
@@ -276,7 +279,7 @@ async def main():
         conn.execute("REPLACE INTO system_state (key, value, updated_at) VALUES ('balance_total', ?, ?)", (str(config.INITIAL_BALANCE), now_iso))
         conn.execute("REPLACE INTO system_state (key, value, updated_at) VALUES ('session_start', ?, ?)", (now_iso, now_iso))
         conn.commit()
-    log.info(f"Database Reset: Fresh session initialized with ${config.INITIAL_BALANCE:,.2f}")
+    log.info(f"Database Reset: Fresh session initialized with ${config.INITIAL_BALANCE:,.2f} at {sim_db_path}")
 
     # Initialize multi-symbol components
     mock_em = MockExchangeManager(symbols=config.SYMBOLS, initial_balance=config.INITIAL_BALANCE)

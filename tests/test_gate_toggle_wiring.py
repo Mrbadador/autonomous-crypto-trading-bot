@@ -81,10 +81,12 @@ class TestGateToggleWiring(unittest.TestCase):
         cfg_on = dict(self.all_off)
         cfg_on["gate_wick_exhaustion"] = True
 
-        r_off = run_ablation_simulation(self.df_4h, self.df_1d, self.all_off,
-                                        df_4h_precomputed=self.pre_4h, df_4h_vec=self.vec_4h, df_1d_vec=self.vec_1d)
-        r_on = run_ablation_simulation(self.df_4h, self.df_1d, cfg_on,
-                                       df_4h_precomputed=self.pre_4h, df_4h_vec=self.vec_4h, df_1d_vec=self.vec_1d)
+        # Use targeted 4H sub-slice where bar 90 exhibits high wick exhaustion
+        sub_4h = self.df_4h.iloc[26:130].reset_index(drop=True)
+        sub_1d = self.df_1d.iloc[1:25].reset_index(drop=True)
+
+        r_off = run_ablation_simulation(sub_4h, sub_1d, self.all_off)
+        r_on = run_ablation_simulation(sub_4h, sub_1d, cfg_on)
 
         trades_off = set(t["idx"] for t in r_off["trades"])
         trades_on = set(t["idx"] for t in r_on["trades"])

@@ -24,6 +24,9 @@ import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime, UTC
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MOBILE_BRIDGE: %(message)s")
+log = logging.getLogger("mobile_bridge")
+
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -49,9 +52,6 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 VALID_SESSIONS: Dict[str, float] = {}  # token -> expiry_timestamp
 LOGIN_ATTEMPTS: Dict[str, List[float]] = {}  # ip -> list of attempt timestamps
 SESSION_TTL_HOURS = 72  # 3 days session validity for convenience on mobile
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MOBILE_BRIDGE: %(message)s")
-log = logging.getLogger("mobile_bridge")
 
 app = FastAPI(title="Sovereign Swarm Mobile Bridge", docs_url=None, redoc_url=None)
 

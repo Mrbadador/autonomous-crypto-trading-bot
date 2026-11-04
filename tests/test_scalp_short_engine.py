@@ -31,7 +31,7 @@ class TestScalpShortEngine(unittest.TestCase):
                 )
             """)
             conn.execute("CREATE TABLE IF NOT EXISTS mean_reversion_open_positions (symbol TEXT)")
-            conn.execute("CREATE TABLE IF NOT EXISTS asset_locks (symbol TEXT PRIMARY KEY, locked_by TEXT, heartbeat TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS asset_locks (symbol TEXT PRIMARY KEY, locked_by TEXT, locked_at TEXT, reason TEXT, heartbeat TEXT)")
             conn.commit()
 
     @classmethod
@@ -97,7 +97,7 @@ class TestScalpShortEngine(unittest.TestCase):
         self.assertEqual(pos["entry_price"], 100.0)
 
     def test_03_scalp_short_breakeven_ratchet(self):
-        """Verify that gaining +0.80% ratchets the stop loss to Entry - 0.35% fee buffer."""
+        """Verify that gaining +1.25% ratchets the stop loss to Entry - 0.35% fee buffer."""
         async def run_test():
             now_iso = datetime.now(UTC).isoformat()
             trader = SwingArchitectTrader()
@@ -114,11 +114,11 @@ class TestScalpShortEngine(unittest.TestCase):
             }
             trader._load_active_positions_sync = MagicMock()
 
-            # Return current price 99.20 (entry was 100.0, profit = +0.80% >= 0.75% trigger)
+            # Return current price 98.75 (entry was 100.0, profit = +1.25% >= 1.20% trigger)
             trader.uta_client.exchange = MagicMock()
-            trader.uta_client.exchange.fetch_ticker = AsyncMock(return_value={"last": 99.20, "close": 99.20})
+            trader.uta_client.exchange.fetch_ticker = AsyncMock(return_value={"last": 98.75, "close": 98.75})
             trader.uta_client.exchange.fetch_ohlcv = AsyncMock(return_value=[
-                [1000, 100.0, 100.5, 99.0, 99.20, 100.0] for _ in range(50)
+                [1000, 100.0, 100.5, 98.5, 98.75, 100.0] for _ in range(50)
             ])
             trader.uta_client.modify_strategy_order = AsyncMock(return_value={"retCode": 0})
 

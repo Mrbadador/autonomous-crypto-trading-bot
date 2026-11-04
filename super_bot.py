@@ -1036,7 +1036,8 @@ class SuperBotTrader:
 
             # P0-2 LOCK ACQUISITION: Acquire symbol lock BEFORE order placement to prevent race conditions with swing engine
             lock_who = "super_bot_grid" if is_long else "super_bot_scalp_short"
-            lock_why = f"Chop Maker Grid dip-buy ({conv_reason})" if is_long else f"Scalp Short Maker fade ({conv_reason})"
+            reason_text = rationale or f"{pos_side} entry at {current_price}"
+            lock_why = f"Chop Maker Grid dip-buy ({reason_text})" if is_long else f"Scalp Short Maker fade ({reason_text})"
             now_iso_lock = datetime.now(timezone.utc).isoformat()
             
             def _acquire_pre_lock():
@@ -1047,11 +1048,27 @@ class SuperBotTrader:
                         WHERE symbol = ? 
                           AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
                     """, (symbol,))
+                    
+                    # If this engine already owns the active lock for this symbol, refresh it
+                    row = conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = ?", (symbol,)).fetchone()
+                    if row:
+                        if row[0] == lock_who:
+                            conn.execute("""
+                                UPDATE asset_locks
+                                SET locked_at = ?, reason = ?, heartbeat = ?
+                                WHERE symbol = ? AND locked_by = ?
+                            """, (now_iso_lock, lock_why, now_iso_lock, symbol, lock_who))
+                            conn.commit()
+                            return True
+                        else:
+                            # Locked by someone else (e.g. swing engine)
+                            return False
+
                     rowcount = conn.execute("""
                         INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
                         SELECT ?, ?, ?, ?, ?
-                        WHERE NOT EXISTS (SELECT 1 FROM asset_locks WHERE symbol = ? AND locked_by != ?)
-                    """, (symbol, lock_who, now_iso_lock, lock_why, now_iso_lock, symbol, lock_who)).rowcount
+                        WHERE NOT EXISTS (SELECT 1 FROM asset_locks WHERE symbol = ?)
+                    """, (symbol, lock_who, now_iso_lock, lock_why, now_iso_lock, symbol)).rowcount
                     conn.commit()
                     return rowcount > 0
 

@@ -25,7 +25,7 @@ class TestGridRiskCapReal(unittest.IsolatedAsyncioTestCase):
             conn.execute("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS swing_open_positions (id INTEGER PRIMARY KEY, symbol TEXT, side TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS open_positions (id INTEGER PRIMARY KEY, symbol TEXT, side TEXT)")
-            conn.execute("CREATE TABLE IF NOT EXISTS asset_locks (symbol TEXT PRIMARY KEY, locked_by TEXT, heartbeat TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS asset_locks (symbol TEXT PRIMARY KEY, locked_by TEXT, locked_at TEXT, reason TEXT, heartbeat TEXT)")
             conn.commit()
         finally:
             conn.close()

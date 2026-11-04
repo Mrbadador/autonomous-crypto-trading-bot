@@ -545,6 +545,10 @@ class DatabaseManager:
             
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp)')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique ON trades (symbol, entry_price, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_swing_trades_symbol ON swing_trades (symbol)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_swing_trades_timestamp ON swing_trades (timestamp)')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique ON swing_trades (symbol, entry_price, timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cycles_timestamp ON cycles (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_tradesync_timestamp ON tradesync (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs (timestamp)')

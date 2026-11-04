@@ -251,7 +251,7 @@ def audit_paper_positions():
     Checks if prices have violated Stop-Loss or Take-Profit thresholds,
     or if corrupted records (negative qty, zero price) exist, and auto-heals them.
     """
-    audit_summary = {"audited_at": datetime.now(UTC).isoformat(), "desyncs_healed": 0, "positions_active": 0}
+    audit_summary = {"audited_at": datetime.now(UTC).isoformat(), "desyncs_healed": 0, "positions_active": 0, "status": "OK"}
     
     for fleet in FLEET_TABLES:
         table = fleet["table"]
@@ -1336,10 +1336,11 @@ async def reconciliation_main_loop():
             live_audit = await audit_live_exchange_positions()
             
             # 3. Combine telemetry and publish to system_state
-            is_healthy = bool(
-                paper_audit.get("status") in ("OK", "HEALTHY") and
-                (not live_audit or live_audit.get("status") in ("OK", "HEALTHY"))
+            paper_ok = paper_audit.get("status") in ("OK", "HEALTHY")
+            live_ok = (live_audit is None) or (
+                live_audit.get("mode") != "live_error" and "error" not in live_audit
             )
+            is_healthy = bool(paper_ok and live_ok)
             telemetry = {
                 "timestamp": datetime.now(UTC).isoformat(),
                 "status": "HEALTHY" if is_healthy else "DEGRADED",
