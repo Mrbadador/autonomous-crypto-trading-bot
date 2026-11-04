@@ -199,6 +199,19 @@ class SwingArchitectTrader:
                         created_at TEXT NOT NULL
                     )
                 """)
+                # Ledger uniqueness must be enforced by schema code, not by a
+                # one-off SQL command against a database file.
+                try:
+                    conn.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique
+                            ON swing_trades(symbol, side, entry_price, timestamp, size)
+                    """)
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    log.warning(
+                        "[DB-SCHEMA] Cannot create idx_swing_trades_unique: swing_trades contains "
+                        "duplicate rows. Run scripts/dedup_trade_ledger.py to clean the ledger."
+                    )
                 conn.commit()
             log.info("[INIT] Swing Architect tables verified in trading_data.db.")
         except Exception as e:

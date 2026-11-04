@@ -179,26 +179,54 @@ class DBWriteQueue:
                 except Exception:
                     pass
                 break
+            except sqlite3.IntegrityError as e:
+                log.warning(
+                    f"[DBWriteQueue] Ledger constraint rejected a duplicate row "
+                    f"({len(batch)} ops): {e}. Isolating the offending op."
+                )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                written, dropped = self._commit_ops_individually(conn, batch)
+                self.total_flushed += written + dropped
+                if written > 0:
+                    self.total_batches += 1
+                    self.last_flush_time = time.monotonic()
+                break
             except Exception as e:
                 log.error(f"[DBWriteQueue] Non-retryable error in batch commit ({len(batch)} ops): {e}. Attempting isolated 1-by-1 commit fallback.")
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-                # Isolate failure: commit valid operations individually so one bad op doesn't drop the rest
-                salvaged = 0
-                for op in batch:
-                    try:
-                        with conn:
-                            conn.execute(op.query, op.params)
-                        salvaged += 1
-                        self.total_flushed += 1
-                    except Exception as single_err:
-                        log.error(f"[DBWriteQueue] Dropping malformed op on {op.table}: {single_err} | Query: {op.query[:120]}")
-                if salvaged > 0:
+                written, dropped = self._commit_ops_individually(conn, batch)
+                self.total_flushed += written + dropped
+                if written > 0:
                     self.total_batches += 1
                     self.last_flush_time = time.monotonic()
                 break
+
+    def _commit_ops_individually(self, conn, batch):
+        """Commits each op on its own so one bad op cannot drop the rest.
+
+        A duplicate that the ledger's unique index rejects is dropped, not
+        retried: the row it would have written already exists.
+        """
+        written = 0
+        dropped = 0
+        for op in batch:
+            try:
+                with conn:
+                    conn.execute(op.query, op.params)
+                written += 1
+            except sqlite3.IntegrityError as dup_err:
+                dropped += 1
+                log.warning(f"[DBWriteQueue] Duplicate ledger row dropped on {op.table}: {dup_err}")
+            except Exception as single_err:
+                dropped += 1
+                log.error(f"[DBWriteQueue] Dropping malformed op on {op.table}: {single_err} | Query: {op.query[:120]}")
+        return written, dropped
 
     def enqueue_write(self, table: str, query: str, params: tuple = ()):
         """
@@ -749,7 +777,41 @@ class DatabaseManager:
                 log.warning(f"[MIGRATION-1.4] boardroom provenance column note: {prov_err}")
 
             conn.commit()
+        self._ensure_ledger_unique_indexes()
         log.info(f"Database initialized at {self.db_path} with WAL mode.")
+
+    def _ensure_ledger_unique_indexes(self):
+        """Creates the trade-ledger uniqueness indexes.
+
+        The ledger must reject a repeated execution record, so the constraint
+        lives in schema code and is recreated on every startup. A ledger that
+        still contains duplicate rows cannot be indexed; that is reported and
+        scripts/dedup_trade_ledger.py must be run to clean it.
+        """
+        with self._get_conn() as conn:
+            for stmt, idx_name, tbl in (
+                (
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique "
+                    "ON trades (symbol, side, entry_price, timestamp, qty)",
+                    "idx_trades_unique",
+                    "trades",
+                ),
+                (
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique "
+                    "ON swing_trades (symbol, side, entry_price, timestamp, size)",
+                    "idx_swing_trades_unique",
+                    "swing_trades",
+                ),
+            ):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    log.warning(
+                        f"[DB-SCHEMA] Cannot create {idx_name} on {tbl}: the table contains "
+                        f"duplicate rows. Run scripts/dedup_trade_ledger.py to clean the ledger."
+                    )
+            conn.commit()
 
     def log_trade(self, symbol, side, type, pnl, notes, entry_price=0.0, exit_price=0.0, qty=0.0, balance=0.0, regime="", phase="", mfe=0.0, pos_id=None, quality=0.0, sl_mode="NORMAL", tp_mode="NORMAL", trail_mode="NORMAL", status="closed"):
         """Inserts a trade event into the database via batched write queue with full metadata."""
