@@ -37,9 +37,6 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MOBILE_BRIDGE: %(message)s")
-log = logging.getLogger("mobile_bridge")
-
 # Security Configuration — P0-8: Enforce explicit password from environment, never ship hardcoded defaults
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 if not APP_PASSWORD:
