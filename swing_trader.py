@@ -2539,7 +2539,8 @@ class SwingArchitectTrader:
                 else:
                     # Ratchet 0A: Fast Micro-Breakeven Ratchet for Quick Scalp Short (deliberate fast-harvest design)
                     peak_profit_pct = (entry_p - peak_p) / entry_p
-                    short_be_trigger = max(float(getattr(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0120)), 0.0050)
+                    short_be_trigger = float(getattr(config, "SCALP_SHORT_BREAKEVEN_TRIGGER_PCT", 0.0075))
+                    grid_be_trigger = max(float(getattr(config, "GRID_BREAKEVEN_TRIGGER_PCT", 0.0050)), 0.0050)
                     short_fee_buffer = max(float(getattr(config, "SCALP_SHORT_BE_FEE_BUFFER_PCT", 0.0035)), 0.0035)
 
                     if is_scalp_short and peak_profit_pct >= short_be_trigger and sl > (entry_p * (1.0 - short_fee_buffer)):
@@ -2550,7 +2551,7 @@ class SwingArchitectTrader:
                         self._track_task(self.uta_client.modify_strategy_order(symbol, sl=new_sl, tp=pos.get("take_profit")), f"scalp_be_short_{symbol}")
 
                     # Ratchet 0B: Grid SHORT partial take-profit (item #3b)
-                    elif is_grid_pos and peak_profit_pct >= short_be_trigger and int(pos.get("grid_partial_tp_harvested") or 0) == 0:
+                    elif is_grid_pos and peak_profit_pct >= grid_be_trigger and int(pos.get("grid_partial_tp_harvested") or 0) == 0:
                         if curr_price < entry_p and sl > entry_p:
                             await self._harvest_grid_partial_tp(symbol, pos, entry_p, is_long, curr_price, short_fee_buffer)
 

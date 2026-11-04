@@ -128,6 +128,7 @@ GRID_BB_STD                   = float(os.getenv("GRID_BB_STD", "2.5"))          
 GRID_VWAP_WINDOW              = int(os.getenv("GRID_VWAP_WINDOW", "96"))          # NOT CONSUMED by any engine — the live VWAP window is 24 bars (see super_bot.compute_grid_5m_indicators); setting this has no effect.
 GRID_PARTIAL_TP_ENABLED       = os.getenv("GRID_PARTIAL_TP_ENABLED", "false").lower() in ("true", "1") # Disabled: Let winners ride to Limit TP
 GRID_BREAKEVEN_TRIGGER_PCT    = float(os.getenv("GRID_BREAKEVEN_TRIGGER_PCT", "0.0120")) # Only breakeven at +1.20% (80% of TP)
+SCALP_SHORT_BREAKEVEN_TRIGGER_PCT = float(os.getenv("SCALP_SHORT_BREAKEVEN_TRIGGER_PCT", "0.0075")) # Fast micro-breakeven for Quick Scalp Short only (Ratchet 0A). Grid ratchets use GRID_BREAKEVEN_TRIGGER_PCT.
 
 # ---------------------------------------------------------------------------
 # Quick Scalp Short Engine (Fast Turnover Protocol - Disabled: Restored Long Swing + Maker Grid Core)
