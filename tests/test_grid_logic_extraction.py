@@ -89,17 +89,17 @@ class TestGridLogicExtraction(unittest.TestCase):
         self.assertTrue(is_sig)
         self.assertIn("CHOP_DIP_CONFIRMED", reason)
 
-        # Blocked when market regime ADX >= 28.0
+        # Blocked when market regime ADX >= 25.0 and sellers dominate (DI spread < -4.0)
         is_sig_regime, reason_regime = evaluate_chop_grid_signal(
             ind=ind_copy,
             curr_price=curr_price,
             rsi_thresh=30.0,
             max_adx=24.0,
-            regime_adx=29.0,
-            di_spread=0.0
+            regime_adx=26.0,
+            di_spread=-5.0
         )
         self.assertFalse(is_sig_regime)
-        self.assertIn("REGIME_EXPANSION", reason_regime)
+        self.assertIn("REGIME_SELLER_DOMINANCE", reason_regime)
 
         # Blocked when 5m asset ADX >= 24.0 (waterfall)
         ind_copy["adx_5m"] = 26.0

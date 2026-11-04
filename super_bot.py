@@ -201,11 +201,9 @@ def evaluate_chop_grid_signal(
     if not ind or "rsi" not in ind:
         return False, "NO_INDICATORS"
 
-    # Regime gates
+    # Regime gates: Veto dip-buys if sellers dominate in strong expansion
     if regime_adx >= 25.0 and di_spread < -4.0:
         return False, f"REGIME_SELLER_DOMINANCE (ADX={regime_adx:.1f}, DI_SPREAD={di_spread:+.1f})"
-    if regime_adx >= 28.0:
-        return False, f"REGIME_EXPANSION (ADX={regime_adx:.1f})"
 
     # Asset 5m ADX exhaustion guard
     if ind.get("adx_5m", 0.0) >= max_adx:
@@ -634,10 +632,6 @@ class SuperBotTrader:
             log.info(f"[GRID-MARKET-SHIELD] 🛡️ Market ADX={self.regime_adx:.1f} >= 25.0 with seller dominance (DI spread={self.market_regime_di_spread:+.1f}). Chop Grid dip-buys muted.")
             return
 
-        if self.regime_adx >= 28.0:
-            log.info(f"[GRID-MARKET-SHIELD] 🛡️ Market ADX={self.regime_adx:.1f} >= 28.0 indicates powerful directional expansion. Chop Grid muted.")
-            return
-
         # Eligible symbols: not currently locked
         unlocked = [s for s in self.symbols if s not in self.active_positions]
         if not unlocked:
@@ -713,10 +707,16 @@ class SuperBotTrader:
                 rsi = ind["rsi"]
                 lower_band = ind["lower_band"]
 
+                # Dynamic dip threshold: In confirmed BULL_TREND, pullbacks are shallow (RSI <= 36.0 or lower Bollinger touch).
+                # In Chop/Neutral regimes, require standard oversold threshold (e.g. RSI <= 30.0).
+                eff_rsi_thresh = self.grid_rsi_thresh
+                if "BULL" in str(self.current_regime).upper() or self.market_regime_di_spread >= 2.0:
+                    eff_rsi_thresh = max(self.grid_rsi_thresh, 36.0)
+
                 is_sig, sig_reason = evaluate_chop_grid_signal(
                     ind=ind,
                     curr_price=curr_price,
-                    rsi_thresh=self.grid_rsi_thresh,
+                    rsi_thresh=eff_rsi_thresh,
                     max_adx=getattr(self, "grid_max_adx", 24.0),
                     regime_adx=self.regime_adx,
                     di_spread=self.market_regime_di_spread
@@ -1752,23 +1752,13 @@ class SuperBotTrader:
                             self._track_task(self.swing_engine.scan_fleet(allowed_direction=target_direction), "swing_scan_fleet")
                         last_4h_scan = now_ts
 
-                    # 3b. Engine 2: 15m/5m Clean Chop Maker Grid Dip-Buy Scan
-                    # Active during chop or neutral consolidation when directional ADX < 25 (Zero dip-buys in active bear or strong bull trends)
-                    if is_chop and not is_bull and not is_bear:
-                        if self._chop_grid_adx_active and adx >= 25.5:
-                            self._chop_grid_adx_active = False
-                        elif not self._chop_grid_adx_active and adx <= 24.5:
-                            self._chop_grid_adx_active = True
-
-                        if not self._chop_grid_adx_active:
-                            log.info(f"[CHOP-GRID-VETO] Market ADX={adx:.1f} >= 25.0 (hysteresis ceiling 25.5) indicates directional expansion. Chop Grid dip-buying suppressed.")
-                        else:
-                            await self.scan_chop_grid_opportunities()
-                    elif is_bear:
-                        log.debug(f"[REGIME-GATE] 🛡️ Bear regime active ({regime}): Suppressing Chop Grid dip-buys to avoid catching falling knives.")
-                    elif is_bull:
-                        log.debug(f"[REGIME-GATE] 🚀 Confirmed BULL_TREND active ({regime}): Suppressing Chop Grid mean-reversion dip-buys to prioritize 4H trend-following runners.")
-                        log.debug(f"[REGIME-GATE] 🚀 Confirmed BULL_TREND active ({regime}): Suppressing Chop Grid mean-reversion dip-buys to prioritize 4H trend-following runners.")
+                    # 3b. Engine 2: 15m/5m Clean Chop & Tactical Trend-Pullback Maker Grid Scan
+                    # Active during chop or during bull/consolidation when sellers are not crashing the market.
+                    # In bear regimes with seller dominance (DI spread < -4.0 and ADX >= 25.0), dip-buys are muted to avoid catching knives.
+                    if is_bear and (adx >= 25.0 and self.market_regime_di_spread < -4.0):
+                        log.debug(f"[REGIME-GATE] 🛡️ Active Bear breakdown ({regime}, ADX={adx:.1f}, DI Spread={self.market_regime_di_spread:+.1f}): Suppressing dip-buys.")
+                    else:
+                        await self.scan_chop_grid_opportunities()
 
                 # 4. Telemetry Logging (every 60s)
                 if now_ts - last_telemetry >= 60:
