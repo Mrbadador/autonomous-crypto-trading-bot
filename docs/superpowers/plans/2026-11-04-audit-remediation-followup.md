@@ -1116,3 +1116,55 @@ These are real but were not part of the `59bdd91` remediation and are not requir
 4. **Lookahead bias in every published backtest metric.** `quant_validation.py` fills at the same bar's close that produced the signal; `backtest_swing_architect.py` attaches the same-day daily bar to 4H bars via `merge_asof`. The live engine is causal — only the backtests leak. Every Sharpe and Profit-Factor published so far describes a strategy that cannot be traded.
 5. **`tests/test_key_type.py` makes a live API call at import time and prints the API key.** Move it out of `tests/` or gate it behind an env var.
 6. **`main.py:962` imports `nightly_trainer` from the repo root, but it lives in `scripts/`.** The ImportError is swallowed, so the RL/calibration layer never runs and `models/*.pth` are never loaded by any live engine.
+
+---
+
+## Post-verification follow-up (2026-11-04, after the branch was merged)
+
+Running the replay during final verification exposed two defects that the plan's
+source-inspection tests could not see. Both are fixed on `main` in commits
+`5b7d266` and `13b1806`, with 9 new tests (`tests/test_sandbox_ledger_isolation.py`,
+`tests/test_backtest_entry_path.py`). The suite is **1586 passed, 0 failed**.
+
+### F1 — The replay opened the production ledger (P0)
+
+Task 2 sandboxed the replay's **CWD**, but `DatabaseManager()` resolves its default
+path from its own module directory, not the CWD. `archive/legacy_agents/state_manager.py:63`
+(`EngineState.__init__` → `DatabaseManager()`) therefore opened the **production**
+`trading_data.db` in write mode on every replay. Proof: the ledger's md5 changed
+during a replay and its `idx_trades_unique` was rebuilt from the 3-column to the
+5-column identity.
+
+Fix: a `TRADING_DATA_DB_PATH` override that `DatabaseManager()` honours,
+`state_manager.ledger_path()` resolves, and the replay publishes via
+`apply_sandbox_ledger_path()`. The state manager's three raw
+`sqlite3.connect("trading_data.db")` calls now go through `ledger_path()` too, so
+they read the sandbox ledger instead of an empty sandbox file.
+
+**Consequence for the operator:** the local ledger's schema was modified by that
+accidental write. No rows were lost (244 `trades` / 181 `swing_trades`, `max(timestamp)`
+still 2026-10-21), but the md5 is no longer a valid "untouched" witness — compare row
+counts and `max(timestamp)` instead.
+
+### F2 — The replay could never open a position (P0)
+
+`archive/legacy_agents/core_engine.py:123` `calculate_exits()` returns **three**
+values `(soft_sl, tp, hard_sl)`, but `archive/bot_v10_backtest.py:421` unpacked two.
+Every entry that passed the gates raised `ValueError: too many values to unpack
+(expected 2, got 3)` **before the position was created**, so the harness reported
+`TOTAL TRADES: 0 / NET PNL $0.00`. That output is indistinguishable from "the
+strategy has no edge", and it is what every backtest number in this repo was
+measured against. The same stale unpack existed in `archive/experimental_traders/live_trader.py:419,1204`
+and `archive/live_trader_backup_pre_audit_fix.py:392,854`.
+
+Fix: unpack all three values; a regression test drives a real entry with a stubbed
+LLM verdict and asserts a simulated position opens.
+
+After the fix, one full replay produced **41 trades, +$35.71 net, 7.01% max
+drawdown** (BTC/USDT 38.9% win / PF 1.50 / +$3.57; ETH/USDT 34.8% / PF 2.10 / +$32.14).
+
+**Caveat:** the replay still calls the live LLM for every entry verdict
+(`archive/bot_v10_backtest.py:367`), so it is non-deterministic and bills real API
+calls; a large share of calls here log `All cloud API endpoints exhausted` and are
+vetoed with score 0.0. Treat any single replay as a smoke test, not a measurement,
+until the AI dependency is stubbed or removed from the replay path.
