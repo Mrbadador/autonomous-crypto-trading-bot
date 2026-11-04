@@ -418,7 +418,7 @@ async def run_cycle(symbol, em: ExchangeManager, state: EngineState, candle_time
             return None
 
         if qty > 0:
-            sl, tp = calculate_exits(exec_p, side, atr)
+            sl, tp, _hard_sl = calculate_exits(exec_p, side, atr)
             new_p = em.open_sim_pos(symbol, side, qty, exec_p, config.LEVERAGE, sl=sl, tp=tp, regime=hard_regime, phase=trend_ctx.phase, quality=quality, notes=ai_res.get("notes", "AI Trade"))
             if new_p: 
                 state.in_position[symbol] = True

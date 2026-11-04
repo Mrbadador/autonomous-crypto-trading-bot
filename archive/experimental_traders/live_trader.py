@@ -416,7 +416,7 @@ class LiveTrader:
                                 _flag_row = _cursor.fetchone()
                                 if _flag_row and _flag_row[0] == '1':
                                     _ghost_ts = datetime.now(UTC).isoformat()
-                                    _paper_sl, _paper_tp = calculate_exits(price, signal, atr)
+                                    _paper_sl, _paper_tp, _paper_hard_sl = calculate_exits(price, signal, atr)
                                     conn.execute(
                                         "INSERT INTO ghost_trades "
                                         "(timestamp, symbol, signal, entry_price, paper_sl, paper_tp, signal_type) VALUES (?,?,?,?,?,?,?)",
@@ -1201,7 +1201,7 @@ class LiveTrader:
                     if df is not None and not df.empty and "atr14" in df.columns:
                         raw_atr = df["atr14"].iloc[-1]
                         if pd.notna(raw_atr) and float(raw_atr) > 0:
-                            paper_sl, paper_tp = calculate_exits(entry_price, signal, float(raw_atr))
+                            paper_sl, paper_tp, _paper_hard_sl = calculate_exits(entry_price, signal, float(raw_atr))
                     
                     if paper_sl is None or paper_tp is None:
                         continue  # Skip resolving this entry if ATR is unavailable
