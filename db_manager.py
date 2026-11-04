@@ -573,10 +573,8 @@ class DatabaseManager:
             
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp)')
-            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique ON trades (symbol, entry_price, timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_swing_trades_symbol ON swing_trades (symbol)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_swing_trades_timestamp ON swing_trades (timestamp)')
-            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique ON swing_trades (symbol, entry_price, timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cycles_timestamp ON cycles (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_tradesync_timestamp ON tradesync (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs (timestamp)')
@@ -787,22 +785,35 @@ class DatabaseManager:
         lives in schema code and is recreated on every startup. A ledger that
         still contains duplicate rows cannot be indexed; that is reported and
         scripts/dedup_trade_ledger.py must be run to clean it.
+
+        An index that already exists under the same name but covers different
+        columns is replaced, otherwise `CREATE INDEX IF NOT EXISTS` would
+        silently keep the narrower key.
         """
         with self._get_conn() as conn:
-            for stmt, idx_name, tbl in (
+            for stmt, idx_name, tbl, columns in (
                 (
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique "
                     "ON trades (symbol, side, entry_price, timestamp, qty)",
                     "idx_trades_unique",
                     "trades",
+                    ("symbol", "side", "entry_price", "timestamp", "qty"),
                 ),
                 (
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique "
                     "ON swing_trades (symbol, side, entry_price, timestamp, size)",
                     "idx_swing_trades_unique",
                     "swing_trades",
+                    ("symbol", "side", "entry_price", "timestamp", "size"),
                 ),
             ):
+                existing = self._index_columns(conn, idx_name)
+                if existing and existing != columns:
+                    log.warning(
+                        f"[DB-SCHEMA] {idx_name} covers {list(existing)}; rebuilding it on "
+                        f"{list(columns)} so distinct trades are not rejected."
+                    )
+                    conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
                 try:
                     conn.execute(stmt)
                 except sqlite3.IntegrityError:
@@ -812,6 +823,12 @@ class DatabaseManager:
                         f"duplicate rows. Run scripts/dedup_trade_ledger.py to clean the ledger."
                     )
             conn.commit()
+
+    @staticmethod
+    def _index_columns(conn, index_name):
+        """Columns an existing index covers, or () when it does not exist."""
+        rows = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+        return tuple(r[2] for r in rows)
 
     def log_trade(self, symbol, side, type, pnl, notes, entry_price=0.0, exit_price=0.0, qty=0.0, balance=0.0, regime="", phase="", mfe=0.0, pos_id=None, quality=0.0, sl_mode="NORMAL", tp_mode="NORMAL", trail_mode="NORMAL", status="closed"):
         """Inserts a trade event into the database via batched write queue with full metadata."""

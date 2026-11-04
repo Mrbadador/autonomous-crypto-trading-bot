@@ -1,9 +1,14 @@
 """
 scripts/migrations_002_dedup_and_unique_indexes.py
 =================================================
-Deduplicates rows in `trades` and `swing_trades` based on
-(symbol, entry_price, timestamp) and enforces UNIQUE indexes
-so duplicate closed trades can never re-accumulate.
+Deduplicates rows in `trades` and `swing_trades` based on the full trade
+identity and enforces UNIQUE indexes so duplicate closed trades can never
+re-accumulate.
+
+The key must include side and size: (symbol, entry_price, timestamp) alone
+rejects a long and a short, or two different-sized fills, of the same symbol
+at the same price. scripts/dedup_trade_ledger.py is the preferred tool
+(it backs the ledger up first and supports --dry-run).
 """
 
 import os
@@ -35,13 +40,13 @@ def run_migration(db_path: str = "trading_data.db"):
                 WHERE rowid NOT IN (
                     SELECT MIN(rowid)
                     FROM trades
-                    GROUP BY symbol, entry_price, timestamp
+                    GROUP BY symbol, side, entry_price, timestamp, qty
                 )
             """)
             count_post = conn.execute("SELECT count(*) FROM trades").fetchone()[0]
             log.info(f"trades table deduplicated: {count_pre} -> {count_post} rows (removed {count_pre - count_post})")
-            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique ON trades (symbol, entry_price, timestamp)")
-            log.info("Created unique index idx_trades_unique on trades(symbol, entry_price, timestamp)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique ON trades (symbol, side, entry_price, timestamp, qty)")
+            log.info("Created unique index idx_trades_unique on trades(symbol, side, entry_price, timestamp, qty)")
 
         # 2. Deduplicate swing_trades table
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='swing_trades'")
@@ -52,12 +57,12 @@ def run_migration(db_path: str = "trading_data.db"):
                 WHERE rowid NOT IN (
                     SELECT MIN(rowid)
                     FROM swing_trades
-                    GROUP BY symbol, entry_price, timestamp
+                    GROUP BY symbol, side, entry_price, timestamp, size
                 )
             """)
             count_post = conn.execute("SELECT count(*) FROM swing_trades").fetchone()[0]
             log.info(f"swing_trades table deduplicated: {count_pre} -> {count_post} rows (removed {count_pre - count_post})")
-            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique ON swing_trades (symbol, entry_price, timestamp)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique ON swing_trades (symbol, side, entry_price, timestamp, size)")
             log.info("Created unique index idx_swing_trades_unique on swing_trades(symbol, entry_price, timestamp)")
 
     conn.close()

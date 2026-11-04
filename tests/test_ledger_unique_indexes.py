@@ -32,6 +32,45 @@ class TestLedgerUniqueIndexes(unittest.TestCase):
         db_manager.DatabaseManager(db_path=self.db_path)
         self.assertIn("idx_trades_unique", self._indexes("trades"))
 
+    def test_unique_index_covers_the_full_trade_identity(self):
+        """The key must include side and size: two fills of the same symbol at
+        the same price are different trades."""
+        db_manager.DatabaseManager(db_path=self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            trades_cols = tuple(
+                r[2] for r in conn.execute("PRAGMA index_info(idx_trades_unique)").fetchall()
+            )
+            swing_cols = tuple(
+                r[2] for r in conn.execute("PRAGMA index_info(idx_swing_trades_unique)").fetchall()
+            )
+        self.assertEqual(
+            trades_cols, ("symbol", "side", "entry_price", "timestamp", "qty")
+        )
+        self.assertEqual(
+            swing_cols, ("symbol", "side", "entry_price", "timestamp", "size")
+        )
+
+    def test_a_narrower_existing_index_is_replaced(self):
+        """A ledger that already carries the narrower (symbol, entry_price,
+        timestamp) index must not keep it: it would reject distinct trades."""
+        db_manager.DatabaseManager(db_path=self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_trades_unique")
+            conn.execute(
+                "CREATE UNIQUE INDEX idx_trades_unique ON trades (symbol, entry_price, timestamp)"
+            )
+            conn.commit()
+
+        db_manager.DatabaseManager(db_path=self.db_path)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cols = tuple(
+                r[2] for r in conn.execute("PRAGMA index_info(idx_trades_unique)").fetchall()
+            )
+        self.assertEqual(
+            cols, ("symbol", "side", "entry_price", "timestamp", "qty")
+        )
+
     def test_swing_trades_unique_index_is_created_by_schema_code(self):
         db_manager.DatabaseManager(db_path=self.db_path)
         self.assertIn("idx_swing_trades_unique", self._indexes("swing_trades"))
