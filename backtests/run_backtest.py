@@ -7,18 +7,68 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime, UTC, timezone
+import sys
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 import config
 from dataclasses import dataclass, field
 from typing import Optional
 # NOTE: This script runs the V10.0 backtest/replay engine.
 # It is NOT part of the V11.0 live stack. Use main.py to run live engines.
 # The archived bot logic lives in archive/bot_v10_backtest.py.
-import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(__file__), "archive"))
+import sys, os
+for _archive_dir in (
+    os.path.join(REPO_ROOT, "archive"),
+    os.path.join(REPO_ROOT, "archive", "legacy_agents"),
+):
+    if _archive_dir not in sys.path:
+        sys.path.insert(0, _archive_dir)
+# `simulator` lives in scripts/; appended (not prepended) so it cannot shadow
+# any module the replay imports from the repository root.
+_scripts_dir = os.path.join(REPO_ROOT, "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.append(_scripts_dir)
 from bot_v10_backtest import run_cycle, calculate_btc_macro_trend
 from state_manager import EngineState, TradeEntry
 from db_manager import DatabaseManager
 from exchange_manager import ExchangeManager
 from indicators import compute_indicators
+
+# ---------------------------------------------------------------------------
+# P0-6: The replay must never touch the production ledger or any repository-root
+# artifact. It runs inside a dedicated sandbox directory: the historical CSVs
+# are read from a fixed read-only location, and every writable artifact (the
+# replay's SQLite ledger, trade_history.csv, trades.csv) lands in the sandbox.
+# ---------------------------------------------------------------------------
+SIM_DIR = os.path.join(REPO_ROOT, "backtests")
+SIM_WORKSPACE = os.path.join(SIM_DIR, "sim_workspace")
+HISTORICAL_DIR = os.path.join(REPO_ROOT, "data", "historical")
+
+
+def simulation_workspace() -> str:
+    """Writable sandbox the replay runs inside; becomes the process CWD."""
+    os.makedirs(SIM_WORKSPACE, exist_ok=True)
+    return SIM_WORKSPACE
+
+
+def historical_data_dir() -> str:
+    """Read-only directory holding the historical OHLCV CSVs."""
+    return HISTORICAL_DIR
+
+
+def resolve_sim_db_path() -> str:
+    """Absolute path of the replay's own SQLite ledger."""
+    return os.path.join(SIM_WORKSPACE, "backtest_sim.db")
+
+
+def sim_artifact_paths() -> list:
+    """Paths the replay is allowed to delete before each run."""
+    return [
+        os.path.join(SIM_WORKSPACE, "trade_history.csv"),
+        os.path.join(SIM_WORKSPACE, "trades.csv"),
+        resolve_sim_db_path(),
+    ]
 
 # Setup basic logging for backtest
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -63,11 +113,11 @@ class MockExchangeManager:
         for symbol in symbols:
             # Normalize symbol name for file path: BTC/USDT -> btc_usdt
             safe_name = symbol.replace("/", "_").lower()
-            csv_path = f"historical_{safe_name}.csv"
-            
+            csv_path = os.path.join(historical_data_dir(), f"historical_{safe_name}.csv")
+
             # Fallback for the existing historical_1h.csv if only BTC is used
             if not os.path.exists(csv_path) and symbol == "BTC/USDT":
-                csv_path = "historical_1h.csv"
+                csv_path = os.path.join(historical_data_dir(), "historical_1h.csv")
                 
             if not os.path.exists(csv_path):
                 log.warning(f"Data file not found for {symbol}: {csv_path}. Skipping.")
@@ -261,17 +311,18 @@ async def main():
     print("   LAUNCHING SQUADRON BACKTEST SIMULATOR [MULTI-ASSET]")
     print("============================================================")
     
-    # Purge old simulation artifacts to avoid ParserErrors
-    # P0-6 FIX: Never remove the production root trading_data.db! Only backtest-scoped artifacts.
-    sim_dir = os.path.dirname(os.path.abspath(__file__))
-    sim_db_path = os.path.join(sim_dir, "backtest_sim.db")
-    sim_trade_history = os.path.join(sim_dir, "trade_history.csv")
-    sim_trades_csv = os.path.join(sim_dir, "trades.csv")
-    for f in [sim_trade_history, sim_trades_csv, sim_db_path]:
-        if os.path.exists(f): 
+    # P0-6 FIX: the replay must never open the production ledger for write.
+    # It chdirs into a dedicated sandbox so every CWD-relative artifact
+    # (trade_history.csv, trades.csv, the archived state manager's own SQLite
+    # file) lands in the sandbox instead of the repository root.
+    workspace = simulation_workspace()
+    os.chdir(workspace)
+
+    for f in sim_artifact_paths():
+        if os.path.exists(f):
             os.remove(f)
-        
-    db = DatabaseManager(db_path=sim_db_path)
+
+    db = DatabaseManager(db_path=resolve_sim_db_path())
     now_iso = datetime.now(UTC).isoformat()
     with db._get_conn() as conn:
         conn.execute("DELETE FROM trades")
@@ -279,7 +330,7 @@ async def main():
         conn.execute("REPLACE INTO system_state (key, value, updated_at) VALUES ('balance_total', ?, ?)", (str(config.INITIAL_BALANCE), now_iso))
         conn.execute("REPLACE INTO system_state (key, value, updated_at) VALUES ('session_start', ?, ?)", (now_iso, now_iso))
         conn.commit()
-    log.info(f"Database Reset: Fresh session initialized with ${config.INITIAL_BALANCE:,.2f} at {sim_db_path}")
+    log.info(f"Database Reset: Fresh session initialized with ${config.INITIAL_BALANCE:,.2f}")
 
     # Initialize multi-symbol components
     mock_em = MockExchangeManager(symbols=config.SYMBOLS, initial_balance=config.INITIAL_BALANCE)
