@@ -981,15 +981,15 @@ git commit -m "fix(swing): give the grid short partial-TP its own 1.20% breakeve
 
 ## Final verification
 
-- [ ] Run the complete suite:
+- [x] Run the complete suite:
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/ -q --tb=no -rf
 ```
 
-Expected: `2 failed, 1542 passed` — the only remaining failures are `tests/test_event_catalyst.py::test_catalyst` and `tests/test_sentinel_event.py::test_sentinel`, which are `async def` tests that need `pytest-asyncio` (see below). Any other failure means a regression — stop and investigate.
+Actual result on `48aa0c9`: **1577 passed, 0 failed, 47 subtests passed** (689s). The two expected async failures no longer occur — `main` has since added `pytest.ini` with `asyncio_mode = auto` and the `pytest-asyncio` plugin, so `tests/test_event_catalyst.py::test_catalyst` and `tests/test_sentinel_event.py::test_sentinel` now execute and pass. The planned expectation of `2 failed, 1542 passed` was written before that upstream change.
 
-- [ ] The two async tests remain unfixed by this plan. They are not broken by `59bdd91`; they have never run because no async plugin is installed. To enable them:
+- [x] The two async tests remain unfixed by this plan. They are not broken by `59bdd91`; they have never run because no async plugin is installed. To enable them:
 
 ```bash
 .venv/Scripts/python.exe -m pip install pytest-asyncio
@@ -1005,7 +1005,7 @@ asyncio_mode = auto
 
 `pytest.ini` also fixes the bare-`pytest` crash, which currently collects the vendored interpreter under `Python/` and produces 174 collection errors plus an access-violation crash. `testpaths = tests` excludes `scratch/`, `Python/` and `.qoder/`.
 
-- [ ] Confirm the production ledger was not modified locally:
+- [x] Confirm the production ledger was not modified locally:
 
 ```bash
 .venv/Scripts/python.exe -c "
