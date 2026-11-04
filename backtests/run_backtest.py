@@ -70,6 +70,19 @@ def sim_artifact_paths() -> list:
         resolve_sim_db_path(),
     ]
 
+
+def apply_sandbox_ledger_path() -> str:
+    """Point every default-constructed ledger at the sandbox.
+
+    A CWD sandbox alone is not isolation: DatabaseManager() resolves its
+    default path from its own module directory, and the archived state
+    manager builds one, so the replay would otherwise open the production
+    ledger for write.
+    """
+    sim_db = resolve_sim_db_path()
+    os.environ["TRADING_DATA_DB_PATH"] = sim_db
+    return sim_db
+
 # Setup basic logging for backtest
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger("backtest")
@@ -104,6 +117,7 @@ class MockExchangeManager:
     """Simulates CCXT behavior for multiple symbols - Optimized for Speed."""
     def __init__(self, symbols, initial_balance=None):
         self.symbols = symbols
+        self.loaded_symbols = []
         self.dfs = {}
         self.dfs_4h = {}
         self.mappings_4h = {}
@@ -132,6 +146,7 @@ class MockExchangeManager:
             log.info(f"Pre-calculating indicators for {symbol}...")
             df = compute_indicators(df)
             self.dfs[symbol] = df
+            self.loaded_symbols.append(symbol)
             all_indices.append(df.index)
             
             # Pre-calculate 4h
@@ -317,6 +332,7 @@ async def main():
     # file) lands in the sandbox instead of the repository root.
     workspace = simulation_workspace()
     os.chdir(workspace)
+    apply_sandbox_ledger_path()
 
     for f in sim_artifact_paths():
         if os.path.exists(f):
@@ -356,7 +372,7 @@ async def main():
                 await calculate_btc_macro_trend(mock_em, state, candle_time=candle_time)
                 
                 # 2. Fire Squadron Cycles in parallel
-                tasks = [run_cycle(symbol, mock_em, state, candle_time=candle_time) for symbol in config.SYMBOLS]
+                tasks = [run_cycle(symbol, mock_em, state, candle_time=candle_time) for symbol in mock_em.loaded_symbols]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
                 for res in results:

@@ -333,9 +333,15 @@ def ensure_boardroom_provenance_schema(ledger_db_path: str) -> bool:
 class DatabaseManager:
     def __init__(self, db_path=None):
         if db_path is None:
-            # Default to absolute path in the same directory as this file
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            db_path = os.path.join(base_dir, "trading_data.db")
+            # A sandbox (e.g. the backtest replay) overrides the ledger so that
+            # a default-constructed manager cannot reach the production file.
+            override = os.getenv("TRADING_DATA_DB_PATH")
+            if override:
+                db_path = override
+            else:
+                # Default to absolute path in the same directory as this file
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                db_path = os.path.join(base_dir, "trading_data.db")
         self.db_path = db_path
         self._init_db()
         self.write_queue = DBWriteQueue.get_instance(self.db_path)

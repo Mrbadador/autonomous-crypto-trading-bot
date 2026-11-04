@@ -12,6 +12,16 @@ import config
 
 log = logging.getLogger(__name__)
 
+
+def ledger_path() -> str:
+    """The SQLite ledger this module reads and writes.
+
+    A sandboxed run (the backtest replay) sets TRADING_DATA_DB_PATH so that
+    the archived state manager never reaches the production ledger.
+    """
+    return os.getenv("TRADING_DATA_DB_PATH") or "trading_data.db"
+
+
 @dataclass
 class TradeEntry:
     symbol: str
@@ -60,7 +70,7 @@ class TradeJournal:
 
 class EngineState:
     def __init__(self, sim_instance=None):
-        self.db = DatabaseManager()
+        self.db = DatabaseManager(db_path=ledger_path())
         self.notifier = NotificationManager()
         self.journal = TradeJournal()
         self.sim = sim_instance
@@ -134,7 +144,7 @@ class EngineState:
         """Restores canonical user deposit baseline from system_state."""
         try:
             import sqlite3
-            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+            with sqlite3.connect(ledger_path(), timeout=5.0) as conn:
                 row = conn.execute("SELECT value FROM system_state WHERE key = 'user_total_deposit'").fetchone()
                 if row and row[0]:
                     return float(row[0])
@@ -147,7 +157,7 @@ class EngineState:
         peaks = [self.start_balance]
         try:
             import sqlite3
-            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+            with sqlite3.connect(ledger_path(), timeout=5.0) as conn:
                 rows = conn.execute("SELECT value FROM system_state WHERE key IN ('hwm_balance', 'peak_balance_sniper', 'peak_balance_live')").fetchall()
                 for r in rows:
                     try:
@@ -172,7 +182,7 @@ class EngineState:
             try:
                 import sqlite3
                 from datetime import datetime, UTC
-                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                with sqlite3.connect(ledger_path(), timeout=5.0) as conn:
                     conn.execute("INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('hwm_balance', ?, ?)", (str(current), datetime.now(UTC).isoformat()))
                     conn.commit()
             except Exception:
