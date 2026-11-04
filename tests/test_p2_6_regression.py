@@ -265,21 +265,21 @@ def test_n4_zombie_locks_on_null_heartbeat():
         # 1. Lock with NULL heartbeat, locked_at 25 minutes ago (1500s > 900s) -> MUST BE DELETED
         old_locked_at = (datetime.now(timezone.utc) - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
         conn.execute(
-            "INSERT INTO asset_locks VALUES ('ADA/USDT', 'super_bot_grid', ?, NULL)",
+            "INSERT INTO asset_locks (symbol, locked_by, locked_at, heartbeat) VALUES ('ADA/USDT', 'super_bot_grid', ?, NULL)",
             (old_locked_at,)
         )
 
         # 2. Lock with fresh heartbeat 2 minutes ago (120s < 900s) -> MUST BE KEPT
         fresh_hb = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
         conn.execute(
-            "INSERT INTO asset_locks VALUES ('ETH/USDT', 'super_bot_grid', ?, ?)",
+            "INSERT INTO asset_locks (symbol, locked_by, locked_at, heartbeat) VALUES ('ETH/USDT', 'super_bot_grid', ?, ?)",
             (old_locked_at, fresh_hb)
         )
 
         # 3. Lock with NULL heartbeat, but locked_at only 2 minutes ago (120s < 900s) -> MUST BE KEPT
         recent_locked_at = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
         conn.execute(
-            "INSERT INTO asset_locks VALUES ('SOL/USDT', 'super_bot_grid', ?, NULL)",
+            "INSERT INTO asset_locks (symbol, locked_by, locked_at, heartbeat) VALUES ('SOL/USDT', 'super_bot_grid', ?, NULL)",
             (recent_locked_at,)
         )
         conn.commit()
