@@ -256,6 +256,7 @@ def test_n4_zombie_locks_on_null_heartbeat():
                 symbol TEXT PRIMARY KEY,
                 locked_by TEXT,
                 locked_at TEXT,
+                reason TEXT,
                 heartbeat TEXT
             )
         """)

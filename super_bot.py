@@ -14,6 +14,7 @@ Critical Features:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -62,6 +63,48 @@ if not log.handlers:
             log.addHandler(_fh)
         except Exception:
             pass
+
+
+def acquire_asset_lock(db_path: str, symbol: str, owner: str, reason: str, now_iso: str) -> bool:
+    """Atomically take or renew the exclusive symbol lock.
+
+    Returns True when `owner` holds the lock for `symbol` once this returns, and
+    False only when another engine holds a lock that is still fresh (<900s).
+    """
+    with contextlib.closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+        conn.execute(
+            """DELETE FROM asset_locks
+               WHERE symbol = ?
+                 AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0""",
+            (symbol,),
+        )
+        renewed = conn.execute(
+            """UPDATE asset_locks SET locked_at = ?, reason = ?, heartbeat = ?
+               WHERE symbol = ? AND locked_by = ?""",
+            (now_iso, reason, now_iso, symbol, owner),
+        ).rowcount
+        if renewed == 0:
+            try:
+                taken = conn.execute(
+                    """INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
+                       SELECT ?, ?, ?, ?, ?
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM asset_locks
+                           WHERE symbol = ?
+                             AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 <= 900.0
+                       )""",
+                    (symbol, owner, now_iso, reason, now_iso, symbol),
+                ).rowcount
+            except sqlite3.IntegrityError:
+                # Another engine inserted the row between the check and the
+                # insert; the lock is held elsewhere, so refuse it.
+                conn.rollback()
+                return False
+            if taken == 0:
+                conn.rollback()
+                return False
+        conn.commit()
+        return True
 
 
 def compute_grid_5m_indicators(df: pd.DataFrame) -> dict:
@@ -1036,43 +1079,12 @@ class SuperBotTrader:
 
             # P0-2 LOCK ACQUISITION: Acquire symbol lock BEFORE order placement to prevent race conditions with swing engine
             lock_who = "super_bot_grid" if is_long else "super_bot_scalp_short"
-            reason_text = rationale or f"{pos_side} entry at {current_price}"
-            lock_why = f"Chop Maker Grid dip-buy ({reason_text})" if is_long else f"Scalp Short Maker fade ({reason_text})"
+            lock_why = f"Chop Maker Grid dip-buy ({rationale})" if is_long else f"Scalp Short Maker fade ({rationale})"
             now_iso_lock = datetime.now(timezone.utc).isoformat()
             
-            def _acquire_pre_lock():
-                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                    # Clean out expired locks (> 900s) first
-                    conn.execute("""
-                        DELETE FROM asset_locks 
-                        WHERE symbol = ? 
-                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
-                    """, (symbol,))
-                    
-                    # If this engine already owns the active lock for this symbol, refresh it
-                    row = conn.execute("SELECT locked_by FROM asset_locks WHERE symbol = ?", (symbol,)).fetchone()
-                    if row:
-                        if row[0] == lock_who:
-                            conn.execute("""
-                                UPDATE asset_locks
-                                SET locked_at = ?, reason = ?, heartbeat = ?
-                                WHERE symbol = ? AND locked_by = ?
-                            """, (now_iso_lock, lock_why, now_iso_lock, symbol, lock_who))
-                            conn.commit()
-                            return True
-                        else:
-                            # Locked by someone else (e.g. swing engine)
-                            return False
-
-                    rowcount = conn.execute("""
-                        INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
-                        SELECT ?, ?, ?, ?, ?
-                        WHERE NOT EXISTS (SELECT 1 FROM asset_locks WHERE symbol = ?)
-                    """, (symbol, lock_who, now_iso_lock, lock_why, now_iso_lock, symbol)).rowcount
-                    conn.commit()
-                    return rowcount > 0
-
-            lock_ok = await asyncio.to_thread(_acquire_pre_lock)
+            lock_ok = await asyncio.to_thread(
+                acquire_asset_lock, "trading_data.db", symbol, lock_who, lock_why, now_iso_lock
+            )
             if not lock_ok:
                 log.warning(f"[{engine_tag}-LOCK-RACE-VETO] Could not acquire asset_locks for {symbol} prior to order placement. Aborting.")
                 return
