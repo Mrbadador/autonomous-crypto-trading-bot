@@ -251,7 +251,7 @@ def audit_paper_positions():
     Checks if prices have violated Stop-Loss or Take-Profit thresholds,
     or if corrupted records (negative qty, zero price) exist, and auto-heals them.
     """
-    audit_summary = {"audited_at": datetime.now(UTC).isoformat(), "desyncs_healed": 0, "positions_active": 0, "status": "OK"}
+    audit_summary = {"audited_at": datetime.now(UTC).isoformat(), "desyncs_healed": 0, "positions_active": 0, "status": "HEALTHY"}
     
     for fleet in FLEET_TABLES:
         table = fleet["table"]
@@ -347,6 +347,7 @@ def audit_paper_positions():
                             log.warning(f"[{bot}] DEFERRING prune of {symbol} in {table} — closed-trade row not written; retry next pass")
 
         except Exception as e:
+            audit_summary["status"] = "DEGRADED"
             log.error(f"Error auditing table {table}: {e}")
 
     return audit_summary
@@ -357,7 +358,7 @@ async def audit_live_exchange_positions():
     Queries Bitget UTA or Binance Futures positions, matches them against local DB records, and syncs balances.
     """
     if config.MODE == "paper" and getattr(config, "PAPER_TRADE", True):
-        return {"mode": "paper_active", "live_reconciliation": "bypassed"}
+        return {"mode": "paper_active", "status": "HEALTHY", "live_reconciliation": "bypassed"}
 
     ex_id = getattr(config, "EXCHANGE_ID", "bitget").lower()
 
@@ -1258,6 +1259,7 @@ async def audit_live_exchange_positions():
 
             return {
                 "mode": "live_bitget_uta",
+                "status": "HEALTHY",
                 "exchange_positions": len(active_exchange_positions),
                 "recovered_to_db": recovered_count,
                 "pruned_phantoms": pruned_count,
@@ -1266,7 +1268,7 @@ async def audit_live_exchange_positions():
             }
         except Exception as e:
             log.warning(f"[EXCHANGE] Bitget UTA live reconciliation failed: {e}")
-            return {"mode": "live_error", "error": str(e)}
+            return {"mode": "live_error", "status": "DEGRADED", "error": str(e)}
         finally:
             if uta:
                 try:
@@ -1301,14 +1303,38 @@ async def audit_live_exchange_positions():
         log.info(f"[EXCHANGE] Live Bitget exchange positions found: {len(active_exchange_positions)}")
         return {
             "mode": "live_bitget",
+            "status": "HEALTHY",
             "exchange_positions": len(active_exchange_positions),
             "synced_at": datetime.now(UTC).isoformat()
         }
     except Exception as e:
         log.warning(f"[EXCHANGE] Live Bitget position fetch failed: {e}")
-        return {"mode": "live_error", "error": str(e)}
+        return {"mode": "live_error", "status": "DEGRADED", "error": str(e)}
     finally:
         await exchange.close()
+
+def _is_healthy(paper_audit, live_audit) -> bool:
+    """True only when every audit that ran published a HEALTHY status.
+
+    A missing status is not healthy: the heartbeat must never claim a fleet
+    is reconciled when an audit could not report.
+    """
+    if not isinstance(paper_audit, dict) or paper_audit.get("status") != "HEALTHY":
+        return False
+    if live_audit and (not isinstance(live_audit, dict) or live_audit.get("status") != "HEALTHY"):
+        return False
+    return True
+
+
+def build_heartbeat_telemetry(paper_audit, live_audit) -> dict:
+    """Builds the reconciliation heartbeat payload published to system_state."""
+    return {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "status": "HEALTHY" if _is_healthy(paper_audit, live_audit) else "DEGRADED",
+        "paper_audit": paper_audit,
+        "live_audit": live_audit
+    }
+
 
 async def reconciliation_main_loop():
     log.info("=" * 60)
@@ -1336,19 +1362,9 @@ async def reconciliation_main_loop():
             live_audit = await audit_live_exchange_positions()
             
             # 3. Combine telemetry and publish to system_state
-            paper_ok = paper_audit.get("status") in ("OK", "HEALTHY")
-            live_ok = (live_audit is None) or (
-                live_audit.get("mode") != "live_error" and "error" not in live_audit
-            )
-            is_healthy = bool(paper_ok and live_ok)
-            telemetry = {
-                "timestamp": datetime.now(UTC).isoformat(),
-                "status": "HEALTHY" if is_healthy else "DEGRADED",
-                "paper_audit": paper_audit,
-                "live_audit": live_audit
-            }
+            telemetry = build_heartbeat_telemetry(paper_audit, live_audit)
             update_system_state("reconciliation_heartbeat", json.dumps(telemetry))
-            log.info(f"[HEARTBEAT] Active: {paper_audit['positions_active']} | Desyncs Healed: {paper_audit['desyncs_healed']} | Status: OK")
+            log.info(f"[HEARTBEAT] Active: {paper_audit['positions_active']} | Desyncs Healed: {paper_audit['desyncs_healed']} | Status: {telemetry['status']}")
             
         except Exception as e:
             log.error(f"Reconciliation cycle exception: {e}")

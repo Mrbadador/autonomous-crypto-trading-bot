@@ -166,8 +166,14 @@ def test_r4_reconciler_locks_scoped_and_preserves_other_engines():
                     queries[node.lineno] = arg.value
 
     # Scoped closure delete query in reconciliation_engine.py
-    sql_closure = queries.get(687) or queries.get(730) or queries.get(1094) or queries.get(1174) or queries.get(547) or queries.get(892)
-    assert sql_closure is not None, "Could not find AST-extracted closure delete query in reconciliation_engine.py"
+    # Matched by content, not by line number: edits above it shift the lines.
+    scoped = [
+        q for q in queries.values()
+        if "WHERE symbol = ?" in q
+        and "locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')" in q
+    ]
+    assert scoped, "Could not find AST-extracted closure delete query in reconciliation_engine.py"
+    sql_closure = scoped[0]
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
         db_path = tf.name
@@ -227,7 +233,15 @@ def test_r4_reconciler_null_heartbeat_prune():
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and "COALESCE(heartbeat, locked_at)" in arg.value:
                     prune_queries[node.lineno] = arg.value
 
-    sql_prune = prune_queries.get(962) or next(iter(prune_queries.values()), None)
+    # The background prune deletes by age, not by symbol, so it is the scoped
+    # query that does NOT bind a symbol parameter.
+    sql_prune = next(
+        (q for q in prune_queries.values()
+         if "DELETE FROM asset_locks" in q
+         and "WHERE symbol = ?" not in q
+         and "locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')" in q),
+        None,
+    )
     assert sql_prune is not None, "Could not find AST-extracted background prune query in reconciliation_engine.py"
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
