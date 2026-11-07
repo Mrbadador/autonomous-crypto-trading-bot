@@ -60,14 +60,14 @@ async def run_recovery_loop():
                 positions = []
                 
                 try:
-                    cursor = conn.execute("SELECT symbol, side, entry_price, qty, stop_loss FROM open_positions")
+                    cursor = conn.execute("SELECT symbol, side, entry_price, qty FROM open_positions")
                     for row in cursor.fetchall():
                         positions.append(("open_positions", *row))
                 except sqlite3.OperationalError as oe:
                     log.warning(f"[RECOVERY] Sniper positions read failed: {oe}")
                     
                 try:
-                    cursor = conn.execute("SELECT symbol, side, entry_price, qty, stop_loss FROM berserker_open_positions")
+                    cursor = conn.execute("SELECT symbol, side, entry_price, qty FROM berserker_open_positions")
                     for row in cursor.fetchall():
                         positions.append(("berserker_open_positions", *row))
                 except sqlite3.OperationalError as oe:
@@ -75,133 +75,85 @@ async def run_recovery_loop():
                 
                 conn.close()
                 
-                for table_name, symbol, side, entry_price, qty, stop_loss in positions:
+                for table_name, symbol, side, entry_price, qty in positions:
                     try:
-                        # N-12 FIX: Normalize side to lowercase immediately upon row unpacking
-                        side_norm = str(side).strip().lower()
-                        is_long_side = (side_norm in ("long", "buy"))
-
                         fetch_sym = symbol
                         if ex_id == "bitget" and ":USDT" not in fetch_sym:
                             fetch_sym = f"{symbol}:USDT"
                         ticker = await exchange.fetch_ticker(fetch_sym)
                         current_price = float(ticker['last'])
                         
-                        if is_long_side:
+                        if side == "long":
                             pnl_pct = (current_price - entry_price) / entry_price
                         else:
                             pnl_pct = (entry_price - current_price) / entry_price
                             
                         if pnl_pct < -0.03:
                             # Position is > 3% underwater
-                            # Dual Regime Verification: Check both global BTC macro AND the specific asset's own trend
-                            # Re-use cached Warden60Minute instances to prevent aiohttp ClientSession & OHLCV churn
-                            if "BTC/USDT" not in warden_cache:
-                                warden_cache["BTC/USDT"] = Warden60Minute(symbol='BTC/USDT')
-                            btc_regime = await warden_cache["BTC/USDT"].determine_regime()
-
                             if symbol not in warden_cache:
-                                warden_cache[symbol] = Warden60Minute(symbol=symbol)
-                            asset_regime = await warden_cache[symbol].determine_regime()
-
-                            # Require both global BTC and the specific asset to be aligned in trend
-                            regime_aligned = (
-                                (is_long_side and btc_regime == "LONG_ONLY" and asset_regime == "LONG_ONLY") or
-                                (not is_long_side and btc_regime == "SHORT_ONLY" and asset_regime == "SHORT_ONLY")
-                            )
-
-                            if not regime_aligned:
-                                log.warning(f"[RECOVERY] DCA Veto for {symbol} ({side_norm}): Regime misaligned (BTC={btc_regime}, Asset={asset_regime}). Blocking DCA to avoid averaging into structural trend collapse.")
-                                continue
-
-                            # P1-PATCH: Persist DCA count & cooldown in SQLite system_state to survive daemon restarts
-                            DCA_COOLDOWN_SECONDS = 4 * 3600  # 4 hours
-                            dca_state_key = f"dca_state_{symbol}_{side_norm}"
-                            dca_meta = {"count": 0, "last_ts": 0.0}
-                            try:
-                                conn_st = sqlite3.connect(db_path, timeout=5.0)
-                                row_st = conn_st.execute("SELECT value FROM system_state WHERE key = ?", (dca_state_key,)).fetchone()
-                                if row_st and row_st[0]:
-                                    import json as _json
-                                    dca_meta = _json.loads(row_st[0])
-                                conn_st.close()
-                            except Exception:
-                                pass
-
-                            time_since_last_dca = time.time() - float(dca_meta.get("last_ts", 0.0))
-                            current_dca_count = int(dca_meta.get("count", 0))
-
-                            if time_since_last_dca < DCA_COOLDOWN_SECONDS:
-                                remaining_mins = (DCA_COOLDOWN_SECONDS - time_since_last_dca) / 60
-                                log.info(f"[RECOVERY] DCA cooldown active for {symbol} ({side}). "
-                                         f"Next DCA eligible in {remaining_mins:.0f}m. Skipping.")
-                            elif current_dca_count >= 3:
-                                log.warning(f"[RECOVERY] MAX DCA LIMIT (3) reached for {symbol} ({side}). Aborting further DCAs to prevent liquidation.")
-                            else:
-                                dca_qty = qty * 0.5
-                                new_qty = qty + dca_qty
-                                new_entry_price = ((entry_price * qty) + (current_price * dca_qty)) / new_qty
+                                # P1-PATCH: Always evaluate global BTC macro trend, not the asset's own
+                                # trend, to avoid circular logic (e.g. using ETH regime to validate ETH DCA).
+                                warden_cache[symbol] = Warden60Minute(symbol='BTC/USDT')
+                            
+                            warden = warden_cache[symbol]
+                            regime = await warden.determine_regime()
+                            
+                            if (side == "long" and regime == "LONG_ONLY") or (side == "short" and regime == "SHORT_ONLY"):
+                                # P1-PATCH: 4-hour DCA re-entry guard.
+                                # Prevents loop from stacking 10+ DCAs on a sustained drawdown.
+                                DCA_COOLDOWN_SECONDS = 4 * 3600  # 4 hours
+                                last_dca = last_dca_time.get(symbol, 0)
+                                time_since_last_dca = time.time() - last_dca
                                 
-                                # R-3 FIX: Case-insensitive side normalization to prevent inverted stop losses
-                                side_norm = str(side).strip().lower()
-                                is_long_pos = (side_norm in ("long", "buy"))
-
-                                # Proportional Stop Loss Recalculation (precomputed before order execution)
-                                sl_val = float(stop_loss) if (stop_loss is not None and float(stop_loss) > 0) else (entry_price * 0.97 if is_long_pos else entry_price * 1.03)
-                                old_sl_dist_pct = abs(entry_price - sl_val) / entry_price if entry_price > 0 else 0.03
-                                new_sl = new_entry_price * (1.0 - old_sl_dist_pct) if is_long_pos else new_entry_price * (1.0 + old_sl_dist_pct)
-                                
-                                # Execute DCA Recovery Order on the Exchange!
-                                try:
-                                    order_side = "buy" if is_long_pos else "sell"
-                                    if ex_id == "bitget":
-                                        uta = get_bitget_uta_client()
-                                        await uta.create_market_order(symbol, "long" if is_long_pos else "short", dca_qty)
-                                        await uta.close()
-                                    else:
-                                        await exchange.create_market_order(symbol, order_side, dca_qty)
-                                    log.info(f"[RECOVERY] Exchange Order Executed: {order_side.upper()} {dca_qty} {symbol}")
-                                except Exception as e:
-                                    log.error(f"[RECOVERY] Exchange Order FAILED for {symbol}. Aborting DB update. Err: {e}")
-                                    continue # Skip DB update if the actual trade fails
-                                
-                                # CRITICAL: Immediately persist DCA cooldown & counter in DB to eliminate crash loops
-                                conn_dca = None
-                                try:
+                                if time_since_last_dca < DCA_COOLDOWN_SECONDS:
+                                    remaining_mins = (DCA_COOLDOWN_SECONDS - time_since_last_dca) / 60
+                                    log.info(f"[RECOVERY] DCA cooldown active for {symbol}. "
+                                             f"Next DCA eligible in {remaining_mins:.0f}m. Skipping.")
+                                else:
+                                    dca_qty = qty * 0.5
+                                    
+                                    # dca_count is tracked on the warden object.
+                                    # The warden is guaranteed initialized above.
+                                    if not hasattr(warden, 'dca_count'):
+                                        warden.dca_count = 0
+                                        
+                                    if warden.dca_count >= 3:
+                                        log.warning(f"[RECOVERY] MAX DCA LIMIT (3) reached for {symbol}. Aborting further DCAs to prevent liquidation.")
+                                        continue
+                                    
+                                    # Execute DCA Recovery Order on the Exchange!
+                                    try:
+                                        order_side = "buy" if side == "long" else "sell"
+                                        if ex_id == "bitget":
+                                            uta = get_bitget_uta_client()
+                                            await uta.create_market_order(symbol, side, dca_qty)
+                                            await uta.close()
+                                        else:
+                                            await exchange.create_market_order(symbol, order_side, dca_qty)
+                                        log.info(f"[RECOVERY] Exchange Order Executed: {order_side.upper()} {dca_qty} {symbol}")
+                                    except Exception as e:
+                                        log.error(f"[RECOVERY] Exchange Order FAILED for {symbol}. Aborting DB update. Err: {e}")
+                                        continue # Skip DB update if the actual trade fails
+                                    
+                                    new_qty = qty + dca_qty
+                                    new_entry_price = ((entry_price * qty) + (current_price * dca_qty)) / new_qty
+                                    
+                                    # Execute DCA Recovery DB Update
                                     conn_dca = sqlite3.connect(db_path, timeout=10.0)
                                     conn_dca.execute("PRAGMA journal_mode=WAL;")
                                     conn_dca.execute("PRAGMA busy_timeout=30000;")
-                                    dca_meta["count"] = current_dca_count + 1
-                                    dca_meta["last_ts"] = time.time()
-                                    import json as _json
-                                    conn_dca.execute(
-                                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
-                                        (dca_state_key, _json.dumps(dca_meta))
-                                    )
-                                    conn_dca.execute(
-                                        f"UPDATE {table_name} SET qty = ?, entry_price = ?, stop_loss = ? WHERE symbol = ? AND LOWER(side) = ?",
-                                        (new_qty, new_entry_price, new_sl, symbol, side.lower())
-                                    )
+                                    conn_dca.execute(f"UPDATE {table_name} SET qty = ?, entry_price = ? WHERE symbol = ?",
+                                                 (new_qty, new_entry_price, symbol))
                                     conn_dca.commit()
-                                except Exception as dca_db_err:
-                                    log.error(f"[RECOVERY] Failed to persist DCA state to DB for {symbol}: {dca_db_err}")
-                                finally:
-                                    if conn_dca:
-                                        conn_dca.close()
-
-                                # Update native strategy stop loss order on Bitget
-                                if ex_id == "bitget":
-                                    try:
-                                        uta = get_bitget_uta_client()
-                                        await uta.modify_strategy_order(symbol, sl=new_sl)
-                                        await uta.close()
-                                        log.info(f"[RECOVERY] Exchange Stop Loss updated to ${new_sl:,.4f} for {symbol} {side.upper()}")
-                                    except Exception as sl_mod_err:
-                                        log.warning(f"[RECOVERY] Could not modify exchange SL after DCA: {sl_mod_err}")
-
-                                # Log AFTER the DB update to confirm end-to-end success
-                                log.info(f"[RECOVERY] Position {symbol} ({side}) underwater. Macro valid. Safety DCA #{dca_meta['count']} completed.")
-                                log.info(f"           -> Old Entry: {entry_price:.4f} | New Entry: {new_entry_price:.4f} | New SL: {new_sl:.4f} | Qty: {new_qty:.4f}")
+                                    conn_dca.close()
+                                    
+                                    # Record DCA timestamp to enforce cooldown on next iteration
+                                    last_dca_time[symbol] = time.time()
+                                    warden.dca_count += 1
+                                    
+                                    # Log AFTER the DB update to confirm end-to-end success
+                                    log.info(f"[RECOVERY] Position {symbol} underwater. Macro valid. Safety DCA completed.")
+                                    log.info(f"           -> Old Entry: {entry_price:.2f} | New Entry: {new_entry_price:.2f} | Qty: {new_qty:.4f} | DCA #{warden.dca_count}")
                     except Exception as e:
                         log.error(f"[RECOVERY] Error processing {symbol}: {e}")
                         

@@ -124,8 +124,6 @@ class DBWriteQueue:
                     last_flush = time.monotonic()
                     self._flush_requested = False
             except Exception as e:
-                if not self._running:
-                    break
                 log.critical(f"[DB-WORKER-CRASH] Worker loop fault: {e}", exc_info=True)
                 try:
                     conn.close()
@@ -179,54 +177,13 @@ class DBWriteQueue:
                 except Exception:
                     pass
                 break
-            except sqlite3.IntegrityError as e:
-                log.warning(
-                    f"[DBWriteQueue] Ledger constraint rejected a duplicate row "
-                    f"({len(batch)} ops): {e}. Isolating the offending op."
-                )
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                written, dropped = self._commit_ops_individually(conn, batch)
-                self.total_flushed += written + dropped
-                if written > 0:
-                    self.total_batches += 1
-                    self.last_flush_time = time.monotonic()
-                break
             except Exception as e:
-                log.error(f"[DBWriteQueue] Non-retryable error in batch commit ({len(batch)} ops): {e}. Attempting isolated 1-by-1 commit fallback.")
+                log.error(f"[DBWriteQueue] Non-retryable error in batch commit ({len(batch)} ops): {e}")
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-                written, dropped = self._commit_ops_individually(conn, batch)
-                self.total_flushed += written + dropped
-                if written > 0:
-                    self.total_batches += 1
-                    self.last_flush_time = time.monotonic()
                 break
-
-    def _commit_ops_individually(self, conn, batch):
-        """Commits each op on its own so one bad op cannot drop the rest.
-
-        A duplicate that the ledger's unique index rejects is dropped, not
-        retried: the row it would have written already exists.
-        """
-        written = 0
-        dropped = 0
-        for op in batch:
-            try:
-                with conn:
-                    conn.execute(op.query, op.params)
-                written += 1
-            except sqlite3.IntegrityError as dup_err:
-                dropped += 1
-                log.warning(f"[DBWriteQueue] Duplicate ledger row dropped on {op.table}: {dup_err}")
-            except Exception as single_err:
-                dropped += 1
-                log.error(f"[DBWriteQueue] Dropping malformed op on {op.table}: {single_err} | Query: {op.query[:120]}")
-        return written, dropped
 
     def enqueue_write(self, table: str, query: str, params: tuple = ()):
         """
@@ -298,50 +255,12 @@ class DBWriteQueue:
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=timeout)
 
-
-def ensure_boardroom_provenance_schema(ledger_db_path: str) -> bool:
-    """
-    FIX 2 (additive, idempotent): guarantee boardroom_debates exists in the ledger DB
-    with a nullable `served_model_id TEXT` column. Never rewrites or deletes rows;
-    no non-default values are backfilled. Returns True when the column is present.
-    """
-    if not os.path.exists(ledger_db_path):
-        return False
-    with sqlite3.connect(ledger_db_path, timeout=30.0) as conn:
-        conn.execute("PRAGMA busy_timeout=30000;")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS boardroom_debates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                side TEXT,
-                execute INTEGER,
-                conviction_score REAL,
-                red_team_objection TEXT,
-                alpha_thesis TEXT,
-                final_rationale TEXT,
-                timestamp TEXT,
-                served_model_id TEXT
-            )
-        """)
-        cols = [c[1] for c in conn.execute("PRAGMA table_info(boardroom_debates)").fetchall()]
-        if "served_model_id" not in cols:
-            conn.execute("ALTER TABLE boardroom_debates ADD COLUMN served_model_id TEXT;")
-            log.info("[FIX 2] boardroom_debates.served_model_id column added (nullable, additive).")
-        return True
-
-
 class DatabaseManager:
     def __init__(self, db_path=None):
         if db_path is None:
-            # A sandbox (e.g. the backtest replay) overrides the ledger so that
-            # a default-constructed manager cannot reach the production file.
-            override = os.getenv("TRADING_DATA_DB_PATH")
-            if override:
-                db_path = override
-            else:
-                # Default to absolute path in the same directory as this file
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                db_path = os.path.join(base_dir, "trading_data.db")
+            # Default to absolute path in the same directory as this file
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            db_path = os.path.join(base_dir, "trading_data.db")
         self.db_path = db_path
         self._init_db()
         self.write_queue = DBWriteQueue.get_instance(self.db_path)
@@ -482,105 +401,9 @@ class DatabaseManager:
                     source TEXT
                 )
             """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS boardroom_decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    direction TEXT NOT NULL,
-                    conviction_score REAL NOT NULL,
-                    verdict TEXT NOT NULL,
-                    agents_votes_json TEXT,
-                    rationale TEXT,
-                    subsequent_12h_pnl REAL,
-                    counterfactual_outcome TEXT
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS shadow_signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    strategy TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    direction TEXT NOT NULL,
-                    entry_price REAL NOT NULL,
-                    stop_loss REAL,
-                    take_profit REAL,
-                    veto_reason TEXT,
-                    exit_price REAL,
-                    pnl_pct REAL,
-                    status TEXT DEFAULT 'OPEN',
-                    candle_key TEXT
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS prereg_registry (
-                    id TEXT PRIMARY KEY,
-                    hypothesis_name TEXT NOT NULL,
-                    engine TEXT NOT NULL,
-                    target_sample_size INTEGER NOT NULL,
-                    metric_target TEXT NOT NULL,
-                    status TEXT DEFAULT 'ACTIVE',
-                    created_at TEXT NOT NULL,
-                    notes TEXT
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS swing_open_positions (
-                    symbol TEXT PRIMARY KEY,
-                    side TEXT NOT NULL,
-                    entry_price REAL NOT NULL,
-                    size REAL NOT NULL,
-                    stop_loss REAL NOT NULL,
-                    take_profit REAL NOT NULL,
-                    trailing_stop REAL NOT NULL,
-                    peak_price REAL NOT NULL,
-                    leverage INTEGER DEFAULT 3,
-                    opened_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    status TEXT DEFAULT 'ACTIVE',
-                    r_multiple REAL DEFAULT 0.0,
-                    initial_risk_usd REAL,
-                    notes TEXT,
-                    intended_entry_price REAL,
-                    actual_fill_price REAL,
-                    slippage_bps REAL,
-                    fee_entry_usd REAL,
-                    execution_type TEXT,
-                    gates_snapshot TEXT
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS swing_trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    entry_price REAL NOT NULL,
-                    exit_price REAL,
-                    size REAL NOT NULL,
-                    pnl REAL,
-                    roe_pct REAL,
-                    holding_hours REAL,
-                    exit_reason TEXT,
-                    notes TEXT,
-                    intended_entry_price REAL,
-                    actual_fill_price REAL,
-                    slippage_bps REAL,
-                    fee_paid_usd REAL,
-                    fee_maker_usd REAL,
-                    fee_taker_usd REAL,
-                    funding_usd REAL,
-                    funding_source TEXT,
-                    gates_snapshot TEXT,
-                    status TEXT DEFAULT 'CLOSED'
-                )
-            """)
             
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_swing_trades_symbol ON swing_trades (symbol)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_swing_trades_timestamp ON swing_trades (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cycles_timestamp ON cycles (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_tradesync_timestamp ON tradesync (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs (timestamp)')
@@ -588,7 +411,7 @@ class DatabaseManager:
             # Check if migrations are already applied to save I/O and time during startup
             cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
             row = cursor.fetchone()
-            if row and row[0] == "1.1":
+            if row and row[0] == "1.0":
                 # Migrations already applied, skip
                 pass
             else:
@@ -627,214 +450,15 @@ class DatabaseManager:
                             cursor.execute(f"ALTER TABLE cycles ADD COLUMN {col_name} TEXT")
                         else:
                             cursor.execute(f"ALTER TABLE cycles ADD COLUMN {col_name} REAL")
-
-                # Stage 1 Instrumentation: Truthful execution ledger columns for swing_trades & swing_open_positions
-                try:
-                    cursor.execute("PRAGMA table_info(swing_trades)")
-                    st_cols = [c[1] for c in cursor.fetchall()]
-                    if st_cols:
-                        st_new_cols = {
-                            "intended_entry_price": "REAL",
-                            "actual_fill_price": "REAL",
-                            "slippage_bps": "REAL",
-                            "fee_paid_usd": "REAL",
-                            "fee_maker_usd": "REAL",
-                            "fee_taker_usd": "REAL",
-                            "funding_usd": "REAL",
-                            "funding_source": "TEXT",
-                            "gates_snapshot": "TEXT",
-                            "status": "TEXT DEFAULT 'CLOSED'"
-                        }
-                        for col_name, col_type in st_new_cols.items():
-                            if col_name not in st_cols:
-                                log.info(f"Migrating database: Adding '{col_name}' column to 'swing_trades'.")
-                                cursor.execute(f"ALTER TABLE swing_trades ADD COLUMN {col_name} {col_type}")
-                except Exception as ex_st:
-                    log.warning(f"Failed to migrate swing_trades: {ex_st}")
-
-                try:
-                    cursor.execute("PRAGMA table_info(swing_open_positions)")
-                    sop_cols = [c[1] for c in cursor.fetchall()]
-                    if sop_cols:
-                        sop_new_cols = {
-                            "intended_entry_price": "REAL",
-                            "actual_fill_price": "REAL",
-                            "slippage_bps": "REAL",
-                            "fee_entry_usd": "REAL",
-                            "execution_type": "TEXT",
-                            "gates_snapshot": "TEXT"
-                        }
-                        for col_name, col_type in sop_new_cols.items():
-                            if col_name not in sop_cols:
-                                log.info(f"Migrating database: Adding '{col_name}' column to 'swing_open_positions'.")
-                                cursor.execute(f"ALTER TABLE swing_open_positions ADD COLUMN {col_name} {col_type}")
-                except Exception as ex_sop:
-                    log.warning(f"Failed to migrate swing_open_positions: {ex_sop}")
                 
                 # Mark as applied
                 from datetime import datetime, UTC
                 cursor.execute(
-                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.1', ?)",
+                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.0', ?)",
                     (datetime.now(UTC).isoformat(),)
                 )
-
-            # Migration 1.2: Rebuild swing_trades table with nullable exit_price, pnl, and roe_pct (FIX 1)
-            cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
-            row_v = cursor.fetchone()
-            curr_v = str(row_v[0]) if row_v else "0.0"
-            if curr_v < "1.2":
-                log.info("Migrating database to 1.2: Rebuilding swing_trades with nullable exit_price/pnl/roe_pct...")
-                try:
-                    cursor.execute("PRAGMA foreign_keys = OFF;")
-                    # 1. Create temporary migration table with identical modern schema but NULLABLE exit columns
-                    cursor.execute("""
-                        CREATE TABLE IF NOT EXISTS swing_trades_mig (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            timestamp TEXT NOT NULL,
-                            symbol TEXT NOT NULL,
-                            side TEXT NOT NULL,
-                            entry_price REAL NOT NULL,
-                            exit_price REAL,
-                            size REAL NOT NULL,
-                            pnl REAL,
-                            roe_pct REAL,
-                            holding_hours REAL,
-                            exit_reason TEXT,
-                            notes TEXT,
-                            intended_entry_price REAL,
-                            actual_fill_price REAL,
-                            slippage_bps REAL,
-                            fee_paid_usd REAL,
-                            fee_maker_usd REAL,
-                            fee_taker_usd REAL,
-                            funding_usd REAL,
-                            funding_source TEXT,
-                            gates_snapshot TEXT,
-                            status TEXT DEFAULT 'CLOSED'
-                        );
-                    """)
-                    
-                    # 2. Copy all existing records across matching columns
-                    cursor.execute("PRAGMA table_info(swing_trades)")
-                    existing_cols = [c[1] for c in cursor.fetchall()]
-                    target_cols = [
-                        "id", "timestamp", "symbol", "side", "entry_price", "exit_price", "size",
-                        "pnl", "roe_pct", "holding_hours", "exit_reason", "notes",
-                        "intended_entry_price", "actual_fill_price", "slippage_bps",
-                        "fee_paid_usd", "fee_maker_usd", "fee_taker_usd", "funding_usd",
-                        "funding_source", "gates_snapshot", "status"
-                    ]
-                    common_cols = [c for c in target_cols if c in existing_cols]
-                    cols_csv = ", ".join(common_cols)
-                    
-                    cursor.execute(f"INSERT INTO swing_trades_mig ({cols_csv}) SELECT {cols_csv} FROM swing_trades;")
-                    
-                    # 3. Atomic swap
-                    cursor.execute("DROP TABLE swing_trades;")
-                    cursor.execute("ALTER TABLE swing_trades_mig RENAME TO swing_trades;")
-                    
-                    # 4. Recreate indexes
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swing_trades_symbol ON swing_trades (symbol);")
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_swing_trades_timestamp ON swing_trades (timestamp);")
-                    
-                    from datetime import datetime, UTC
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.2', ?)",
-                        (datetime.now(UTC).isoformat(),)
-                    )
-                except Exception as mig_err:
-                    log.critical(f"Database migration 1.2 FAILED: {mig_err}", exc_info=True)
-                    raise mig_err
-                finally:
-                    cursor.execute("PRAGMA foreign_keys = ON;")
-
-            # Migration 1.3: Add candle_key to shadow_signals and unique index (FIX 3)
-            cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
-            row_v = cursor.fetchone()
-            curr_v = str(row_v[0]) if row_v else "0.0"
-            if curr_v < "1.3":
-                log.info("Migrating database to 1.3: Adding candle_key and unique index to shadow_signals...")
-                try:
-                    cursor.execute("PRAGMA table_info(shadow_signals)")
-                    shadow_cols = [c[1] for c in cursor.fetchall()]
-                    if "candle_key" not in shadow_cols:
-                        cursor.execute("ALTER TABLE shadow_signals ADD COLUMN candle_key TEXT;")
-                    cursor.execute("""
-                        CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_signals_unique ON shadow_signals (symbol, direction, candle_key);
-                    """)
-                    from datetime import datetime, UTC
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('migrations_version', '1.3', ?)",
-                        (datetime.now(UTC).isoformat(),)
-                    )
-                    log.info("Database migration 1.3 SUCCESS: shadow_signals deduplication index created.")
-                except Exception as mig_err:
-                    log.critical(f"Database migration 1.3 FAILED: {mig_err}", exc_info=True)
-                    raise mig_err
-
-            # Migration 1.4 (FIX 2): model provenance — additive served_model_id on boardroom_debates
-            # lives in trading_ledger.db, not this DB; helper is idempotent and additive-only.
-            try:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                ensure_boardroom_provenance_schema(os.path.join(base_dir, "trading_ledger.db"))
-            except Exception as prov_err:
-                log.warning(f"[MIGRATION-1.4] boardroom provenance column note: {prov_err}")
-
             conn.commit()
-        self._ensure_ledger_unique_indexes()
         log.info(f"Database initialized at {self.db_path} with WAL mode.")
-
-    def _ensure_ledger_unique_indexes(self):
-        """Creates the trade-ledger uniqueness indexes.
-
-        The ledger must reject a repeated execution record, so the constraint
-        lives in schema code and is recreated on every startup. A ledger that
-        still contains duplicate rows cannot be indexed; that is reported and
-        scripts/dedup_trade_ledger.py must be run to clean it.
-
-        An index that already exists under the same name but covers different
-        columns is replaced, otherwise `CREATE INDEX IF NOT EXISTS` would
-        silently keep the narrower key.
-        """
-        with self._get_conn() as conn:
-            for stmt, idx_name, tbl, columns in (
-                (
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_unique "
-                    "ON trades (symbol, side, entry_price, timestamp, qty)",
-                    "idx_trades_unique",
-                    "trades",
-                    ("symbol", "side", "entry_price", "timestamp", "qty"),
-                ),
-                (
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_swing_trades_unique "
-                    "ON swing_trades (symbol, side, entry_price, timestamp, size)",
-                    "idx_swing_trades_unique",
-                    "swing_trades",
-                    ("symbol", "side", "entry_price", "timestamp", "size"),
-                ),
-            ):
-                existing = self._index_columns(conn, idx_name)
-                if existing and existing != columns:
-                    log.warning(
-                        f"[DB-SCHEMA] {idx_name} covers {list(existing)}; rebuilding it on "
-                        f"{list(columns)} so distinct trades are not rejected."
-                    )
-                    conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
-                try:
-                    conn.execute(stmt)
-                except sqlite3.IntegrityError:
-                    conn.rollback()
-                    log.warning(
-                        f"[DB-SCHEMA] Cannot create {idx_name} on {tbl}: the table contains "
-                        f"duplicate rows. Run scripts/dedup_trade_ledger.py to clean the ledger."
-                    )
-            conn.commit()
-
-    @staticmethod
-    def _index_columns(conn, index_name):
-        """Columns an existing index covers, or () when it does not exist."""
-        rows = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
-        return tuple(r[2] for r in rows)
 
     def log_trade(self, symbol, side, type, pnl, notes, entry_price=0.0, exit_price=0.0, qty=0.0, balance=0.0, regime="", phase="", mfe=0.0, pos_id=None, quality=0.0, sl_mode="NORMAL", tp_mode="NORMAL", trail_mode="NORMAL", status="closed"):
         """Inserts a trade event into the database via batched write queue with full metadata."""
@@ -903,7 +527,7 @@ class DatabaseManager:
         try:
             with self._get_conn() as conn:
                 conn.row_factory = sqlite3.Row
-                cursor = conn.execute("SELECT * FROM trades ORDER BY replace(substr(timestamp, 1, 19), 'T', ' ') DESC LIMIT ?", (limit,))
+                cursor = conn.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?", (limit,))
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             log.error(f"Failed to get recent trades: {e}")
@@ -919,7 +543,7 @@ class DatabaseManager:
                 MAX(pnl) as best_trade,
                 MIN(pnl) as worst_trade
             FROM trades 
-            WHERE replace(substr(timestamp, 1, 19), 'T', ' ') > datetime('now', '-1 day')
+            WHERE timestamp > datetime('now', '-1 day')
         """
         try:
             with self._get_conn() as conn:
@@ -1040,7 +664,7 @@ class DatabaseManager:
                     try:
                         cutoff = f"datetime('now', '-{days} days')"
                         deleted = conn.execute(
-                            f"DELETE FROM {table} WHERE replace(substr(timestamp, 1, 19), 'T', ' ') < {cutoff}"
+                            f"DELETE FROM {table} WHERE timestamp < {cutoff}"
                         ).rowcount
                         results[table] = deleted
                         if deleted > 0:
