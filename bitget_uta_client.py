@@ -554,21 +554,28 @@ class BitgetUTAClient:
         order_side = "buy" if is_long else "sell"
         pos_side = "long" if is_long else "short"
 
-        # If limit price is not provided, fetch current order book inside best bid/ask
-        if price is None or price <= 0.0:
-            try:
-                ob = await self.exchange.fetch_order_book(clean_sym, limit=5)
-                bids = ob.get("bids", [])
-                asks = ob.get("asks", [])
-                if is_long and bids:
-                    price = float(bids[0][0])
-                elif not is_long and asks:
-                    price = float(asks[0][0])
-                else:
-                    ticker = await self.exchange.fetch_ticker(clean_sym)
-                    price = float(ticker.get("bid", ticker.get("last", 0.0))) if is_long else float(ticker.get("ask", ticker.get("last", 0.0)))
-            except Exception as pe:
-                log.warning(f"[BITGET-UTA] Failed to fetch inside spread for post-only order: {pe}")
+        # Ensure limit price rests passively on the book (long <= best_bid, short >= best_ask)
+        try:
+            ob = await self.exchange.fetch_order_book(clean_sym, limit=5)
+            bids = ob.get("bids", []) if isinstance(ob, dict) else []
+            asks = ob.get("asks", []) if isinstance(ob, dict) else []
+            best_bid = float(bids[0][0]) if bids and len(bids[0]) > 0 else 0.0
+            best_ask = float(asks[0][0]) if asks and len(asks[0]) > 0 else 0.0
+            if best_bid <= 0.0 or best_ask <= 0.0:
+                ticker = await self.exchange.fetch_ticker(clean_sym)
+                if isinstance(ticker, dict):
+                    best_bid = float(ticker.get("bid") or ticker.get("last") or 0.0)
+                    best_ask = float(ticker.get("ask") or ticker.get("last") or 0.0)
+            if price is None or price <= 0.0:
+                price = best_bid if is_long else best_ask
+            else:
+                if is_long and best_bid > 0.0:
+                    price = min(float(price), best_bid)
+                elif not is_long and best_ask > 0.0:
+                    price = max(float(price), best_ask)
+        except Exception as pe:
+            log.warning(f"[BITGET-UTA] Failed to fetch inside spread for post-only order: {pe}")
+            if price is None or price <= 0.0:
                 ticker = await self.exchange.fetch_ticker(clean_sym)
                 price = float(ticker.get("last", 0.0))
 

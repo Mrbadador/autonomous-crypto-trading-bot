@@ -14,6 +14,7 @@ Critical Features:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ import signal
 import sqlite3
 import sys
 import time
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, timezone, UTC, timedelta
 import pandas as pd
 import numpy as np
 import ta
@@ -30,9 +31,10 @@ import config
 from bitget_uta_client import BitgetUTAClient
 from conviction_filter import ConvictionBoardroom
 from db_manager import DBWriteQueue
-from swing_trader import SwingArchitectTrader
+from swing_trader import SwingArchitectTrader, EXCHANGE_MIN_MARGIN_USD
 from indicators import detect_momentum_divergence, compute_volume_profile, compute_td_sequential
 from microstructure_guard import MicrostructureStateCache
+from strategy_base import SwingKumoStrategy, ChopGridMakerStrategy, BearScalpShortStrategy
 
 
 try:
@@ -50,13 +52,252 @@ if not log.handlers:
     _sh = logging.StreamHandler(sys.stdout)
     _sh.setFormatter(_fmt)
     log.addHandler(_sh)
+    # Note: When spawned under start_system.py, stdout/stderr is already redirected to logs/super_bot.log.
+    # Attaching a redundant FileHandler here causes every log statement to be written twice.
+    # Only attach FileHandler if explicitly requested via SUPER_BOT_FILE_LOGGING or if running standalone interactively.
+    if os.getenv("SUPER_BOT_FILE_LOGGING", "").lower() in ("1", "true"):
+        try:
+            os.makedirs("logs", exist_ok=True)
+            _fh = logging.FileHandler("logs/super_bot.log", encoding="utf-8")
+            _fh.setFormatter(_fmt)
+            log.addHandler(_fh)
+        except Exception:
+            pass
+
+
+def acquire_asset_lock(db_path: str, symbol: str, owner: str, reason: str, now_iso: str) -> bool:
+    """Atomically take or renew the exclusive symbol lock.
+
+    Returns True when `owner` holds the lock for `symbol` once this returns, and
+    False only when another engine holds a lock that is still fresh (<900s).
+    """
+    with contextlib.closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+        conn.execute(
+            """DELETE FROM asset_locks
+               WHERE symbol = ?
+                 AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0""",
+            (symbol,),
+        )
+        renewed = conn.execute(
+            """UPDATE asset_locks SET locked_at = ?, reason = ?, heartbeat = ?
+               WHERE symbol = ? AND locked_by = ?""",
+            (now_iso, reason, now_iso, symbol, owner),
+        ).rowcount
+        if renewed == 0:
+            try:
+                taken = conn.execute(
+                    """INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
+                       SELECT ?, ?, ?, ?, ?
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM asset_locks
+                           WHERE symbol = ?
+                             AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 <= 900.0
+                       )""",
+                    (symbol, owner, now_iso, reason, now_iso, symbol),
+                ).rowcount
+            except sqlite3.IntegrityError:
+                # Another engine inserted the row between the check and the
+                # insert; the lock is held elsewhere, so refuse it.
+                conn.rollback()
+                return False
+            if taken == 0:
+                conn.rollback()
+                return False
+        conn.commit()
+        return True
+
+
+def compute_grid_5m_indicators(df: pd.DataFrame) -> dict:
+    """
+    Pure indicator pipeline for 5m Chop Grid & Scalp Short engines.
+    Zero-lookahead: computes RSI (14), 24-period rolling VWAP & deviation bands,
+    EMA20, candle wick ratios, and 14-period ADX strictly up to the current bar.
+    """
+    if df is None or len(df) < 25:
+        return {}
+
+    c = df["close"]
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / (loss + 1e-9)
+    rsi_series = 100.0 - (100.0 / (1.0 + rs))
+    rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
+    rsi_prev = float(rsi_series.iloc[-2]) if len(rsi_series) >= 2 and not pd.isna(rsi_series.iloc[-2]) else rsi
+
+    cum_pv = (c * df["volume"]).rolling(24).sum()
+    cum_v = df["volume"].rolling(24).sum()
+    vwap_series = cum_pv / (cum_v + 1e-9)
+    vwap = float(vwap_series.iloc[-1]) if not pd.isna(vwap_series.iloc[-1]) else float(c.iloc[-1])
+
+    # True VWAP deviation band: σ of (price - rolling VWAP), fallback to std-of-closes
+    vwap_diff = c - vwap_series
+    std_series = vwap_diff.rolling(24).std()
+    rolling_std = float(std_series.iloc[-1]) if not pd.isna(std_series.iloc[-1]) else 0.0
+    if rolling_std <= 0:
+        c_std = c.rolling(24).std()
+        rolling_std = float(c_std.iloc[-1]) if not pd.isna(c_std.iloc[-1]) else 0.0
+
+    lower_band = vwap - (2.0 * rolling_std)
+    upper_band = vwap + (2.0 * rolling_std)
+
+    ema20_series = c.ewm(span=20, adjust=False).mean()
+    ema20 = float(ema20_series.iloc[-1]) if not pd.isna(ema20_series.iloc[-1]) else float(c.iloc[-1])
+
+    c_open = float(df["open"].iloc[-1])
+    c_high = float(df["high"].iloc[-1])
+    c_low = float(df["low"].iloc[-1])
+    c_close = float(df["close"].iloc[-1])
+    c_range = max(c_high - c_low, 1e-6)
+    upper_wick = c_high - max(c_open, c_close)
+    upper_wick_ratio = upper_wick / c_range
+    lower_wick = min(c_open, c_close) - c_low
+    lower_wick_ratio = lower_wick / c_range
+
+    adx_5m = 0.0
     try:
-        os.makedirs("logs", exist_ok=True)
-        _fh = logging.FileHandler("logs/super_bot.log", encoding="utf-8")
-        _fh.setFormatter(_fmt)
-        log.addHandler(_fh)
+        adx_series = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
+        if not pd.isna(adx_series.iloc[-1]):
+            adx_5m = float(adx_series.iloc[-1])
     except Exception:
-        pass
+        adx_5m = 0.0
+
+    is_red_candle = c_close < c_open
+    is_shooting_star = upper_wick_ratio >= 0.35
+    is_rsi_falling = rsi < (rsi_prev - 0.5)
+    has_bearish_reversal = (is_red_candle and upper_wick_ratio >= 0.25) or (is_shooting_star and is_rsi_falling)
+
+    rebound_hook = (
+        (c_close > c_open and lower_wick_ratio >= 0.20) or
+        (lower_wick_ratio >= 0.35) or
+        (rsi >= (rsi_prev + 1.0))
+    )
+
+    return {
+        "rsi": rsi,
+        "rsi_prev": rsi_prev,
+        "vwap": vwap,
+        "rolling_std": rolling_std,
+        "lower_band": lower_band,
+        "upper_band": upper_band,
+        "ema20": ema20,
+        "adx_5m": adx_5m,
+        "curr_price": c_close,
+        "open": c_open,
+        "high": c_high,
+        "low": c_low,
+        "close": c_close,
+        "upper_wick_ratio": upper_wick_ratio,
+        "lower_wick_ratio": lower_wick_ratio,
+        "rebound_hook": rebound_hook,
+        "is_red_candle": is_red_candle,
+        "is_shooting_star": is_shooting_star,
+        "is_rsi_falling": is_rsi_falling,
+        "has_bearish_reversal": has_bearish_reversal,
+    }
+
+
+def evaluate_chop_grid_signal(
+    ind: dict,
+    curr_price: float,
+    rsi_thresh: float = 30.0,
+    max_adx: float = 24.0,
+    regime_adx: float = 20.0,
+    di_spread: float = 0.0
+) -> tuple[bool, str]:
+    """
+    Pure evaluation of Chop Grid Maker Long Dip-Buy entry.
+    Enforces:
+      - Market regime seller dominance gate (regime_adx < 25 or di_spread >= -4.0)
+      - Asset 5m ADX ceiling (adx_5m < 24.0)
+      - Rebound hook / lower wick rejection confirmation:
+        (C > O and lower_wick_ratio >= 0.20) or (lower_wick_ratio >= 0.35) or (RSI_t >= RSI_{t-1} + 1.0)
+      - Band penetration & oversold RSI (RSI < rsi_thresh and price <= lower_band)
+    """
+    if not ind or "rsi" not in ind:
+        return False, "NO_INDICATORS"
+
+    # Regime gates: Veto dip-buys if sellers dominate in strong expansion
+    if regime_adx >= 25.0 and di_spread < -4.0:
+        return False, f"REGIME_SELLER_DOMINANCE (ADX={regime_adx:.1f}, DI_SPREAD={di_spread:+.1f})"
+
+    # Asset 5m ADX exhaustion guard (must be chopping: 5m ADX < 24.0)
+    if ind.get("adx_5m", 0.0) >= max_adx:
+        return False, f"ASSET_5M_ADX_WATERFALL (ADX={ind.get('adx_5m', 0.0):.1f} >= {max_adx:.1f})"
+
+    rsi = float(ind["rsi"])
+    rsi_prev = float(ind.get("rsi_prev", rsi))
+    lower_band = float(ind["lower_band"])
+
+    c_open = float(ind.get("open", curr_price))
+    c_high = float(ind.get("high", curr_price))
+    c_low = float(ind.get("low", curr_price))
+    c_close = float(ind.get("close", curr_price))
+    c_range = max(c_high - c_low, 1e-6)
+    lower_wick_ratio = float(
+        ind.get("lower_wick_ratio", (min(c_open, c_close) - c_low) / c_range)
+    )
+    rebound_hook = bool(
+        (c_close > c_open and lower_wick_ratio >= 0.20)
+        or (lower_wick_ratio >= 0.35)
+        or (rsi >= (rsi_prev + 1.0))
+        or ind.get("rebound_hook", False)
+    )
+
+    if rsi < rsi_thresh and curr_price <= lower_band:
+        if not rebound_hook:
+            return False, (
+                f"LACKS_REBOUND_HOOK (LowerWick={lower_wick_ratio:.1%}, "
+                f"RSI={rsi:.1f}, RSI_prev={rsi_prev:.1f})"
+            )
+        return True, (
+            f"CHOP_DIP_CONFIRMED (RSI={rsi:.1f} < {rsi_thresh:.1f}, "
+            f"Price={curr_price} <= Lower={lower_band:.4f}, LowerWick={lower_wick_ratio:.1%})"
+        )
+
+    return False, "CONDITIONS_NOT_MET"
+
+
+def evaluate_scalp_short_signal(
+    ind: dict,
+    curr_price: float,
+    mode: str = "CHOP",
+    min_rsi: float = 38.0,
+    rsi_overbought: float = 68.0,
+    max_adx: float = 22.0
+) -> tuple[bool, str]:
+    """
+    Pure evaluation of Quick Scalp Short entry.
+    """
+    if not ind or "rsi" not in ind:
+        return False, "NO_INDICATORS"
+
+    rsi = ind["rsi"]
+    if rsi < min_rsi:
+        return False, f"ANTI_BOTTOM_RSI (RSI={rsi:.1f} < {min_rsi:.1f})"
+
+    adx_5m = ind.get("adx_5m", 0.0)
+    if mode == "CHOP" and adx_5m >= max_adx:
+        return False, f"ACTIVE_BREAKOUT_ADX (5m ADX={adx_5m:.1f} >= {max_adx:.1f})"
+
+    upper_band = ind["upper_band"]
+    has_bearish_reversal = ind.get("has_bearish_reversal", False)
+    vwap = ind["vwap"]
+    ema20 = ind["ema20"]
+    is_red_candle = ind.get("is_red_candle", False)
+
+    if mode == "CHOP":
+        if curr_price >= (upper_band * 0.998) and rsi >= rsi_overbought:
+            if not has_bearish_reversal:
+                return False, f"LACKS_REVERSAL_CONFIRMATION (Wick={ind.get('upper_wick_ratio', 0.0):.1%})"
+            return True, f"CHOP_RANGE_TOP_FADE (Price={curr_price} >= Upper={upper_band:.4f}, RSI={rsi:.1f}, ADX={adx_5m:.1f})"
+    elif mode == "BEAR":
+        bounced_to_resistance = (curr_price >= vwap * 0.997) or (curr_price >= ema20 * 0.998)
+        in_relief_rsi_window = (45.0 <= rsi <= 68.0)
+        if bounced_to_resistance and in_relief_rsi_window and is_red_candle:
+            return True, f"BEAR_RELIEF_BOUNCE_FADE (Price={curr_price}, RSI={rsi:.1f})"
+
+    return False, "CONDITIONS_NOT_MET"
 
 
 class SuperBotTrader:
@@ -82,7 +323,7 @@ class SuperBotTrader:
         self.grid_max_adx = getattr(config, "GRID_MAX_5M_ADX", 24.0)   # 5m ADX exhaustion ceiling (blocks waterfall dips)
         
         # Quick Scalp Short Parameters (Fast Turnover Protocol V36.6)
-        self.scalp_short_enabled = getattr(config, "SCALP_SHORT_ENABLED", True)
+        self.scalp_short_enabled = getattr(config, "SCALP_SHORT_ENABLED", False)
         self.scalp_short_tp_pct = getattr(config, "SCALP_SHORT_TP_PCT", 0.0120)     # +1.20% limit target
         self.scalp_short_sl_pct = getattr(config, "SCALP_SHORT_SL_PCT", 0.0100)     # -1.00% tight stop
         self.scalp_short_be_trigger = getattr(config, "SCALP_SHORT_BE_TRIGGER_PCT", 0.0050) # +0.50% profit triggers breakeven ratchet
@@ -106,9 +347,13 @@ class SuperBotTrader:
         self.db_queue = DBWriteQueue.get_instance("trading_data.db")
         self._stop_event = asyncio.Event()
         self._background_tasks = set()
+        self._chop_grid_adx_active = True  # Q-2: stateful hysteresis tracker for Market ADX chop gate
         
-        # Sub-engine for Swing Architecture
+        # Sub-engine for Swing Architecture + Declarative Strategy Registry (Jesse Pattern)
         self.swing_engine = SwingArchitectTrader()
+        self.swing_strategy = SwingKumoStrategy()
+        self.grid_strategy = ChopGridMakerStrategy()
+        self.scalp_short_strategy = BearScalpShortStrategy()
         
         # Internal state
         self.active_positions = {}  # symbol -> dict
@@ -118,13 +363,24 @@ class SuperBotTrader:
         self.regime_adx = 20.0
         self.regime_hurst = 0.50
         self.market_regime_di_spread = 0.0
+        self.turbulence_index = 0.0
+        self.turbulence_threshold = 22.0
+        self.turbulence_state = "CALM_NORMAL"
+        # Fail-closed regime health: new entries are blocked while the regime row is missing,
+        # stale, unparseable or non-finite. Position management/exits ignore this flag.
+        self.regime_data_ok = False
+        self.regime_stale_reason = "no regime read yet"
+        self._regime_health_logged = None
+        self.peak_balance = float(getattr(config, "INITIAL_BALANCE", 250.0))
         
         self._init_database()
 
     def _init_database(self):
-        """Ensures Super Bot tables and state exist."""
+        """Ensures Super Bot tables and state exist, and restores High-Water Mark peak balance."""
         try:
             with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=10000;")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS super_bot_telemetry (
                         timestamp TEXT PRIMARY KEY,
@@ -137,10 +393,58 @@ class SuperBotTrader:
                         status TEXT
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS system_state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT,
+                        updated_at TEXT
+                    )
+                """)
+                row_gp = conn.execute(
+                    "SELECT MAX(CAST(value AS REAL)) FROM system_state WHERE key = 'global_peak_balance'"
+                ).fetchone()
+                init_bal = float(getattr(config, "INITIAL_BALANCE", 250.0))
+                if row_gp and row_gp[0] is not None and float(row_gp[0]) > 0:
+                    self.peak_balance = max(float(row_gp[0]), init_bal)
+                else:
+                    self.peak_balance = init_bal
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('global_peak_balance', ?, ?)",
+                        (str(round(self.peak_balance, 4)), datetime.now(UTC).isoformat()),
+                    )
                 conn.commit()
-            log.info("[DB-INIT] Super Bot telemetry schema initialized.")
+            log.info(f"[DB-INIT] Super Bot telemetry schema initialized (HWM Peak Balance: ${self.peak_balance:,.2f}).")
         except Exception as e:
             log.error(f"[DB-INIT-ERR] {e}")
+
+    def _sync_and_check_hwm_drawdown_sync(self, current_balance: float) -> tuple[bool, float, float]:
+        """Updates persistent 'global_peak_balance' in system_state and checks GLOBAL_MAX_DD_LIMIT."""
+        init_bal = float(getattr(config, "INITIAL_BALANCE", 250.0))
+        peak = max(float(getattr(self, "peak_balance", init_bal) or init_bal), init_bal)
+        try:
+            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                row_gp = conn.execute(
+                    "SELECT MAX(CAST(value AS REAL)) FROM system_state WHERE key = 'global_peak_balance'"
+                ).fetchone()
+                if row_gp and row_gp[0] is not None and float(row_gp[0]) > 0:
+                    peak = max(peak, float(row_gp[0]))
+                if current_balance > peak:
+                    peak = current_balance
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES ('global_peak_balance', ?, ?)",
+                        (str(round(peak, 4)), datetime.now(UTC).isoformat()),
+                    )
+                    conn.commit()
+        except Exception as e:
+            log.debug(f"[HWM-SYNC-NOTE] {e}")
+            if current_balance > peak:
+                peak = current_balance
+
+        self.peak_balance = peak
+        drawdown = (peak - current_balance) / peak if peak > 0 else 0.0
+        max_dd_limit_pct = float(getattr(config, "GLOBAL_MAX_DD_LIMIT", 20.0))
+        is_breached = (drawdown * 100.0) >= max_dd_limit_pct
+        return is_breached, drawdown, peak
 
     def _track_task(self, coro, name="task"):
         """SRE-P0: Anchors background coroutines in a persistent set to prevent garbage collection."""
@@ -150,11 +454,13 @@ class SuperBotTrader:
         return task
 
     async def initialize_clients(self):
-        """Initializes Bitget UTA async exchange client and links to sub-engines."""
+        """Initializes Bitget UTA async exchange client and links to sub-engines + Sentinel."""
         try:
             self.uta_client = BitgetUTAClient()
             self.swing_engine.uta_client = self.uta_client
-            log.info("[CLIENT] BitgetUTAClient successfully connected and bound to Super Bot.")
+            if hasattr(self.swing_engine, "sentinel") and self.swing_engine.sentinel:
+                self.swing_engine.sentinel.start_background_refresh([s.split("/")[0] for s in self.symbols])
+            log.info("[CLIENT] BitgetUTAClient connected and Sentinel background refresh started for Super Bot.")
         except Exception as e:
             log.critical(f"[CLIENT] Failed to initialize BitgetUTAClient: {e}")
             raise
@@ -166,20 +472,30 @@ class SuperBotTrader:
         """Adopts and syncs active positions from both swing_open_positions and mean_reversion_open_positions."""
         try:
             with sqlite3.connect("trading_data.db", timeout=10.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=10000;")
                 conn.row_factory = sqlite3.Row
                 
-                # 1. Adopt active 4H Swing and Chop Grid positions
-                rows_swing = conn.execute("SELECT * FROM swing_open_positions WHERE status = 'ACTIVE'").fetchall()
+                # 1. Adopt active 4H Swing and Chop Grid positions (including PENDING_CLOSE)
+                rows_swing = conn.execute("SELECT * FROM swing_open_positions WHERE status IN ('ACTIVE', 'PENDING_CLOSE')").fetchall()
                 active = {}
+                configured_symbols = set(getattr(config, "SYMBOLS", []))
                 for r in rows_swing:
                     pos = dict(r)
+                    sym = pos.get("symbol")
+                    if configured_symbols and sym not in configured_symbols:
+                        log.warning(f"[ADOPT-SKIP-UNKNOWN] ⚠️ Skipping adoption of unknown symbol '{sym}' (not in config.SYMBOLS).")
+                        continue
                     notes = str(pos.get("notes", "")).lower()
                     if "scalp_short" in notes or "scalp short" in notes or "short scalp" in notes:
                         pos["engine_type"] = "SCALP_SHORT"
+                        pos["lock_owner"] = "super_bot_scalp_short"
                     elif "grid" in notes or "chop" in notes:
                         pos["engine_type"] = "GRID_MAKER"
+                        pos["lock_owner"] = "super_bot_grid"
                     else:
                         pos["engine_type"] = "SWING_4H"
+                        pos["lock_owner"] = "swing_architect"
                     active[pos["symbol"]] = pos
                     
                 # 2. Adopt active Mean Reversion Grid positions (legacy fallback if any)
@@ -187,42 +503,191 @@ class SuperBotTrader:
                     rows_grid = conn.execute("SELECT * FROM mean_reversion_open_positions").fetchall()
                     for r in rows_grid:
                         pos = dict(r)
-                        pos["engine_type"] = "GRID_MAKER"
-                        active[pos["symbol"]] = pos
+                        sym = pos.get("symbol")
+                        if not sym:
+                            continue
+                        if configured_symbols and sym not in configured_symbols:
+                            log.warning(f"[ADOPT-SKIP-UNKNOWN] ⚠️ Skipping legacy mean_reversion symbol '{sym}' (not in config.SYMBOLS).")
+                            continue
+                        if sym not in active:
+                            pos["engine_type"] = "GRID_MAKER"
+                            pos["lock_owner"] = "super_bot_grid"
+                            active[sym] = pos
                 except Exception:
                     pass
                     
                 self.active_positions = active
                 # Mirror ALL active positions to swing engine so manage_active_positions tracks them with ratchets
                 self.swing_engine.active_positions = dict(active)
+
+                # Renew heartbeats for active positions and prune orphaned asset_locks that have no active position
+                now_iso = datetime.now(timezone.utc).isoformat()
+                active_syms = list(active.keys())
+                for sym in active_syms:
+                    conn.execute("""
+                        UPDATE asset_locks SET heartbeat = ?
+                        WHERE symbol = ?
+                          AND locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                    """, (now_iso, sym))
+
+                if active_syms:
+                    placeholders = ",".join("?" for _ in active_syms)
+                    conn.execute(f"""
+                        DELETE FROM asset_locks
+                        WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                          AND symbol NOT IN ({placeholders})
+                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
+                    """, active_syms)
+                else:
+                    conn.execute("""
+                        DELETE FROM asset_locks
+                        WHERE locked_by IN ('super_bot_grid', 'super_bot_scalp_short', 'swing_architect')
+                          AND (julianday('now') - julianday(COALESCE(heartbeat, locked_at))) * 86400.0 > 900.0
+                    """)
+                conn.commit()
                 
         except Exception as e:
-            log.error(f"[SYNC-ERR] Error adopting positions: {e}")
+            log.warning(f"[SYNC-ERR] Error adopting positions or refreshing lock heartbeats: {e}")
+
+    @staticmethod
+    def _regime_row_age_sec(raw_ts):
+        """Age in seconds of a regime row's publication timestamp; None if unparseable."""
+        if not raw_ts:
+            return None
+        try:
+            cleaned = str(raw_ts).strip().replace("Z", "+00:00")
+            if "T" not in cleaned and " " in cleaned:
+                cleaned = cleaned.replace(" ", "T")
+            parsed = datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return max(0.0, time.time() - parsed.timestamp())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _finite_or_none(value):
+        try:
+            as_float = float(value)
+        except (TypeError, ValueError):
+            return None
+        return as_float if np.isfinite(as_float) else None
+
+    def _note_regime_health(self, is_ok, reason):
+        """Log once per health transition rather than on every 5-second routing loop."""
+        if self._regime_health_logged == is_ok:
+            return
+        self._regime_health_logged = is_ok
+        if is_ok:
+            log.info("[REGIME-GATE] ✅ Regime telemetry valid again — new entries re-enabled.")
+        else:
+            log.warning(f"[REGIME-GATE] 🛑 Blocking NEW entries: {reason}. Live positions keep being managed and exited normally.")
 
     def _get_market_regime_sync(self):
-        """Reads current market regime determined by regime_classifier.py."""
-        regime = "CHOP"
-        adx = 20.0
+        """Reads current market regime & FinRL Mahalanobis Turbulence determined by regime_classifier.py.
+
+        Fail-closed for NEW entries: an absent row, a missing/too-old/unparseable publication
+        timestamp, an UNKNOWN label, or non-finite ADX/Hurst/DI telemetry leaves
+        self.regime_data_ok False so the router stops opening positions. Trailing stops,
+        breakeven ratchets, profit floors and exits are deliberately not gated on it.
+        """
+        regime = "UNKNOWN"
+        adx = 0.0
         hurst = 0.50
         di_spread = 0.0
+        turb_idx = 0.0
+        turb_thresh = 22.0
+        turb_state = "UNKNOWN"
+        problem = None
+
+        max_age = self._finite_or_none(getattr(config, "REGIME_MAX_AGE_SEC", None))
+        if max_age is None or max_age <= 0:
+            max_age = 900.0
+
         try:
             with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
-                row = conn.execute("SELECT regime, adx, hurst, plus_di, minus_di FROM market_regime ORDER BY id DESC LIMIT 1").fetchone()
-                if row:
-                    regime = str(row[0] or "CHOP").upper()
-                    if row[1] is not None: adx = float(row[1])
-                    if row[2] is not None: hurst = float(row[2])
-                    p_di = float(row[3]) if row[3] is not None else 0.0
-                    m_di = float(row[4]) if row[4] is not None else 0.0
+                row = conn.execute(
+                    "SELECT regime, adx, hurst, plus_di, minus_di, turbulence_index, turbulence_threshold, turbulence_state, timestamp "
+                    "FROM market_regime ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            if not row:
+                problem = "market_regime table has no rows"
+            else:
+                regime = str(row[0] or "").strip().upper() or "UNKNOWN"
+                adx_val = self._finite_or_none(row[1])
+                hurst_val = self._finite_or_none(row[2])
+                p_di = self._finite_or_none(row[3])
+                m_di = self._finite_or_none(row[4])
+                raw_ts = row[8] if len(row) > 8 else None
+                age = self._regime_row_age_sec(raw_ts)
+
+                if adx_val is not None:
+                    adx = adx_val
+                if hurst_val is not None:
+                    hurst = hurst_val
+                if p_di is not None and m_di is not None:
                     di_spread = p_di - m_di
+                if len(row) > 5:
+                    tv = self._finite_or_none(row[5])
+                    if tv is not None:
+                        turb_idx = tv
+                    tv = self._finite_or_none(row[6])
+                    if tv is not None:
+                        turb_thresh = tv
+                    if row[7]:
+                        turb_state = str(row[7])
+
+                if adx_val is None:
+                    problem = f"ADX is missing or non-finite ({row[1]!r})"
+                elif not 0.0 <= adx_val <= 100.0:
+                    problem = f"ADX out of range ({adx_val:.2f})"
+                elif hurst_val is None or not 0.0 <= hurst_val <= 1.0:
+                    problem = f"Hurst is missing, non-finite or out of range ({row[2]!r})"
+                elif p_di is None or m_di is None:
+                    problem = f"+DI/-DI missing or non-finite ({row[3]!r}, {row[4]!r})"
+                elif age is None:
+                    problem = f"regime timestamp missing or unparseable ({raw_ts!r})"
+                elif age > max_age:
+                    problem = f"regime row is {age:.0f}s old (max {max_age:.0f}s)"
+                elif regime == "UNKNOWN":
+                    problem = "regime label is UNKNOWN"
         except Exception as e:
-            log.debug(f"[REGIME-READ-NOTE] {e}")
-            
+            log.warning(f"[REGIME-READ-FAIL-CLOSED] Error reading market_regime: {e}. Forcing regime=UNKNOWN.")
+            regime = "UNKNOWN"
+            adx = 0.0
+            problem = f"market_regime read failed: {e}"
+
+        self.regime_data_ok = problem is None
+        self.regime_stale_reason = problem or "regime telemetry valid"
+        self._note_regime_health(self.regime_data_ok, problem)
+
         self.current_regime = regime
         self.regime_adx = adx
         self.regime_hurst = hurst
         self.market_regime_di_spread = di_spread
+        self.turbulence_index = turb_idx
+        self.turbulence_threshold = turb_thresh
+        self.turbulence_state = turb_state
         return regime, adx, hurst
+
+    def _get_finrl_strategy_weight(self, engine_tag: str) -> float:
+        """
+        Reads FinRL Rolling Validation Sharpe Strategy Ensemble multiplier from quant_validation_report.json.
+        Overweights the highest-Sharpe strategy (up to 1.20x) and throttles low-Sharpe strategies (0.75x-0.90x).
+        """
+        try:
+            report_path = os.path.join("cache", "quant_validation_report.json")
+            if os.path.exists(report_path):
+                with open(report_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                weights = (data.get("finrl_ensemble_selector") or {}).get("strategy_weights") or {}
+                w_info = weights.get(engine_tag) or {}
+                mult = float(w_info.get("allocation_weight_mult", 1.0))
+                return max(0.75, min(1.25, mult))
+        except Exception:
+            pass
+        return 1.0
 
     # ---------------------------------------------------------------------------
     # Mean Reversion Maker Engine (CHOP Mode)
@@ -232,6 +697,14 @@ class SuperBotTrader:
         # Check available capacity
         active_count = len(self.active_positions)
         if active_count >= self.max_locks:
+            return
+
+        # FinRL Cross-Asset Mahalanobis Turbulence Circuit Breaker
+        if self.turbulence_state == "EXTREME_SHOCK":
+            log.warning(
+                f"[FINRL-TURBULENCE-SHIELD] 🚨 Cross-asset turbulence breach active "
+                f"(d_t={self.turbulence_index:.2f} > {self.turbulence_threshold:.2f}). Chop Grid dip-buying muted."
+            )
             return
 
         # Safeguard 0: Fleet-Wide Long Exposure Cap (Strictly Max 2 Active Longs Across Fleet)
@@ -246,10 +719,6 @@ class SuperBotTrader:
         # If market ADX >= 25.0 and DI spread is negative (sellers dominate), dip-buying is strictly prohibited.
         if self.regime_adx >= 25.0 and self.market_regime_di_spread < -4.0:
             log.info(f"[GRID-MARKET-SHIELD] 🛡️ Market ADX={self.regime_adx:.1f} >= 25.0 with seller dominance (DI spread={self.market_regime_di_spread:+.1f}). Chop Grid dip-buys muted.")
-            return
-
-        if self.regime_adx >= 28.0:
-            log.info(f"[GRID-MARKET-SHIELD] 🛡️ Market ADX={self.regime_adx:.1f} >= 28.0 indicates powerful directional expansion. Chop Grid muted.")
             return
 
         # Eligible symbols: not currently locked
@@ -319,38 +788,131 @@ class SuperBotTrader:
                     continue
                     
                 df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                c = df["close"]
+                # TASK 2: Evaluate primary indicator thresholds on the closed candle (df.iloc[:-1])
+                # so mid-candle waterfalls do not trigger premature knife-catching entries.
+                df_closed = df.iloc[:-1] if len(df) > 25 else df
+                ind = compute_grid_5m_indicators(df_closed)
+                if not ind:
+                    continue
                 
-                # Indicators (Clean Sept 30 Core Formula: 5m RSI + 24-period VWAP Lower Band)
-                delta = c.diff()
-                gain = delta.clip(lower=0).rolling(14).mean()
-                loss = (-delta.clip(upper=0)).rolling(14).mean()
-                rs = gain / (loss + 1e-9)
-                rsi = float((100.0 - (100.0 / (1.0 + rs))).iloc[-1])
-                
-                cum_pv = (c * df["volume"]).rolling(24).sum()
-                cum_v = df["volume"].rolling(24).sum()
-                vwap = cum_pv / (cum_v + 1e-9)
-                rolling_std = c.rolling(24).std()
-                lower_band = float((vwap - (2.0 * rolling_std)).iloc[-1])
-                
-                curr_price = float(c.iloc[-1])
+                curr_price = ind["curr_price"]
+                rsi = ind["rsi"]
+                lower_band = ind["lower_band"]
+                adx_5m = ind.get("adx_5m", 0.0)
 
-                # Signal: Oversold dip in range (RSI < threshold and price <= VWAP - 2.0 std)
-                if rsi < self.grid_rsi_thresh and curr_price <= lower_band:
-                    log.info(f"[GRID-OPPORTUNITY] [SIGNAL] {symbol} Oversold Dip! Price: ${curr_price:,.4f} <= Lower Band: ${lower_band:,.4f} | RSI: {rsi:.1f} <= {self.grid_rsi_thresh:.1f}")
+                # Dynamic dip threshold: In confirmed BULL_TREND, pullbacks are shallow (RSI <= 36.0 or lower Bollinger touch).
+                # In Chop/Neutral regimes, require standard oversold threshold (e.g. RSI <= 30.0).
+                eff_rsi_thresh = self.grid_rsi_thresh
+                if "BULL" in str(self.current_regime).upper() or self.market_regime_di_spread >= 2.0:
+                    eff_rsi_thresh = max(self.grid_rsi_thresh, 36.0)
+
+                # Verify ChopGridMakerStrategy rules on closed bar:
+                # 1) 5m ADX < 24.0
+                # 2) Rebound hook / lower wick rejection: (C > O and lower_wick_ratio >= 0.20) or (lower_wick_ratio >= 0.35) or (RSI_t >= RSI_{t-1} + 1.0)
+                # 3) Band penetration (curr_price <= lower_band) and oversold RSI (rsi < eff_rsi_thresh)
+                is_sig, sig_reason = evaluate_chop_grid_signal(
+                    ind=ind,
+                    curr_price=curr_price,
+                    rsi_thresh=eff_rsi_thresh,
+                    max_adx=getattr(self, "grid_max_adx", 24.0),
+                    regime_adx=self.regime_adx,
+                    di_spread=self.market_regime_di_spread
+                )
+
+                if is_sig:
+                    # Microstructure & Markov Gates for Dip-Buy
+                    from microstructure_guard import MicrostructureStateCache
+                    ms_state = MicrostructureStateCache.get_state(clean_sym)
+                    tox_halt = bool(ms_state.get("toxicity_halt", False))
+                    vpin_val = float(ms_state.get("vpin", 0.0) or 0.0)
+                    micro_p = float(ms_state.get("micro_price", 0.0) or curr_price)
+                    if micro_p <= 0.0:
+                        micro_p = curr_price
+
+                    # N-3 FIX: If microstructure state is empty (missing key or stale daemon), apply defensive sizing
+                    ms_is_degraded = (not ms_state)
+                    if ms_is_degraded:
+                        log.info(f"[GRID-MS-DEGRADED] Microstructure state for {clean_sym} is missing or stale (>60s). Scaling margin 50% for defense.")
+
+                    # P0-3 FIX: hawkes_rho is mathematically frozen (0.30314) due to static branching ratios.
+                    # Excised rho comparison from entry veto path; hawkes_spoof_index and VPIN remain live controls.
+                    hawkes_spoof = float(ms_state.get("hawkes_spoof_index", 0.0) or 0.0)
+                    hawkes_veto = bool(ms_state.get("hawkes_veto", False))
+                    spoof_cut = float(getattr(config, "HAWKES_SPOOF_VETO_THRESHOLD", 0.78))
+
+                    if hawkes_veto or hawkes_spoof >= spoof_cut:
+                        log.warning(f"[GRID-HAWKES-VETO] 🚨 Order flow spoofing detected on {symbol}: spoof={hawkes_spoof:.2f}>={spoof_cut}, veto_flag={hawkes_veto}. Suppressing dip-buy.")
+                        continue
+
+                    vpin_threshold = float(getattr(config, "MICROSTRUCTURE_VPIN_VETO_THRESHOLD", 0.70))
+                    if tox_halt or vpin_val >= vpin_threshold:
+                        # Q-1 FIX: Hard veto on toxicity_halt and high VPIN >= threshold
+                        # Fail-closed: blocks entries during severe adverse informed flow cascades
+                        log.warning(f"[GRID-VPIN-TOXICITY-VETO] 🚨 Microstructure Toxicity veto for {symbol}: tox_halt={tox_halt}, VPIN={vpin_val:.2f} >= {vpin_threshold:.2f}. Suppressing dip-buy.")
+                        continue
+
+
+                    # Markov Regime Cascade & Tradability Duration Screen (Playbook Step 9)
+                    def _check_markov_telemetry():
+                        try:
+                            max_age = float(getattr(config, "REGIME_MAX_AGE_SEC", 900.0) or 900.0)
+                        except (TypeError, ValueError):
+                            max_age = 900.0
+                        try:
+                            with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                                row = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                if row and row[0]:
+                                    raw_val, raw_ts = row[0], row[1]
+                                    age = self._regime_row_age_sec(raw_ts)
+                                    if age is not None and age > max_age:
+                                        log.warning(f"[GRID-MARKOV-STALE] ⚠️ markov_regime_telemetry is stale ({age:.1f}s > {max_age:.1f}s). Skipping Markov gate.")
+                                        return {}
+                                    parsed = json.loads(raw_val)
+                                    if "is_tradable" not in parsed:
+                                        age_str = f"{age:.1f}s" if age is not None else "unknown"
+                                        log.warning(f"[GRID-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'is_tradable' key (age: {age_str}).")
+                                    if "sizing_multiplier" not in parsed:
+                                        age_str = f"{age:.1f}s" if age is not None else "unknown"
+                                        log.warning(f"[GRID-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'sizing_multiplier' key (age: {age_str}).")
+                                    return parsed
+                        except Exception:
+                            pass
+                        return {}
+                    m_data = await asyncio.to_thread(_check_markov_telemetry)
+                    if m_data:
+                        # 1. Bear cascade gate
+                        p_bear = float(m_data.get("state_probabilities", {}).get("BEAR_CASCADE", 0.0) or 0.0)
+                        if p_bear >= 0.55:
+                            log.warning(f"[GRID-VETO] 🛑 Markov Bear Cascade Probability {p_bear:.2f} >= 0.55 for {symbol}. Skipping dip-buy into cascade.")
+                            continue
+
+                        # 2. Tradability duration gate (anti-churn fee shield)
+                        is_tradable = m_data.get("is_tradable", True)
+                        if not is_tradable:
+                            tradable_rsn = m_data.get("tradability_reason", "Duration too short")
+                            log.warning(f"[GRID-VETO] 🛑 Markov Tradability Screen Veto for {symbol}: {tradable_rsn}. Blocking entry to prevent fee churn.")
+                            continue
+
+                    # Maker entry pricing: strictly at or below top of bid (min(curr_price, best_bid, micro_p))
+                    best_bid = float(ms_state.get("best_bid", 0.0) or 0.0)
+                    maker_entry_price = min(curr_price, micro_p)
+                    if best_bid > 0.0:
+                        maker_entry_price = min(maker_entry_price, best_bid)
+
+                    log.info(f"[GRID-OPPORTUNITY] [SIGNAL] {symbol} Oversold Dip! Price: ${curr_price:,.4f} | MicroPrice: ${micro_p:,.4f}")
                     
                     conv_score = 0.75
-                    rationale = f"Maker Grid dip confirmed: RSI {rsi:.1f} <= {self.grid_rsi_thresh:.0f}, Lower VWAP Band touch (${lower_band:,.4f})"
-                    log.info(f"[GRID-APPROVED] ⚡ {symbol} Approved via Clean Maker Dip-Buy Engine (Score: {conv_score:.2f} | {rationale})")
+                    rationale = f"Maker Grid dip: RSI {rsi:.1f}, MicroPrice ${micro_p:,.4f}, Entry ${maker_entry_price:,.4f}, TP +{self.grid_tp_pct*100:.2f}%"
+                    log.info(f"[GRID-APPROVED] ⚡ {symbol} Approved via Maker Engine (Score: {conv_score:.2f} | {rationale})")
                         
                     # Execute Post-Only Maker Order
                     await self._execute_grid_maker_entry(
                         symbol=symbol,
-                        current_price=curr_price,
+                        current_price=maker_entry_price,
                         rsi=rsi,
                         conv_score=conv_score,
-                        rationale=rationale
+                        rationale=rationale,
+                        ms_is_degraded=ms_is_degraded
                     )
                     break  # One entry per cycle
                     
@@ -364,7 +926,8 @@ class SuperBotTrader:
         rsi: float = 0.0,
         conv_score: float = 0.0,
         rationale: str = "",
-        side: str = "long"
+        side: str = "long",
+        ms_is_degraded: bool = False
     ):
         """Places a post-only limit buy or sell order on Bitget UTA using dynamic 70% wallet allocation."""
         try:
@@ -375,12 +938,74 @@ class SuperBotTrader:
             order_verb = "Buy" if is_long else "Sell"
             engine_tag = "GRID_MAKER" if is_long else "SCALP_SHORT"
 
-            # P0-4 DEFENSE: Check if Portfolio Risk Agent has activated RISK_HALT
-            with sqlite3.connect("trading_data.db", timeout=5.0) as rh_conn:
-                rh_row = rh_conn.execute("SELECT value FROM system_state WHERE key = 'RISK_HALT'").fetchone()
-                if rh_row and str(rh_row[0]).strip() in ("1", "true", "TRUE"):
-                    log.warning(f"[GRID-VETO] RISK_HALT active in system_state! Blocking new {pos_side.upper()} entry for {symbol}.")
+            # P0-4 DEFENSE: Check if Portfolio Risk Agent or Operator has activated RISK_HALT / OPERATOR_HALT (Fail-Closed)
+            def _check_risk_halt():
+                with sqlite3.connect("trading_data.db", timeout=5.0) as rh_conn:
+                    rh_rows = rh_conn.execute(
+                        "SELECT value FROM system_state WHERE key IN ('RISK_HALT', 'OPERATOR_HALT')"
+                    ).fetchall()
+                    return any(r and str(r[0]).strip().upper() in ("1", "TRUE") for r in rh_rows)
+
+            try:
+                if await asyncio.to_thread(_check_risk_halt):
+                    log.warning(f"[GRID-VETO] RISK_HALT / OPERATOR_HALT active in system_state! Blocking new {pos_side.upper()} entry for {symbol}.")
                     return
+            except Exception as rhe:
+                log.warning(f"[GRID-RISK-HALT-VETO] Failed to read RISK_HALT state (fail-closed) for {symbol}: {rhe}")
+                return
+
+            # Check if another fleet engine (e.g. swing_architect) currently holds an active fresh lock
+            def _check_asset_lock():
+                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    row = conn.execute("SELECT locked_by, heartbeat FROM asset_locks WHERE symbol = ?", (symbol,)).fetchone()
+                    if row and row[0]:
+                        holder = str(row[0])
+                        if holder not in ('super_bot_grid', 'super_bot_scalp_short'):
+                            hb_str = str(row[1] or "")
+                            try:
+                                clean_hb = hb_str.replace("Z", "+00:00")
+                                if "+" not in clean_hb: clean_hb += "+00:00"
+                                hb_dt = datetime.fromisoformat(clean_hb)
+                                if (datetime.now(timezone.utc) - hb_dt).total_seconds() <= 900.0:
+                                    return holder, hb_str
+                            except Exception:
+                                return holder, hb_str
+                    return None, None
+
+            locked_by, locked_hb = await asyncio.to_thread(_check_asset_lock)
+            if locked_by:
+                log.warning(f"[{engine_tag}-LOCK-VETO] Cannot enter {symbol}: Already locked by '{locked_by}' (heartbeat: {locked_hb}). Aborting entry.")
+                return
+
+            # Unified Sentinel News & Sentiment Gate (2h max-age, fail-closed, WARNING=0.5x size-down)
+            news_ok, news_rsn = await self.swing_engine._check_news_veto(
+                symbol, direction="LONG" if is_long else "SHORT"
+            )
+            if not news_ok:
+                log.warning(f"[{engine_tag}-NEWS-VETO] {symbol} ({pos_side.upper()}) blocked: {news_rsn}")
+                return
+
+            # P0-6 DEFENSE: Boardroom Pre-Filters (BIS Crash Shield, TradFi Macro Credit, ALT_LONG_PAUSE, Whitelist)
+            # FAIL-DIRECTION SPECIFICATION (R6): Fail-closed on DB error or critical macro/credit signals.
+            boardroom_ctx = {
+                "strategy": "Mean Reversion Maker Dip-Buy" if is_long else "Scalp Short Maker Fade",
+                "timeframe": "5m",
+                "rsi": rsi,
+                "current_price": current_price
+            }
+            try:
+                boardroom_eval = await self.boardroom.get_conviction(symbol, pos_side, boardroom_ctx)
+                if isinstance(boardroom_eval, dict):
+                    if boardroom_eval.get("execute") is False or boardroom_eval.get("conviction_score", 1.0) == 0.0:
+                        stage = boardroom_eval.get("stage", "boardroom_veto")
+                        rationale_v = boardroom_eval.get("final_rationale", "Boardroom pre-filter veto")
+                        log.warning(f"[{engine_tag}-BOARDROOM-VETO] 🛑 {symbol} {pos_side.upper()} vetoed at stage '{stage}': {rationale_v}")
+                        return
+                    if "conviction_score" in boardroom_eval:
+                        conv_score = float(boardroom_eval.get("conviction_score", conv_score) or conv_score)
+            except Exception as b_err:
+                log.warning(f"[{engine_tag}-BOARDROOM-VETO] 🛑 Exception evaluating Boardroom pre-filters for {symbol}: {b_err}. Failing closed.")
+                return
 
             # Enforce Fleet-Wide Long Cap (Strictly Max 2 Active Longs Across Fleet)
             if is_long:
@@ -390,43 +1015,195 @@ class SuperBotTrader:
                     log.warning(f"[GRID-LONG-CAP-VETO] 🛑 Fleet already holds >= 2 active LONG positions. Vetoing {symbol} LONG execution.")
                     return
 
-            # Dynamic Balance Sizing: 70% Wallet Utilization Protocol
-            max_wallet_margin_pct = getattr(config, "GLOBAL_MARGIN_LIMIT", 70.0) / 100.0  # 0.70
-            margin = self.grid_allocation_usdt
+            # Dynamic Balance Sizing: 70% Wallet Utilization Protocol & 2.0% Hard Risk Cap
+            global_margin_limit = float(getattr(config, "GLOBAL_MARGIN_LIMIT", 70.0))
+            max_wallet_margin_pct = global_margin_limit / 100.0  # 0.70 or 0.80
+            max_margin_per_trade_pct = float(getattr(config, "MAX_MARGIN_PER_TRADE_PCT", 0.20))
             try:
                 live_bal = await self.uta_client.fetch_balance()
-                if live_bal and live_bal > 10.0:
-                    total_locked_margin = sum(
-                        (float(p.get("size", 0.0)) * float(p.get("entry_price", 0.0))) / max(1.0, float(p.get("leverage", 3.0)))
-                        for p in self.active_positions.values()
+                if not live_bal or live_bal <= 10.0:
+                    log.warning(f"[{engine_tag}-BALANCE-VETO] 🛑 Live balance unresolved or invalid (${live_bal}). Vetoing {symbol} entry to enforce strict risk caps.")
+                    return
+
+                # TASK 4: Enforce persistent High-Water Mark (HWM) drawdown circuit breaker across restarts
+                dd_breached, dd_ratio, hwm_peak = await asyncio.to_thread(
+                    self._sync_and_check_hwm_drawdown_sync, float(live_bal)
+                )
+                if dd_breached:
+                    max_dd_cfg = float(getattr(config, "GLOBAL_MAX_DD_LIMIT", 20.0))
+                    log.warning(
+                        f"[{engine_tag}-HWM-DD-VETO] 🛑 Drawdown {dd_ratio*100:.2f}% >= {max_dd_cfg:.1f}% limit "
+                        f"(Balance=${live_bal:,.2f}, Peak=${hwm_peak:,.2f}). Blocking new {pos_side.upper()} entry for {symbol}."
                     )
-                    max_allowed_margin = live_bal * max_wallet_margin_pct
-                    available_margin_buffer = max(0.0, max_allowed_margin - total_locked_margin)
+                    return
 
-                    if available_margin_buffer < 5.0:
-                        log.warning(f"[GRID-MARGIN-CEILING] 70% Wallet Utilization reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing {pos_side.upper()} entry.")
-                        return
+                total_locked_margin = sum(
+                    (float(p.get("size", 0.0)) * float(p.get("entry_price", 0.0))) / max(1.0, float(p.get("leverage", 3.0)))
+                    for p in self.active_positions.values()
+                )
+                max_allowed_margin = live_bal * max_wallet_margin_pct
+                available_margin_buffer = max(0.0, max_allowed_margin - total_locked_margin)
 
-                    target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+                if available_margin_buffer < 5.0:
+                    log.warning(f"[GRID-MARGIN-CEILING] {global_margin_limit:.0f}% Wallet Utilization reached! Locked: ${total_locked_margin:.2f} / Max: ${max_allowed_margin:.2f} ({total_locked_margin/live_bal*100:.1f}%). Vetoing {pos_side.upper()} entry.")
+                    return
+
+                target_per_trade = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+                
+                # Empirical Growth-Optimal Kelly Sizing + FinRL Rolling Sharpe Ensemble Weight + Markov Regime Multiplier
+                try:
+                    from risk_manager import RiskManager
+                    rm = RiskManager()
+                    kelly_frac = await asyncio.to_thread(rm.calculate_empirical_kelly_fraction)
+                    finrl_mult = self._get_finrl_strategy_weight(engine_tag)
                     
-                    # Empirical Growth-Optimal Kelly Sizing
-                    try:
-                        from risk_manager import RiskManager
-                        rm = RiskManager()
-                        kelly_frac = rm.calculate_empirical_kelly_fraction()
-                        conv_mult = max(0.5, min(1.2, conv_score))
-                        target_kelly_margin = live_bal * kelly_frac * conv_mult
-                        target_per_trade = max(target_per_trade * 0.7, min(target_per_trade * 1.3, target_kelly_margin))
-                        log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} -> Target Margin: ${target_per_trade:.2f}")
-                    except Exception as ke:
-                        log.debug(f"[{engine_tag}-KELLY-NOTE] {ke}")
+                    # Continuous Markov Risk Multiplier (Playbook Step 8)
+                    markov_mult = 0.50
+                    def _get_markov_mult():
+                        try:
+                            max_age = float(getattr(config, "REGIME_MAX_AGE_SEC", 900.0) or 900.0)
+                        except (TypeError, ValueError):
+                            max_age = 900.0
+                        try:
+                            with sqlite3.connect("trading_data.db", timeout=3.0) as conn:
+                                row = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'markov_regime_telemetry'").fetchone()
+                                if row and row[0]:
+                                    raw_val, raw_ts = row[0], row[1]
+                                    age = self._regime_row_age_sec(raw_ts)
+                                    if age is not None and age > max_age:
+                                        log.warning(f"[{engine_tag}-MARKOV-STALE] ⚠️ markov_regime_telemetry is stale ({age:.1f}s > {max_age:.1f}s). Defaulting sizing_multiplier to 0.50 (defensive).")
+                                        return 0.50
+                                    m_d = json.loads(raw_val)
+                                    if "sizing_multiplier" not in m_d:
+                                        age_str = f"{age:.1f}s" if age is not None else "unknown"
+                                        log.warning(f"[{engine_tag}-MARKOV-KEY-MISSING] ⚠️ markov_regime_telemetry missing 'sizing_multiplier' key (age: {age_str}). Defaulting to 0.50 (defensive).")
+                                        return 0.50
+                                    return float(m_d.get("sizing_multiplier", 1.0) or 1.0)
+                        except Exception:
+                            pass
+                        log.warning(f"[{engine_tag}-MARKOV-DEFENSIVE] ⚠️ Unable to load Markov telemetry. Applying defensive 0.50x multiplier.")
+                        return 0.50
+                    markov_mult = await asyncio.to_thread(_get_markov_mult)
 
-                    margin = max(6.0, min(round(target_per_trade, 2), round(available_margin_buffer, 2)))
+                    # Fix #5 (same semantics as the swing engine): Kelly only SHRINKS
+                    # from the fair-share ceiling. The old max(0.7x, min(1.35x, kelly))
+                    # floor collided with the per-trade cap, so Kelly never sized anything.
+                    target_per_trade, sizing_note = SwingArchitectTrader._resolve_swing_target(
+                        live_bal=live_bal,
+                        max_wallet_margin_pct=max_wallet_margin_pct,
+                        max_locks=self.max_locks,
+                        per_trade_cap_pct=max_margin_per_trade_pct,
+                        kelly_frac=kelly_frac,
+                        conviction_score=conv_score,
+                        finrl_mult=finrl_mult,
+                        markov_mult=markov_mult,
+                    )
+                    log.info(f"[{engine_tag}-KELLY] Empirical Kelly: {kelly_frac:.2%} | FinRL: {finrl_mult:.2f}x | Markov Mult: {markov_mult:.2f}x -> Target Margin: ${target_per_trade:.2f} ({sizing_note})")
+                except Exception as ke:
+                    fair_share = live_bal * (max_wallet_margin_pct / max(1, self.max_locks))
+                    target_per_trade = max(EXCHANGE_MIN_MARGIN_USD, fair_share * 0.30)
+                    log.warning(f"[{engine_tag}-KELLY-SIZING-FAILCLOSED] {ke}. Sizing at minimum viable (${target_per_trade:.2f}) instead of the unclamped ceiling.")
+
+                # Q-10 FIX: Clamp target margin per trade to MAX_MARGIN_PER_TRADE_PCT ceiling (e.g. 14% or 20% of equity)
+                max_trade_margin_cap = live_bal * max_margin_per_trade_pct
+                if target_per_trade > max_trade_margin_cap:
+                    log.info(f"[{engine_tag}-MARGIN-CLAMP] Clamping target margin ${target_per_trade:.2f} to {max_margin_per_trade_pct:.0%} per-trade cap (${max_trade_margin_cap:.2f}).")
+                    target_per_trade = max_trade_margin_cap
+
+                # Headroom binds absolutely: the old six-dollar floor could push margin
+                # above the remaining buffer (and above the minimum it was meant to satisfy).
+                margin = SwingArchitectTrader._collateral_for(target_per_trade, available_margin_buffer)
+                if margin < EXCHANGE_MIN_MARGIN_USD:
+                    log.warning(
+                        f"[{engine_tag}-MIN-MARGIN-VETO] 🛑 ${margin:.2f} is below the $6.00 Bitget minimum "
+                        f"(target ${target_per_trade:.2f}, headroom ${available_margin_buffer:.2f}). Vetoing {symbol} entry."
+                    )
+                    return
+
+                # Enforce Hard Equity Risk Cap per Trade (Strict 2.0% Dollar Risk Ceiling)
+                max_risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 2.0)) / 100.0  # 0.02
+                max_risk_usd = live_bal * max_risk_pct
+                sl_pct = self.grid_sl_pct if is_long else self.scalp_short_sl_pct
+                max_margin_by_risk = max_risk_usd / (self.grid_leverage * sl_pct)
+                if max_margin_by_risk < 6.0:
+                    log.warning(
+                        f"[{engine_tag}-RISK-CAP-VETO] 🛑 Max allowed margin by risk (${max_margin_by_risk:.2f}) is below exchange minimum $6.00. "
+                        f"Account balance ${live_bal:.2f} cannot support a {sl_pct*100:.2f}% SL within {max_risk_pct*100:.1f}% risk ceiling. Vetoing entry."
+                    )
+                    return
+                if margin > max_margin_by_risk:
+                    margin = round(max_margin_by_risk, 2)
+                    log.info(
+                        f"[{engine_tag}-RISK-CAP] Clamped {symbol} margin to ${margin:.2f} "
+                        f"to enforce {max_risk_pct*100:.1f}% max equity risk (${max_risk_usd:.2f} on {sl_pct*100:.2f}% SL at {self.grid_leverage}x)."
+                    )
+
             except Exception as be:
-                log.warning(f"[{engine_tag}-BALANCE-NOTE] Using fallback allocation (${margin:,.2f} USDT): {be}")
+                log.warning(f"[{engine_tag}-BALANCE-VETO] 🛑 Exception fetching balance for {symbol}: {be}. Vetoing entry to protect capital.")
+                return
+
+            # Apply Sentinel WARNING size-down multiplier (0.5x on caution news)
+            news_mult = float(getattr(self.swing_engine, "_news_size_multipliers", {}).get(symbol, 1.0))
+            if 0.0 < news_mult < 1.0:
+                prev_margin = margin
+                margin = SwingArchitectTrader._floor_to_step(margin * news_mult, 0.01)
+                log.warning(f"[{engine_tag}-NEWS-SIZE-DOWN] {symbol} WARNING tier active -> scaling margin ${prev_margin:.2f} -> ${margin:.2f} ({news_mult:.2f}x)")
+                if margin < EXCHANGE_MIN_MARGIN_USD:
+                    log.warning(f"[{engine_tag}-NEWS-SIZE-VETO] 🛑 Size-down pushed margin ${margin:.2f} under the $6.00 exchange minimum. Vetoing {symbol}.")
+                    return
+
+            # P0-4 DEFENSE: Apply 50% margin haircut if microstructure state is missing or stale
+            if ms_is_degraded:
+                prev_margin = margin
+                margin = SwingArchitectTrader._floor_to_step(margin * 0.50, 0.01)
+                log.warning(f"[{engine_tag}-MS-DEGRADED-SIZING] {symbol} Microstructure degraded -> scaling margin ${prev_margin:.2f} -> ${margin:.2f} (0.50x)")
+                if margin < EXCHANGE_MIN_MARGIN_USD:
+                    log.warning(f"[{engine_tag}-MS-DEGRADED-VETO] 🛑 0.50x haircut puts margin ${margin:.2f} under the $6.00 exchange minimum. Vetoing {symbol}.")
+                    return
+
+            # TASK 1: Price long entries strictly at or below top of bid (min(current_price, best_bid)),
+            # and short entries at or above top of ask (max(current_price, best_ask)) so the post-only order rests on the book.
+            try:
+                clean_sym_ob = self.uta_client._normalize_symbol(symbol)
+                ms_ob = MicrostructureStateCache.get_state(clean_sym_ob)
+                best_bid = float(ms_ob.get("best_bid", 0.0) or 0.0)
+                best_ask = float(ms_ob.get("best_ask", 0.0) or 0.0)
+                if (is_long and best_bid <= 0.0) or (not is_long and best_ask <= 0.0):
+                    if hasattr(self.uta_client, "exchange") and hasattr(self.uta_client.exchange, "fetch_order_book"):
+                        ob = await self.uta_client.exchange.fetch_order_book(clean_sym_ob, limit=5)
+                        if isinstance(ob, dict):
+                            bids = ob.get("bids", [])
+                            asks = ob.get("asks", [])
+                            if bids and len(bids[0]) > 0:
+                                best_bid = float(bids[0][0])
+                            if asks and len(asks[0]) > 0:
+                                best_ask = float(asks[0][0])
+                if is_long and best_bid > 0.0:
+                    current_price = min(current_price, best_bid)
+                elif not is_long and best_ask > 0.0:
+                    current_price = max(current_price, best_ask)
+            except Exception as ob_err:
+                log.debug(f"[{engine_tag}-OB-PEG-NOTE] {symbol}: {ob_err}")
 
             notional = margin * self.grid_leverage
             qty = self.uta_client.format_qty_precision(symbol, notional / current_price)
+            if qty <= 0:
+                log.warning(
+                    f"[{engine_tag}-QTY-FLOOR-VETO] 🛑 Formatted order quantity ({qty}) is below exchange minimum contract floor for {symbol}. "
+                    f"Notional ${notional:.2f} at price ${current_price:,.4f} insufficient. Vetoing entry."
+                )
+                return
+
+            # Post-Rounding Step Risk Check: Verify contract rounding didn't push risk beyond 2.0% equity cap (+15% step tolerance)
+            sl_pct = self.grid_sl_pct if is_long else self.scalp_short_sl_pct
+            actual_risk_usd = (qty * current_price) * sl_pct
+            max_allowed_post_round_risk = live_bal * max_risk_pct * 1.15
+            if actual_risk_usd > max_allowed_post_round_risk:
+                log.warning(
+                    f"[{engine_tag}-ROUNDING-RISK-VETO] 🛑 Post-rounding risk (${actual_risk_usd:.2f}) exceeds max allowed "
+                    f"(${max_allowed_post_round_risk:.2f} = {max_risk_pct*100:.1f}% equity * 1.15 step tol) for {symbol}. Vetoing entry."
+                )
+                return
             
             # Formulate TP & SL
             if is_long:
@@ -435,25 +1212,52 @@ class SuperBotTrader:
             else:
                 tp_price = current_price * (1.0 - self.scalp_short_tp_pct)
                 sl_price = current_price * (1.0 + self.scalp_short_sl_pct)
+
+            # P0-2 LOCK ACQUISITION: Acquire symbol lock BEFORE order placement to prevent race conditions with swing engine
+            lock_who = "super_bot_grid" if is_long else "super_bot_scalp_short"
+            lock_why = f"Chop Maker Grid dip-buy ({rationale})" if is_long else f"Scalp Short Maker fade ({rationale})"
+            now_iso_lock = datetime.now(timezone.utc).isoformat()
             
-            log.info(f"[{engine_tag}] [LIMIT-{order_verb.upper()}] Placing Post-Only Limit {order_verb} for {symbol}: {qty:.4f} units @ ${current_price:,.4f} | TP: ${tp_price:,.4f} | SL: ${sl_price:,.4f}")
-            
-            # Place Maker order via UTA client
-            order = await self.uta_client.create_limit_order(
-                symbol=symbol,
-                side=pos_side,
-                qty=qty,
-                price=current_price,
-                sl=sl_price,
-                tp=tp_price,
-                leverage_val=self.grid_leverage
+            lock_ok = await asyncio.to_thread(
+                acquire_asset_lock, "trading_data.db", symbol, lock_who, lock_why, now_iso_lock
             )
-            order_id = order.get("id") or order.get("orderId") if order else None
-            if not order_id:
-                log.warning(f"[{engine_tag}] Order placement failed on {symbol}.")
+            if not lock_ok:
+                log.warning(f"[{engine_tag}-LOCK-RACE-VETO] Could not acquire asset_locks for {symbol} prior to order placement. Aborting.")
                 return
 
-            log.info(f"[{engine_tag}] Order {order_id} placed for {symbol}. Monitoring fill queue (30s TTL)...")
+            def _release_pre_lock():
+                try:
+                    with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                        conn.execute("DELETE FROM asset_locks WHERE symbol = ? AND locked_by = ?", (symbol, lock_who))
+                        conn.commit()
+                except Exception as r_err:
+                    log.warning(f"[{engine_tag}-LOCK-RELEASE-ERR] {r_err}")
+
+            log.info(f"[{engine_tag}] [POST-ONLY-{order_verb.upper()}] Placing True Post-Only Maker Limit {order_verb} for {symbol}: {qty:.4f} units @ ${current_price:,.4f}")
+            
+            # Place TRUE Maker Post-Only order with ATOMIC PRESET STOP LOSS (P0-3) via UTA client
+            try:
+                order = await self.uta_client.create_post_only_order(
+                    symbol=symbol,
+                    side=pos_side,
+                    qty=qty,
+                    price=current_price,
+                    sl=sl_price,
+                    tp=tp_price,
+                    leverage_val=self.grid_leverage
+                )
+            except Exception as po_err:
+                log.warning(f"[{engine_tag}] [POST-ONLY-REJECT] Maker post-only order placement exception on {symbol}: {po_err}. Skipping rather than falling back to taker.")
+                await asyncio.to_thread(_release_pre_lock)
+                return
+
+            order_id = order.get("id") or order.get("orderId") if order else None
+            if not order_id:
+                log.warning(f"[{engine_tag}] [POST-ONLY-REJECT] Maker post-only order placement rejected or crossed spread on {symbol}. Skipping rather than falling back to taker.")
+                await asyncio.to_thread(_release_pre_lock)
+                return
+
+            log.info(f"[{engine_tag}] Maker order {order_id} placed for {symbol}. Monitoring fill queue (30s TTL)...")
             start_t = time.time()
             is_filled = False
             actual_entry = current_price
@@ -471,10 +1275,10 @@ class SuperBotTrader:
                         deal_p = float(info.get("deal_avg_price") or info.get("avgPrice") or 0.0)
                         if deal_p > 0:
                             actual_entry = deal_p
-                        log.info(f"[{engine_tag}-FILLED] Order {order_id} FILLED on {symbol}! Qty: {qty} @ ${actual_entry:,.4f}")
+                        log.info(f"[{engine_tag}-FILLED] Maker order {order_id} FILLED on {symbol}! Qty: {qty} @ ${actual_entry:,.4f}")
                         break
                     elif st in ("canceled", "cancelled"):
-                        log.warning(f"[{engine_tag}-CANCELED] Order {order_id} cancelled by exchange.")
+                        log.warning(f"[{engine_tag}-CANCELED] [POST-ONLY-REJECT] Order {order_id} cancelled by exchange (post-only spread cross protection). Skipping without taker fallback.")
                         break
                 except Exception as pe:
                     log.debug(f"[{engine_tag}-POLL-NOTE] {pe}")
@@ -499,14 +1303,38 @@ class SuperBotTrader:
                     log.debug(f"[{engine_tag}-LATE-FILL-NOTE] {le}")
 
                 if not is_filled:
+                    await asyncio.to_thread(_release_pre_lock)
                     return
 
+            # Formulate TP & SL accurately based on ACTUAL execution fill price (not pre-fill quote)
+            if is_long:
+                tp_price = actual_entry * (1.0 + self.grid_tp_pct)
+                sl_price = actual_entry * (1.0 - self.grid_sl_pct)
+            else:
+                tp_price = actual_entry * (1.0 - self.scalp_short_tp_pct)
+                sl_price = actual_entry * (1.0 + self.scalp_short_sl_pct)
+
             # Register native strategy stop loss on Bitget with aggressive retry
+            # F-08 FIX: Give Bitget matching engine 1.5s to settle the filled position before attaching strategy orders
+            await asyncio.sleep(1.5)
             sl_attached = False
             last_se = None
-            sl_qty_str = str(self.uta_client.format_qty_precision(symbol, qty))
-            for sl_att in range(3):
+            effective_qty = qty
+            for sl_att in range(5):
                 try:
+                    # Re-confirm actual filled position size from exchange to prevent 25610 precision mismatch
+                    try:
+                        clean_sym_norm = self.uta_client._normalize_symbol(symbol)
+                        live_pos = await self.uta_client.fetch_positions(symbol=clean_sym_norm)
+                        pos_match = [p for p in (live_pos or []) if str(p.get("posSide", "long")).lower() == pos_side]
+                        if pos_match:
+                            real_tot = float(pos_match[0].get("total", 0.0) or pos_match[0].get("contracts", 0.0) or 0.0)
+                            if real_tot > 0:
+                                effective_qty = real_tot
+                    except Exception as pos_chk_err:
+                        log.debug(f"[{engine_tag}-SHIELD-NOTE] Position size query note: {pos_chk_err}")
+
+                    sl_qty_str = self.uta_client.format_quantity_precision(symbol, effective_qty) if hasattr(self.uta_client, "format_quantity_precision") else str(self.uta_client.format_qty_precision(symbol, effective_qty))
                     sl_str = self.uta_client.format_price_precision(symbol, sl_price)
                     sl_p = {
                         "category": "USDT-FUTURES",
@@ -527,16 +1355,87 @@ class SuperBotTrader:
                     break
                 except Exception as se:
                     last_se = se
-                    log.warning(f"[{engine_tag}-SHIELD-NOTE] Stop loss attach attempt {sl_att+1}/3 failed: {se}")
-                    await asyncio.sleep(0.5 * (sl_att + 1))
+                    log.warning(f"[{engine_tag}-SHIELD-NOTE] Stop loss attach attempt {sl_att+1}/5 failed: {se}")
+                    await asyncio.sleep(1.5 + 1.0 * sl_att)
 
             if not sl_attached:
-                log.critical(f"[{engine_tag}-SHIELD] 🚨 Native Stop Loss failed on {symbol} after 3 retries ({last_se})! Aborting position to eliminate naked capital exposure.")
+                log.critical(f"[{engine_tag}-SHIELD] 🚨 Native Stop Loss failed on {symbol} after 5 retries ({last_se})! Aborting position to eliminate naked capital exposure.")
+                close_success = False
+                abort_err_str = "None"
                 try:
                     await self.uta_client.close_position_order(symbol=symbol, side=pos_side, qty=qty)
                     log.warning(f"[{engine_tag}-SHIELD] Emergency position abort SUCCESS for {symbol}.")
+                    close_success = True
                 except Exception as ab_err:
+                    abort_err_str = str(ab_err)
                     log.error(f"[{engine_tag}-SHIELD] Failed to abort position on {symbol}: {ab_err}")
+                
+                # P0-4 REMEDIATION: If abort close succeeded, release lock.
+                # If abort close FAILED, write emergency state AND register in swing_open_positions as UNPROTECTED_NAKED_POSITION
+                # so the position is tracked, visible to VaR, visible to reconciler, and never invisible.
+                if close_success:
+                    await asyncio.to_thread(_release_pre_lock)
+                    return
+
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    clean_sym = symbol.replace("/", "")
+                    
+                    with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                        conn.execute("""
+                            INSERT INTO system_state (key, value, updated_at)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+                        """, (
+                            f"emergency_sl_failure_{clean_sym}",
+                            json.dumps({
+                                "symbol": clean_sym,
+                                "side": pos_side,
+                                "qty": qty,
+                                "sl_error": str(last_se),
+                                "close_error": abort_err_str,
+                                "timestamp": now_iso,
+                                "status": "UNPROTECTED_NAKED_POSITION",
+                                "engine": engine_tag
+                            }),
+                            now_iso,
+                            json.dumps({
+                                "symbol": clean_sym,
+                                "side": pos_side,
+                                "qty": qty,
+                                "sl_error": str(last_se),
+                                "close_error": abort_err_str,
+                                "timestamp": now_iso,
+                                "status": "UNPROTECTED_NAKED_POSITION",
+                                "engine": engine_tag
+                            }),
+                            now_iso
+                        ))
+                        # Register in open positions table with critical status
+                        conn.execute("""
+                            INSERT OR REPLACE INTO swing_open_positions 
+                            (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price,
+                             leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes,
+                             intended_entry_price, actual_fill_price, slippage_bps, fee_entry_usd, execution_type, gates_snapshot)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            symbol, pos_side, actual_entry, qty, sl_price, tp_price, sl_price, actual_entry,
+                            self.grid_leverage, now_iso, now_iso, "UNPROTECTED_NAKED_POSITION", 0.0,
+                            round((qty * actual_entry) * sl_pct, 4),
+                            f"CRITICAL: SL & abort close failed ({abort_err_str})",
+                            current_price, actual_entry, 0.0, 0.0, "emergency_orphan", "{}"
+                        ))
+                        conn.commit()
+                        log.critical(f"[{engine_tag}-EMERGENCY-STATE] Persisted critical failure & open position record for {clean_sym} — manual intervention required!")
+                except Exception as state_err:
+                    log.critical(f"[{engine_tag}-EMERGENCY-STATE] Failed to persist emergency state for {symbol}: {state_err}")
+                
+                self.active_positions[symbol] = {
+                    "symbol": symbol, "side": pos_side, "entry_price": actual_entry,
+                    "size": qty, "stop_loss": sl_price, "take_profit": tp_price,
+                    "leverage": self.grid_leverage, "status": "UNPROTECTED_NAKED_POSITION",
+                    "opened_at": now_iso, "notes": "CRITICAL: SL & abort close failed"
+                }
                 return
 
             # Register native strategy Take Profit (pos_profit) on Bitget so TP executes immediately on-exchange
@@ -563,20 +1462,37 @@ class SuperBotTrader:
 
             now_iso = datetime.now(UTC).isoformat()
             init_risk = (actual_entry - sl_price) * qty if is_long else (sl_price - actual_entry) * qty
+            intended_p = float(current_price)
+            actual_fill_p = float(actual_entry)
+            slippage_bps = ((actual_fill_p - intended_p) / intended_p * 10000.0) if intended_p > 0 else 0.0
+            fee_entry_usd = actual_fill_p * qty * 0.0002  # Maker fee 0.02%
+            grid_gates = {
+                "engine": engine_tag,
+                "5m_rsi": round(float(rsi), 2),
+                "conviction_score": round(float(conv_score), 2),
+                "rationale": str(rationale),
+                "intended_entry": intended_p,
+                "order_type": "post_only_limit"
+            }
+            grid_gates_json = json.dumps(grid_gates)
+
             notes_str = (
                 f"Chop Maker Grid [Post-Only Limit] (TP: +{self.grid_tp_pct*100:.1f}%)"
                 if is_long
                 else f"Quick Scalp Short [Post-Only Limit] (TP: +{self.scalp_short_tp_pct*100:.1f}%)"
             )
+            lock_who = 'super_bot_grid' if is_long else 'super_bot_scalp_short'
+            lock_why = 'CHOP_GRID_LONG' if is_long else 'SCALP_SHORT'
+
             pos_record = {
                 "symbol": symbol,
                 "side": pos_side,
-                "entry_price": actual_entry,
+                "entry_price": actual_fill_p,
                 "size": qty,
                 "stop_loss": sl_price,
                 "take_profit": tp_price,
                 "trailing_stop": sl_price,
-                "peak_price": actual_entry,
+                "peak_price": actual_fill_p,
                 "leverage": self.grid_leverage,
                 "opened_at": now_iso,
                 "updated_at": now_iso,
@@ -584,7 +1500,14 @@ class SuperBotTrader:
                 "r_multiple": 0.0,
                 "initial_risk_usd": init_risk,
                 "notes": notes_str,
-                "engine_type": engine_tag
+                "engine_type": engine_tag,
+                "lock_owner": lock_who,
+                "intended_entry_price": intended_p,
+                "actual_fill_price": actual_fill_p,
+                "slippage_bps": slippage_bps,
+                "fee_entry_usd": fee_entry_usd,
+                "execution_type": "maker",
+                "gates_snapshot": grid_gates_json
             }
             
             # Record in swing_open_positions for unified management
@@ -592,19 +1515,26 @@ class SuperBotTrader:
                 with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                     conn.execute("""
                         INSERT OR REPLACE INTO swing_open_positions 
-                        (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price, leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (symbol, side, entry_price, size, stop_loss, take_profit, trailing_stop, peak_price,
+                         leverage, opened_at, updated_at, status, r_multiple, initial_risk_usd, notes,
+                         intended_entry_price, actual_fill_price, slippage_bps, fee_entry_usd, execution_type, gates_snapshot)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        symbol, pos_side, actual_entry, qty, sl_price, tp_price, sl_price, actual_entry,
-                        self.grid_leverage, now_iso, now_iso, "ACTIVE", 0.0, pos_record["initial_risk_usd"], pos_record["notes"]
+                        symbol, pos_side, actual_fill_p, qty, sl_price, tp_price, sl_price, actual_fill_p,
+                        self.grid_leverage, now_iso, now_iso, "ACTIVE", 0.0, pos_record["initial_risk_usd"], pos_record["notes"],
+                        intended_p, actual_fill_p, slippage_bps, fee_entry_usd, "maker", grid_gates_json
                     ))
-                    # Acquire exclusive lock
-                    lock_who = 'super_bot_grid' if is_long else 'super_bot_scalp_short'
-                    lock_why = 'CHOP_GRID_LONG' if is_long else 'SCALP_SHORT'
+                    # Refresh/confirm exclusive lock atomically
                     conn.execute("""
-                        INSERT OR REPLACE INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
+                        INSERT INTO asset_locks (symbol, locked_by, locked_at, reason, heartbeat)
                         VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET 
+                            locked_by = excluded.locked_by,
+                            heartbeat = excluded.heartbeat,
+                            reason = excluded.reason
+                        WHERE locked_by = excluded.locked_by
                     """, (symbol, lock_who, now_iso, lock_why, now_iso))
+                    
                     conn.commit()
                     
             await asyncio.to_thread(_save)
@@ -786,75 +1716,41 @@ class SuperBotTrader:
                     continue
 
                 df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                c = df["close"]
+                ind = compute_grid_5m_indicators(df)
+                if not ind:
+                    continue
 
-                delta = c.diff()
-                gain = delta.clip(lower=0).rolling(14).mean()
-                loss = (-delta.clip(upper=0)).rolling(14).mean()
-                rs = gain / (loss + 1e-9)
-                rsi = float((100.0 - (100.0 / (1.0 + rs))).iloc[-1])
-
-                cum_pv = (c * df["volume"]).rolling(24).sum()
-                cum_v = df["volume"].rolling(24).sum()
-                vwap = float((cum_pv / (cum_v + 1e-9)).iloc[-1])
-                rolling_std = float(c.rolling(24).std().iloc[-1])
-                upper_band = vwap + (2.0 * rolling_std)
-                ema20 = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
-
-                curr_price = float(c.iloc[-1])
-                c_open = float(df["open"].iloc[-1])
-                c_high = float(df["high"].iloc[-1])
-                c_low = float(df["low"].iloc[-1])
-                c_close = float(df["close"].iloc[-1])
-                c_range = max(c_high - c_low, 1e-6)
-                upper_wick = c_high - max(c_open, c_close)
-                upper_wick_ratio = upper_wick / c_range
+                curr_price = ind["curr_price"]
+                rsi = ind["rsi"]
+                upper_band = ind["upper_band"]
+                upper_wick_ratio = ind["upper_wick_ratio"]
+                adx_5m = ind["adx_5m"]
 
                 # STRICT ANTI-BOTTOM SHORTING GATE:
-                # Never short an oversold flush (RSI < 38) or an asset already dumped far below VWAP
                 if rsi < self.scalp_short_min_rsi:
                     log.debug(f"[SCALP-SHORT-VETO] {symbol} RSI={rsi:.1f} < {self.scalp_short_min_rsi:.0f} (Oversold flush). Never short the bottom.")
                     continue
 
                 # Safeguard 3A: Asset-Specific 5m ADX Exhaustion Ceiling (< 22.0)
-                # Prevents fading active 5m trend breakouts
-                adx_5m_series = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14).adx()
-                adx_5m = float(adx_5m_series.iloc[-1]) if not pd.isna(adx_5m_series.iloc[-1]) else 0.0
                 if mode == "CHOP" and adx_5m >= self.scalp_short_max_adx:
                     log.info(f"[SCALP-SHORT-ADX-VETO] 🛑 {symbol} 5m ADX={adx_5m:.1f} >= {self.scalp_short_max_adx:.1f} (Active Breakout Expansion). Never fade high-ADX momentum.")
                     continue
 
-                is_red_candle = c_close < c_open
-                is_shooting_star = upper_wick_ratio >= 0.35
-                rsi_prev = float((100.0 - (100.0 / (1.0 + rs))).iloc[-2]) if len(rs) >= 2 else rsi
-                is_rsi_falling = rsi < (rsi_prev - 0.5)
-                # Strict rejection confirmation: never trigger on is_rsi_falling alone on an advancing green candle
-                has_bearish_reversal = (is_red_candle and upper_wick_ratio >= 0.25) or (is_shooting_star and is_rsi_falling)
+                is_sig, sig_reason = evaluate_scalp_short_signal(
+                    ind=ind,
+                    curr_price=curr_price,
+                    mode=mode,
+                    min_rsi=self.scalp_short_min_rsi,
+                    rsi_overbought=self.scalp_short_rsi_overbought,
+                    max_adx=self.scalp_short_max_adx
+                )
 
-                signal_triggered = False
-                trigger_reason = ""
-
-                if mode == "CHOP":
-                    # Range Top Fade: Price at/above upper band (VWAP + 2.0 std), RSI >= 68, rejection confirmation
-                    if curr_price >= (upper_band * 0.998) and rsi >= self.scalp_short_rsi_overbought:
-                        if not has_bearish_reversal:
-                            log.debug(f"[SCALP-SHORT-CHOP-VETO] {symbol} At upper band (${curr_price:,.4f}) but lacks rejection wick/candle (wick={upper_wick_ratio:.1%}). Waiting for rejection.")
-                            continue
-                        signal_triggered = True
-                        trigger_reason = f"Chop Range Top Fade (Price ${curr_price:,.4f} >= Upper Band ${upper_band:,.4f}, RSI {rsi:.1f} >= {self.scalp_short_rsi_overbought:.0f}, 5m ADX {adx_5m:.1f} < {self.scalp_short_max_adx:.0f})"
-
-                elif mode == "BEAR":
-                    # Bear Relief Bounce Fade:
-                    # In a bear trend, price bounced up into VWAP or EMA20, RSI in relief zone [45, 68]
-                    # and prints a red rejection candle
-                    bounced_to_resistance = (curr_price >= vwap * 0.997) or (curr_price >= ema20 * 0.998)
-                    in_relief_rsi_window = (45.0 <= rsi <= 68.0)
-                    if bounced_to_resistance and in_relief_rsi_window and is_red_candle:
-                        signal_triggered = True
-                        trigger_reason = f"Bear Trend Relief Bounce Fade (Price ${curr_price:,.4f} tested VWAP/EMA20 resistance, RSI relief {rsi:.1f}, red rejection candle)"
-
-                if not signal_triggered:
+                if not is_sig:
+                    if mode == "CHOP" and curr_price >= (upper_band * 0.998) and rsi >= self.scalp_short_rsi_overbought and not ind.get("has_bearish_reversal", False):
+                        log.debug(f"[SCALP-SHORT-CHOP-VETO] {symbol} At upper band (${curr_price:,.4f}) but lacks rejection wick/candle (wick={upper_wick_ratio:.1%}). Waiting for rejection.")
                     continue
+
+                trigger_reason = sig_reason
 
                 # Safeguard 3: 15m Higher-Timeframe Exhaustion Confirmation
                 # Reject fading if the 15m candle is actively advancing green without an upper rejection wick (>= 20%)
@@ -882,14 +1778,17 @@ class SuperBotTrader:
                     continue
 
                 # Microstructure Guard & VPIN
+                ms_is_degraded = False
                 try:
-                    ms_state = MicrostructureStateCache.get_state(symbol)
+                    clean_sym = self.uta_client._normalize_symbol(symbol) if self.uta_client else symbol.replace("/", "").replace("-", "").upper()
+                    ms_state = MicrostructureStateCache.get_state(clean_sym)
+                    ms_is_degraded = (not ms_state)
                     vpin_score = float(ms_state.get("vpin", 0.0) or 0.0)
                     if vpin_score >= 0.75:
                         log.info(f"[SCALP-SHORT-VPIN-VETO] [VETO] {symbol} VPIN={vpin_score:.2f} >= 0.75. Toxic flow squeeze risk. Skipping.")
                         continue
                 except Exception:
-                    pass
+                    ms_is_degraded = True
 
                 log.info(f"[SCALP-SHORT-OPPORTUNITY] 🎯 {symbol} Quick Scalp Short Signal! {trigger_reason} | RSI: {rsi:.1f} | Wick: {upper_wick_ratio:.1%}")
 
@@ -901,7 +1800,8 @@ class SuperBotTrader:
                     rsi=rsi,
                     conv_score=conv_score,
                     rationale=trigger_reason,
-                    side="short"
+                    side="short",
+                    ms_is_degraded=ms_is_degraded
                 )
                 break  # One entry per cycle
             except Exception as e:
@@ -924,6 +1824,20 @@ class SuperBotTrader:
         await self.initialize_clients()
         await asyncio.to_thread(self._load_all_positions_sync)
 
+        # Reconcile system_state.SWING_TRADER_ENABLED with config at startup
+        def _reconcile_swing_enabled():
+            try:
+                cfg_val = "1" if getattr(config, "SWING_TRADER_ENABLED", False) else "0"
+                with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                    conn.execute(
+                        "INSERT INTO system_state (key, value, updated_at) VALUES ('SWING_TRADER_ENABLED', ?, datetime('now')) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                        (cfg_val,)
+                    )
+            except Exception as se_err:
+                log.warning(f"[RECONCILE-SWING-CONFIG-ERR] {se_err}")
+        await asyncio.to_thread(_reconcile_swing_enabled)
+
         log.info(f"[STARTUP-AUDIT] Adopted {len(self.active_positions)} active position(s): {list(self.active_positions.keys())}")
         for sym, pos in self.active_positions.items():
             log.info(f"   -> {sym}: {pos.get('side', 'long').upper()} | Size: {pos.get('size')} | Entry: ${pos.get('entry_price')} | SL: ${pos.get('stop_loss')} | TP: ${pos.get('take_profit')}")
@@ -945,39 +1859,60 @@ class SuperBotTrader:
                 
                 is_bull = any(x in regime for x in ("BULL", "TRENDING")) and self.market_regime_di_spread >= 0.0
                 is_bear = any(x in regime for x in ("BEAR", "CRASH", "BREAKDOWN")) or (adx >= 26.0 and self.market_regime_di_spread < -5.0)
-                is_chop = (not is_bear) and any(x in regime for x in ("CHOP", "SIDEWAYS", "UNKNOWN", "RANGING", "NEUTRAL", "CONSOLIDATION"))
+                is_chop = (not is_bear) and (not is_bull) and any(x in regime for x in ("CHOP", "SIDEWAYS", "UNKNOWN", "RANGING", "NEUTRAL", "CONSOLIDATION"))
 
                 # 3. Route Scans Based on Live Regime
-                if is_bear:
-                    # Bear Mode: BEAR_SHIELD Active (Zero Longs, 100% Cash Preservation)
-                    if now_ts - last_4h_scan >= self.check_interval_4h:
-                        log.info(f"[REGIME: BEAR_SHIELD] 🛡️ (ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) -> Bear Shield Active (Zero Longs).")
-                        last_4h_scan = now_ts
-                    if self.scalp_short_enabled:
-                        await self.scan_quick_scalp_short_opportunities(mode="BEAR")
-
+                if not self.regime_data_ok:
+                    # Fail-closed: no NEW entries while regime telemetry is absent, stale,
+                    # UNKNOWN or non-finite. Position management already ran above this loop,
+                    # so trailing stops, breakeven ratchets and exits are unaffected.
+                    log.debug(f"[REGIME-GATE] Entry scans skipped this cycle: {self.regime_stale_reason}")
                 else:
-                    # 3a. 4H Swing Architect + AI Boardroom Scan (every 5m when not in Bear Shield and DI spread >= -2.0)
-                    # Unchains decoupled momentum leaders (NEAR, LINK, AVAX, SUI, APT) even when BTC ADX is in CHOP
+                    # 3a. Engine 1: 4H Swing Trend Engine (both LONG and SHORT)
+                    # Scans every check_interval_4h across the fleet
                     if now_ts - last_4h_scan >= self.check_interval_4h:
-                        if is_bull or self.market_regime_di_spread >= -2.0:
-                            log.info(f"[REGIME: {regime}] (ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}, Hurst: {hurst:.2f}) -> Running 4H Swing Architect + AI Boardroom fleet scan (LONG)...")
-                            await self.swing_engine.scan_fleet(allowed_direction="LONG")
+                        if self.turbulence_state == "EXTREME_SHOCK":
+                            log.warning(
+                                f"[FINRL-TURBULENCE-SHIELD] 🚨 Cross-asset turbulence breach active "
+                                f"(d_t={self.turbulence_index:.2f} > {self.turbulence_threshold:.2f}). 4H Swing scan muted."
+                            )
+                        else:
+                            # Dynamic directional bias: if market is distinctly bull, bias LONG; if bear, bias SHORT; otherwise allow both directions
+                            target_direction = "SHORT" if is_bear else ("LONG" if is_bull else None)
+                            
+                            log.info(
+                                f"[ENGINE-1: 4H SWING] (Regime: {regime}, ADX: {adx:.1f}, DI Spread: {self.market_regime_di_spread:+.1f}) "
+                                f"-> Running 4H Swing Breakout scan (direction: {target_direction or 'BOTH'})..."
+                            )
+                            # Run 4H scan decoupled as a tracked task so maker sniper waits don't freeze the 15s loop
+                            self._track_task(self.swing_engine.scan_fleet(allowed_direction=target_direction), "swing_scan_fleet")
                         last_4h_scan = now_ts
 
-                    # 3b. Clean Sept 30 Chop Maker Grid Dip-Buy Scan (in CHOP regime when ADX < 25.0)
-                    if is_chop:
-                        if adx >= 25.0:
-                            log.info(f"[CHOP-GRID-VETO] Market ADX={adx:.1f} >= 25.0 indicates directional expansion. Chop Grid dip-buying suppressed.")
-                        else:
-                            await self.scan_chop_grid_opportunities()
-                        if self.scalp_short_enabled:
-                            await self.scan_quick_scalp_short_opportunities(mode="CHOP")
+                    # 3b. Engine 2: 15m/5m Clean Chop & Tactical Trend-Pullback Maker Grid Scan
+                    # Active during chop or during bull/consolidation when sellers are not crashing the market.
+                    # In bear regimes with seller dominance (DI spread < -4.0 and ADX >= 25.0), dip-buys are muted to avoid catching knives.
+                    if is_bear and (adx >= 25.0 and self.market_regime_di_spread < -4.0):
+                        log.debug(f"[REGIME-GATE] 🛡️ Active Bear breakdown ({regime}, ADX={adx:.1f}, DI Spread={self.market_regime_di_spread:+.1f}): Suppressing dip-buys.")
+                    else:
+                        await self.scan_chop_grid_opportunities()
 
                 # 4. Telemetry Logging (every 60s)
                 if now_ts - last_telemetry >= 60:
                     last_telemetry = now_ts
                     now_iso = datetime.now(UTC).isoformat()
+                    # S2-11 FIX: Compute truthful aggregate unrealized PnL from active positions
+                    total_unrealized_pnl = 0.0
+                    for p in self.active_positions.values():
+                        try:
+                            e_price = float(p.get("entry_price", 0.0) or 0.0)
+                            c_price = float(p.get("current_price", e_price) or e_price)
+                            p_size = float(p.get("size", 0.0) or 0.0)
+                            p_side = str(p.get("side", "long")).lower()
+                            if e_price > 0 and p_size > 0:
+                                pos_upnl = (c_price - e_price) * p_size if "long" in p_side else (e_price - c_price) * p_size
+                                total_unrealized_pnl += pos_upnl
+                        except Exception:
+                            pass
                     def _write_telemetry():
                         with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
                             conn.execute("""
@@ -988,10 +1923,12 @@ class SuperBotTrader:
                                 now_iso, regime, adx, hurst,
                                 len([p for p in self.active_positions.values() if p.get("engine_type") == "SWING_4H"]),
                                 len([p for p in self.active_positions.values() if p.get("engine_type") in ("GRID_MAKER", "SCALP_SHORT")]),
-                                0.0, "OPERATIONAL"
+                                round(total_unrealized_pnl, 4), "OPERATIONAL"
                             ))
                             conn.commit()
                     await asyncio.to_thread(_write_telemetry)
+                    # Delegate swing_trader_telemetry exclusively to swing_engine.publish_telemetry()
+                    self.swing_engine.publish_telemetry()
 
             except Exception as e:
                 log.error(f"[SUPER-BOT-LOOP-ERR] {e}")
