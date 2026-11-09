@@ -22,7 +22,7 @@ import signal
 import sqlite3
 import sys
 import time
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, UTC, timedelta, timezone
 import pandas as pd
 import numpy as np
 
@@ -1959,7 +1959,6 @@ class SwingArchitectTrader:
                                 
                                 if not close_success:
                                     try:
-                                        from datetime import datetime, timezone
                                         now_iso = datetime.now(timezone.utc).isoformat()
                                         clean_sym = self.uta_client._normalize_symbol(symbol)
                                         with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
@@ -3486,7 +3485,9 @@ class SwingArchitectTrader:
                             await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, curr_p, veto_reason=f"Prefilter: {veto_rsn}", candle_key=candle_key)
                             continue
                     except Exception as pre_err:
-                        log.warning(f"[PREFILTER-CHECK-NOTE] {symbol}: {pre_err}")
+                        log.error(f"[PREFILTER-FAIL-CLOSED] {symbol}: Deterministic prefilter execution failed ({pre_err}). Enforcing fail-closed veto.")
+                        await asyncio.to_thread(self._record_shadow_signal_sync, "SWING_4H", symbol, cand_direction, curr_p, veto_reason=f"Prefilter Error (Fail-Closed): {pre_err}", candle_key=candle_key)
+                        continue
 
                 # Assemble Gate Snapshot for Truthful Quantitative Logging
                 gates_snapshot = {

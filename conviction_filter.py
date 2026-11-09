@@ -125,288 +125,291 @@ class ConvictionBoardroom:
     def __init__(self, db_path: str = "trading_data.db"):
         self.db_path = db_path
 
-    async def get_conviction(self, symbol: str, side: str, context_data: dict) -> dict:
-        # P1-1 FIX: Offload all initial synchronous SQLite reads off the event loop thread
-        def _check_pre_filters_sync():
-            res = {"veto": None}
-            conn = None
-            try:
-                conn = sqlite3.connect(self.db_path, timeout=5.0)
-                # 0. Database Integrity Gate (Fail-Closed on corrupted, stale, or unverified production DBs)
-                integ_report = check_database_integrity(conn)
-                if not integ_report["is_ok"]:
-                    if integ_report["is_stale"]:
-                        stale_list = ", ".join(integ_report["stale_dbs"])
-                        res["veto"] = {
-                            "execute": False,
-                            "conviction_score": 0.0,
-                            "stage": "database_integrity_stale",
-                            "final_rationale": f"integrity signal stale/absent: {stale_list} integrity status is older than {getattr(config, 'DB_INTEGRITY_MAX_AGE_SEC', 900)}s or unparseable/absent."
-                        }
-                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {stale_list} integrity signal is stale/absent. Halting new entries."
-                        return res
-                    elif integ_report["is_corrupt"]:
-                        corrupt_list = ", ".join(integ_report["corrupt_dbs"])
-                        res["veto"] = {
-                            "execute": False,
-                            "conviction_score": 0.0,
-                            "stage": "database_integrity_gate",
-                            "final_rationale": f"Database Integrity Gate Veto: {corrupt_list} integrity status is CRITICAL/CORRUPT or persistent ERROR. Halting new entries (Fail-Closed)."
-                        }
-                        res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {corrupt_list} failed integrity verification. Halting new order entries."
-                        return res
+    async def _check_deterministic_prefilters(self, symbol: str, side: str, context_data: dict) -> dict:
+        """Asynchronously evaluate the 7 deterministic risk pre-filters off the event loop thread."""
+        return await asyncio.to_thread(self._check_pre_filters_sync, symbol, side, context_data)
 
-                # 1. Config-owned symbol whitelist (intersected with config.SYMBOLS)
-                row = conn.execute("SELECT value FROM system_state WHERE key = 'ALLOWED_SYMBOLS'").fetchone()
-                import config as _cfg
-                cfg_symbols = getattr(_cfg, "SYMBOLS", [])
-                cfg_clean_map = {s.upper().replace("/", "").replace("-", ""): s for s in cfg_symbols}
-                
-                if row and row[0]:
-                    try:
-                        allowed_raw = json.loads(row[0])
-                    except Exception:
-                        allowed_raw = cfg_symbols
-                else:
-                    allowed_raw = cfg_symbols
-
-                # Intersect stored whitelist with config.SYMBOLS to discard wrong-venue symbols
-                allowed = []
-                for s in allowed_raw:
-                    s_clean = s.upper().replace("/", "").replace("-", "")
-                    if s_clean in cfg_clean_map:
-                        allowed.append(cfg_clean_map[s_clean])
-                    else:
-                        log.warning(f"[BOARDROOM-WHITELIST] Dropping symbol '{s}' from active whitelist: not present in config.SYMBOLS venue scope.")
-
-                if not allowed and cfg_symbols:
-                    allowed = cfg_symbols
-
-                if allowed:
-                    sym_clean = symbol.upper().replace("/", "").replace("-", "")
-                    allowed_clean = [s.upper().replace("/", "").replace("-", "") for s in allowed]
-                    if sym_clean not in allowed_clean:
-                        res["veto"] = {
-                            "execute": False,
-                            "conviction_score": 0.0,
-                            "stage": "whitelist_gate",
-                            "final_rationale": f"Asset {symbol} filtered out — ALLOWED_SYMBOLS fleet constraint active."
-                        }
-                        res["log"] = f"[BOARDROOM] VETO: {symbol} is not in ALLOWED_SYMBOLS whitelist ({allowed}). Bypassing entry."
-                        return res
-
-                # 1B. Emergency SL Failure Quarantining Gate (F-03 Defense)
-                sym_clean_key = symbol.upper().replace("/", "").replace("-", "")
-                row_emerg = conn.execute("SELECT value, updated_at FROM system_state WHERE key = ?", (f"emergency_sl_failure_{sym_clean_key}",)).fetchone()
-                if row_emerg and row_emerg[0]:
+    def _check_pre_filters_sync(self, symbol: str, side: str, context_data: dict) -> dict:
+        res = {"veto": None}
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            # 0. Database Integrity Gate (Fail-Closed on corrupted, stale, or unverified production DBs)
+            integ_report = check_database_integrity(conn)
+            if not integ_report["is_ok"]:
+                if integ_report["is_stale"]:
+                    stale_list = ", ".join(integ_report["stale_dbs"])
                     res["veto"] = {
                         "execute": False,
                         "conviction_score": 0.0,
-                        "stage": "emergency_sl_failure_quarantine",
-                        "final_rationale": f"Emergency stop-loss failure row active in system_state for {symbol}. Re-entry blocked until position protected or operator cleared."
+                        "stage": "database_integrity_stale",
+                        "final_rationale": f"integrity signal stale/absent: {stale_list} integrity status is older than {getattr(config, 'DB_INTEGRITY_MAX_AGE_SEC', 900)}s or unparseable/absent."
                     }
-                    res["log_warning"] = f"[BOARDROOM] 🚨 EMERGENCY SL FAILURE QUARANTINE: {symbol} has an un-cleared emergency_sl_failure record. Halting entry."
+                    res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {stale_list} integrity signal is stale/absent. Halting new entries."
+                    return res
+                elif integ_report["is_corrupt"]:
+                    corrupt_list = ", ".join(integ_report["corrupt_dbs"])
+                    res["veto"] = {
+                        "execute": False,
+                        "conviction_score": 0.0,
+                        "stage": "database_integrity_gate",
+                        "final_rationale": f"Database Integrity Gate Veto: {corrupt_list} integrity status is CRITICAL/CORRUPT or persistent ERROR. Halting new entries (Fail-Closed)."
+                    }
+                    res["log_warning"] = f"[BOARDROOM] 🚨 DATABASE INTEGRITY VETO: {corrupt_list} failed integrity verification. Halting new order entries."
                     return res
 
-                # Check if this is a mean-reversion dip buy (oversold scalp)
-                is_dip_buy = (
-                    context_data.get("strategy") == "Mean Reversion Maker Dip-Buy" or
-                    (context_data.get("timeframe") == "5m" and float(context_data.get("rsi", 50.0) or 50.0) <= 30.0)
-                )
+            # 1. Config-owned symbol whitelist (intersected with config.SYMBOLS)
+            row = conn.execute("SELECT value FROM system_state WHERE key = 'ALLOWED_SYMBOLS'").fetchone()
+            import config as _cfg
+            cfg_symbols = getattr(_cfg, "SYMBOLS", [])
+            cfg_clean_map = {s.upper().replace("/", "").replace("-", ""): s for s in cfg_symbols}
+            
+            if row and row[0]:
+                try:
+                    allowed_raw = json.loads(row[0])
+                except Exception:
+                    allowed_raw = cfg_symbols
+            else:
+                allowed_raw = cfg_symbols
 
-                # 2. Bitcoin Anchor & BIS Crash-Risk Contagion Filter
-                norm_side = side.upper()
-                is_long_side = ("LONG" in norm_side or "BUY" in norm_side)
-                if is_long_side:
-                    # BIS Crash-Risk Contagion Shield: Funding > +0.045% while 4H ROC <= 0
-                    row_crash = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'funding_crash_risk'").fetchone()
-                    if row_crash and row_crash[0]:
-                        crash_val = str(row_crash[0]).upper()
-                        crash_ts = row_crash[1]
-                        # TTL Guard: scout loop runs every 15m-4h; if CRITICAL, preserve veto even if stale (fail-closed)
-                        is_stale = False
-                        if crash_ts:
-                            try:
-                                ts_str = str(crash_ts).replace("Z", "+00:00")
-                                updated_dt = datetime.fromisoformat(ts_str)
-                                if updated_dt.tzinfo is None:
-                                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
-                                age_sec = (datetime.now(timezone.utc) - updated_dt).total_seconds()
-                                if age_sec > 14400.0:
-                                    if crash_val == "CRITICAL":
-                                        is_stale = False
-                                        log.critical(f"[BOARDROOM-BIS] 🚨 funding_crash_risk is CRITICAL and stale ({age_sec:.1f}s > 14400s). Enforcing FAIL-CLOSED (veto preserved).")
-                                    else:
-                                        is_stale = True
-                                        log.warning(f"[BOARDROOM-BIS] ⚠️ funding_crash_risk is stale ({age_sec:.1f}s > 14400s, val={crash_val}). Holding NORMAL.")
-                            except Exception as ts_err:
-                                # N-11 FIX: Bounded fail-safe. If timestamp is corrupt, do NOT blindly fail-open if the reading is CRITICAL.
-                                # Maintain defensive shield to prevent bypassing risk during telemetry corruption.
-                                is_stale = False
-                                log.critical(f"[BOARDROOM-BIS] 🚨 Corrupt funding_crash_risk timestamp '{crash_ts}': {ts_err}. Enforcing defensive fail-safe (veto preserved).")
+            # Intersect stored whitelist with config.SYMBOLS to discard wrong-venue symbols
+            allowed = []
+            for s in allowed_raw:
+                s_clean = s.upper().replace("/", "").replace("-", "")
+                if s_clean in cfg_clean_map:
+                    allowed.append(cfg_clean_map[s_clean])
+                else:
+                    log.warning(f"[BOARDROOM-WHITELIST] Dropping symbol '{s}' from active whitelist: not present in config.SYMBOLS venue scope.")
 
-                        if not is_stale and crash_val == "CRITICAL":
-                            res["veto"] = {
-                                "execute": False,
-                                "conviction_score": 0.0,
-                                "stage": "bis_crash_shield",
-                                "final_rationale": "BIS Crash-Risk Shield Veto: Overheated perpetual funding (> +0.045%) with negative momentum detected across fleet. Long entries frozen."
-                            }
-                            res["log_warning"] = f"[BOARDROOM] 🚨 BIS CRASH SHIELD VETO: Extreme funding squeeze contagion detected. Blocking LONG entry for {symbol}."
-                            return res
+            if not allowed and cfg_symbols:
+                allowed = cfg_symbols
 
-                    # 2B. TradFi Macro Credit & Spot ETF Gate (Stationary HYG/LQD Spread & SPY Trend)
-                    # FAIL-DIRECTION SPECIFICATION (R6):
-                    # Design decision: FAIL-CLOSED when TRADFI_FAIL_CLOSED=True (default).
-                    # If TradFi telemetry is missing, corrupt/unparseable, or stale (>21600s),
-                    # new LONG entries are blocked to prevent trading blind into credit blowouts.
-                    # Rate-limited warning alert emitted so the operator is notified.
-                    fail_closed_enabled = getattr(_cfg, "TRADFI_FAIL_CLOSED", True)
-                    row_etf_telemetry = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'etf_macro_telemetry'").fetchone()
+            if allowed:
+                sym_clean = symbol.upper().replace("/", "").replace("-", "")
+                allowed_clean = [s.upper().replace("/", "").replace("-", "") for s in allowed]
+                if sym_clean not in allowed_clean:
+                    res["veto"] = {
+                        "execute": False,
+                        "conviction_score": 0.0,
+                        "stage": "whitelist_gate",
+                        "final_rationale": f"Asset {symbol} filtered out — ALLOWED_SYMBOLS fleet constraint active."
+                    }
+                    res["log"] = f"[BOARDROOM] VETO: {symbol} is not in ALLOWED_SYMBOLS whitelist ({allowed}). Bypassing entry."
+                    return res
 
-                    if not row_etf_telemetry or not row_etf_telemetry[0]:
-                        if is_long_side and fail_closed_enabled:
-                            res["veto"] = {
-                                "execute": False,
-                                "conviction_score": 0.0,
-                                "stage": "tradfi_macro_credit_shield",
-                                "final_rationale": "TradFi Macro/Credit Shield Veto: Telemetry missing (fail-closed)."
-                            }
-                            res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Missing TradFi telemetry (fail-closed). Blocking LONG entry for {symbol}."
-                            return res
-                    else:
+            # 1B. Emergency SL Failure Quarantining Gate (F-03 Defense)
+            sym_clean_key = symbol.upper().replace("/", "").replace("-", "")
+            row_emerg = conn.execute("SELECT value, updated_at FROM system_state WHERE key = ?", (f"emergency_sl_failure_{sym_clean_key}",)).fetchone()
+            if row_emerg and row_emerg[0]:
+                res["veto"] = {
+                    "execute": False,
+                    "conviction_score": 0.0,
+                    "stage": "emergency_sl_failure_quarantine",
+                    "final_rationale": f"Emergency stop-loss failure row active in system_state for {symbol}. Re-entry blocked until position protected or operator cleared."
+                }
+                res["log_warning"] = f"[BOARDROOM] 🚨 EMERGENCY SL FAILURE QUARANTINE: {symbol} has an un-cleared emergency_sl_failure record. Halting entry."
+                return res
+
+            # Check if this is a mean-reversion dip buy (oversold scalp)
+            is_dip_buy = (
+                context_data.get("strategy") == "Mean Reversion Maker Dip-Buy" or
+                (context_data.get("timeframe") == "5m" and float(context_data.get("rsi", 50.0) or 50.0) <= 30.0)
+            )
+
+            # 2. Bitcoin Anchor & BIS Crash-Risk Contagion Filter
+            norm_side = side.upper()
+            is_long_side = ("LONG" in norm_side or "BUY" in norm_side)
+            if is_long_side:
+                # BIS Crash-Risk Contagion Shield: Funding > +0.045% while 4H ROC <= 0
+                row_crash = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'funding_crash_risk'").fetchone()
+                if row_crash and row_crash[0]:
+                    crash_val = str(row_crash[0]).upper()
+                    crash_ts = row_crash[1]
+                    # TTL Guard: scout loop runs every 15m-4h; if CRITICAL, preserve veto even if stale (fail-closed)
+                    is_stale = False
+                    if crash_ts:
                         try:
-                            etf_data = json.loads(row_etf_telemetry[0])
-                            is_tradfi_veto = bool(etf_data.get("veto_long_entries", False))
-                            conf_weight = float(etf_data.get("confidence_weight", 1.0))
-                            etf_rationale = etf_data.get("rationale", "")
-                            
-                            # Check telemetry staleness (TTL Guard: 6 hours = 21600s)
-                            etf_ts = row_etf_telemetry[1]
-                            is_etf_stale = False
-                            if etf_ts:
-                                try:
-                                    ts_clean = str(etf_ts).replace("Z", "+00:00")
-                                    etf_dt = datetime.fromisoformat(ts_clean)
-                                    if etf_dt.tzinfo is None:
-                                        etf_dt = etf_dt.replace(tzinfo=timezone.utc)
-                                    if (datetime.now(timezone.utc) - etf_dt).total_seconds() > 21600.0:
-                                        is_etf_stale = True
-                                except Exception:
-                                    is_etf_stale = True
-                            else:
-                                is_etf_stale = True
+                            ts_str = str(crash_ts).replace("Z", "+00:00")
+                            updated_dt = datetime.fromisoformat(ts_str)
+                            if updated_dt.tzinfo is None:
+                                updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                            age_sec = (datetime.now(timezone.utc) - updated_dt).total_seconds()
+                            if age_sec > 14400.0:
+                                if crash_val == "CRITICAL":
+                                    is_stale = False
+                                    log.critical(f"[BOARDROOM-BIS] 🚨 funding_crash_risk is CRITICAL and stale ({age_sec:.1f}s > 14400s). Enforcing FAIL-CLOSED (veto preserved).")
+                                else:
+                                    is_stale = True
+                                    log.warning(f"[BOARDROOM-BIS] ⚠️ funding_crash_risk is stale ({age_sec:.1f}s > 14400s, val={crash_val}). Holding NORMAL.")
+                        except Exception as ts_err:
+                            # N-11 FIX: Bounded fail-safe. If timestamp is corrupt, do NOT blindly fail-open if the reading is CRITICAL.
+                            # Maintain defensive shield to prevent bypassing risk during telemetry corruption.
+                            is_stale = False
+                            log.critical(f"[BOARDROOM-BIS] 🚨 Corrupt funding_crash_risk timestamp '{crash_ts}': {ts_err}. Enforcing defensive fail-safe (veto preserved).")
 
-                            if is_etf_stale:
-                                if is_long_side and fail_closed_enabled:
-                                    res["veto"] = {
-                                        "execute": False,
-                                        "conviction_score": 0.0,
-                                        "stage": "tradfi_macro_credit_shield",
-                                        "final_rationale": "TradFi Macro/Credit Shield Veto: Telemetry stale >21600s (fail-closed)."
-                                    }
-                                    res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Stale TradFi telemetry >6h (fail-closed). Blocking LONG entry for {symbol}."
-                                    return res
-                            elif is_tradfi_veto:
-                                # Active veto reported by producer. Confidence weight does not disarm a hard veto.
-                                res["veto"] = {
-                                    "execute": False,
-                                    "conviction_score": 0.0,
-                                    "stage": "tradfi_macro_credit_shield",
-                                    "final_rationale": f"TradFi Macro/Credit Shield Veto: {etf_rationale}"
-                                }
-                                res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Toxic macro credit or equity regime active. Blocking LONG entry for {symbol}."
-                                return res
-                            else:
-                                res["tradfi_macro_info"] = f"[BOARDROOM-TRADFI] {etf_rationale} (Confidence: {conf_weight:.2f})"
-                        except Exception as etf_parse_err:
-                            log.warning(f"[BOARDROOM-TRADFI-ALERT] 🚨 Telemetry parse failure: {etf_parse_err}")
+                    if not is_stale and crash_val == "CRITICAL":
+                        res["veto"] = {
+                            "execute": False,
+                            "conviction_score": 0.0,
+                            "stage": "bis_crash_shield",
+                            "final_rationale": "BIS Crash-Risk Shield Veto: Overheated perpetual funding (> +0.045%) with negative momentum detected across fleet. Long entries frozen."
+                        }
+                        res["log_warning"] = f"[BOARDROOM] 🚨 BIS CRASH SHIELD VETO: Extreme funding squeeze contagion detected. Blocking LONG entry for {symbol}."
+                        return res
+
+                # 2B. TradFi Macro Credit & Spot ETF Gate (Stationary HYG/LQD Spread & SPY Trend)
+                # FAIL-DIRECTION SPECIFICATION (R6):
+                # Design decision: FAIL-CLOSED when TRADFI_FAIL_CLOSED=True (default).
+                # If TradFi telemetry is missing, corrupt/unparseable, or stale (>21600s),
+                # new LONG entries are blocked to prevent trading blind into credit blowouts.
+                # Rate-limited warning alert emitted so the operator is notified.
+                fail_closed_enabled = getattr(_cfg, "TRADFI_FAIL_CLOSED", True)
+                row_etf_telemetry = conn.execute("SELECT value, updated_at FROM system_state WHERE key = 'etf_macro_telemetry'").fetchone()
+
+                if not row_etf_telemetry or not row_etf_telemetry[0]:
+                    if is_long_side and fail_closed_enabled:
+                        res["veto"] = {
+                            "execute": False,
+                            "conviction_score": 0.0,
+                            "stage": "tradfi_macro_credit_shield",
+                            "final_rationale": "TradFi Macro/Credit Shield Veto: Telemetry missing (fail-closed)."
+                        }
+                        res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Missing TradFi telemetry (fail-closed). Blocking LONG entry for {symbol}."
+                        return res
+                else:
+                    try:
+                        etf_data = json.loads(row_etf_telemetry[0])
+                        is_tradfi_veto = bool(etf_data.get("veto_long_entries", False))
+                        conf_weight = float(etf_data.get("confidence_weight", 1.0))
+                        etf_rationale = etf_data.get("rationale", "")
+                        
+                        # Check telemetry staleness (TTL Guard: 6 hours = 21600s)
+                        etf_ts = row_etf_telemetry[1]
+                        is_etf_stale = False
+                        if etf_ts:
+                            try:
+                                ts_clean = str(etf_ts).replace("Z", "+00:00")
+                                etf_dt = datetime.fromisoformat(ts_clean)
+                                if etf_dt.tzinfo is None:
+                                    etf_dt = etf_dt.replace(tzinfo=timezone.utc)
+                                if (datetime.now(timezone.utc) - etf_dt).total_seconds() > 21600.0:
+                                    is_etf_stale = True
+                            except Exception:
+                                is_etf_stale = True
+                        else:
+                            is_etf_stale = True
+
+                        if is_etf_stale:
                             if is_long_side and fail_closed_enabled:
                                 res["veto"] = {
                                     "execute": False,
                                     "conviction_score": 0.0,
                                     "stage": "tradfi_macro_credit_shield",
-                                    "final_rationale": f"TradFi Macro/Credit Shield Veto: Corrupt telemetry ({etf_parse_err}) (fail-closed)."
+                                    "final_rationale": "TradFi Macro/Credit Shield Veto: Telemetry stale >21600s (fail-closed)."
                                 }
-                                res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Corrupt TradFi telemetry ({etf_parse_err}). Blocking LONG entry for {symbol}."
+                                res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Stale TradFi telemetry >6h (fail-closed). Blocking LONG entry for {symbol}."
                                 return res
-
-                # R-4 FIX: Consistent usage of is_long_side
-                if is_long_side and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
-                    row_pause = conn.execute("SELECT value FROM system_state WHERE key IN ('ALT_LONG_PAUSE', 'alt_long_pause')").fetchall()
-                    row_state = conn.execute("SELECT value FROM system_state WHERE key = 'btc_anchor_state'").fetchone()
-                    is_paused = any(r[0] in ("1", "true", "True") for r in row_pause)
-                    btc_st = row_state[0] if row_state else "NEUTRAL_RANGE"
-                    if is_paused or btc_st == "DISTRIBUTION_DUMP_RISK":
-                        row_runners = conn.execute("SELECT value FROM system_state WHERE key = 'ai_decoupled_runners'").fetchone()
-                        decoupled_runners = set(s.strip().upper().replace("/", "").replace("-", "") for s in (row_runners[0].split(",") if row_runners and row_runners[0] else []))
-                        row_matrix = conn.execute("SELECT value FROM system_state WHERE key = 'ai_decoupled_regime_matrix'").fetchone()
-                        if row_matrix and row_matrix[0]:
-                            try:
-                                m_data = json.loads(row_matrix[0])
-                                for mk, mv in m_data.items():
-                                    if isinstance(mv, dict) and mv.get("independent_trade_allowed"):
-                                        decoupled_runners.add(mk.strip().upper().replace("/", "").replace("-", ""))
-                            except Exception:
-                                pass
-                        reg_row = conn.execute("SELECT plus_di, minus_di FROM market_regime ORDER BY id DESC LIMIT 1").fetchone()
-                        buyers_dominate = bool(reg_row and float(reg_row[0] or 0.0) > float(reg_row[1] or 0.0))
-                        sym_clean = symbol.upper().replace("/", "").replace("-", "")
-                        
-                        # Contagion protection: if Bitcoin is in severe systemic dump or contagion crisis,
-                        # a minor 15m +DI micro-bounce must NOT bypass the altcoin pause.
-                        is_severe_contagion = btc_st in ("DISTRIBUTION_DUMP_RISK", "CONTAGION_CRITICAL", "SYSTEMIC_DUMP", "EXTREME_CONTRACTION")
-                        can_exempt = (sym_clean in decoupled_runners) or (buyers_dominate and not is_severe_contagion)
-                        
-                        if can_exempt:
-                            res["decoupled_info"] = f"[BOARDROOM] 🚀 DECOUPLED ALPHA EXEMPTION: {symbol} authorized (Runner or Market +DI > -DI)."
-                        elif is_dip_buy and not is_severe_contagion:
-                            res["decoupled_info"] = f"[BOARDROOM] ⚡ MEAN-REVERSION DIP EXEMPTION: {symbol} is at severe oversold levels (RSI: {context_data.get('rsi')}). Dip-buy authorized despite Bitcoin Anchor pause."
+                        elif is_tradfi_veto:
+                            # Active veto reported by producer. Confidence weight does not disarm a hard veto.
+                            res["veto"] = {
+                                "execute": False,
+                                "conviction_score": 0.0,
+                                "stage": "tradfi_macro_credit_shield",
+                                "final_rationale": f"TradFi Macro/Credit Shield Veto: {etf_rationale}"
+                            }
+                            res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Toxic macro credit or equity regime active. Blocking LONG entry for {symbol}."
+                            return res
                         else:
+                            res["tradfi_macro_info"] = f"[BOARDROOM-TRADFI] {etf_rationale} (Confidence: {conf_weight:.2f})"
+                    except Exception as etf_parse_err:
+                        log.warning(f"[BOARDROOM-TRADFI-ALERT] 🚨 Telemetry parse failure: {etf_parse_err}")
+                        if is_long_side and fail_closed_enabled:
                             res["veto"] = {
                                 "execute": False,
                                 "conviction_score": 0.0,
-                                "stage": "bitcoin_anchor",
-                                "final_rationale": f"Bitcoin Anchor Contagion Veto: BTC is under institutional distribution ({btc_st}). Alt longs paused."
+                                "stage": "tradfi_macro_credit_shield",
+                                "final_rationale": f"TradFi Macro/Credit Shield Veto: Corrupt telemetry ({etf_parse_err}) (fail-closed)."
                             }
-                            res["log_warning"] = f"[BOARDROOM] ⚓ BITCOIN ANCHOR VETO: Altcoin long on {symbol} blocked. BTC state: {btc_st}, ALT_LONG_PAUSE=1."
+                            res["log_warning"] = f"[BOARDROOM] 🚨 TRADFI CREDIT SHIELD VETO: Corrupt TradFi telemetry ({etf_parse_err}). Blocking LONG entry for {symbol}."
                             return res
 
-                # 3. Multi-Asset Relative Strength Leader Gate (Avoid/Chop list)
-                # Only blocks breakout/momentum entries; mean-reversion dip-buys during chop are explicitly permitted
-                if not is_dip_buy:
-                    row_avoid = conn.execute("SELECT value FROM system_state WHERE key = 'ai_asset_avoid'").fetchone()
-                    if row_avoid and row_avoid[0]:
-                        avoid_raw = row_avoid[0]
-                        avoid_symbols = [s.strip().upper().replace("/", "").replace("-", "") for s in avoid_raw.split(",") if s.strip()]
-                        sym_clean = symbol.upper().replace("/", "").replace("-", "")
-                        if sym_clean in avoid_symbols:
-                            res["veto"] = {
-                                "execute": False,
-                                "conviction_score": 0.0,
-                                "stage": "leader_gate",
-                                "final_rationale": f"Leader Gate Veto: Asset {symbol} is currently flagged on the AI Avoid/Chop List. Capital reserved for alpha leaders."
-                            }
-                            res["log_warning"] = f"[BOARDROOM] 🚫 LEADER GATE VETO: {symbol} is in the AI Avoid/Chop List ({avoid_raw}). Vetoing entry."
-                            return res
-            except Exception as e:
-                res["err"] = str(e)
-                res["veto"] = {
-                    "execute": False,
-                    "conviction_score": 0.0,
-                    "stage": "db_error_fail_closed",
-                    "final_rationale": f"Boardroom Pre-Filter Veto (Fail-Closed on DB Error): {e}"
-                }
-                res["log_warning"] = f"[BOARDROOM] 🛡️ FAIL-CLOSED SAFETY VETO: Error reading system_state pre-filters: {e}"
-            finally:
-                if conn:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-            return res
+            # R-4 FIX: Consistent usage of is_long_side
+            if is_long_side and symbol.upper() not in ["BTC/USDT", "BTCUSDT", "BTC"]:
+                row_pause = conn.execute("SELECT value FROM system_state WHERE key IN ('ALT_LONG_PAUSE', 'alt_long_pause')").fetchall()
+                row_state = conn.execute("SELECT value FROM system_state WHERE key = 'btc_anchor_state'").fetchone()
+                is_paused = any(r[0] in ("1", "true", "True") for r in row_pause)
+                btc_st = row_state[0] if row_state else "NEUTRAL_RANGE"
+                if is_paused or btc_st == "DISTRIBUTION_DUMP_RISK":
+                    row_runners = conn.execute("SELECT value FROM system_state WHERE key = 'ai_decoupled_runners'").fetchone()
+                    decoupled_runners = set(s.strip().upper().replace("/", "").replace("-", "") for s in (row_runners[0].split(",") if row_runners and row_runners[0] else []))
+                    row_matrix = conn.execute("SELECT value FROM system_state WHERE key = 'ai_decoupled_regime_matrix'").fetchone()
+                    if row_matrix and row_matrix[0]:
+                        try:
+                            m_data = json.loads(row_matrix[0])
+                            for mk, mv in m_data.items():
+                                if isinstance(mv, dict) and mv.get("independent_trade_allowed"):
+                                    decoupled_runners.add(mk.strip().upper().replace("/", "").replace("-", ""))
+                        except Exception:
+                            pass
+                    reg_row = conn.execute("SELECT plus_di, minus_di FROM market_regime ORDER BY id DESC LIMIT 1").fetchone()
+                    buyers_dominate = bool(reg_row and float(reg_row[0] or 0.0) > float(reg_row[1] or 0.0))
+                    sym_clean = symbol.upper().replace("/", "").replace("-", "")
+                    
+                    # Contagion protection: if Bitcoin is in severe systemic dump or contagion crisis,
+                    # a minor 15m +DI micro-bounce must NOT bypass the altcoin pause.
+                    is_severe_contagion = btc_st in ("DISTRIBUTION_DUMP_RISK", "CONTAGION_CRITICAL", "SYSTEMIC_DUMP", "EXTREME_CONTRACTION")
+                    can_exempt = (sym_clean in decoupled_runners) or (buyers_dominate and not is_severe_contagion)
+                    
+                    if can_exempt:
+                        res["decoupled_info"] = f"[BOARDROOM] 🚀 DECOUPLED ALPHA EXEMPTION: {symbol} authorized (Runner or Market +DI > -DI)."
+                    elif is_dip_buy and not is_severe_contagion:
+                        res["decoupled_info"] = f"[BOARDROOM] ⚡ MEAN-REVERSION DIP EXEMPTION: {symbol} is at severe oversold levels (RSI: {context_data.get('rsi')}). Dip-buy authorized despite Bitcoin Anchor pause."
+                    else:
+                        res["veto"] = {
+                            "execute": False,
+                            "conviction_score": 0.0,
+                            "stage": "bitcoin_anchor",
+                            "final_rationale": f"Bitcoin Anchor Contagion Veto: BTC is under institutional distribution ({btc_st}). Alt longs paused."
+                        }
+                        res["log_warning"] = f"[BOARDROOM] ⚓ BITCOIN ANCHOR VETO: Altcoin long on {symbol} blocked. BTC state: {btc_st}, ALT_LONG_PAUSE=1."
+                        return res
 
-        pre_filter_res = await asyncio.to_thread(_check_pre_filters_sync)
+            # 3. Multi-Asset Relative Strength Leader Gate (Avoid/Chop list)
+            # Only blocks breakout/momentum entries; mean-reversion dip-buys during chop are explicitly permitted
+            if not is_dip_buy:
+                row_avoid = conn.execute("SELECT value FROM system_state WHERE key = 'ai_asset_avoid'").fetchone()
+                if row_avoid and row_avoid[0]:
+                    avoid_raw = row_avoid[0]
+                    avoid_symbols = [s.strip().upper().replace("/", "").replace("-", "") for s in avoid_raw.split(",") if s.strip()]
+                    sym_clean = symbol.upper().replace("/", "").replace("-", "")
+                    if sym_clean in avoid_symbols:
+                        res["veto"] = {
+                            "execute": False,
+                            "conviction_score": 0.0,
+                            "stage": "leader_gate",
+                            "final_rationale": f"Leader Gate Veto: Asset {symbol} is currently flagged on the AI Avoid/Chop List. Capital reserved for alpha leaders."
+                        }
+                        res["log_warning"] = f"[BOARDROOM] 🚫 LEADER GATE VETO: {symbol} is in the AI Avoid/Chop List ({avoid_raw}). Vetoing entry."
+                        return res
+        except Exception as e:
+            res["err"] = str(e)
+            res["veto"] = {
+                "execute": False,
+                "conviction_score": 0.0,
+                "stage": "db_error_fail_closed",
+                "final_rationale": f"Boardroom Pre-Filter Veto (Fail-Closed on DB Error): {e}"
+            }
+            res["log_warning"] = f"[BOARDROOM] 🛡️ FAIL-CLOSED SAFETY VETO: Error reading system_state pre-filters: {e}"
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return res
+
+    async def get_conviction(self, symbol: str, side: str, context_data: dict) -> dict:
+        pre_filter_res = await asyncio.to_thread(self._check_pre_filters_sync, symbol, side, context_data)
         if pre_filter_res.get("decoupled_info"):
             log.info(pre_filter_res["decoupled_info"])
         if pre_filter_res.get("log"):

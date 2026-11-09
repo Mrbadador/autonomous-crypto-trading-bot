@@ -2,12 +2,22 @@ import sqlite3
 import logging
 from datetime import datetime, UTC
 import os
+import re
 import asyncio
 import threading
 import queue
 import time
 
 log = logging.getLogger(__name__)
+
+def _parse_version(v_str: str) -> tuple[int, ...]:
+    """Parse version string into an integer tuple for reliable semver comparison.
+    Prevents alphabetical string comparison defects (e.g. '1.10' < '1.2' is True).
+    """
+    if not v_str:
+        return (0,)
+    nums = re.findall(r'\d+', str(v_str))
+    return tuple(int(n) for n in nums) if nums else (0,)
 
 class WriteOp:
     __slots__ = ("table", "query", "params", "enqueued_at")
@@ -588,8 +598,9 @@ class DatabaseManager:
             # Check if migrations are already applied to save I/O and time during startup
             cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
             row = cursor.fetchone()
-            if row and row[0] == "1.1":
-                # Migrations already applied, skip
+            curr_v_raw = str(row[0]) if row and row[0] else "0.0"
+            if _parse_version(curr_v_raw) >= _parse_version("1.1"):
+                # Migrations 1.1 already applied, skip
                 pass
             else:
                 # Migration: Ensure new columns exist for all trades tables
@@ -682,7 +693,7 @@ class DatabaseManager:
             cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
             row_v = cursor.fetchone()
             curr_v = str(row_v[0]) if row_v else "0.0"
-            if curr_v < "1.2":
+            if _parse_version(curr_v) < _parse_version("1.2"):
                 log.info("Migrating database to 1.2: Rebuilding swing_trades with nullable exit_price/pnl/roe_pct...")
                 try:
                     cursor.execute("PRAGMA foreign_keys = OFF;")
@@ -752,7 +763,7 @@ class DatabaseManager:
             cursor.execute("SELECT value FROM system_state WHERE key = 'migrations_version'")
             row_v = cursor.fetchone()
             curr_v = str(row_v[0]) if row_v else "0.0"
-            if curr_v < "1.3":
+            if _parse_version(curr_v) < _parse_version("1.3"):
                 log.info("Migrating database to 1.3: Adding candle_key and unique index to shadow_signals...")
                 try:
                     cursor.execute("PRAGMA table_info(shadow_signals)")

@@ -543,11 +543,18 @@ class InflightPositionShepherd:
 
                             if c_detected and c_act == "HARVEST_CLIMAX_NOW":
                                 log.warning(f"[CLIMAX-SENTINEL] 🚨 BLOW-OFF CLIMAX EXHAUSTION DETECTED for {std_sym} at {r_multiple:+.2f}R ({roe_pct:+.1f}% ROE)! Reason: {c_reason}")
-                                log.info(f"[CLIMAX-HARVEST] Executing instant market close on Bitget for {std_sym} to bank peak gains...")
-                                close_res = await client.close_position_order(clean_sym, pos_side, size)
-                                verdict = "HARVEST_CLIMAX_EXECUTED"
-                                diagnosis = f"Peak Climax Harvest Executed at {r_multiple:+.2f}R: {c_reason}"
-                                log.info(f"[CLIMAX-HARVEST] Position {std_sym} banked cleanly! {close_res}")
+                                swing_is_locked, lock_reason = await asyncio.to_thread(_is_swing_locked, std_sym)
+                                if swing_is_locked:
+                                    log.info(f"[SHEPHERD-SKIP-CLOSE] Inflight Shepherd skipping climax close on {std_sym} ({lock_reason}); acting in advisory mode.")
+                                    diagnosis = f"Advisory Climax Harvest ({lock_reason}): {c_reason}"
+                                else:
+                                    log.info(f"[CLIMAX-HARVEST] Executing instant market close on Bitget for {std_sym} to bank peak gains...")
+                                    close_res = await client.close_position_order(clean_sym, pos_side, size)
+                                    verdict = "HARVEST_CLIMAX_EXECUTED"
+                                    diagnosis = f"Peak Climax Harvest Executed at {r_multiple:+.2f}R: {c_reason}"
+                                    if close_res:
+                                        self._sync_local_position_after_close(std_sym, size, is_full_close=True)
+                                    log.info(f"[CLIMAX-HARVEST] Position {std_sym} banked cleanly! {close_res}")
                             elif c_act == "TIGHTEN_TIGHT_TICK" and c_tight_sl:
                                 suggested_sl = float(c_tight_sl)
                                 tighten_sl = True
@@ -588,15 +595,21 @@ class InflightPositionShepherd:
 
                                 if rev_action == "EXIT_IMMEDIATE" and not breathing_room_active:
                                     log.warning(f"[EARLY-REVERSAL] 🚨 Closing {std_sym} immediately to preserve capital and abort failing trade...")
-                                    try:
-                                        close_res = await client.close_position_order(clean_sym, pos_side, size)
-                                        if close_res:
-                                            verdict = "EARLY_REVERSAL_EXIT"
-                                            diagnosis = f"Early Reversal Capital Defense Exit: {rev_reason}"
-                                        else:
-                                            log.error(f"[EARLY-REVERSAL] Close position returned false for {std_sym}. Position retained.")
-                                    except Exception as c_err:
-                                        log.error(f"[EARLY-REVERSAL] Close position failed on exchange for {std_sym}: {c_err}")
+                                    swing_is_locked, lock_reason = await asyncio.to_thread(_is_swing_locked, std_sym)
+                                    if swing_is_locked:
+                                        log.info(f"[SHEPHERD-SKIP-CLOSE] Inflight Shepherd skipping early reversal close on {std_sym} ({lock_reason}); acting in advisory mode.")
+                                        diagnosis = f"Advisory Early Reversal ({lock_reason}): {rev_reason}"
+                                    else:
+                                        try:
+                                            close_res = await client.close_position_order(clean_sym, pos_side, size)
+                                            if close_res:
+                                                verdict = "EARLY_REVERSAL_EXIT"
+                                                diagnosis = f"Early Reversal Capital Defense Exit: {rev_reason}"
+                                                self._sync_local_position_after_close(std_sym, size, is_full_close=True)
+                                            else:
+                                                log.error(f"[EARLY-REVERSAL] Close position returned false for {std_sym}. Position retained.")
+                                        except Exception as c_err:
+                                            log.error(f"[EARLY-REVERSAL] Close position failed on exchange for {std_sym}: {c_err}")
                                 elif rev_action == "TIGHTEN_SL" and rev_tight_sl:
                                     suggested_sl = float(rev_tight_sl)
                                     tighten_sl = True
@@ -604,11 +617,18 @@ class InflightPositionShepherd:
                                 elif rev_action == "HARVEST_HALF":
                                     half_size = round(size * 0.5, 4)
                                     if half_size > 0:
-                                        log.info(f"[DYNAMIC-HARVEST] 🌾 Executing 50% partial profit harvest ({half_size} units) on {std_sym}: {rev_reason}")
-                                        try:
-                                            await client.close_position_order(clean_sym, pos_side, half_size)
-                                        except Exception as h_err:
-                                            log.warning(f"[DYNAMIC-HARVEST-ERR] {h_err}")
+                                        swing_is_locked, lock_reason = await asyncio.to_thread(_is_swing_locked, std_sym)
+                                        if swing_is_locked:
+                                            log.info(f"[SHEPHERD-SKIP-CLOSE] Inflight Shepherd skipping 50% partial harvest on {std_sym} ({lock_reason}); acting in advisory mode.")
+                                            diagnosis = f"Advisory Dynamic Harvest 50% ({lock_reason}): {rev_reason}"
+                                        else:
+                                            log.info(f"[DYNAMIC-HARVEST] 🌾 Executing 50% partial profit harvest ({half_size} units) on {std_sym}: {rev_reason}")
+                                            try:
+                                                h_res = await client.close_position_order(clean_sym, pos_side, half_size)
+                                                if h_res:
+                                                    self._sync_local_position_after_close(std_sym, half_size, is_full_close=False)
+                                            except Exception as h_err:
+                                                log.warning(f"[DYNAMIC-HARVEST-ERR] {h_err}")
                                     if "LONG" in pos_side and entry_p > current_sl:
                                         suggested_sl = entry_p + (atr_val * 0.2)
                                         tighten_sl = True
@@ -664,9 +684,16 @@ class InflightPositionShepherd:
 
                                 if c_risk == "HIGH" and c_act == "HARVEST_BEFORE_SETTLEMENT" and holding_mins >= 60.0:
                                     log.warning(f"[CARRY-OPTIMIZER] 💸 HIGH FUNDING DRAG for {std_sym} ({fr_val*100:+.4f}% in {mins_to_settle:.0f}m). Harvesting before settlement...")
-                                    close_res = await client.close_position_order(clean_sym, pos_side, size)
-                                    verdict = "FUNDING_CARRY_HARVEST"
-                                    diagnosis = f"Funding Carry Pre-Settlement Harvest ({fr_val*100:+.4f}%): {c_reason}"
+                                    swing_is_locked, lock_reason = await asyncio.to_thread(_is_swing_locked, std_sym)
+                                    if swing_is_locked:
+                                        log.info(f"[SHEPHERD-SKIP-CLOSE] Inflight Shepherd skipping funding carry harvest on {std_sym} ({lock_reason}); acting in advisory mode.")
+                                        diagnosis = f"Advisory Funding Carry Harvest ({lock_reason}): {c_reason}"
+                                    else:
+                                        close_res = await client.close_position_order(clean_sym, pos_side, size)
+                                        verdict = "FUNDING_CARRY_HARVEST"
+                                        diagnosis = f"Funding Carry Pre-Settlement Harvest ({fr_val*100:+.4f}%): {c_reason}"
+                                        if close_res:
+                                            self._sync_local_position_after_close(std_sym, size, is_full_close=True)
                                 elif c_act == "TIGHTEN_TO_BREAKEVEN":
                                     if "LONG" in pos_side and entry_p > current_sl:
                                         suggested_sl = entry_p
@@ -813,6 +840,23 @@ class InflightPositionShepherd:
                 conn.commit()
         except Exception as e:
             log.warning(f"Could not update local SL: {e}")
+
+    def _sync_local_position_after_close(self, symbol: str, closed_qty: float, is_full_close: bool = True):
+        """Synchronizes local open_positions and swing_open_positions tables after an executed close or partial harvest."""
+        try:
+            clean_s = symbol.upper().replace("/", "").replace("-", "")
+            raw_s = symbol
+            with sqlite3.connect("trading_data.db", timeout=5.0) as conn:
+                if is_full_close:
+                    conn.execute("DELETE FROM open_positions WHERE symbol = ? OR symbol LIKE ?", (raw_s, f"%{clean_s}%"))
+                    conn.execute("DELETE FROM swing_open_positions WHERE symbol = ? OR symbol LIKE ?", (raw_s, f"%{clean_s}%"))
+                else:
+                    # Partial close / harvest: decrement existing position size
+                    conn.execute("UPDATE open_positions SET qty = MAX(0.0, qty - ?) WHERE symbol = ? OR symbol LIKE ?", (closed_qty, raw_s, f"%{clean_s}%"))
+                    conn.execute("UPDATE swing_open_positions SET size = MAX(0.0, size - ?), updated_at = ? WHERE symbol = ? OR symbol LIKE ?", (closed_qty, datetime.now(UTC).isoformat(), raw_s, f"%{clean_s}%"))
+                conn.commit()
+        except Exception as e:
+            log.warning(f"[SHEPHERD] Could not sync local position after close for {symbol}: {e}")
 
     def _persist_shepherd_report(self, rep: dict):
         """Writes report to system_state and trading_ledger.db."""

@@ -46,6 +46,27 @@ FLEET_TABLES = [
     {"table": "mean_reversion_open_positions", "bot": "MeanRev", "closed_table": "mean_reversion_trades", "is_live": False, "closed_status": "closed", "unreconciled_status": "unreconciled"},
 ]
 
+REQUIRED_SWING_TRADES_COLS = {
+    "timestamp", "symbol", "side", "entry_price", "exit_price", "size", "pnl", "roe_pct",
+    "holding_hours", "exit_reason", "notes", "intended_entry_price", "actual_fill_price",
+    "slippage_bps", "fee_paid_usd", "fee_maker_usd", "fee_taker_usd", "funding_usd",
+    "funding_source", "gates_snapshot", "status"
+}
+
+def _check_required_columns(conn: sqlite3.Connection, table_name: str, required_cols: set[str]) -> bool:
+    """Verifies that the target SQLite table contains all required columns before executing an INSERT."""
+    try:
+        cur = conn.execute(f"PRAGMA table_info({table_name})")
+        existing_cols = {r[1] for r in cur.fetchall()}
+        missing = required_cols - existing_cols
+        if missing:
+            log.error(f"[RECONCILER] Table '{table_name}' missing required columns {missing}. Skipping INSERT to prevent OperationalError.")
+            return False
+        return True
+    except Exception as e:
+        log.error(f"[RECONCILER] Error checking schema for table '{table_name}': {e}")
+        return False
+
 # In-memory deduplication tracker for closure alerts to prevent email spam
 _recently_alerted_closures = {}  # symbol -> timestamp
 _background_tasks = set()
@@ -698,6 +719,8 @@ async def audit_live_exchange_positions():
                                         rec_status = fleet.get("unreconciled_status", "unreconciled") if is_unreconciled else fleet.get("closed_status", "closed")
 
                                         if closed_tbl == "swing_trades":
+                                            if not _check_required_columns(conn, "swing_trades", REQUIRED_SWING_TRADES_COLS):
+                                                raise sqlite3.OperationalError("swing_trades table missing required columns — skipping insert to preserve position row")
                                             cur_ins = conn.execute(
                                                 """INSERT INTO swing_trades (
                                                     timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct,
@@ -1143,6 +1166,8 @@ async def audit_live_exchange_positions():
                                         rec_status = fleet.get("unreconciled_status", "unreconciled") if is_unreconciled else fleet.get("closed_status", "closed")
 
                                         if closed_tbl == "swing_trades":
+                                            if not _check_required_columns(conn, "swing_trades", REQUIRED_SWING_TRADES_COLS):
+                                                raise sqlite3.OperationalError("swing_trades table missing required columns — skipping insert to preserve position row")
                                             cur_ins = conn.execute(
                                                 """INSERT INTO swing_trades (
                                                     timestamp, symbol, side, entry_price, exit_price, size, pnl, roe_pct,
