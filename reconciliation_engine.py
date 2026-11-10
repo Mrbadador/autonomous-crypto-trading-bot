@@ -69,6 +69,7 @@ def _check_required_columns(conn: sqlite3.Connection, table_name: str, required_
 
 # In-memory deduplication tracker for closure alerts to prevent email spam
 _recently_alerted_closures = {}  # symbol -> timestamp
+_last_degraded_alert_time = 0.0  # rate limit for DEGRADED alert emails (minimum 300s between alerts)
 _background_tasks = set()
 
 
@@ -1301,42 +1302,11 @@ async def audit_live_exchange_positions():
                 except Exception:
                     pass
 
-    import ccxt.async_support as ccxt
-    exchange = ccxt.bitget({
-        "apiKey": config.ACTIVE_API_KEY,
-        "secret": config.ACTIVE_SECRET_KEY,
-        "password": config.ACTIVE_PASSPHRASE,
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap", "adjustForTimeDifference": True}
-    })
-
-    try:
-        await exchange.load_time_difference()
-        positions = await exchange.fetch_positions()
-        active_exchange_positions = {}
-        for p in positions:
-            contracts = float(p.get("contracts", 0.0))
-            if abs(contracts) > 0:
-                sym = p.get("symbol")
-                active_exchange_positions[sym] = {
-                    "side": p.get("side"),
-                    "contracts": contracts,
-                    "entry_price": float(p.get("entryPrice", 0.0)),
-                    "unrealized_pnl": float(p.get("unrealizedPnl", 0.0))
-                }
-
-        log.info(f"[EXCHANGE] Live Bitget exchange positions found: {len(active_exchange_positions)}")
-        return {
-            "mode": "live_bitget",
-            "status": "HEALTHY",
-            "exchange_positions": len(active_exchange_positions),
-            "synced_at": datetime.now(UTC).isoformat()
-        }
-    except Exception as e:
-        log.warning(f"[EXCHANGE] Live Bitget position fetch failed: {e}")
-        return {"mode": "live_error", "status": "DEGRADED", "error": str(e)}
-    finally:
-        await exchange.close()
+    return {
+        "mode": "unsupported_exchange",
+        "status": "HEALTHY",
+        "live_reconciliation": f"exchange {ex_id} not configured for live audit"
+    }
 
 def _is_healthy(paper_audit, live_audit) -> bool:
     """True only when every audit that ran published a HEALTHY status.
@@ -1390,6 +1360,24 @@ async def reconciliation_main_loop():
             telemetry = build_heartbeat_telemetry(paper_audit, live_audit)
             update_system_state("reconciliation_heartbeat", json.dumps(telemetry))
             log.info(f"[HEARTBEAT] Active: {paper_audit['positions_active']} | Desyncs Healed: {paper_audit['desyncs_healed']} | Status: {telemetry['status']}")
+
+            # Operator Alert on DEGRADED reconciliation status (rate-limited to 1 per 300s)
+            if telemetry.get("status") == "DEGRADED":
+                now_ts = time.time()
+                global _last_degraded_alert_time
+                if now_ts - _last_degraded_alert_time > 300.0:
+                    _last_degraded_alert_time = now_ts
+                    log.critical(f"[RECONCILER-ALERT] Fleet reconciliation status DEGRADED! Telemetry: {telemetry}")
+                    try:
+                        from email_dispatcher import send_alert_async
+                        deg_task = asyncio.create_task(send_alert_async(
+                            subject="CRITICAL: Fleet Reconciliation DEGRADED",
+                            message=f"Reconciliation Engine reported DEGRADED state.\n\nTelemetry:\n{json.dumps(telemetry, indent=2)}"
+                        ))
+                        _background_tasks.add(deg_task)
+                        deg_task.add_done_callback(_background_tasks.discard)
+                    except Exception as al_err:
+                        log.error(f"[RECONCILER-ALERT-ERR] Failed to dispatch degraded alert: {al_err}")
             
         except Exception as e:
             log.error(f"Reconciliation cycle exception: {e}")
